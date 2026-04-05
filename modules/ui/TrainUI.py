@@ -581,7 +581,7 @@ class TrainUI(ctk.CTk):
                          tooltip="Open the profiling tools.")
         components.button(frame, 4, 1, "Open", self.open_profiling_tool)
 
-        components.label(frame, 5, 0, "Queue",
+        components.label(frame, 5, 0, "Queue Tool",
                          tooltip="Open the training queue tool")
         components.button(frame, 5, 1, "Open", self.open_queue_tool)
 
