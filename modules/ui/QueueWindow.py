@@ -1,13 +1,18 @@
 import contextlib
+import json
+import os
+import pathlib
 import threading
 import tkinter as tk
 from collections import OrderedDict
 from enum import Enum
 from tkinter import filedialog, messagebox
 
+from modules.util import path_util
 from modules.util.config.QueueConfig import QueueEntry
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.QueueEntryStatus import QueueEntryStatus
+from modules.util.image_util import load_image
 from modules.util.queue.QueueExecutor import QueueExecutor
 from modules.util.queue.QueueManager import QueueManager
 from modules.util.queue.QueueValidator import QueueValidator
@@ -17,6 +22,7 @@ from modules.util.type_util import issubclass_safe
 from modules.util.ui.ui_utils import set_window_icon
 
 import customtkinter as ctk
+from PIL import Image
 
 PAD = 10
 
@@ -234,6 +240,77 @@ class _FieldInfo:
         self.is_overridden = False
 
 
+CONCEPT_THUMB_SIZE = 100
+CONCEPT_CARD_COLS = 6
+
+
+def _get_concept_preview(concept_dict: dict) -> Image.Image:
+    concept_path = concept_dict.get("path", "")
+    include_sub = concept_dict.get("include_subdirectories", False)
+    glob_pattern = "**/*.*" if include_sub else "*.*"
+
+    preview_path = None
+    if concept_path and os.path.isdir(concept_path):
+        for p in pathlib.Path(concept_path).glob(glob_pattern):
+            if any(part.startswith('.') for part in p.relative_to(concept_path).parent.parts):
+                continue
+            ext = os.path.splitext(p)[1]
+            if (p.is_file()
+                    and path_util.is_supported_image_extension(ext)
+                    and not p.name.endswith("-masklabel.png")
+                    and not p.name.endswith("-condlabel.png")):
+                preview_path = str(p)
+                break
+
+    if preview_path:
+        try:
+            image = load_image(preview_path, convert_mode="RGBA")
+        except OSError:
+            image = Image.new("RGBA", (CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE), (200, 200, 200, 255))
+    else:
+        image = Image.new("RGBA", (CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE), (200, 200, 200, 255))
+
+    size = min(image.width, image.height)
+    image = image.crop((
+        (image.width - size) // 2,
+        (image.height - size) // 2,
+        (image.width - size) // 2 + size,
+        (image.height - size) // 2 + size,
+    ))
+    return image.resize((CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE), Image.Resampling.BILINEAR)
+
+
+class _QueueConceptCard(ctk.CTkFrame):
+    def __init__(self, master, concept_dict: dict, index: int, on_toggle):
+        super().__init__(master, width=CONCEPT_THUMB_SIZE + 20, height=CONCEPT_THUMB_SIZE + 50,
+                         corner_radius=8)
+        self.concept_dict = concept_dict
+        self.index = index
+        self.grid_propagate(False)
+        self.grid_columnconfigure(0, weight=1)
+
+        self._ctk_image = ctk.CTkImage(
+            light_image=_get_concept_preview(concept_dict),
+            size=(CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE),
+        )
+        ctk.CTkLabel(self, text="", image=self._ctk_image,
+                     height=CONCEPT_THUMB_SIZE, width=CONCEPT_THUMB_SIZE).grid(row=0, column=0)
+
+        name = concept_dict.get("name") or os.path.basename(concept_dict.get("path", "")) or f"Concept {index}"
+        ctk.CTkLabel(self, text=name, wraplength=CONCEPT_THUMB_SIZE + 10,
+                     font=ctk.CTkFont(size=11)).grid(row=1, column=0, pady=(2, 0))
+
+        self.enabled_var = tk.BooleanVar(value=concept_dict.get("enabled", True))
+        self._switch = ctk.CTkSwitch(self, variable=self.enabled_var, text="", width=40,
+                                      command=on_toggle)
+        self._switch.grid(row=2, column=0, pady=(2, 4))
+
+    def place_in_grid(self, visible_index: int):
+        col = visible_index % CONCEPT_CARD_COLS
+        row = visible_index // CONCEPT_CARD_COLS
+        self.grid(row=row, column=col, padx=4, pady=4)
+
+
 class QueueWindow(ctk.CTkToplevel):
     def __init__(self, parent, train_config: TrainConfig):
         super().__init__(parent)
@@ -248,6 +325,12 @@ class QueueWindow(ctk.CTkToplevel):
         self._executor: QueueExecutor | None = None
         self._executor_thread: threading.Thread | None = None
         self._suppress_save = False
+        self._concept_cards: list[_QueueConceptCard] = []
+        self._concept_grid: ctk.CTkFrame | None = None
+        self._concept_override_indicator: ctk.CTkLabel | None = None
+        self._concept_reset_btn: ctk.CTkButton | None = None
+        self._concepts_overridden = False
+        self._loaded_concepts: list[dict] = []
 
         self.title("Training Queue")
         self.geometry("1100x750")
@@ -444,6 +527,8 @@ class QueueWindow(ctk.CTkToplevel):
                     self._create_field_row(content, field_name, ft, ref_config.nullables[field_name], field_row)
                     field_row += 1
                     assigned.add(field_name)
+            if section_name == "Concepts":
+                field_row = self._build_concept_grid(content, field_row)
             section_row += 1
 
         other_fields = [n for n in ref_config.types if n not in assigned and n not in EXCLUDED_FIELDS]
@@ -550,6 +635,137 @@ class QueueWindow(ctk.CTkToplevel):
         self._fields[path] = _FieldInfo(value_var, widget, field_type, nullable, path, indicator, reset_btn)
         value_var.trace_add("write", lambda *_, p=path: self._on_value_change(p))
 
+    # ── Concept grid ──────────────────────────────────────────────────
+
+    def _build_concept_grid(self, content, start_row: int) -> int:
+        ctk.CTkFrame(content, height=1, fg_color="gray40").grid(
+            row=start_row, column=0, columnspan=5, sticky="ew", padx=PAD, pady=(PAD, 4))
+        start_row += 1
+
+        header_row = ctk.CTkFrame(content, fg_color="transparent")
+        header_row.grid(row=start_row, column=0, columnspan=5, sticky="ew")
+        header_row.grid_columnconfigure(1, weight=1)
+
+        self._concept_override_indicator = ctk.CTkLabel(
+            header_row, text="", width=16, font=ctk.CTkFont(size=10))
+        self._concept_override_indicator.grid(row=0, column=0, padx=(2, 0))
+
+        ctk.CTkLabel(header_row, text="Concept Selection",
+                     font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(
+            row=0, column=1, sticky="w", padx=PAD)
+
+        self._concept_reset_btn = ctk.CTkButton(
+            header_row, text="\u21ba", width=30, height=26, fg_color="transparent",
+            text_color=("gray40", "gray60"), hover_color=("gray80", "gray30"),
+            command=self._reset_concept_overrides)
+        self._concept_reset_btn.grid(row=0, column=2, padx=(0, PAD))
+        start_row += 1
+
+        self._concept_grid = ctk.CTkFrame(content, fg_color="transparent")
+        self._concept_grid.grid(row=start_row, column=0, columnspan=5, sticky="ew",
+                                padx=(PAD, 0), pady=(4, PAD))
+        start_row += 1
+
+        self._concept_empty_label = ctk.CTkLabel(
+            self._concept_grid, text="Select a queue entry to see concepts",
+            text_color="gray50", font=ctk.CTkFont(size=12))
+        self._concept_empty_label.grid(row=0, column=0, pady=PAD)
+
+        return start_row
+
+    def _load_concepts_from_file(self, path: str) -> list[dict]:
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return []
+
+    def _get_effective_concept_path(self) -> str:
+        if self._selected_entry_id:
+            entry = self.queue_manager.get_entry(self._selected_entry_id)
+            if entry and "concept_file_name" in entry.overrides:
+                return entry.overrides["concept_file_name"]
+        return self.train_config.concept_file_name
+
+    def _refresh_concept_cards(self):
+        for card in self._concept_cards:
+            card.destroy()
+        self._concept_cards.clear()
+        self._loaded_concepts.clear()
+
+        if not self._selected_entry_id:
+            self._concept_empty_label.configure(text="Select a queue entry to see concepts")
+            self._concept_empty_label.grid(row=0, column=0, pady=PAD)
+            return
+
+        concept_path = self._get_effective_concept_path()
+        file_concepts = self._load_concepts_from_file(concept_path)
+
+        if not file_concepts:
+            self._concept_empty_label.configure(
+                text=f"No concepts found in: {os.path.basename(concept_path)}")
+            self._concept_empty_label.grid(row=0, column=0, pady=PAD)
+            return
+
+        self._concept_empty_label.grid_remove()
+
+        entry = self.queue_manager.get_entry(self._selected_entry_id)
+        override_concepts = entry.overrides.get("concepts") if entry else None
+
+        for i, concept_dict in enumerate(file_concepts):
+            if override_concepts and i < len(override_concepts):
+                concept_dict = {**concept_dict, "enabled": override_concepts[i].get("enabled", True)}
+            self._loaded_concepts.append(concept_dict)
+            card = _QueueConceptCard(self._concept_grid, concept_dict, i, self._on_concept_toggle)
+            card.place_in_grid(i)
+            self._concept_cards.append(card)
+
+        has_overrides = override_concepts is not None
+        self._concepts_overridden = has_overrides
+        self._update_concept_override_indicator(has_overrides)
+
+    def _on_concept_toggle(self):
+        if self._suppress_save or not self._selected_entry_id:
+            return
+        entry = self.queue_manager.get_entry(self._selected_entry_id)
+        if not entry:
+            return
+
+        for i, card in enumerate(self._concept_cards):
+            if i < len(self._loaded_concepts):
+                self._loaded_concepts[i]["enabled"] = card.enabled_var.get()
+
+        entry.overrides["concepts"] = [
+            {**c} for c in self._loaded_concepts
+        ]
+        self.queue_manager.save()
+
+        self._concepts_overridden = True
+        self._update_concept_override_indicator(True)
+
+    def _reset_concept_overrides(self):
+        if not self._selected_entry_id:
+            return
+        entry = self.queue_manager.get_entry(self._selected_entry_id)
+        if not entry:
+            return
+        entry.overrides.pop("concepts", None)
+        self.queue_manager.save()
+        self._concepts_overridden = False
+        self._update_concept_override_indicator(False)
+        self._refresh_concept_cards()
+
+    def _update_concept_override_indicator(self, is_overridden: bool):
+        if self._concept_override_indicator:
+            if is_overridden:
+                self._concept_override_indicator.configure(text="\u25cf", text_color="#0d6efd")
+                self._concept_reset_btn.configure(text_color=("#0d6efd", "#6ea8fe"))
+            else:
+                self._concept_override_indicator.configure(text="")
+                self._concept_reset_btn.configure(text_color=("gray40", "gray60"))
+
+    # ── End concept grid ──────────────────────────────────────────────
+
     def _on_value_change(self, path: str):
         if self._suppress_save:
             return
@@ -558,6 +774,8 @@ class QueueWindow(ctk.CTkToplevel):
             fi.is_overridden = True
             self._update_override_indicator(fi, True)
             self._write_override(path)
+            if path == "concept_file_name":
+                self._refresh_concept_cards()
 
     def _on_name_change(self):
         if self._suppress_save or not self._selected_entry_id:
@@ -576,13 +794,15 @@ class QueueWindow(ctk.CTkToplevel):
         self._update_override_indicator(fi, False)
         self._remove_override(path)
         self._set_field_to_global(path)
+        if path == "concept_file_name":
+            self._refresh_concept_cards()
 
     def _update_override_indicator(self, fi: _FieldInfo, is_overridden: bool):
         if is_overridden:
             fi.indicator.configure(text="\u25cf", text_color="#0d6efd")
             fi.reset_btn.configure(text_color=("#0d6efd", "#6ea8fe"))
         else:
-            fi.indicator.configure(text="  ", text_color="transparent")
+            fi.indicator.configure(text="")
             fi.reset_btn.configure(text_color=("gray40", "gray60"))
 
     def _write_override(self, path: str):
@@ -685,6 +905,7 @@ class QueueWindow(ctk.CTkToplevel):
                     self._set_field_display(fi, self._get_global_value(path))
         finally:
             self._suppress_save = False
+        self._refresh_concept_cards()
 
     def _clear_editor(self):
         self._suppress_save = True
@@ -699,6 +920,15 @@ class QueueWindow(ctk.CTkToplevel):
                     fi.value_var.set("")
         finally:
             self._suppress_save = False
+        for card in self._concept_cards:
+            card.destroy()
+        self._concept_cards.clear()
+        self._loaded_concepts.clear()
+        self._concepts_overridden = False
+        self._update_concept_override_indicator(False)
+        if self._concept_grid:
+            self._concept_empty_label.configure(text="Select a queue entry to see concepts")
+            self._concept_empty_label.grid(row=0, column=0, pady=PAD)
 
     @staticmethod
     def _get_override_value(overrides: dict, path: str):
