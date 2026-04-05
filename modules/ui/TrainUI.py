@@ -23,6 +23,7 @@ from modules.ui.ConvertModelUI import ConvertModelUI
 from modules.ui.LoraTab import LoraTab
 from modules.ui.ModelTab import ModelTab
 from modules.ui.ProfilingWindow import ProfilingWindow
+from modules.ui.QueueWindow import QueueWindow
 from modules.ui.SampleWindow import SampleWindow
 from modules.ui.SamplingTab import SamplingTab
 from modules.ui.TopBar import TopBar
@@ -131,6 +132,8 @@ class TrainUI(ctk.CTk):
         self.training_thread = None
         self.training_callbacks = None
         self.training_commands = None
+        self._queue_executor = None
+        self._queue_window = None
 
         self.always_on_tensorboard_subprocess = None
         self.current_workspace_dir = self.train_config.workspace_dir
@@ -144,6 +147,8 @@ class TrainUI(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.__close)
 
     def __close(self):
+        if self._queue_executor is not None:
+            self._queue_executor.stop_queue_immediate()
         self.top_bar_component.save_default()
         self._stop_always_on_tensorboard()
         if hasattr(self, 'workspace_dir_trace_id'):
@@ -574,6 +579,10 @@ class TrainUI(ctk.CTk):
                          tooltip="Open the profiling tools.")
         components.button(frame, 4, 1, "Open", self.open_profiling_tool)
 
+        components.label(frame, 5, 0, "Queue",
+                         tooltip="Open the training queue tool")
+        components.button(frame, 5, 1, "Open", self.open_queue_tool)
+
         frame.pack(fill="both", expand=1)
         return frame
 
@@ -680,6 +689,12 @@ class TrainUI(ctk.CTk):
     def open_profiling_tool(self):
         self.profiling_window.deiconify()
 
+    def open_queue_tool(self):
+        if self._queue_window is None or not self._queue_window.winfo_exists():
+            self._queue_window = QueueWindow(self, self.train_config)
+        else:
+            self._queue_window.show()
+
     def generate_debug_package(self):
         zip_path = filedialog.askdirectory(
             initialdir=".",
@@ -762,6 +777,10 @@ class TrainUI(ctk.CTk):
             self.after(0, self._start_always_on_tensorboard)
 
     def start_training(self):
+        if self._queue_executor is not None:
+            messagebox.showwarning("Queue Running",
+                                   "Cannot start training while queue is running.")
+            return
         if self.training_thread is None:
             self.save_default()
 
