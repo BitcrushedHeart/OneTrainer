@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git log:*)",
+      "Bash(git merge:*)",
+      "Bash(git push:*)",
+      "Bash(pip show:*)",
+      "Bash(gh repo:*)",
+      "Bash(rm:*)",
+      "Bash(where cl:*)",
+      "Read(//c/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/**)",
+      "Read(//c/Program Files \\(x86\\)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/**)",
+      "Bash(cmd.exe:*)",
+      "Bash(powershell.exe:*)"
+    ]
+  }
+}
