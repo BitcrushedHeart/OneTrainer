@@ -6,9 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import torch
-
 from modules.util.commands.TrainCommands import TrainCommands
+
+import torch
 
 
 def _make_config(patience=True, patience_epochs=3, validation=True, workspace_dir=None):

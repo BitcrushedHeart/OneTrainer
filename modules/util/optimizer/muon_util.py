@@ -1,5 +1,5 @@
-from collections.abc import Callable
 import re
+from collections.abc import Callable
 
 from modules.model.BaseModel import BaseModel, TrainConfig
 from modules.module.LoRAModule import LoRAModuleWrapper
