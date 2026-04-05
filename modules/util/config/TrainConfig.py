@@ -134,6 +134,14 @@ class TrainOptimizerConfig(BaseConfig):
     approx_mars: False
     auto_kappa_p: False
     compile: False
+    spectral_normalization: False
+    scaled_optm: False
+    freeze_on_flip: False
+    l1_adaptive: False
+    centered_wd: float
+    centered_wd_mode: str
+    factored_2nd: False
+    fisher_wd: False
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(data)
@@ -243,6 +251,14 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("approx_mars", False, bool, False))
         data.append(("auto_kappa_p", False, bool, False))
         data.append(("compile", False, bool, False))
+        data.append(("spectral_normalization", False, bool, False))
+        data.append(("scaled_optm", False, bool, False))
+        data.append(("freeze_on_flip", False, bool, False))
+        data.append(("l1_adaptive", False, bool, False))
+        data.append(("centered_wd", 0.0, float, False))
+        data.append(("centered_wd_mode", "float8", str, False))
+        data.append(("factored_2nd", False, bool, False))
+        data.append(("fisher_wd", False, bool, False))
 
         return TrainOptimizerConfig(data)
 
