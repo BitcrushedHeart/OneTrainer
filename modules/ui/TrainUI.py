@@ -44,6 +44,7 @@ from modules.util.ui import components
 from modules.util.ui.ui_utils import set_window_icon
 from modules.util.ui.UIState import UIState
 from modules.util.ui.validation import flush_and_validate_all
+from modules.util.validation_checker_util import collect_validation_checker_concepts
 
 import torch
 
@@ -117,6 +118,8 @@ class TrainUI(ctk.CTk):
         self.training_button = None
         self.export_button = None
         self.tabview = None
+        self.validation_checker_button = None
+        self.validation_checker_button_refresh_id = None
 
         self.model_tab = None
         self.training_tab = None
@@ -137,10 +140,12 @@ class TrainUI(ctk.CTk):
         self._check_start_always_on_tensorboard()
 
         self.workspace_dir_trace_id = self.ui_state.add_var_trace("workspace_dir", self._on_workspace_dir_change_trace)
+        self.validation_trace_id = self.ui_state.add_var_trace("validation", self._update_validation_checker_button_state)
 
         # Persistent profiling window.
         self.profiling_window = ProfilingWindow(self)
 
+        self._schedule_validation_checker_button_refresh()
         self.protocol("WM_DELETE_WINDOW", self.__close)
 
     def __close(self):
@@ -148,6 +153,10 @@ class TrainUI(ctk.CTk):
         self._stop_always_on_tensorboard()
         if hasattr(self, 'workspace_dir_trace_id'):
             self.ui_state.remove_var_trace("workspace_dir", self.workspace_dir_trace_id)
+        if hasattr(self, 'validation_trace_id'):
+            self.ui_state.remove_var_trace("validation", self.validation_trace_id)
+        if self.validation_checker_button_refresh_id:
+            self.after_cancel(self.validation_checker_button_refresh_id)
         self.quit()
 
     def top_bar(self, master):
@@ -298,6 +307,14 @@ class TrainUI(ctk.CTk):
         components.label(frame, 8, 2, "Validate after",
                          tooltip="The interval used when validate training")
         components.time_entry(frame, 8, 3, self.ui_state, "validate_after", "validate_after_unit")
+
+        components.label(frame, 9, 0, "Validation Checker",
+                         tooltip="Scan training and validation concepts for duplicate or near-duplicate validation leaks before training.")
+        self.validation_checker_button = components.button(
+            frame, 9, 1, "Check Validation", self.open_validation_checker,
+            tooltip="Checks train vs validation concepts for exact duplicates, perceptual near-matches, and optional CLIP similarity."
+        )
+        self._update_validation_checker_button_state()
 
         # device
         components.label(frame, 10, 0, "Dataloader Threads",
@@ -664,6 +681,41 @@ class TrainUI(ctk.CTk):
     def open_profiling_tool(self):
         self.profiling_window.deiconify()
 
+    def open_validation_checker(self):
+        if self.training_thread is not None:
+            messagebox.showwarning("Training Active", "Stop training before running the Validation Checker.")
+            return
+
+        errors = flush_and_validate_all()
+        if errors:
+            bullet_list = "\n".join(f"• {error}" for error in errors)
+            messagebox.showerror(
+                "Cannot Check Validation",
+                f"Please fix the following errors before running the Validation Checker:\n\n{bullet_list}",
+            )
+            return
+
+        self.save_default()
+
+        train_concepts, val_concepts = collect_validation_checker_concepts(self.concepts_tab.current_config)
+        if not train_concepts or not val_concepts:
+            messagebox.showwarning(
+                "Validation Checker Unavailable",
+                "Enable validation and configure at least one training concept plus one validation concept before running the checker.",
+            )
+            self._update_validation_checker_button_state()
+            return
+
+        from modules.ui.ValidationCheckerWindow import ValidationCheckerWindow
+
+        window = ValidationCheckerWindow(
+            self,
+            self.concepts_tab.current_config,
+            training_is_active=lambda: self.training_thread is not None,
+        )
+        self.wait_window(window)
+        torch_gc()
+
     def generate_debug_package(self):
         zip_path = filedialog.askdirectory(
             initialdir=".",
@@ -780,6 +832,7 @@ class TrainUI(ctk.CTk):
         self.concepts_tab.save_current_config()
         self.sampling_tab.save_current_config()
         self.additional_embeddings_tab.save_current_config()
+        self._update_validation_checker_button_state()
 
     def export_training(self):
         file_path = filedialog.asksaveasfilename(filetypes=[
@@ -870,6 +923,27 @@ class TrainUI(ctk.CTk):
         else:
             if not (self.training_thread and self.train_config.tensorboard):
                 self._stop_always_on_tensorboard()
+
+    def _schedule_validation_checker_button_refresh(self):
+        self._update_validation_checker_button_state()
+        self.validation_checker_button_refresh_id = self.after(500, self._schedule_validation_checker_button_refresh)
+
+    def _update_validation_checker_button_state(self):
+        if not self.validation_checker_button:
+            return
+
+        enabled = self.train_config.validation and self._has_validation_checker_concepts()
+        self.validation_checker_button.configure(state="normal" if enabled else "disabled")
+
+    def _has_validation_checker_concepts(self) -> bool:
+        concepts_tab = getattr(self, "concepts_tab", None)
+        if concepts_tab is None:
+            return False
+        current_config = getattr(concepts_tab, "current_config", None)
+        if current_config is None:
+            return False
+        train_concepts, val_concepts = collect_validation_checker_concepts(current_config)
+        return bool(train_concepts and val_concepts)
 
     def _set_training_button_style(self, mode: str):
         if not self.training_button:
