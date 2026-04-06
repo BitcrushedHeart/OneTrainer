@@ -271,7 +271,14 @@ class ValidationCheckerUtilTest(unittest.TestCase):
     def test_deep_scan_gracefully_fails_without_clip_support(self):
         with mock.patch("modules.util.validation_checker_util.load_clip_components", return_value=(None, None, None, None)):
             with self.assertRaisesRegex(RuntimeError, "Deep Scan requires"):
-                scan_clip_similarity_matches([], [])
+                scan_clip_similarity_matches([mock.Mock()], [mock.Mock()])
+
+    def test_deep_scan_returns_no_matches_for_empty_inputs(self):
+        self.assertEqual(scan_clip_similarity_matches([], []), [])
+        train = mock.Mock()
+        val = mock.Mock()
+        self.assertEqual(scan_clip_similarity_matches([train], []), [])
+        self.assertEqual(scan_clip_similarity_matches([], [val]), [])
 
     @unittest.skipUnless(os.environ.get("VALIDATION_CHECKER_RUN_CLIP") == "1", "Set VALIDATION_CHECKER_RUN_CLIP=1 to run CLIP integration test.")
     def test_deep_scan_flags_high_similarity_when_clip_is_available(self):
@@ -329,4 +336,3 @@ class ValidationCheckerUtilTest(unittest.TestCase):
             raise ValueError(f"Unknown variant: {variant}")
 
         image.save(path)
-

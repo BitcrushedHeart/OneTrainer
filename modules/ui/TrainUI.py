@@ -44,7 +44,12 @@ from modules.util.ui import components
 from modules.util.ui.ui_utils import set_window_icon
 from modules.util.ui.UIState import UIState
 from modules.util.ui.validation import flush_and_validate_all
-from modules.util.validation_checker_util import collect_validation_checker_concepts
+from modules.util.validation_checker_util import (
+    collect_validation_checker_concepts,
+    concept_type_name,
+    is_train_concept_type,
+    is_validation_concept_type,
+)
 
 import torch
 
@@ -119,7 +124,6 @@ class TrainUI(ctk.CTk):
         self.export_button = None
         self.tabview = None
         self.validation_checker_button = None
-        self.validation_checker_button_refresh_id = None
 
         self.model_tab = None
         self.training_tab = None
@@ -145,7 +149,6 @@ class TrainUI(ctk.CTk):
         # Persistent profiling window.
         self.profiling_window = ProfilingWindow(self)
 
-        self._schedule_validation_checker_button_refresh()
         self.protocol("WM_DELETE_WINDOW", self.__close)
 
     def __close(self):
@@ -155,8 +158,6 @@ class TrainUI(ctk.CTk):
             self.ui_state.remove_var_trace("workspace_dir", self.workspace_dir_trace_id)
         if hasattr(self, 'validation_trace_id'):
             self.ui_state.remove_var_trace("validation", self.validation_trace_id)
-        if self.validation_checker_button_refresh_id:
-            self.after_cancel(self.validation_checker_button_refresh_id)
         self.quit()
 
     def top_bar(self, master):
@@ -924,10 +925,6 @@ class TrainUI(ctk.CTk):
             if not (self.training_thread and self.train_config.tensorboard):
                 self._stop_always_on_tensorboard()
 
-    def _schedule_validation_checker_button_refresh(self):
-        self._update_validation_checker_button_state()
-        self.validation_checker_button_refresh_id = self.after(500, self._schedule_validation_checker_button_refresh)
-
     def _update_validation_checker_button_state(self):
         if not self.validation_checker_button:
             return
@@ -942,8 +939,19 @@ class TrainUI(ctk.CTk):
         current_config = getattr(concepts_tab, "current_config", None)
         if current_config is None:
             return False
-        train_concepts, val_concepts = collect_validation_checker_concepts(current_config)
-        return bool(train_concepts and val_concepts)
+
+        has_train = False
+        has_val = False
+        for concept in current_config:
+            if not getattr(concept, "enabled", False):
+                continue
+            concept_type = concept_type_name(concept.type)
+            has_train |= is_train_concept_type(concept_type)
+            has_val |= is_validation_concept_type(concept_type)
+            if has_train and has_val:
+                return True
+
+        return False
 
     def _set_training_button_style(self, mode: str):
         if not self.training_button:
