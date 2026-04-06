@@ -305,6 +305,9 @@ def scan_clip_similarity_matches(
     stop_event: threading.Event | None = None,
 ) -> list[ValidationCheckerMatch]:
     stop_event = stop_event or threading.Event()
+    if not train_images or not val_images:
+        _report_progress(progress_callback, "Deep Scan skipped", 0, 1)
+        return []
     _report_progress(progress_callback, "Loading CLIP model", 0, max(len(train_images) + len(val_images), 1))
 
     model_name, clip_model, clip_processor, torch_module = load_clip_components()
