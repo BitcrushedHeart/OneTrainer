@@ -19,6 +19,8 @@ debug*.py
 config.json
 secrets.json
 *.zip
+.env*
+!.env.example
 
 # environments
 /.venv*
@@ -37,3 +39,15 @@ pixi.toml
 train.bat
 debug_report.log
 config_diff.txt
+
+# Webdev
+web/gui/dist/
+web/gui/release/
+web/gui/node_modules/
+web/gui/package-lock.json
+web/gui/.prettierrc.json
+web/gui/public/ui-schema.json
+web/gui/src/renderer/types/generated/
+web/backend/__pycache__/
+web/backend/**/__pycache__/
+web/backend/generated/
