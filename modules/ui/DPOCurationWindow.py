@@ -14,6 +14,7 @@ from modules.util.dpo_curation_util import (
     find_orphaned_pairs,
     load_manifest,
     manifest_pair_counts,
+    prune_orphaned_pairs,
     remove_pair,
 )
 from modules.util.image_metadata_util import extract_metadata
@@ -169,12 +170,19 @@ class DPOCurationWindow(ctk.CTkToplevel):
             self.output_dir = folder
             self.output_path_var.set(folder)
             self.manifest = load_manifest(folder)
+            pruned = prune_orphaned_pairs(folder, self.manifest)
             existing = len(self.manifest.get("pairs", []))
             if existing:
-                self.resume_label.configure(
-                    text=f"Found {existing} existing pairs \u2014 completed groups will be skipped.")
+                msg = f"Found {existing} existing pairs \u2014 completed groups will be skipped."
+                if pruned:
+                    msg += f"\n(Removed {pruned} orphaned entries with missing files.)"
+                self.resume_label.configure(text=msg)
             else:
-                self.resume_label.configure(text="")
+                if pruned:
+                    self.resume_label.configure(
+                        text=f"Removed {pruned} orphaned entries with missing files.")
+                else:
+                    self.resume_label.configure(text="")
 
     def _start(self, mode: str):
         if not self.source_folder:
@@ -246,8 +254,9 @@ class DPOCurationWindow(ctk.CTkToplevel):
                 meta = extract_metadata(path)
                 prompt = meta.get('prompt', '').strip()
                 ar = meta.get('aspectratio', '').strip()
-                if prompt:
-                    groups_dict[(prompt, ar)].append(path)
+                if not prompt:
+                    prompt = "UNCONDITIONAL"
+                groups_dict[(prompt, ar)].append(path)
                 self._scan_count += 1
 
         raw_groups = [
@@ -264,7 +273,8 @@ class DPOCurationWindow(ctk.CTkToplevel):
                 return
 
             group_key = (group['prompt'], group['aspectratio'])
-            if existing_counts.get(group_key, 0) >= self.pairs_per_group:
+            is_unconditional = group['prompt'] == "UNCONDITIONAL"
+            if not is_unconditional and existing_counts.get(group_key, 0) >= self.pairs_per_group:
                 continue
 
             deduped = self._dedup_by_dhash(group['images'])
@@ -335,7 +345,8 @@ class DPOCurationWindow(ctk.CTkToplevel):
             existing_counts = manifest_pair_counts(self.manifest)
             group_key = (group['prompt'], group['aspectratio'])
             pairs_done = existing_counts.get(group_key, 0)
-            if pairs_done >= self.pairs_per_group:
+            is_unconditional = group['prompt'] == "UNCONDITIONAL"
+            if not is_unconditional and pairs_done >= self.pairs_per_group:
                 continue
 
             self._current_group = group
@@ -625,7 +636,8 @@ class DPOCurationWindow(ctk.CTkToplevel):
         self.current_remaining_images = [image for image in self.current_remaining_images if image not in {chosen, rejected}]
         self.pairs_created_in_group += 1
 
-        keep_going = continue_scoring or self.pairs_created_in_group < self.pairs_per_group
+        is_unconditional = group['prompt'] == "UNCONDITIONAL"
+        keep_going = continue_scoring or is_unconditional or self.pairs_created_in_group < self.pairs_per_group
         if keep_going and len(self.current_remaining_images) >= 2:
             if self.mode == "elo":
                 self._start_elo_round()
@@ -649,6 +661,12 @@ class DPOCurationWindow(ctk.CTkToplevel):
     def _build_prompt_expander(self, parent, prompt: str):
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         frame.pack(fill="x", padx=10, pady=(5, 0))
+
+        if prompt == "UNCONDITIONAL":
+            ctk.CTkLabel(frame, text="UNCONDITIONAL", font=("", 14, "bold"),
+                         text_color="#FFD700",
+                         fg_color="#3A3000", corner_radius=4).pack(side="left", padx=(0, 8), ipadx=8, ipady=2)
+            return frame
 
         truncated = prompt[:100] + ("..." if len(prompt) > 100 else "")
         expanded = ctk.BooleanVar(value=False)
