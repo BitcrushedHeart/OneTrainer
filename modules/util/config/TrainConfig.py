@@ -842,7 +842,7 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("patience", False)
         migrated_data.setdefault("patience_epochs", 5)
         migrated_data.setdefault("rlhf_enabled", False)
-        migrated_data.setdefault("rlhf_dpo_beta", 5000.0)
+        migrated_data.setdefault("rlhf_dpo_beta", 300.0)
         migrated_data.setdefault("rlhf_dpo_label_smoothing", 0.0)
         migrated_data.setdefault("rlhf_dpo_ref_mode", "NEW_ADAPTER")
         migrated_data.setdefault("rlhf_supervised_mix", 0.0)
@@ -1267,7 +1267,7 @@ class TrainConfig(BaseConfig):
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
         data.append(("rlhf_enabled", False, bool, False))
-        data.append(("rlhf_dpo_beta", 5000.0, float, False))
+        data.append(("rlhf_dpo_beta", 300.0, float, False))
         data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
         data.append(("rlhf_dpo_execution_mode", DPOExecutionMode.FULL_CONCURRENT, DPOExecutionMode, False))
