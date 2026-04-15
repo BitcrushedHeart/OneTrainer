@@ -1,10 +1,8 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-REM Avoid footgun by explictly navigating to the directory containing the batch file
 cd /d "%~dp0"
 
-REM Verify that OneTrainer is our current working directory
 if not exist "scripts\train_ui.py" (
     echo Error: train_ui.py does not exist, you have done something very wrong. Reclone the repository.
     goto :end
@@ -17,13 +15,11 @@ if not defined VENV_DIR ( set "VENV_DIR=%~dp0venv" )
 :git_pull
 echo Checking repository and branch information...
 
-REM Get current branch name
 FOR /F "tokens=* USEBACKQ" %%F IN (`"%GIT%" rev-parse --abbrev-ref HEAD`) DO (
     set "current_branch=%%F"
 )
 echo Current branch: %current_branch%
 
-REM Determine tracking information (remote and branch)
 set "tracking_info="
 FOR /F "tokens=* USEBACKQ" %%F IN (`"%GIT%" rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2^>NUL`) DO (
     set "tracking_info=%%F"
@@ -62,7 +58,6 @@ if not defined tracking_info (
         echo      This is normal if you're using a fork or working on a specific branch.
     )
 
-    REM Get current commit hash
     FOR /F "tokens=* USEBACKQ" %%F IN (`"%GIT%" rev-parse HEAD`) DO (
         set "local_commit=%%F"
     )
@@ -75,7 +70,6 @@ if not defined tracking_info (
         goto :end_error
     )
 
-    REM Get remote commit hash
     FOR /F "tokens=* USEBACKQ" %%F IN (`"%GIT%" rev-parse !tracking_remote!/!tracking_branch!`) DO (
         set "remote_commit=%%F"
     )
@@ -139,6 +133,40 @@ echo Installing requirements (this may take a while)...
 if errorlevel 1 (
     echo Error: Installing requirements failed.
     goto :end_error
+)
+
+echo.
+echo Generating UI schema...
+"%PYTHON%" -m web.scripts.generate_ui_schema
+if errorlevel 1 (
+  echo WARNING: UI schema generation failed. Using existing schema.
+)
+REM Reset errorlevel so schema failure does not affect exit code
+cmd /c "exit /b 0"
+
+where node >NUL 2>NUL
+if errorlevel 1 (
+  echo Node.js not found. Skipping web UI rebuild.
+) else (
+  if exist "web\gui\dist\main\main\index.cjs" (
+    echo Rebuilding web UI...
+    pushd web\gui
+    call npm install
+    if errorlevel 1 (
+      echo WARNING: npm install failed. Web UI may be stale.
+      popd
+      goto :end_success
+    )
+    call npm run build:electron
+    if errorlevel 1 (
+      echo WARNING: Web UI rebuild failed. Web UI may be stale.
+    ) else (
+      echo Web UI rebuilt successfully.
+    )
+    popd
+  ) else (
+    echo Web UI not previously built. Run start-web-ui.bat to build and launch.
+  )
 )
 
 :end_success

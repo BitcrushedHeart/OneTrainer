@@ -1,0 +1,298 @@
+import contextlib
+import json
+import os
+import random
+import threading
+import time
+import uuid
+from collections import OrderedDict
+
+from web.backend.paths import CONCEPTS_DIR
+from web.backend.services.concept_service import ConceptService
+from web.backend.services.config_service import ConfigService
+from web.backend.utils.path_security import validate_path
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+router = APIRouter(prefix="/concepts", tags=["concepts"])
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+_THUMBNAIL_CACHE_MAXSIZE = 256
+_THUMBNAIL_CACHE_TTL = 60
+_thumbnail_cache: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+_thumbnail_cache_lock = threading.Lock()
+
+
+def _pick_thumbnail(dir_path: str) -> str | None:
+    now = time.monotonic()
+
+    with _thumbnail_cache_lock:
+        if dir_path in _thumbnail_cache:
+            ts, value = _thumbnail_cache[dir_path]
+            if now - ts < _THUMBNAIL_CACHE_TTL:
+                _thumbnail_cache.move_to_end(dir_path)
+                return value
+            else:
+                del _thumbnail_cache[dir_path]
+
+    if not os.path.isdir(dir_path):
+        result = None
+    else:
+        candidates: list[str] = []
+        try:
+            for entry in os.scandir(dir_path):
+                if entry.is_file():
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if ext in _IMAGE_EXTENSIONS:
+                        candidates.append(entry.path)
+        except PermissionError:
+            result = None
+        else:
+            result = random.choice(candidates) if candidates else None
+
+    with _thumbnail_cache_lock:
+        _thumbnail_cache[dir_path] = (now, result)
+        _thumbnail_cache.move_to_end(dir_path)
+        while len(_thumbnail_cache) > _THUMBNAIL_CACHE_MAXSIZE:
+            _thumbnail_cache.popitem(last=False)
+
+    return result
+
+
+def invalidate_thumbnail_cache() -> None:
+    with _thumbnail_cache_lock:
+        _thumbnail_cache.clear()
+
+
+@router.get("/thumbnail")
+def get_thumbnail(path: str = Query(..., description="Directory path to scan for images")):
+    path = validate_path(path, allow_file=False)
+    chosen = _pick_thumbnail(path)
+    if chosen is None:
+        raise HTTPException(status_code=404, detail="No images found in directory")
+
+    return FileResponse(chosen, media_type="image/*")
+
+
+@router.get("/images")
+def list_images(
+    path: str = Query(..., description="Directory path to scan for images"),
+    offset: int = Query(0, ge=0, description="Start index"),
+    limit: int = Query(50, ge=1, le=10000, description="Max images to return"),
+):
+    path = validate_path(path, allow_file=False)
+
+    entries: list[dict] = []
+    try:
+        for entry in sorted(os.scandir(path), key=lambda e: e.name):
+            if entry.is_file():
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext in _IMAGE_EXTENSIONS:
+                    stem = os.path.splitext(entry.path)[0]
+                    caption_path = stem + ".txt"
+                    caption: str | None = None
+                    if os.path.isfile(caption_path):
+                        try:
+                            with open(caption_path, "r", encoding="utf-8") as fh:
+                                caption = fh.read().strip()
+                        except Exception:
+                            caption = None
+                    entries.append({
+                        "filename": entry.name,
+                        "path": entry.path.replace("\\", "/"),
+                        "caption": caption,
+                    })
+    except PermissionError as err:
+        raise HTTPException(status_code=403, detail="Permission denied") from err
+
+    total = len(entries)
+    page = entries[offset:offset + limit]
+
+    return JSONResponse({"total": total, "offset": offset, "images": page})
+
+
+@router.get("/image")
+def get_image(path: str = Query(..., description="Full path to an image file")):
+    path = validate_path(path, allow_dir=False)
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Not a supported image file")
+
+    return FileResponse(path, media_type="image/*")
+
+
+@router.get("/text-file")
+def get_text_file(path: str = Query(..., description="Path to a text file")):
+    path = validate_path(path, allow_dir=False)
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".txt", ".caption", ".csv"}:
+        raise HTTPException(status_code=400, detail="Not a supported text file")
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        return JSONResponse({"content": content})
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="Permission denied") from exc
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid file encoding") from exc
+
+
+@router.get("/configs")
+def list_concept_configs() -> list[dict]:
+    configs: list[dict] = []
+    if os.path.isdir(CONCEPTS_DIR):
+        for entry in sorted(os.listdir(CONCEPTS_DIR)):
+            if entry.endswith(".json") and os.path.isfile(os.path.join(CONCEPTS_DIR, entry)):
+                name = os.path.splitext(entry)[0]
+                rel_path = f"training_concepts/{entry}"
+                configs.append({"name": name, "path": rel_path})
+    return configs
+
+
+class CreateConfigRequest(BaseModel):
+    name: str = Field(max_length=200)
+
+
+@router.post("/configs")
+def create_concept_config(req: CreateConfigRequest) -> dict:
+    safe_name = "".join(c for c in req.name if c.isalnum() or c in " _-").strip()
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid config name")
+
+    os.makedirs(CONCEPTS_DIR, exist_ok=True)
+    file_path = os.path.join(CONCEPTS_DIR, f"{safe_name}.json")
+    rel_path = f"training_concepts/{safe_name}.json"
+
+    if os.path.exists(file_path):
+        raise HTTPException(status_code=409, detail=f"Config '{safe_name}' already exists")
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+    return {"name": safe_name, "path": rel_path}
+
+
+@router.get("")
+def get_concepts() -> list[dict]:
+    service = ConfigService.get_instance()
+    concept_path = service.config.concept_file_name
+
+    if not concept_path:
+        raise HTTPException(status_code=422, detail="No concept_file_name configured")
+
+    concept_service = ConceptService()
+    try:
+        return concept_service.load_concepts(concept_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Concept file not found: {concept_path}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.put("")
+def save_concepts(concepts: list[dict]) -> dict:
+    service = ConfigService.get_instance()
+    concept_path = service.config.concept_file_name
+
+    if not concept_path:
+        raise HTTPException(status_code=422, detail="No concept_file_name configured")
+
+    concept_service = ConceptService()
+    try:
+        concept_service.save_concepts(concept_path, concepts)
+    except Exception as exc:
+        invalidate_thumbnail_cache()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    invalidate_thumbnail_cache()
+
+    return {"saved": len(concepts), "path": concept_path}
+
+
+_active_scans: dict[str, threading.Event] = {}
+_active_scans_lock = threading.Lock()
+
+
+class StatsRequest(BaseModel):
+    path: str
+    include_subdirectories: bool = False
+    advanced: bool = False
+
+
+@router.post("/stats")
+def scan_concept_stats(req: StatsRequest):
+    req.path = validate_path(req.path, allow_file=False)
+
+    try:
+        from modules.util import concept_stats
+        from modules.util.config.ConceptConfig import ConceptConfig
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Backend modules not available: {exc}",
+        ) from exc
+
+    scan_id = uuid.uuid4().hex
+    cancel_flag = threading.Event()
+    with _active_scans_lock:
+        _active_scans[scan_id] = cancel_flag
+
+    try:
+        start_time = time.perf_counter()
+        max_scan_seconds = 120
+
+        concept_config = ConceptConfig.default_values()
+        concept_config.path = req.path
+        concept_config.include_subdirectories = req.include_subdirectories
+
+        stats_dict = concept_stats.init_concept_stats(req.advanced)
+
+        subfolders = [req.path]
+
+        for folder in subfolders:
+            if cancel_flag.is_set():
+                break
+            if time.perf_counter() - start_time > max_scan_seconds:
+                stats_dict["force_cancelled"] = True
+                break
+            stats_dict = concept_stats.folder_scan(
+                folder, stats_dict, req.advanced, concept_config,
+                start_time, max_scan_seconds, cancel_flag,
+            )
+            if req.include_subdirectories and not cancel_flag.is_set():
+                with contextlib.suppress(PermissionError):
+                    subfolders.extend(
+                        entry.path for entry in os.scandir(folder) if entry.is_dir()
+                    )
+
+        stats_dict["processing_time"] = round(time.perf_counter() - start_time, 3)
+        stats_dict["scan_id"] = scan_id
+
+        return JSONResponse(stats_dict)
+    finally:
+        with _active_scans_lock:
+            _active_scans.pop(scan_id, None)
+
+
+@router.delete("/stats/cancel")
+def cancel_concept_stats(scan_id: str = Query("", description="Scan ID to cancel; empty cancels all active scans")):
+    with _active_scans_lock:
+        if scan_id:
+            flag = _active_scans.get(scan_id)
+            if flag is None:
+                raise HTTPException(status_code=404, detail=f"No active scan with id: {scan_id}")
+            flag.set()
+            return {"cancelled": True, "scan_id": scan_id}
+        else:
+            cancelled_ids = list(_active_scans.keys())
+            for flag in _active_scans.values():
+                flag.set()
+            return {"cancelled": True, "scan_ids": cancelled_ids}

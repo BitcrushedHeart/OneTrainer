@@ -2,10 +2,8 @@
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
 
-rem --- Color codes ---
 set "RED=[31m" & set "YEL=[33m" & set "GRN=[92m" & set "CYAN=[36m" & set "RESET=[0m"
 
-rem --- Constants ---
 pushd "%~dp0" || call :die "Cannot cd to script directory"
 set "SCRIPT_DIR=%CD%"
 set "VENV_DIR=%SCRIPT_DIR%\\venv"
@@ -14,7 +12,6 @@ set "MIN_PY=3.10" & set "MAX_PY=3.14"
 
 goto :main
 
-rem --- Helpers ---
 :die
   echo.
   echo %RED%ERROR:%RESET% %~1
@@ -51,7 +48,6 @@ rem --- Helpers ---
   cmd /c "%~1" || call :die "Command failed: %~2"
   exit /b 0
 
-rem --- Main ---
 :main
 echo %CYAN%Searching for a suitable Python installation...%RESET%
 set "PYTHON="
@@ -61,7 +57,6 @@ if not exist "%VERSION_FILE%" (
     goto :final_python_failure_handling
 )
 
-rem --- Python Detection ---
 echo %CYAN%Step 1: Checking for Python in PATH (to support Conda installs)...%RESET%
 where python >nul 2>&1
 if not errorlevel 1 (
@@ -87,15 +82,10 @@ if not errorlevel 1 (
     echo %YEL%No 'python' found in PATH. Proceeding with other checks.%RESET%
 )
 
-rem If we found a valid PATH python version, we can skip the rest of the checks
 if defined PYTHON goto :py_ok
-
 
 echo.
-rem 2) Loop through ver reported by py
 echo %CYAN%Step 2: Scanning Python installations reported by "py --list"...%RESET%
-
-if defined PYTHON goto :py_ok
 
 set "PYTHON_VERSION_FROM_PY_LIST="
 for /f "tokens=2 delims=:" %%L in ('py --list 2^>nul ^| findstr /R /C:"-V:[0-9][.][0-9]"') do (
@@ -112,20 +102,16 @@ for /f "tokens=2 delims=:" %%L in ('py --list 2^>nul ^| findstr /R /C:"-V:[0-9][
             echo   %YEL%Python !CURRENT_PY_VER_TO_TEST! via py.exe is not suitable or version_check.py failed.%RESET%
         )
     )
-    rem Check if we found Python and need to exit outer loop
     if defined PYTHON_VERSION_FROM_PY_LIST goto :found_python_via_py_list
 )
 
 :found_python_via_py_list
 if not defined PYTHON_VERSION_FROM_PY_LIST (
     echo %YEL%No suitable Python version found via "py --list" that satisfies %MIN_PY% ^>= v ^< %MAX_PY%.%RESET%
-    rem PYTHON remains unset, script will proceed to the next step
 )
 
-rem Check if PYTHON was set by found_python_via_py_list logic. If so, go to :py_ok.
 if defined PYTHON goto :py_ok
 
-rem 3) If py launcher fails, search common install directories
 echo.
 echo %CYAN%Step 3: Searching for Python in common installation directories...%RESET%
 set "SEARCH_PATHS="%ProgramFiles%\Python" "%LOCALAPPDATA%\Programs\Python""
@@ -150,7 +136,6 @@ for %%D in (%SEARCH_PATHS%) do (
 )
 echo %YEL%No suitable Python found in common directories.%RESET%
 
-rem 4) Finally as a failsafe try to ask about Windows Store python, only if not found yet
 if not defined PYTHON (
     echo.
     echo %CYAN%Step 4: Checking for Windows Store Python installations in PATH...%RESET%
@@ -163,7 +148,6 @@ if not defined PYTHON (
       if errorlevel 1 (
         echo %YEL%  ^> Skipping Store Python "%%P" due to user choice or warning issue.%RESET%
       ) else (
-        REM User agreed to use this Store Python (warn_store returned 0)
         echo Testing agreed-upon Store Python at "%%P"...
         "%%P" "%VERSION_FILE%" %MIN_PY% %MAX_PY%
         set "LAST_ERRORLEVEL=!errorlevel!"
@@ -176,7 +160,6 @@ if not defined PYTHON (
         ) else (
           echo %RED%  ^> Version check failed for this agreed-upon Store Python "%%P" ^(Code: !LAST_ERRORLEVEL!^).%RESET%
           call :wrong_python_version_message
-          REM After calling wrong_python_version_message, which tries to exit, we must ensure this path also exits.
           echo %RED%ERROR: The selected Windows Store Python version is not supported.%RESET%
           pause
           popd
@@ -192,11 +175,9 @@ if not defined PYTHON (
     )
 )
 
-rem If we reach here and PYTHON is not set, no suitable Python was found at all
 if not defined PYTHON (
   echo.
   call :wrong_python_version_message
-  REM The above call prints details and sets errorlevel. Now, exit the main script.
   echo.
   echo %RED%ERROR: Failed to find a supported Python version after all checks.%RESET%
   echo Please ensure a Python version between %MIN_PY% and %MAX_PY% is available.
@@ -215,8 +196,6 @@ if not defined PYTHON (
 )
 echo.
 echo %GRN%Using Python: !PYTHON!%RESET%
-
-rem 4) Create & activate venv
 echo.
 echo %CYAN%Managing virtual environment...%RESET%
 if not exist "%VENV_DIR%\\Scripts\\python.exe" (
@@ -235,7 +214,6 @@ echo Activating virtual environment...
 call "%VENV_DIR%\Scripts\activate.bat"
 echo Virtual environment activated.
 
-rem  Check for Tkinter
 echo %CYAN%Checking for Tkinter availability...%RESET%
 python -c "import tkinter,sys; sys.exit(0 if hasattr(tkinter,'TkVersion') else 1)" >nul 2>&1
 if not errorlevel 1 goto :tk_ok
@@ -247,15 +225,11 @@ goto :EOF
 :tk_ok
 echo %GRN%Tkinter is available, proceeding ... %RESET%
 
-rem 5) Upgrade pip & install
 echo.
 echo %CYAN%Upgrading pip and installing dependencies from requirements.txt...%RESET%
-echo Executing: python -m pip install --upgrade pip
 python -m pip install --upgrade pip || call :die "pip upgrade failed"
-echo Executing: python -m pip install -r requirements.txt
 python -m pip install -r requirements.txt || call :die "Dependencies install failed"
 
-rem 6) Check CUDA
 echo.
 echo %CYAN%Checking CUDA availability...%RESET%
 python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"
@@ -264,7 +238,6 @@ if errorlevel 1 (
   set "ans_amd="
   set /p "ans_amd=AMD GPU? (y/n): "
   if /i "!ans_amd!"=="y" (
-    echo Executing: python "%SCRIPT_DIR%\scripts\install_zluda.py"
     python "%SCRIPT_DIR%\scripts\install_zluda.py" || call :die "ZLUDA install failed"
   ) else (
     call :die "CUDA unavailable and not an AMD GPU setup - aborting. Please check PyTorch and NVIDIA driver compatibility."
@@ -272,6 +245,37 @@ if errorlevel 1 (
 ) else (
     echo %GRN%CUDA is available.%RESET%
 )
+
+echo.
+echo %CYAN%Generating UI schema...%RESET%
+python -m web.scripts.generate_ui_schema
+if errorlevel 1 (
+  echo %YEL%WARNING: UI schema generation failed. Using existing schema.%RESET%
+)
+
+echo.
+where node >NUL 2>NUL
+if errorlevel 1 (
+  echo %YEL%Node.js not found. Skipping web UI build.%RESET%
+  echo To use the web UI, install Node.js from https://nodejs.org/ and re-run install.bat
+) else (
+  echo %CYAN%Building web UI...%RESET%
+  pushd web\gui
+  call npm install
+  if errorlevel 1 (
+    echo %YEL%WARNING: npm install failed. Web UI will not be available.%RESET%
+    popd
+    goto :skip_web_build
+  )
+  call npm run build:electron
+  if errorlevel 1 (
+    echo %YEL%WARNING: Web UI build failed. Web UI will not be available.%RESET%
+  ) else (
+    echo %GRN%Web UI built successfully.%RESET%
+  )
+  popd
+)
+:skip_web_build
 
 echo.
 echo %GRN%**** Install successful^^! ****%RESET%
