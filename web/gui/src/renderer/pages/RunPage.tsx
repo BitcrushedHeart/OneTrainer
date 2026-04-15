@@ -1,3 +1,4 @@
+import { CheckIcon, CirclePlay, Pause, Play, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { configApi } from "@/api/configApi";
@@ -308,25 +309,7 @@ export default function RunPage() {
                 onClick={() => setAutoRefresh(!autoRefresh)}
                 title={autoRefresh ? "Pause auto-refresh" : "Resume auto-refresh"}
               >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  {autoRefresh ? (
-                    <>
-                      <rect x="6" y="4" width="4" height="16" />
-                      <rect x="14" y="4" width="4" height="16" />
-                    </>
-                  ) : (
-                    <polygon points="5,3 19,12 5,21" />
-                  )}
-                </svg>
+                {autoRefresh ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
                 {autoRefresh ? "Live" : "Paused"}
               </button>
 
@@ -335,19 +318,7 @@ export default function RunPage() {
                 onClick={() => loadRunData(selectedRun)}
                 title="Refresh data"
               >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <polyline points="23,4 23,10 17,10" />
-                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
-                </svg>
+                <RefreshCw className="w-3 h-3" />
               </button>
             </div>
           )}
@@ -355,18 +326,7 @@ export default function RunPage() {
 
         {trainingCompleted && (
           <div className="mt-3 px-3 py-2 rounded-md flex items-center gap-2 text-caption font-medium text-[var(--color-success-500)] bg-[var(--color-success-500-alpha-08)] border border-[var(--color-success-500-alpha-15)]">
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <polyline points="20,6 9,17 4,12" />
-            </svg>
+            <CheckIcon className="w-3.5 h-3.5" />
             Training completed. Results shown below.
           </div>
         )}
@@ -392,20 +352,7 @@ export default function RunPage() {
 
       {!loading && noRunsExist && !fetchError && (
         <div className="card card-static p-8 text-center">
-          <svg
-            width="48"
-            height="48"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="var(--color-on-surface-secondary)"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="mx-auto mb-4 block opacity-50"
-          >
-            <circle cx="12" cy="12" r="10" />
-            <polygon points="10,8 16,12 10,16" fill="var(--color-on-surface-secondary)" stroke="none" />
-          </svg>
+          <CirclePlay className="mx-auto mb-4 block opacity-50 w-12 h-12 text-[var(--color-on-surface-secondary)]" />
           <h3 className="m-0 mb-2 text-[var(--color-on-surface)] text-body font-semibold">No Training Runs Found</h3>
           <p className="m-0 mx-auto text-[var(--color-on-surface-secondary)] text-small leading-relaxed max-w-[420px]">
             TensorBoard event files will appear here once you start a training run. The log directory is derived from

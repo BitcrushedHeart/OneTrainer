@@ -88,7 +88,7 @@ export default function MaskEditorPage({ initialFolder }: MaskEditorPageProps) {
   ];
 
   return (
-    <div className="flex h-screen bg-[var(--color-surface-default)] text-[var(--color-on-surface)]">
+    <div className="flex h-screen bg-[var(--color-surface)] text-[var(--color-on-surface)]">
       <div className="w-64 flex-shrink-0 border-r border-[var(--color-border-subtle)] flex flex-col bg-[var(--color-surface-elevated)]">
         <div className="p-3 border-b border-[var(--color-border-subtle)] flex flex-col gap-2">
           <DirPicker label="Folder" value={state.folder} onChange={(v) => update("folder", v)} />

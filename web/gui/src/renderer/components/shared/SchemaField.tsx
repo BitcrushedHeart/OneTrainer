@@ -5,8 +5,6 @@ import { FilePicker } from "./FilePicker";
 import { FormEntry } from "./FormEntry";
 import { LayerFilterEntry } from "./LayerFilterEntry";
 import { Select } from "./Select";
-import { SelectAdvanced } from "./SelectAdvanced";
-import { SelectKV } from "./SelectKV";
 import { TimeEntry } from "./TimeEntry";
 import { Toggle } from "./Toggle";
 
@@ -44,10 +42,10 @@ export function SchemaField({ field, onAdvancedClick, resolveOptions, resolveKvO
     case "select":
       return <Select label={field.label} configPath={field.key} options={stringOptions} tooltip={field.tooltip} />;
     case "select-kv":
-      return <SelectKV label={field.label} configPath={field.key} options={kvOptions ?? []} tooltip={field.tooltip} />;
+      return <Select label={field.label} configPath={field.key} options={kvOptions ?? []} tooltip={field.tooltip} />;
     case "select-adv":
       return (
-        <SelectAdvanced
+        <Select
           label={field.label}
           configPath={field.key}
           options={stringOptions}

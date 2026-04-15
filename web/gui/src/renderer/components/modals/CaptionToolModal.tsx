@@ -1,8 +1,10 @@
 import { Eye, Loader2, Plus, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { type ApiCaptionRequest, type PreviewResponse, toolsApi, type ToolStatusResponse } from "@/api/toolsApi";
+import { type ApiCaptionRequest, type PreviewResponse, toolsApi } from "@/api/toolsApi";
 import { Button, DirPicker, FormEntry, ProgressBar, Select, SliderEntry, Toggle, Tooltip } from "@/components/shared";
+import { useToolPolling } from "@/hooks/useToolPolling";
+import { INPUT_FLEX, TEXTAREA_FULL } from "@/utils/inputStyles";
 
 import { ModalBase } from "./ModalBase";
 
@@ -82,13 +84,11 @@ function isApiModel(model: string): boolean {
 
 export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
   const [state, setState] = useState<CaptionState>({ ...DEFAULT_STATE });
-  const [status, setStatus] = useState<ToolStatusResponse | null>(null);
-  const [isRunning, setIsRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const polling = useToolPolling();
+  const { status, isRunning, error } = polling;
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const update = useCallback(<K extends keyof CaptionState>(field: K, value: CaptionState[K]) => {
     setState((prev) => ({ ...prev, [field]: value }));
@@ -110,34 +110,12 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
       });
   }, [open, state.model]);
 
-  useEffect(() => {
-    if (!isRunning) return;
-    const poll = async () => {
-      try {
-        const s = await toolsApi.getStatus();
-        setStatus(s);
-        if (s.status === "completed" || s.status === "error" || s.status === "idle") {
-          setIsRunning(false);
-          if (s.status === "error" && s.error) setError(s.error);
-        }
-      } catch {
-        /* ignore */
-      }
-    };
-    pollRef.current = setInterval(poll, 500);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, [isRunning]);
-
   const handleGenerate = async () => {
     if (!state.folder) {
-      setError("Please select a folder.");
+      polling.setError("Please select a folder.");
       return;
     }
-    setError(null);
-    setIsRunning(true);
-    setStatus(null);
+    polling.start();
 
     try {
       let result;
@@ -177,24 +155,23 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
         });
       }
       if (!result.ok) {
-        setError(result.error ?? "Failed to start");
-        setIsRunning(false);
+        polling.setError(result.error ?? "Failed to start");
+        polling.stop();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
-      setIsRunning(false);
+      polling.setError(err instanceof Error ? err.message : "Unknown error");
+      polling.stop();
     }
   };
 
   const handlePreview = async () => {
     if (!state.folder) {
-      setError("Please select a folder.");
+      polling.setError("Please select a folder.");
       return;
     }
-    setError(null);
+    polling.setError(null);
     setIsPreviewing(true);
     setPreview(null);
-
     try {
       const result = await toolsApi.previewCaption({
         backend: isApiModel(state.model) ? (state.model === "OpenAI Compatible" ? "openai" : "gemini") : "",
@@ -214,9 +191,9 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
         pass_current_caption: state.pass_current_caption,
       });
       setPreview(result);
-      if (!result.ok && result.error) setError(result.error);
+      if (!result.ok && result.error) polling.setError(result.error);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Preview failed");
+      polling.setError(err instanceof Error ? err.message : "Preview failed");
     } finally {
       setIsPreviewing(false);
     }
@@ -225,7 +202,7 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
   const handleCancel = async () => {
     try {
       await toolsApi.cancel();
-      setIsRunning(false);
+      polling.stop();
     } catch {
       /* ignore */
     }
@@ -248,14 +225,6 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
       additional_prompts: prev.additional_prompts.map((p, i) => (i === index ? value : p)),
     }));
   };
-
-  const progress = status && status.max_progress > 0 ? (status.progress / status.max_progress) * 100 : 0;
-  const progressLabel =
-    status && status.max_progress > 0
-      ? `${status.progress} / ${status.max_progress}`
-      : isRunning
-        ? "Starting..."
-        : "0 / 0";
 
   return (
     <ModalBase open={open} onClose={onClose} title="Batch Generate Captions" size="lg" closeOnBackdrop={!isRunning}>
@@ -297,16 +266,20 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
           </>
         )}
 
-        {state.model === "OpenAI Compatible" && (
+        {isApiModel(state.model) && (
           <div className="flex flex-col gap-3 p-3 rounded-[var(--radius-sm)] bg-[var(--color-surface-elevated)] border border-[var(--color-border-subtle)]">
-            <h4 className="text-sm font-semibold text-[var(--color-on-surface-secondary)]">OpenAI API Settings</h4>
-            <FormEntry
-              label="API URL"
-              value={state.api_url}
-              onChange={(v) => update("api_url", String(v))}
-              placeholder="http://localhost:1234/v1/chat/completions"
-              disabled={isRunning}
-            />
+            <h4 className="text-sm font-semibold text-[var(--color-on-surface-secondary)]">
+              {state.model === "OpenAI Compatible" ? "OpenAI" : "Gemini"} API Settings
+            </h4>
+            {state.model === "OpenAI Compatible" && (
+              <FormEntry
+                label="API URL"
+                value={state.api_url}
+                onChange={(v) => update("api_url", String(v))}
+                placeholder="http://localhost:1234/v1/chat/completions"
+                disabled={isRunning}
+              />
+            )}
             <div className="flex flex-col gap-1">
               <label className="text-sm font-medium text-[var(--color-on-surface)]">API Key</label>
               <div className="flex gap-1">
@@ -315,8 +288,8 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
                   value={state.api_key}
                   onChange={(e) => update("api_key", e.target.value)}
                   disabled={isRunning}
-                  placeholder="sk-..."
-                  className="flex-1 px-3 py-1.5 rounded-[var(--radius-sm)] border border-[var(--color-border-default)] bg-[var(--color-surface-default)] text-sm text-[var(--color-on-surface)]"
+                  placeholder={state.model === "OpenAI Compatible" ? "sk-..." : "AIzaSy..."}
+                  className="flex-1 px-3 py-1.5 rounded-[var(--radius-sm)] border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] text-sm text-[var(--color-on-surface)]"
                 />
                 <Button variant="secondary" onClick={() => setShowApiKey(!showApiKey)} disabled={isRunning}>
                   {showApiKey ? "Hide" : "Show"}
@@ -327,7 +300,7 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
               label="Model Name"
               value={state.model_name}
               onChange={(v) => update("model_name", String(v))}
-              placeholder="local-model"
+              placeholder={state.model === "OpenAI Compatible" ? "local-model" : "gemini-1.5-flash"}
               disabled={isRunning}
             />
             <FormEntry
@@ -355,84 +328,35 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
                 placeholder="-1 = unlimited"
                 disabled={isRunning}
               />
-              <FormEntry
-                label="Batch Size"
-                value={state.batch_size}
-                onChange={(v) => update("batch_size", Number(v))}
-                type="number"
-                tooltip="Number of concurrent API requests"
-                disabled={isRunning}
-              />
-              <FormEntry
-                label="RPM Limit"
-                value={state.requests_per_minute}
-                onChange={(v) => update("requests_per_minute", Number(v))}
-                type="number"
-                tooltip="Requests per minute (0 = unlimited)"
-                disabled={isRunning}
-              />
+              {state.model === "OpenAI Compatible" && (
+                <>
+                  <FormEntry
+                    label="Batch Size"
+                    value={state.batch_size}
+                    onChange={(v) => update("batch_size", Number(v))}
+                    type="number"
+                    tooltip="Number of concurrent API requests"
+                    disabled={isRunning}
+                  />
+                  <FormEntry
+                    label="RPM Limit"
+                    value={state.requests_per_minute}
+                    onChange={(v) => update("requests_per_minute", Number(v))}
+                    type="number"
+                    tooltip="Requests per minute (0 = unlimited)"
+                    disabled={isRunning}
+                  />
+                </>
+              )}
             </div>
-            <Toggle
-              label="Enable thinking mode"
-              value={state.enable_thinking}
-              onChange={(v) => update("enable_thinking", v)}
-              disabled={isRunning}
-            />
-          </div>
-        )}
-
-        {state.model === "Gemini API" && (
-          <div className="flex flex-col gap-3 p-3 rounded-[var(--radius-sm)] bg-[var(--color-surface-elevated)] border border-[var(--color-border-subtle)]">
-            <h4 className="text-sm font-semibold text-[var(--color-on-surface-secondary)]">Gemini API Settings</h4>
-            <div className="flex flex-col gap-1">
-              <label className="text-sm font-medium text-[var(--color-on-surface)]">API Key</label>
-              <div className="flex gap-1">
-                <input
-                  type={showApiKey ? "text" : "password"}
-                  value={state.api_key}
-                  onChange={(e) => update("api_key", e.target.value)}
-                  disabled={isRunning}
-                  placeholder="AIzaSy..."
-                  className="flex-1 px-3 py-1.5 rounded-[var(--radius-sm)] border border-[var(--color-border-default)] bg-[var(--color-surface-default)] text-sm text-[var(--color-on-surface)]"
-                />
-                <Button variant="secondary" onClick={() => setShowApiKey(!showApiKey)} disabled={isRunning}>
-                  {showApiKey ? "Hide" : "Show"}
-                </Button>
-              </div>
-            </div>
-            <FormEntry
-              label="Model Name"
-              value={state.model_name}
-              onChange={(v) => update("model_name", String(v))}
-              placeholder="gemini-1.5-flash"
-              disabled={isRunning}
-            />
-            <FormEntry
-              label="System Prompt"
-              value={state.system_prompt}
-              onChange={(v) => update("system_prompt", String(v))}
-              placeholder="Optional system prompt..."
-              disabled={isRunning}
-            />
-            <div className="grid grid-cols-2 gap-3">
-              <SliderEntry
-                label="Temperature"
-                value={state.temperature}
-                onChange={(v) => update("temperature", v)}
-                min={0}
-                max={2}
-                step={0.1}
+            {state.model === "OpenAI Compatible" && (
+              <Toggle
+                label="Enable thinking mode"
+                value={state.enable_thinking}
+                onChange={(v) => update("enable_thinking", v)}
                 disabled={isRunning}
               />
-              <FormEntry
-                label="Max Tokens"
-                value={state.max_tokens}
-                onChange={(v) => update("max_tokens", Number(v))}
-                type="number"
-                placeholder="-1 = unlimited"
-                disabled={isRunning}
-              />
-            </div>
+            )}
           </div>
         )}
 
@@ -445,7 +369,7 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
               disabled={isRunning}
               placeholder="Describe this image."
               rows={3}
-              className="w-full px-3 py-2 rounded-[var(--radius-sm)] border border-[var(--color-border-default)] bg-[var(--color-surface-default)] text-sm text-[var(--color-on-surface)] resize-y"
+              className={`${TEXTAREA_FULL} resize-y`}
             />
 
             {state.additional_prompts.map((p, i) => (
@@ -456,7 +380,7 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
                   onChange={(e) => updatePrompt(i, e.target.value)}
                   disabled={isRunning}
                   placeholder={`Additional prompt ${i + 1}...`}
-                  className="flex-1 px-3 py-1.5 rounded-[var(--radius-sm)] border border-[var(--color-border-default)] bg-[var(--color-surface-default)] text-sm text-[var(--color-on-surface)]"
+                  className={INPUT_FLEX}
                 />
                 <button
                   type="button"
@@ -562,7 +486,11 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
         )}
 
         <div className="pt-2">
-          <ProgressBar value={progress} label={progressLabel} indeterminate={isRunning && progress === 0} />
+          <ProgressBar
+            value={polling.progress}
+            label={polling.progressLabel}
+            indeterminate={isRunning && polling.progress === 0}
+          />
         </div>
 
         {error && (

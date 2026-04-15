@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
-import { toolsApi, type ToolStatusResponse } from "@/api/toolsApi";
+import { toolsApi } from "@/api/toolsApi";
 import { Button, DirPicker, FilePicker, FormEntry, ProgressBar, Select, Toggle } from "@/components/shared";
+import { useToolPolling } from "@/hooks/useToolPolling";
 
 import { ModalBase } from "./ModalBase";
 
@@ -49,11 +50,9 @@ const DEFAULT_STATE: MaskState = {
 
 export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
   const [state, setState] = useState<MaskState>({ ...DEFAULT_STATE });
-  const [status, setStatus] = useState<ToolStatusResponse | null>(null);
-  const [isRunning, setIsRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const polling = useToolPolling();
+  const { status, isRunning, error } = polling;
   const [ultralyticsAvailable, setUltralyticsAvailable] = useState<boolean | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const update = <K extends keyof MaskState>(field: K, value: MaskState[K]) => {
     setState((prev) => ({ ...prev, [field]: value }));
@@ -71,42 +70,16 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
       });
   }, [open]);
 
-  useEffect(() => {
-    if (!isRunning) return;
-
-    const poll = async () => {
-      try {
-        const s = await toolsApi.getStatus();
-        setStatus(s);
-        if (s.status === "completed" || s.status === "error" || s.status === "idle") {
-          setIsRunning(false);
-          if (s.status === "error" && s.error) {
-            setError(s.error);
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    };
-
-    pollRef.current = setInterval(poll, 500);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, [isRunning]);
-
   const handleGenerate = async () => {
     if (!state.folder) {
-      setError("Please select a folder.");
+      polling.setError("Please select a folder.");
       return;
     }
     if (state.model === "YOLO" && !state.model_path) {
-      setError("Please select a YOLO model file (.pt).");
+      polling.setError("Please select a YOLO model file (.pt).");
       return;
     }
-    setError(null);
-    setIsRunning(true);
-    setStatus(null);
+    polling.start();
 
     try {
       const result = await toolsApi.generateMasks({
@@ -123,19 +96,19 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
       });
 
       if (!result.ok) {
-        setError(result.error ?? "Failed to start mask generation");
-        setIsRunning(false);
+        polling.setError(result.error ?? "Failed to start mask generation");
+        polling.stop();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
-      setIsRunning(false);
+      polling.setError(err instanceof Error ? err.message : "Unknown error");
+      polling.stop();
     }
   };
 
   const handleCancel = async () => {
     try {
       await toolsApi.cancel();
-      setIsRunning(false);
+      polling.stop();
     } catch {
       /* ignore */
     }
@@ -149,15 +122,6 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
       window.open(`/?route=mask-editor&folder=${encodeURIComponent(state.folder)}`, "_blank");
     }
   };
-
-  const progress = status && status.max_progress > 0 ? (status.progress / status.max_progress) * 100 : 0;
-
-  const progressLabel =
-    status && status.max_progress > 0
-      ? `${status.progress} / ${status.max_progress}`
-      : isRunning
-        ? "Starting..."
-        : "0 / 0";
 
   return (
     <ModalBase open={open} onClose={onClose} title="Batch Generate Masks" size="md" closeOnBackdrop={!isRunning}>
@@ -255,7 +219,11 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
         />
 
         <div className="pt-2">
-          <ProgressBar value={progress} label={progressLabel} indeterminate={isRunning && progress === 0} />
+          <ProgressBar
+            value={polling.progress}
+            label={polling.progressLabel}
+            indeterminate={isRunning && polling.progress === 0}
+          />
         </div>
 
         {error && (

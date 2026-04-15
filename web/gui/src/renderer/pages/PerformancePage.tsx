@@ -473,58 +473,54 @@ export default function PerformancePage() {
           yMax={latest?.ram_total_gb}
         />
 
-        {Array.from({ length: gpuCount }).map((_, gpuIdx) => {
-          const vramPoints = extractTimeSeries(history, (m) => m.gpus[gpuIdx]?.vram_used_mb ?? null);
-          const gpuName = latest?.gpus[gpuIdx]?.name ?? `GPU ${gpuIdx}`;
-          const vramTotalMb = latest?.gpus[gpuIdx]?.vram_total_mb;
-          return (
+        {Array.from({ length: gpuCount }).flatMap((_, gpuIdx) => {
+          const gpu = latest?.gpus[gpuIdx];
+          const gpuName = gpu?.name ?? `GPU ${gpuIdx}`;
+          const color = GPU_COLORS[gpuIdx % GPU_COLORS.length];
+          const charts: React.ReactNode[] = [];
+
+          charts.push(
             <MetricChart
               key={`vram-${gpuIdx}`}
               title={`VRAM - ${gpuName}`}
-              points={vramPoints}
+              points={extractTimeSeries(history, (m) => m.gpus[gpuIdx]?.vram_used_mb ?? null)}
               unit="MB"
-              color={GPU_COLORS[gpuIdx % GPU_COLORS.length]}
+              color={color}
               area
               yMin={0}
-              yMax={vramTotalMb}
-            />
+              yMax={gpu?.vram_total_mb}
+            />,
           );
-        })}
 
-        {Array.from({ length: gpuCount }).map((_, gpuIdx) => {
-          const hasUtil = latest?.gpus[gpuIdx]?.utilization !== null;
-          if (!hasUtil) return null;
-          const utilPoints = extractTimeSeries(history, (m) => m.gpus[gpuIdx]?.utilization ?? null);
-          const gpuName = latest?.gpus[gpuIdx]?.name ?? `GPU ${gpuIdx}`;
-          return (
-            <MetricChart
-              key={`util-${gpuIdx}`}
-              title={`GPU Utilization - ${gpuName}`}
-              points={utilPoints}
-              unit="%"
-              color={GPU_COLORS[gpuIdx % GPU_COLORS.length]}
-              yMax={100}
-              yMin={0}
-            />
-          );
-        })}
+          if (gpu?.utilization !== null) {
+            charts.push(
+              <MetricChart
+                key={`util-${gpuIdx}`}
+                title={`GPU Utilization - ${gpuName}`}
+                points={extractTimeSeries(history, (m) => m.gpus[gpuIdx]?.utilization ?? null)}
+                unit="%"
+                color={color}
+                yMax={100}
+                yMin={0}
+              />,
+            );
+          }
 
-        {Array.from({ length: gpuCount }).map((_, gpuIdx) => {
-          const hasTemp = latest?.gpus[gpuIdx]?.temperature !== null;
-          if (!hasTemp) return null;
-          const tempPoints = extractTimeSeries(history, (m) => m.gpus[gpuIdx]?.temperature ?? null);
-          const gpuName = latest?.gpus[gpuIdx]?.name ?? `GPU ${gpuIdx}`;
-          return (
-            <MetricChart
-              key={`temp-${gpuIdx}`}
-              title={`Temperature - ${gpuName}`}
-              points={tempPoints}
-              unit={"\u00B0C"}
-              color="var(--color-error-500)"
-              yMin={0}
-              yMax={100}
-            />
-          );
+          if (gpu?.temperature !== null) {
+            charts.push(
+              <MetricChart
+                key={`temp-${gpuIdx}`}
+                title={`Temperature - ${gpuName}`}
+                points={extractTimeSeries(history, (m) => m.gpus[gpuIdx]?.temperature ?? null)}
+                unit={"\u00B0C"}
+                color="var(--color-error-500)"
+                yMin={0}
+                yMax={100}
+              />,
+            );
+          }
+
+          return charts;
         })}
       </div>
 

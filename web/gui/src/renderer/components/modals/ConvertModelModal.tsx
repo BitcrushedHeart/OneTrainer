@@ -1,8 +1,7 @@
 import { useState } from "react";
 
 import { toolsApi } from "@/api/toolsApi";
-import type { SelectKVOption } from "@/components/shared";
-import { Button, FilePicker, SelectKV } from "@/components/shared";
+import { Button, FilePicker, Select, type SelectKVOption } from "@/components/shared";
 
 import { ModalBase } from "./ModalBase";
 
@@ -117,7 +116,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
   return (
     <ModalBase open={open} onClose={onClose} title="Convert Model" size="md" closeOnBackdrop={!isConverting}>
       <div className="flex flex-col gap-4">
-        <SelectKV
+        <Select
           label="Model Type"
           options={MODEL_TYPES}
           value={modelType}
@@ -126,7 +125,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
           tooltip="Type of the model"
         />
 
-        <SelectKV
+        <Select
           label="Training Method"
           options={TRAINING_METHODS}
           value={trainingMethod}
@@ -143,7 +142,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
           tooltip="Filename, directory or Hugging Face repository of the model"
         />
 
-        <SelectKV
+        <Select
           label="Output Data Type"
           options={OUTPUT_DTYPES}
           value={outputDtype}
@@ -152,7 +151,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
           tooltip="Precision to use when saving the output model"
         />
 
-        <SelectKV
+        <Select
           label="Output Format"
           options={OUTPUT_FORMATS}
           value={outputFormat}

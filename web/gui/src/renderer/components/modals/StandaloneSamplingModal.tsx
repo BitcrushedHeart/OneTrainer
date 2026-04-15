@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { type SamplerStatusResponse, samplingApi, type StandaloneSampleRequest } from "@/api/samplingApi";
 import { Button, Card, FormEntry, ProgressBar, Select, Toggle } from "@/components/shared";
 import { NoiseSchedulerValues } from "@/types/generated/enums";
+import { TEXTAREA_FULL } from "@/utils/inputStyles";
 
 import { ModalBase } from "./ModalBase";
 
@@ -209,7 +210,7 @@ export function StandaloneSamplingModal({ open, onClose }: StandaloneSamplingMod
               onChange={(e) => update("prompt", e.target.value)}
               rows={3}
               disabled={isBusy}
-              className="px-3 py-2 rounded-[var(--radius-sm)] text-sm bg-[var(--color-surface-raised)] border border-[var(--color-border-subtle)] text-[var(--color-on-surface)] focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] resize-y disabled:opacity-40 disabled:cursor-not-allowed"
+              className={`${TEXTAREA_FULL} resize-y`}
               placeholder="Enter prompt..."
             />
           </div>
@@ -221,7 +222,7 @@ export function StandaloneSamplingModal({ open, onClose }: StandaloneSamplingMod
               onChange={(e) => update("negative_prompt", e.target.value)}
               rows={2}
               disabled={isBusy}
-              className="px-3 py-2 rounded-[var(--radius-sm)] text-sm bg-[var(--color-surface-raised)] border border-[var(--color-border-subtle)] text-[var(--color-on-surface)] focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] resize-y disabled:opacity-40 disabled:cursor-not-allowed"
+              className={`${TEXTAREA_FULL} resize-y`}
               placeholder="Enter negative prompt..."
             />
           </div>
