@@ -200,6 +200,8 @@ def field_to_dict(field: ParsedField) -> dict:
         d["enumRef"] = field.enum_ref
     if field.kv_options:
         d["options"] = field.kv_options
+    if field.dtype_subset:
+        d["dtypeSubset"] = field.dtype_subset
     if field.adv_command:
         modal = ADV_COMMAND_MAP.get(field.adv_command)
         if modal:

@@ -1,5 +1,7 @@
 import { FilePicker, FormEntry, Select, Toggle } from "@/components/shared";
+import { useConfigField } from "@/hooks/useConfigField";
 import { NoiseSchedulerValues } from "@/types/generated/enums";
+import { MODEL_TYPE_GROUPS } from "@/types/generated/modelTypeInfo";
 
 import { ModalBase } from "./ModalBase";
 
@@ -11,6 +13,10 @@ export interface SampleParamsModalProps {
 
 export function SampleParamsModal({ open, onClose, sampleIndex }: SampleParamsModalProps) {
   const p = `samples.${sampleIndex}`;
+  const [modelType] = useConfigField<string>("model_type");
+  const isFlowMatching = modelType
+    ? (MODEL_TYPE_GROUPS.is_flow_matching as readonly string[]).includes(modelType)
+    : false;
 
   return (
     <ModalBase open={open} onClose={onClose} title={`Sample ${sampleIndex + 1} Parameters`} size="lg">
@@ -21,7 +27,9 @@ export function SampleParamsModal({ open, onClose, sampleIndex }: SampleParamsMo
         <Toggle configPath={`${p}.random_seed`} label="Random Seed" />
         <FormEntry label="Diffusion Steps" configPath={`${p}.diffusion_steps`} type="number" />
         <FormEntry label="CFG Scale" configPath={`${p}.cfg_scale`} type="number" />
-        <Select label="Noise Scheduler" configPath={`${p}.noise_scheduler`} options={[...NoiseSchedulerValues]} />
+        {!isFlowMatching && (
+          <Select label="Noise Scheduler" configPath={`${p}.noise_scheduler`} options={[...NoiseSchedulerValues]} />
+        )}
 
         <FormEntry label="Frames" configPath={`${p}.frames`} type="number" tooltip="Frame count for video models" />
         <FormEntry

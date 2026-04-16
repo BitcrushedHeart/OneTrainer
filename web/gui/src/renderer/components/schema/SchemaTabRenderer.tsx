@@ -4,6 +4,9 @@ import { lazy, Suspense } from "react";
 import { SchemaField, SectionCard } from "@/components/shared";
 import { useConfigStore } from "@/store/configStore";
 import { useUiSchemaStore } from "@/store/uiSchemaStore";
+import type { LossWeight, ModelType } from "@/types/generated/enums";
+import { LOSS_WEIGHT_SUPPORTS_FLOW_MATCHING } from "@/types/generated/lossWeightInfo";
+import { MODEL_TYPE_GROUPS } from "@/types/generated/modelTypeInfo";
 import type { FieldDef, SectionDef, TabDef } from "@/types/uiSchema";
 import { evaluateCondition } from "@/utils/conditionEval";
 
@@ -71,11 +74,22 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
   const resolveEnumOptions = useCallback(
     (field: FieldDef): string[] => {
       if (field.enumRef && schema?.enums[field.enumRef]) {
-        return schema.enums[field.enumRef].values;
+        const values = schema.enums[field.enumRef].values;
+        if (field.key === "loss_weight_fn") {
+          const modelType = configRecord["model_type"] as ModelType | undefined;
+          if (modelType) {
+            const flowMatching = MODEL_TYPE_GROUPS.is_flow_matching ?? [];
+            const isFlowMatching = flowMatching.includes(modelType);
+            return values.filter(
+              (v) => v === "CONSTANT" || LOSS_WEIGHT_SUPPORTS_FLOW_MATCHING[v as LossWeight] === isFlowMatching,
+            );
+          }
+        }
+        return values;
       }
       return [];
     },
-    [schema],
+    [schema, configRecord],
   );
 
   const resolveKvOptions = useCallback(
