@@ -93,12 +93,12 @@ export const configApi = {
       body: JSON.stringify(concepts),
     }),
 
-  conceptImages: (path: string, offset = 0, limit = 9999) =>
+  conceptImages: (path: string, includeSubdirectories = false, offset = 0, limit = 9999) =>
     request<{
       total: number;
       offset: number;
       images: Array<{ filename: string; path: string; caption: string | null }>;
-    }>(`/concepts/images?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}`),
+    }>(`/concepts/images?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}&include_subdirectories=${includeSubdirectories}`),
 
   conceptTextFile: (path: string) =>
     request<{ content: string }>(`/concepts/text-file?path=${encodeURIComponent(path)}`),

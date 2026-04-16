@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/concepts", tags=["concepts"])
 
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
 
 _THUMBNAIL_CACHE_MAXSIZE = 256
 _THUMBNAIL_CACHE_TTL = 60
@@ -26,27 +26,39 @@ _thumbnail_cache: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
 _thumbnail_cache_lock = threading.Lock()
 
 
-def _pick_thumbnail(dir_path: str) -> str | None:
+def _is_valid_image(name: str) -> bool:
+    ext = os.path.splitext(name)[1].lower()
+    return ext in _IMAGE_EXTENSIONS and not name.endswith("-masklabel.png") and not name.endswith("-condlabel.png")
+
+
+def _pick_thumbnail(dir_path: str, include_subdirectories: bool = False) -> str | None:
+    cache_key = f"{dir_path}|{include_subdirectories}"
     now = time.monotonic()
 
     with _thumbnail_cache_lock:
-        if dir_path in _thumbnail_cache:
-            ts, value = _thumbnail_cache[dir_path]
+        if cache_key in _thumbnail_cache:
+            ts, value = _thumbnail_cache[cache_key]
             if now - ts < _THUMBNAIL_CACHE_TTL:
-                _thumbnail_cache.move_to_end(dir_path)
+                _thumbnail_cache.move_to_end(cache_key)
                 return value
             else:
-                del _thumbnail_cache[dir_path]
+                del _thumbnail_cache[cache_key]
 
     if not os.path.isdir(dir_path):
         result = None
     else:
         candidates: list[str] = []
         try:
-            for entry in os.scandir(dir_path):
-                if entry.is_file():
-                    ext = os.path.splitext(entry.name)[1].lower()
-                    if ext in _IMAGE_EXTENSIONS:
+            if include_subdirectories:
+                for root, dirs, files in os.walk(dir_path):
+                    # Skip hidden directories
+                    dirs[:] = [d for d in dirs if not d.startswith('.')]
+                    for fname in files:
+                        if _is_valid_image(fname):
+                            candidates.append(os.path.join(root, fname))
+            else:
+                for entry in os.scandir(dir_path):
+                    if entry.is_file() and _is_valid_image(entry.name):
                         candidates.append(entry.path)
         except PermissionError:
             result = None
@@ -54,8 +66,8 @@ def _pick_thumbnail(dir_path: str) -> str | None:
             result = random.choice(candidates) if candidates else None
 
     with _thumbnail_cache_lock:
-        _thumbnail_cache[dir_path] = (now, result)
-        _thumbnail_cache.move_to_end(dir_path)
+        _thumbnail_cache[cache_key] = (now, result)
+        _thumbnail_cache.move_to_end(cache_key)
         while len(_thumbnail_cache) > _THUMBNAIL_CACHE_MAXSIZE:
             _thumbnail_cache.popitem(last=False)
 
@@ -68,9 +80,12 @@ def invalidate_thumbnail_cache() -> None:
 
 
 @router.get("/thumbnail")
-def get_thumbnail(path: str = Query(..., description="Directory path to scan for images")):
+def get_thumbnail(
+    path: str = Query(..., description="Directory path to scan for images"),
+    include_subdirectories: bool = Query(False, description="Include images from subdirectories"),
+):
     path = validate_path(path, allow_file=False)
-    chosen = _pick_thumbnail(path)
+    chosen = _pick_thumbnail(path, include_subdirectories)
     if chosen is None:
         raise HTTPException(status_code=404, detail="No images found in directory")
 
@@ -82,15 +97,36 @@ def list_images(
     path: str = Query(..., description="Directory path to scan for images"),
     offset: int = Query(0, ge=0, description="Start index"),
     limit: int = Query(50, ge=1, le=10000, description="Max images to return"),
+    include_subdirectories: bool = Query(False, description="Include images from subdirectories"),
 ):
     path = validate_path(path, allow_file=False)
 
     entries: list[dict] = []
     try:
-        for entry in sorted(os.scandir(path), key=lambda e: e.name):
-            if entry.is_file():
-                ext = os.path.splitext(entry.name)[1].lower()
-                if ext in _IMAGE_EXTENSIONS:
+        if include_subdirectories:
+            for root, dirs, files in os.walk(path):
+                # Skip hidden directories
+                dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+                for fname in sorted(files):
+                    if _is_valid_image(fname):
+                        full_path = os.path.join(root, fname)
+                        stem = os.path.splitext(full_path)[0]
+                        caption_path = stem + ".txt"
+                        caption: str | None = None
+                        if os.path.isfile(caption_path):
+                            try:
+                                with open(caption_path, "r", encoding="utf-8") as fh:
+                                    caption = fh.read().strip()
+                            except Exception:
+                                caption = None
+                        entries.append({
+                            "filename": fname,
+                            "path": full_path.replace("\\", "/"),
+                            "caption": caption,
+                        })
+        else:
+            for entry in sorted(os.scandir(path), key=lambda e: e.name):
+                if entry.is_file() and _is_valid_image(entry.name):
                     stem = os.path.splitext(entry.path)[0]
                     caption_path = stem + ".txt"
                     caption: str | None = None

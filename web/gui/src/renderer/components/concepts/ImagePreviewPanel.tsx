@@ -35,7 +35,7 @@ export function ImagePreviewPanel({ conceptPath, includeSubdirectories, textConf
     setLoading(true);
 
     configApi
-      .conceptImages(conceptPath)
+      .conceptImages(conceptPath, includeSubdirectories)
       .then((result) => {
         if (cancelled) return;
         setImages(result.images);
