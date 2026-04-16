@@ -1,6 +1,8 @@
 from web.backend.services.validation_service import ValidationService
+from web.backend.utils.path_security import validate_path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 router = APIRouter(tags=["validation"])
@@ -17,6 +19,10 @@ class DeepScanRequest(BaseModel):
 
 class MatchActionRequest(BaseModel):
     val_image_path: str
+
+
+class MatchBatchActionRequest(BaseModel):
+    val_image_paths: list[str]
 
 
 @router.get("/validation/status")
@@ -63,3 +69,15 @@ def remove_match(req: MatchActionRequest):
 def move_match(req: MatchActionRequest):
     service = ValidationService.get_instance()
     return service.move_match(req.val_image_path)
+
+
+@router.post("/validation/match/remove-batch")
+def remove_match_batch(req: MatchBatchActionRequest):
+    service = ValidationService.get_instance()
+    return service.remove_matches_batch(req.val_image_paths)
+
+
+@router.get("/validation/image")
+def get_validation_image(path: str):
+    safe = validate_path(path, must_exist=True, allow_dir=False)
+    return FileResponse(safe)

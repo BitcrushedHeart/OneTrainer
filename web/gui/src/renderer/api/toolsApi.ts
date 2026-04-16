@@ -14,6 +14,15 @@ export interface ToolStatusResponse {
   task_id: string | null;
 }
 
+export interface QuantizationParams {
+  layer_filter: string;
+  layer_filter_preset: string;
+  layer_filter_regex: boolean;
+  svd_dtype: string;
+  svd_rank: number;
+  cache_dir: string | null;
+}
+
 export interface ConvertModelRequest {
   model_type: string;
   training_method: string;
@@ -21,6 +30,7 @@ export interface ConvertModelRequest {
   output_dtype: string;
   output_model_format: string;
   output_model_destination: string;
+  quantization?: QuantizationParams | null;
 }
 
 export interface ConvertModelResponse {

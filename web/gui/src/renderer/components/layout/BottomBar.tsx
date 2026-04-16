@@ -1,4 +1,6 @@
 import {
+  BarChart3,
+  Bug,
   Camera,
   Clock,
   Download,
@@ -12,6 +14,7 @@ import {
   Timer,
 } from "lucide-react";
 
+import { configApi } from "@/api/configApi";
 import { DualProgress } from "@/components/shared";
 import { useElapsedTime } from "@/hooks/useElapsedTime";
 import { getByPath, useConfigStore } from "@/store/configStore";
@@ -68,6 +71,39 @@ export default function BottomBar() {
       URL.revokeObjectURL(url);
     } catch {
       /* handled by store */
+    }
+  };
+
+  const handleLaunchTensorboard = async () => {
+    try {
+      const result = await configApi.tensorboardLaunch();
+      if (result.ok && result.url) {
+        window.open(result.url, "_blank", "noopener");
+      } else {
+        alert(`Tensorboard launch failed: ${result.error ?? "unknown error"}`);
+      }
+    } catch (e) {
+      alert(`Tensorboard launch failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const handleDebugDownload = async () => {
+    try {
+      const res = await configApi.debugPackage();
+      if (!res.ok) {
+        alert(`Debug package failed (${res.status})`);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.download = `OneTrainer_debug_${ts}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`Debug package failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -172,6 +208,22 @@ export default function BottomBar() {
 
         <button onClick={handleExport} className="theme-toggle" aria-label="Export config" title="Export config">
           <Download className="w-4 h-4" />
+        </button>
+        <button
+          onClick={handleLaunchTensorboard}
+          className="theme-toggle"
+          aria-label="Open Tensorboard in browser"
+          title="Open Tensorboard"
+        >
+          <BarChart3 className="w-4 h-4" />
+        </button>
+        <button
+          onClick={handleDebugDownload}
+          className="theme-toggle"
+          aria-label="Download debug package"
+          title="Download debug package"
+        >
+          <Bug className="w-4 h-4" />
         </button>
         <button
           className={`theme-toggle${terminalOpen ? " terminal-toggle-active" : ""}`}

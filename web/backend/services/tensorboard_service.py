@@ -1,7 +1,12 @@
+import contextlib
 import logging
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from web.backend.services._singleton import SingletonMixin
@@ -29,6 +34,9 @@ class TensorboardService(SingletonMixin):
         self._accumulators: dict[str, EventAccumulator] = {}
         self._access_times: dict[str, float] = {}
         self._accumulator_lock = threading.Lock()
+        self._tb_process: subprocess.Popen | None = None
+        self._tb_port: int | None = None
+        self._tb_lock = threading.Lock()
 
     @staticmethod
     def _resolve_log_dir(log_dir: str | None = None) -> str:
@@ -133,6 +141,100 @@ class TensorboardService(SingletonMixin):
             for event in events
             if event.step > after_step
         ]
+
+    # ---- Process management ----
+
+    def _is_process_alive(self) -> bool:
+        return self._tb_process is not None and self._tb_process.poll() is None
+
+    @staticmethod
+    def _wait_until_responsive(url: str, timeout: float = 10.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                time.sleep(0.3)
+        return False
+
+    @staticmethod
+    def _find_tensorboard_executable() -> str | None:
+        """Locate the tensorboard CLI - prefer the one in our active venv."""
+        # 1. Same directory as the running Python interpreter (venv)
+        venv_dir = Path(sys.executable).parent
+        for candidate in ("tensorboard.exe", "tensorboard"):
+            p = venv_dir / candidate
+            if p.is_file():
+                return str(p)
+        # 2. PATH lookup
+        return shutil.which("tensorboard")
+
+    def ensure_running(self) -> dict:
+        """Start tensorboard if not already running. Returns {ok, url, port, error}."""
+        from web.backend.services.config_service import ConfigService
+
+        config_service = ConfigService.get_instance()
+        config = config_service.config
+        log_dir = config.workspace_dir or "workspace"
+        port = int(getattr(config, "tensorboard_port", 6006) or 6006)
+        expose = bool(getattr(config, "tensorboard_expose", False))
+
+        with self._tb_lock:
+            if self._is_process_alive() and self._tb_port == port:
+                url = f"http://localhost:{port}/"
+                return {"ok": True, "url": url, "port": port, "already_running": True}
+
+            tb_exe = self._find_tensorboard_executable()
+            if tb_exe is None:
+                return {
+                    "ok": False,
+                    "error": "tensorboard CLI not found. Install with: pip install tensorboard",
+                }
+
+            host = "0.0.0.0" if expose else "localhost"
+            args = [
+                tb_exe,
+                "--logdir", log_dir,
+                "--port", str(port),
+                "--host", host,
+            ]
+            try:
+                self._tb_process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._tb_port = port
+            except (OSError, FileNotFoundError) as exc:
+                return {"ok": False, "error": f"Failed to launch tensorboard: {exc}"}
+
+            url = f"http://localhost:{port}/"
+            if not self._wait_until_responsive(url, timeout=15.0):
+                return {
+                    "ok": False,
+                    "error": f"tensorboard did not respond at {url} within 15s",
+                    "url": url,
+                    "port": port,
+                }
+            return {"ok": True, "url": url, "port": port, "already_running": False}
+
+    def stop(self) -> dict:
+        with self._tb_lock:
+            if not self._is_process_alive():
+                self._tb_process = None
+                self._tb_port = None
+                return {"ok": True, "was_running": False}
+            try:
+                self._tb_process.terminate()
+                self._tb_process.wait(timeout=5)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self._tb_process.kill()
+            self._tb_process = None
+            self._tb_port = None
+            return {"ok": True, "was_running": True}
 
     def clear_cache(self, run_name: str | None = None, log_dir: str | None = None) -> None:
         with self._accumulator_lock:

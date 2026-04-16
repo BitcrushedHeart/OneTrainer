@@ -40,6 +40,17 @@ export interface GroupData {
   total_groups: number;
   pairs_done: number;
   pairs_target: number;
+  mode?: "selection" | "elo";
+}
+
+export interface EloPairResponse {
+  ok: boolean;
+  finished?: boolean;
+  pair?: [string, string];
+  ratings?: Record<string, number>;
+  done?: number;
+  suggested?: number;
+  error?: string;
 }
 
 export interface NextGroupResponse {
@@ -88,10 +99,23 @@ export const dpoApi = {
     }),
 
   // Curation session
-  startSession: (sourceFolder: string, outputDir: string, pairsPerGroup = 1) =>
+  startSession: (
+    sourceFolder: string,
+    outputDir: string,
+    pairsPerGroup = 1,
+    mode: "selection" | "elo" = "selection",
+  ) =>
     request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>(
       "/dpo/session/start",
-      { method: "POST", body: JSON.stringify({ source_folder: sourceFolder, output_dir: outputDir, pairs_per_group: pairsPerGroup }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          source_folder: sourceFolder,
+          output_dir: outputDir,
+          pairs_per_group: pairsPerGroup,
+          mode,
+        }),
+      },
     ),
 
   sessionStatus: () => request<SessionStatus>("/dpo/session/status"),
@@ -116,6 +140,29 @@ export const dpoApi = {
 
   cancelSession: () =>
     request<{ ok: boolean }>("/dpo/session/cancel", { method: "POST" }),
+
+  // ELO mode
+  eloPair: () => request<EloPairResponse>("/dpo/session/elo-pair"),
+
+  eloVote: (a: string, b: string, winner: "a" | "b" | "tie") =>
+    request<EloPairResponse>("/dpo/session/elo-vote", {
+      method: "POST",
+      body: JSON.stringify({ a, b, winner }),
+    }),
+
+  eloAccept: (continueScoring = false) =>
+    request<{
+      ok: boolean;
+      pair_created?: boolean;
+      chosen?: string;
+      rejected?: string;
+      continue_group?: boolean;
+      pairs_done?: number;
+      error?: string;
+    }>("/dpo/session/elo-accept", {
+      method: "POST",
+      body: JSON.stringify({ continue_scoring: continueScoring }),
+    }),
 
   imageUrl: (path: string) => `/api/dpo/session/image?path=${encodeURIComponent(path)}`,
 };

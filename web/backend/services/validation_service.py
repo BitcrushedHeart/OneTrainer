@@ -1,5 +1,6 @@
 import logging
 import threading
+import urllib.parse
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -221,17 +222,35 @@ class ValidationService(SingletonMixin):
                 self._status = "done"
 
     @staticmethod
-    def _serialize_match(match: Any) -> dict:
+    def _image_url(path: str) -> str:
+        return f"/validation/image?path={urllib.parse.quote(path)}"
+
+    @classmethod
+    def _serialize_match(cls, match: Any) -> dict:
         return {
             "id": str(uuid.uuid4()),
             "train_image": match.train_image.display_name,
             "train_path": match.train_image.path,
+            "train_image_url": cls._image_url(match.train_image.path),
             "val_image": match.val_image.display_name,
             "val_path": match.val_image.path,
+            "val_image_url": cls._image_url(match.val_image.path),
             "kind": match.kind,
             "detail": match.detail,
             "score": match.score,
         }
+
+    def remove_matches_batch(self, val_image_paths: list[str]) -> dict:
+        """Remove multiple validation matches in one call. Returns count removed."""
+        removed = 0
+        errors: list[str] = []
+        for p in val_image_paths:
+            res = self.remove_match(p)
+            if res.get("ok"):
+                removed += 1
+            else:
+                errors.append(f"{p}: {res.get('error', 'unknown error')}")
+        return {"ok": True, "removed": removed, "errors": errors}
 
     def _find_val_image(self, path: str) -> Any:
         """Rebuild a ValidationCheckerImage for the given path from current concepts."""

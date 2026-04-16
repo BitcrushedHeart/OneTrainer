@@ -1,3 +1,5 @@
+from typing import Literal
+
 from web.backend.services.dpo_service import DPOService
 
 from fastapi import APIRouter
@@ -21,6 +23,7 @@ class StartSessionRequest(BaseModel):
     source_folder: str
     output_dir: str
     pairs_per_group: int = 1
+    mode: Literal["selection", "elo"] = "selection"
 
 
 class SelectImageRequest(BaseModel):
@@ -29,6 +32,16 @@ class SelectImageRequest(BaseModel):
 
 class FinalizeRequest(BaseModel):
     val_percentage: float = 0.0
+
+
+class EloVoteRequest(BaseModel):
+    a: str
+    b: str
+    winner: Literal["a", "b", "tie"]
+
+
+class EloAcceptRequest(BaseModel):
+    continue_scoring: bool = False
 
 
 @router.post("/dpo/check-pairs")
@@ -66,7 +79,9 @@ def fix_multiline_captions():
 @router.post("/dpo/session/start")
 def start_session(req: StartSessionRequest):
     service = DPOService.get_instance()
-    return service.start_session(req.source_folder, req.output_dir, req.pairs_per_group)
+    return service.start_session(
+        req.source_folder, req.output_dir, req.pairs_per_group, req.mode
+    )
 
 
 @router.get("/dpo/session/status")
@@ -112,3 +127,23 @@ def serve_image(path: str):
     if abs_path is None:
         return ActionResponse(ok=False, error="Image not found")
     return FileResponse(abs_path)
+
+
+# ---- ELO mode endpoints ----
+
+@router.get("/dpo/session/elo-pair")
+def elo_pair():
+    service = DPOService.get_instance()
+    return service.elo_current_pair()
+
+
+@router.post("/dpo/session/elo-vote")
+def elo_vote(req: EloVoteRequest):
+    service = DPOService.get_instance()
+    return service.elo_vote(req.a, req.b, req.winner)
+
+
+@router.post("/dpo/session/elo-accept")
+def elo_accept(req: EloAcceptRequest):
+    service = DPOService.get_instance()
+    return service.elo_accept_pair(req.continue_scoring)

@@ -1,8 +1,9 @@
+import json
 from typing import Any
 
 from web.backend.services.queue_service import QueueService
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 router = APIRouter(tags=["queue"])
@@ -116,3 +117,25 @@ def export_queue():
 def import_queue(req: ImportQueueRequest):
     service = QueueService.get_instance()
     return service.import_queue(req.data)
+
+
+@router.get("/queue/entry/{entry_id}/diff")
+def entry_diff(entry_id: str):
+    service = QueueService.get_instance()
+    return service.entry_diff(entry_id)
+
+
+@router.post("/queue/entry/from-file")
+async def entry_from_file(file: UploadFile = File(...), name: str = ""):
+    """Upload a training config JSON; diff against defaults; add as queue entry."""
+    raw = await file.read()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Config file must be a JSON object")
+
+    entry_name = name or file.filename or "Imported"
+    service = QueueService.get_instance()
+    return service.add_entry_from_full_config(payload, name=entry_name)

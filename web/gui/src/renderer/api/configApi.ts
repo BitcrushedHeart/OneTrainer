@@ -105,6 +105,12 @@ export const configApi = {
 
   conceptImageUrl: (path: string) => `${API_BASE}/concepts/image?path=${encodeURIComponent(path)}`,
 
+  saveCaption: (imagePath: string, caption: string) =>
+    request<{ ok: boolean; saved: string }>("/concepts/save-caption", {
+      method: "POST",
+      body: JSON.stringify({ image_path: imagePath, caption }),
+    }),
+
   conceptStats: (path: string, includeSubdirectories: boolean, advanced: boolean) =>
     request<Record<string, unknown>>("/concepts/stats", {
       method: "POST",
@@ -137,6 +143,20 @@ export const configApi = {
     request<Array<{ wall_time: number; step: number; value: number }>>(
       `/tensorboard/scalars/${encodeURIComponent(tag)}?run=${encodeURIComponent(run)}${afterStep != null ? `&after_step=${afterStep}` : ""}`,
     ),
+
+  augmentationPreview: (req: { image_path: string; image: Record<string, unknown>; seed: number }) =>
+    request<{ ok: boolean; image_base64: string; seed: number }>(
+      "/concepts/augmentation-preview",
+      { method: "POST", body: JSON.stringify(req) },
+    ),
+
+  tensorboardLaunch: () =>
+    request<{ ok: boolean; url?: string; port?: number; error?: string; already_running?: boolean }>(
+      "/tensorboard/launch",
+      { method: "POST" },
+    ),
+
+  debugPackage: () => fetch(`${API_BASE}/tools/debug-package`, { method: "POST" }),
 
   wikiPages: () => request<Array<{ title: string; pages: string[] }>>("/wiki/pages"),
 

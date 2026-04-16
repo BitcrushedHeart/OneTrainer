@@ -38,3 +38,16 @@ def _run_exists(run_name: str) -> bool:
     service = TensorboardService.get_instance()
     runs = service.list_runs()
     return run_name in runs
+
+
+@router.post("/launch")
+def launch():
+    """Start tensorboard subprocess if not running. Returns URL when responsive."""
+    service = TensorboardService.get_instance()
+    return service.ensure_running()
+
+
+@router.post("/stop")
+def stop():
+    service = TensorboardService.get_instance()
+    return service.stop()

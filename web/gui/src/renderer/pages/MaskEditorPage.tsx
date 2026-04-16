@@ -2,6 +2,7 @@ import {
   Check,
   ChevronRight,
   Eraser,
+  FileText,
   Loader2,
   MousePointerClick,
   Paintbrush,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { configApi } from "@/api/configApi";
 import { type CapabilitiesResponse, toolsApi } from "@/api/toolsApi";
 import { MaskEditorCanvas, type MaskEditorCanvasHandle } from "@/components/mask-editor/MaskEditorCanvas";
 import { Button, DirPicker, FilePicker, SliderEntry, Toggle } from "@/components/shared";
@@ -31,6 +33,61 @@ export default function MaskEditorPage({ initialFolder }: MaskEditorPageProps) {
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [yoloPanelOpen, setYoloPanelOpen] = useState(true);
   const canvasHandleRef = useRef<MaskEditorCanvasHandle | null>(null);
+
+  // Caption editor state
+  const [caption, setCaption] = useState<string>("");
+  const [captionDirty, setCaptionDirty] = useState(false);
+  const [captionSaving, setCaptionSaving] = useState(false);
+  const captionRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Load caption when current image changes
+  useEffect(() => {
+    setCaptionDirty(false);
+    if (!state.currentImagePath) {
+      setCaption("");
+      return;
+    }
+    const idx = state.currentImagePath.lastIndexOf(".");
+    const txtPath = idx >= 0 ? state.currentImagePath.slice(0, idx) + ".txt" : state.currentImagePath + ".txt";
+    let cancelled = false;
+    configApi
+      .conceptTextFile(txtPath)
+      .then((res) => {
+        if (!cancelled) setCaption(res.content ?? "");
+      })
+      .catch(() => {
+        if (!cancelled) setCaption("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.currentImagePath]);
+
+  const saveCaption = useCallback(async () => {
+    if (!state.currentImagePath || !captionDirty) return;
+    setCaptionSaving(true);
+    try {
+      await configApi.saveCaption(state.currentImagePath, caption);
+      setCaptionDirty(false);
+    } catch (e) {
+      alert(`Failed to save caption: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setCaptionSaving(false);
+    }
+  }, [state.currentImagePath, caption, captionDirty]);
+
+  const navigate = useCallback(
+    (delta: number) => {
+      if (!state.currentImagePath) return;
+      const idx = state.images.findIndex((img) => img.path === state.currentImagePath);
+      if (idx < 0) return;
+      const next = state.images[Math.max(0, Math.min(state.images.length - 1, idx + delta))];
+      if (!next || next.path === state.currentImagePath) return;
+      if ((state.maskModified || captionDirty) && !confirm("Unsaved changes. Continue?")) return;
+      selectImage(next.path);
+    },
+    [state.currentImagePath, state.images, state.maskModified, captionDirty, selectImage],
+  );
 
   useEffect(() => {
     toolsApi
@@ -53,22 +110,31 @@ export default function MaskEditorPage({ initialFolder }: MaskEditorPageProps) {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const inEditor =
+        target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT" || target.isContentEditable);
+
       if (e.ctrlKey && e.key === "z") {
         e.preventDefault();
         undo();
-      }
-      if (e.ctrlKey && e.key === "y") {
+      } else if (e.ctrlKey && e.key === "y") {
         e.preventDefault();
         redo();
-      }
-      if (e.ctrlKey && e.key === "s") {
+      } else if (e.ctrlKey && e.key === "s") {
         e.preventDefault();
         saveMask();
+        if (captionDirty) void saveCaption();
+      } else if (!inEditor && (e.key === "ArrowDown" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        navigate(1);
+      } else if (!inEditor && (e.key === "ArrowUp" || e.key === "ArrowLeft")) {
+        e.preventDefault();
+        navigate(-1);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [undo, redo, saveMask]);
+  }, [undo, redo, saveMask, navigate, saveCaption, captionDirty]);
 
   const handleCanvasReady = useCallback((handle: MaskEditorCanvasHandle) => {
     canvasHandleRef.current = handle;
@@ -240,6 +306,39 @@ export default function MaskEditorPage({ initialFolder }: MaskEditorPageProps) {
           hoveredDetection={hoveredDetection}
           onReady={handleCanvasReady}
         />
+
+        {state.currentImagePath && (
+          <div className="border-t border-[var(--color-border-subtle)] bg-[var(--color-surface-elevated)] p-3 flex flex-col gap-2 max-h-[40vh]">
+            <div className="flex items-center gap-2 text-xs text-[var(--color-on-surface-secondary)]">
+              <FileText className="w-3.5 h-3.5" />
+              <span className="truncate flex-1">
+                Caption: {state.currentImagePath.split(/[/\\]/).pop()?.replace(/\.[^.]+$/, "")}.txt
+              </span>
+              {captionDirty && <span className="text-[var(--color-cobalt-600)]">(unsaved)</span>}
+              <Button variant="primary" size="sm" onClick={saveCaption} disabled={!captionDirty || captionSaving}>
+                {captionSaving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                <span className="ml-1">Save Caption</span>
+              </Button>
+            </div>
+            <textarea
+              ref={captionRef}
+              value={caption}
+              onChange={(e) => {
+                setCaption(e.target.value);
+                setCaptionDirty(true);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault();
+                  void saveCaption();
+                }
+              }}
+              placeholder="Enter caption for this image. Ctrl+Enter to save."
+              className="w-full min-h-[80px] flex-1 resize-y rounded-md border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] p-2 text-sm font-mono text-[var(--color-on-surface)]"
+              spellCheck={false}
+            />
+          </div>
+        )}
       </div>
 
       <div

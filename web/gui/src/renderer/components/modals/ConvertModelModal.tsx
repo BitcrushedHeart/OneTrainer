@@ -1,7 +1,9 @@
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { useState } from "react";
 
-import { toolsApi } from "@/api/toolsApi";
-import { Button, FilePicker, Select, type SelectKVOption } from "@/components/shared";
+import { type QuantizationParams, toolsApi } from "@/api/toolsApi";
+import { Button, DirPicker, FilePicker, Select, type SelectKVOption, Toggle } from "@/components/shared";
+import { DataTypeValues } from "@/types/generated/enums";
 
 import { ModalBase } from "./ModalBase";
 
@@ -58,6 +60,15 @@ interface Status {
 const STATUS_READY: Status = { kind: "ready", message: "Ready" };
 const STATUS_CONVERTING: Status = { kind: "converting", message: "Converting..." };
 
+const DEFAULT_QUANT: QuantizationParams = {
+  layer_filter: "",
+  layer_filter_preset: "full",
+  layer_filter_regex: false,
+  svd_dtype: "NONE",
+  svd_rank: 16,
+  cache_dir: null,
+};
+
 export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
   const [modelType, setModelType] = useState("STABLE_DIFFUSION_15");
   const [trainingMethod, setTrainingMethod] = useState("FINE_TUNE");
@@ -66,8 +77,13 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
   const [outputFormat, setOutputFormat] = useState("SAFETENSORS");
   const [outputDestination, setOutputDestination] = useState("");
   const [status, setStatus] = useState<Status>(STATUS_READY);
+  const [quantOpen, setQuantOpen] = useState(false);
+  const [quant, setQuant] = useState<QuantizationParams>(DEFAULT_QUANT);
 
   const isConverting = status.kind === "converting";
+
+  const updateQuant = <K extends keyof QuantizationParams>(key: K, value: QuantizationParams[K]) =>
+    setQuant((q) => ({ ...q, [key]: value }));
 
   const handleConvert = async () => {
     if (!inputName.trim()) {
@@ -88,6 +104,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
         output_dtype: outputDtype,
         output_model_format: outputFormat,
         output_model_destination: outputDestination,
+        quantization: quantOpen ? quant : null,
       });
       if (result.ok) {
         setStatus({ kind: "success", message: "Model converted successfully." });
@@ -167,6 +184,76 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
           disabled={isConverting}
           tooltip="Filename or directory where the output model is saved"
         />
+
+        <div className="border border-[var(--color-border-subtle)] rounded-md">
+          <button
+            type="button"
+            onClick={() => setQuantOpen((v) => !v)}
+            className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm text-[var(--color-on-surface)] hover:bg-[var(--color-border-subtle)]"
+          >
+            {quantOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+            Quantization (advanced)
+            {quantOpen && (
+              <span className="ml-auto text-xs text-[var(--color-on-surface-secondary)]">applied</span>
+            )}
+          </button>
+          {quantOpen && (
+            <div className="px-3 py-3 flex flex-col gap-3 border-t border-[var(--color-border-subtle)]">
+              <Select
+                label="SVD Data Type"
+                options={[...DataTypeValues]}
+                value={quant.svd_dtype}
+                onChange={(v) => updateQuant("svd_dtype", v)}
+                disabled={isConverting}
+                tooltip="Data type for SVD-based quantization. NONE disables SVD."
+              />
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-[var(--color-on-surface)]">SVD Rank</span>
+                <input
+                  type="number"
+                  value={quant.svd_rank}
+                  onChange={(e) => updateQuant("svd_rank", Number(e.target.value) || 0)}
+                  disabled={isConverting}
+                  className="w-full px-3 py-1.5 rounded border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] text-[var(--color-on-surface)]"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-[var(--color-on-surface)]">Layer Filter Preset</span>
+                <input
+                  type="text"
+                  value={quant.layer_filter_preset}
+                  onChange={(e) => updateQuant("layer_filter_preset", e.target.value)}
+                  disabled={isConverting}
+                  className="w-full px-3 py-1.5 rounded border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] text-[var(--color-on-surface)]"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-[var(--color-on-surface)]">Layer Filter</span>
+                <input
+                  type="text"
+                  value={quant.layer_filter}
+                  onChange={(e) => updateQuant("layer_filter", e.target.value)}
+                  disabled={isConverting}
+                  placeholder="comma-separated layer names"
+                  className="w-full px-3 py-1.5 rounded border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] text-[var(--color-on-surface)]"
+                />
+              </label>
+              <Toggle
+                value={quant.layer_filter_regex}
+                onChange={(v) => updateQuant("layer_filter_regex", v)}
+                label="Interpret layer filter as regex"
+                disabled={isConverting}
+              />
+              <DirPicker
+                label="Quantization Cache Directory"
+                value={quant.cache_dir ?? ""}
+                onChange={(v) => updateQuant("cache_dir", v || null)}
+                disabled={isConverting}
+                tooltip="Optional cache directory for quantization artifacts."
+              />
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center justify-between mt-6 pt-4 border-t border-[var(--color-border-subtle)]">

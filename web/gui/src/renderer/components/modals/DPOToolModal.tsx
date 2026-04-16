@@ -142,6 +142,7 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
   const [sourceFolder, setSourceFolder] = useState("");
   const [outputDir, setOutputDir] = useState("");
   const [pairsPerGroup, setPairsPerGroup] = useState(1);
+  const [mode, setMode] = useState<"selection" | "elo">("selection");
   const [error, setError] = useState<string | null>(null);
   const [scanCount, setScanCount] = useState(0);
 
@@ -151,6 +152,13 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
   const [phase, setPhase] = useState<"best" | "worst">("best");
   const [bestImage, setBestImage] = useState<string | null>(null);
   const [pairsDone, setPairsDone] = useState(0);
+
+  // ELO state
+  const [eloPair, setEloPair] = useState<[string, string] | null>(null);
+  const [eloRatings, setEloRatings] = useState<Record<string, number>>({});
+  const [eloDone, setEloDone] = useState(0);
+  const [eloSuggested, setEloSuggested] = useState(0);
+  const [eloFinished, setEloFinished] = useState(false);
 
   // Export state
   const [totalPairs, setTotalPairs] = useState(0);
@@ -170,13 +178,66 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
       return;
     }
     setError(null);
-    const res = await dpoApi.startSession(sourceFolder, outputDir, pairsPerGroup);
+    const res = await dpoApi.startSession(sourceFolder, outputDir, pairsPerGroup, mode);
     if (!res.ok) {
       setError(res.error ?? "Failed to start session");
       return;
     }
     setStep("scanning");
     pollRef.current = setInterval(pollScan, 500);
+  };
+
+  // ---- ELO helpers ----
+  const refreshEloPair = useCallback(async () => {
+    const res = await dpoApi.eloPair();
+    if (!res.ok) {
+      setError(res.error ?? "ELO pair fetch failed");
+      return;
+    }
+    setEloRatings(res.ratings ?? {});
+    setEloDone(res.done ?? 0);
+    setEloSuggested(res.suggested ?? 0);
+    if (res.finished) {
+      setEloFinished(true);
+      setEloPair(null);
+    } else if (res.pair) {
+      setEloFinished(false);
+      setEloPair(res.pair);
+    }
+  }, []);
+
+  const handleEloVote = async (winner: "a" | "b" | "tie") => {
+    if (!eloPair) return;
+    const [a, b] = eloPair;
+    const res = await dpoApi.eloVote(a, b, winner);
+    if (!res.ok) {
+      setError(res.error ?? "ELO vote failed");
+      return;
+    }
+    setEloRatings(res.ratings ?? {});
+    setEloDone(res.done ?? 0);
+    setEloSuggested(res.suggested ?? 0);
+    if (res.finished) {
+      setEloFinished(true);
+      setEloPair(null);
+    } else if (res.pair) {
+      setEloPair(res.pair);
+    }
+  };
+
+  const handleEloAccept = async (continueScoring: boolean) => {
+    const res = await dpoApi.eloAccept(continueScoring);
+    if (!res.ok) {
+      setError(res.error ?? "Accept failed");
+      return;
+    }
+    setPairsDone(res.pairs_done ?? pairsDone + 1);
+    if (res.continue_group) {
+      setEloFinished(false);
+      await refreshEloPair();
+    } else {
+      await fetchNextGroup();
+    }
   };
 
   const pollScan = async () => {
@@ -207,6 +268,9 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
       setBestImage(null);
       setPairsDone(res.group.pairs_done);
       setStep("selecting");
+      if (mode === "elo" || res.group.mode === "elo") {
+        await refreshEloPair();
+      }
     }
   };
 
@@ -290,6 +354,33 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
               onChange={(v) => setPairsPerGroup(Math.max(1, Number(v)))}
             />
           </div>
+          <div>
+            <label className="block text-sm text-[var(--color-on-surface)] mb-1">Mode</label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setMode("selection")}
+                className={`px-3 py-1.5 text-sm rounded-md border ${
+                  mode === "selection"
+                    ? "border-[var(--color-cobalt-600)] bg-[var(--color-cobalt-600-alpha-15)] text-[var(--color-on-surface)]"
+                    : "border-[var(--color-border-subtle)] text-[var(--color-on-surface-secondary)]"
+                }`}
+              >
+                Selection (best/worst)
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("elo")}
+                className={`px-3 py-1.5 text-sm rounded-md border ${
+                  mode === "elo"
+                    ? "border-[var(--color-cobalt-600)] bg-[var(--color-cobalt-600-alpha-15)] text-[var(--color-on-surface)]"
+                    : "border-[var(--color-border-subtle)] text-[var(--color-on-surface-secondary)]"
+                }`}
+              >
+                ELO ranking
+              </button>
+            </div>
+          </div>
         </div>
         {error && (
           <div className="flex items-center gap-2 text-sm text-[var(--color-error-500)]">
@@ -319,6 +410,99 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
         <Button variant="ghost" size="sm" onClick={handleCancel}>
           Cancel
         </Button>
+      </div>
+    );
+  }
+
+  if (step === "selecting" && group && (mode === "elo" || group.mode === "elo")) {
+    const promptDisplay =
+      group.prompt === "UNCONDITIONAL"
+        ? "UNCONDITIONAL"
+        : group.prompt.length > 100
+          ? group.prompt.slice(0, 100) + "..."
+          : group.prompt;
+
+    return (
+      <div className="space-y-3">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div className="text-xs text-[var(--color-on-surface-secondary)]">
+            Group {group.group_index} / {group.total_groups} &middot; AR: {group.aspectratio} &middot;
+            ELO comparisons {eloDone}/{eloSuggested}
+          </div>
+          <div className="flex gap-1">
+            <Button size="sm" variant="ghost" onClick={handleSkipGroup}>
+              <SkipForward className="w-3.5 h-3.5 mr-1" />
+              Skip
+            </Button>
+            <Button size="sm" variant="ghost" onClick={handleCancel}>
+              <X className="w-3.5 h-3.5 mr-1" />
+              Cancel
+            </Button>
+          </div>
+        </div>
+
+        {/* Prompt */}
+        <div className="text-xs font-mono p-2 rounded bg-[var(--color-surface-container)] text-[var(--color-on-surface)]">
+          {promptDisplay}
+        </div>
+
+        {!eloFinished && eloPair ? (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              {eloPair.map((path, idx) => (
+                <button
+                  key={path}
+                  className="rounded-lg overflow-hidden border-2 border-[var(--color-border-subtle)] hover:border-[var(--color-cobalt-600)] transition-all"
+                  onClick={() => handleEloVote(idx === 0 ? "a" : "b")}
+                  title={`${idx === 0 ? "Left" : "Right"} wins`}
+                >
+                  <img
+                    src={`${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`}
+                    alt={path.split(/[/\\]/).pop()}
+                    className="w-full h-72 object-contain bg-black/30"
+                  />
+                  <div className="bg-black/60 text-white text-xs px-2 py-1 flex items-center justify-between">
+                    <span className="truncate">{path.split(/[/\\]/).pop()}</span>
+                    <span className="tabular-nums ml-2">ELO {eloRatings[path]?.toFixed(0) ?? "—"}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+            <div className="flex justify-center gap-2">
+              <Button variant="secondary" onClick={() => handleEloVote("tie")}>
+                Tie / Skip
+              </Button>
+              <Button
+                variant="primary"
+                onClick={() => handleEloAccept(false)}
+                disabled={eloDone < Math.min(5, eloSuggested)}
+                title="Finalize current ELO ranking into a chosen/rejected pair"
+              >
+                Accept Pair
+              </Button>
+            </div>
+          </>
+        ) : (
+          <div className="text-center py-6 space-y-3">
+            <p className="text-sm text-[var(--color-on-surface)]">
+              Suggested comparisons reached. Accept the current ranking?
+            </p>
+            <div className="flex justify-center gap-2">
+              <Button variant="primary" onClick={() => handleEloAccept(false)}>
+                Accept &amp; Next Group
+              </Button>
+              <Button variant="secondary" onClick={() => handleEloAccept(true)}>
+                Accept &amp; Keep Scoring
+              </Button>
+              <Button variant="ghost" onClick={handleSkipGroup}>
+                Skip Group
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {error && <div className="text-xs text-[var(--color-error-500)]">{error}</div>}
       </div>
     );
   }

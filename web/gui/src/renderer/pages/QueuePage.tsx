@@ -5,6 +5,7 @@ import {
   ChevronUp,
   Copy,
   Download,
+  FilePlus,
   Loader2,
   Pause,
   Play,
@@ -18,6 +19,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { queueApi } from "@/api/queueApi";
+import { DiffPanel } from "@/components/queue/DiffPanel";
 import { Button, Card, FormEntry, Toggle } from "@/components/shared";
 import { useQueueStore } from "@/store/queueStore";
 
@@ -51,8 +53,23 @@ function EntryList() {
   const removeEntry = useQueueStore((s) => s.removeEntry);
   const duplicateEntry = useQueueStore((s) => s.duplicateEntry);
   const reorder = useQueueStore((s) => s.reorder);
+  const loadQueue = useQueueStore((s) => s.loadQueue);
   const status = useQueueStore((s) => s.status);
   const isRunning = status === "running" || status === "stopping";
+  const fromFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleAddFromFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const nameStem = file.name.replace(/\.json$/i, "");
+      await queueApi.entryFromFile(file, nameStem);
+      await loadQueue();
+    } catch (err) {
+      alert(`Add from file failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    e.target.value = "";
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -60,6 +77,22 @@ function EntryList() {
         <Button size="sm" variant="ghost" onClick={() => addEntry()} disabled={isRunning} title="Add entry">
           <Plus className="w-4 h-4" />
         </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => fromFileInputRef.current?.click()}
+          disabled={isRunning}
+          title="Add entry from a training-config JSON file"
+        >
+          <FilePlus className="w-4 h-4" />
+        </Button>
+        <input
+          ref={fromFileInputRef}
+          type="file"
+          accept=".json"
+          className="hidden"
+          onChange={handleAddFromFile}
+        />
         <Button
           size="sm"
           variant="ghost"
@@ -206,6 +239,8 @@ function EntryEditor() {
         />
         {jsonError && <p className="text-xs text-[var(--color-error-500)] mt-1">{jsonError}</p>}
       </div>
+
+      <DiffPanel entryId={entry.id} />
 
       {entry.failure_history.length > 0 && (
         <div>

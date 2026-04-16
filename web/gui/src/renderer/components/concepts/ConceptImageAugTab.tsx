@@ -156,6 +156,7 @@ export function ConceptImageAugTab({ draft, updateImage }: ConceptImageAugTabPro
         conceptPath={draft.path}
         includeSubdirectories={draft.include_subdirectories}
         textConfig={draft.text}
+        imageConfig={draft.image}
       />
     </div>
   );

@@ -79,6 +79,31 @@ class QueueService(SingletonMixin):
             self._manager.move_down(entry_id)
         return {"ok": True}
 
+    # --- Diff & full-config import ---
+
+    def entry_diff(self, entry_id: str) -> dict:
+        """Return overrides grouped by SECTION_MAP for display in the queue UI."""
+        from web.backend.services._queue_diff import diff_section_grouped
+
+        entry = self._manager.get_entry(entry_id)
+        if entry is None:
+            return {"ok": False, "error": "Entry not found"}
+
+        config_service = ConfigService.get_instance()
+        defaults = config_service.get_defaults()
+        grouped = diff_section_grouped(entry.overrides or {}, defaults)
+        return {"ok": True, "sections": grouped, "name": entry.name}
+
+    def add_entry_from_full_config(self, full_config: dict, name: str = "") -> dict:
+        """Diff a full training-config dict against defaults and create an entry."""
+        from web.backend.services._queue_diff import diff_full_config
+
+        config_service = ConfigService.get_instance()
+        defaults = config_service.get_defaults()
+        overrides = diff_full_config(full_config, defaults)
+        entry = self._manager.add_entry(name=name, overrides=overrides)
+        return {"ok": True, "entry": entry.to_dict()}
+
     # --- Settings ---
 
     def update_settings(self, settings_data: dict) -> dict:

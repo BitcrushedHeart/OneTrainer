@@ -1,4 +1,18 @@
-import { request } from "./request";
+import { API_BASE, request } from "./request";
+
+export interface QueueDiffField {
+  field: string;
+  label: string;
+  current: unknown;
+  default: unknown;
+}
+
+export interface QueueDiffResponse {
+  ok: boolean;
+  name?: string;
+  sections?: Record<string, QueueDiffField[]>;
+  error?: string;
+}
 
 export interface QueueEntryData {
   id: string;
@@ -86,4 +100,19 @@ export const queueApi = {
       method: "POST",
       body: JSON.stringify({ data }),
     }),
+
+  entryDiff: (entryId: string) =>
+    request<QueueDiffResponse>(`/queue/entry/${entryId}/diff`),
+
+  entryFromFile: async (file: File, name?: string): Promise<{ ok: boolean; entry?: QueueEntryData }> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const url = `${API_BASE}/queue/entry/from-file${name ? `?name=${encodeURIComponent(name)}` : ""}`;
+    const res = await fetch(url, { method: "POST", body: fd });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Import failed: ${res.status} ${text}`);
+    }
+    return res.json();
+  },
 };

@@ -14,6 +14,15 @@ router = APIRouter(tags=["tools"])
 _convert_lock = threading.Lock()
 
 
+class QuantizationParams(BaseModel):
+    layer_filter: str = ""
+    layer_filter_preset: str = "full"
+    layer_filter_regex: bool = False
+    svd_dtype: str = "NONE"  # DataType enum value
+    svd_rank: int = 16
+    cache_dir: str | None = None
+
+
 class ConvertModelRequest(BaseModel):
     model_type: str  # ModelType enum value, e.g. "STABLE_DIFFUSION_15"
     training_method: str  # "FINE_TUNE", "LORA", "EMBEDDING"
@@ -21,6 +30,7 @@ class ConvertModelRequest(BaseModel):
     output_dtype: str  # "FLOAT_32", "FLOAT_16", "BFLOAT_16"
     output_model_format: str  # "SAFETENSORS", "DIFFUSERS"
     output_model_destination: str  # output file / directory path
+    quantization: QuantizationParams | None = None
 
 
 class ConvertModelResponse(BaseModel):
@@ -59,6 +69,14 @@ def convert_model(req: ConvertModelRequest) -> ConvertModelResponse:
 
         weight_dtypes = ModelWeightDtypes.from_single_dtype(output_dtype)
         quantization = QuantizationConfig.default_values()
+        if req.quantization is not None:
+            q = req.quantization
+            quantization.layer_filter = q.layer_filter
+            quantization.layer_filter_preset = q.layer_filter_preset
+            quantization.layer_filter_regex = q.layer_filter_regex
+            quantization.svd_dtype = DataType(q.svd_dtype)
+            quantization.svd_rank = q.svd_rank
+            quantization.cache_dir = q.cache_dir
 
         model_loader = create.create_model_loader(
             model_type=model_type,

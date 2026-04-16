@@ -332,3 +332,114 @@ def cancel_concept_stats(scan_id: str = Query("", description="Scan ID to cancel
             for flag in _active_scans.values():
                 flag.set()
             return {"cancelled": True, "scan_ids": cancelled_ids}
+
+
+# ---- Caption save ----
+
+class SaveCaptionRequest(BaseModel):
+    image_path: str
+    caption: str
+
+
+@router.post("/save-caption")
+def save_caption(req: SaveCaptionRequest):
+    """Write a .txt caption file next to the given image."""
+    safe = validate_path(req.image_path, must_exist=True, allow_dir=False)
+    base, _ = os.path.splitext(safe)
+    caption_path = base + ".txt"
+    try:
+        with open(caption_path, "w", encoding="utf-8") as fh:
+            fh.write(req.caption)
+        return {"ok": True, "saved": caption_path}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write caption: {exc}") from exc
+
+
+# ---- Augmentation preview ----
+
+class AugPreviewRequest(BaseModel):
+    image_path: str
+    image: dict  # ConceptImageConfig as plain dict
+    seed: int = Field(default_factory=lambda: random.randint(0, 2**30))
+
+
+def _apply_image_augmentations(img, image_cfg: dict, rng: random.Random):
+    """Apply a lightweight subset of augmentations using PIL.
+
+    Mirrors the most common operations from mgds (RandomBrightness/Contrast/
+    Saturation/Hue/Flip/Rotate) but stays self-contained for fast preview.
+    """
+    from PIL import ImageEnhance, ImageOps
+
+    def _strength(enable_random: str, enable_fixed: str, max_strength: float) -> float:
+        if image_cfg.get(enable_random):
+            return rng.uniform(-max_strength, max_strength)
+        if image_cfg.get(enable_fixed):
+            return max_strength
+        return 0.0
+
+    # Flip
+    if image_cfg.get("enable_random_flip") and rng.random() < 0.5:
+        img = ImageOps.mirror(img)
+    elif image_cfg.get("enable_fixed_flip"):
+        img = ImageOps.mirror(img)
+
+    # Rotate
+    if image_cfg.get("enable_random_rotate") or image_cfg.get("enable_fixed_rotate"):
+        max_angle = float(image_cfg.get("random_rotate_max_angle", 0) or 0)
+        if max_angle > 0:
+            angle = rng.uniform(-max_angle, max_angle) if image_cfg.get("enable_random_rotate") else max_angle
+            img = img.rotate(angle, resample=2, expand=False)  # 2 = BILINEAR
+
+    # Brightness (1.0 = unchanged)
+    s = _strength("enable_random_brightness", "enable_fixed_brightness",
+                  float(image_cfg.get("random_brightness_max_strength", 0) or 0))
+    if s != 0.0:
+        img = ImageEnhance.Brightness(img.convert("RGB")).enhance(1.0 + s)
+
+    # Contrast
+    s = _strength("enable_random_contrast", "enable_fixed_contrast",
+                  float(image_cfg.get("random_contrast_max_strength", 0) or 0))
+    if s != 0.0:
+        img = ImageEnhance.Contrast(img.convert("RGB")).enhance(1.0 + s)
+
+    # Saturation
+    s = _strength("enable_random_saturation", "enable_fixed_saturation",
+                  float(image_cfg.get("random_saturation_max_strength", 0) or 0))
+    if s != 0.0:
+        img = ImageEnhance.Color(img.convert("RGB")).enhance(1.0 + s)
+
+    # Hue (PIL has no direct hue control; rotate via HSV)
+    s = _strength("enable_random_hue", "enable_fixed_hue",
+                  float(image_cfg.get("random_hue_max_strength", 0) or 0))
+    if s != 0.0:
+        hsv = img.convert("HSV")
+        h, sat, v = hsv.split()
+        h = h.point(lambda px: int((px + s * 128) % 256))
+        img = __import__("PIL.Image", fromlist=["merge"]).merge("HSV", (h, sat, v)).convert("RGB")
+
+    return img
+
+
+@router.post("/augmentation-preview")
+def augmentation_preview(req: AugPreviewRequest):
+    """Apply augmentations to a single image and return the result as base64 PNG."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    safe_path = validate_path(req.image_path, must_exist=True, allow_dir=False)
+    rng = random.Random(req.seed)
+
+    try:
+        with Image.open(safe_path) as src:
+            src.load()
+            preview = _apply_image_augmentations(src.convert("RGB"), req.image, rng)
+
+        buf = io.BytesIO()
+        preview.save(buf, format="PNG")
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return {"ok": True, "image_base64": encoded, "seed": req.seed}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Augmentation preview failed: {exc}") from exc

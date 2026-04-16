@@ -4,8 +4,10 @@ export interface ValidationMatch {
   id: string;
   train_image: string;
   train_path: string;
+  train_image_url?: string;
   val_image: string;
   val_path: string;
+  val_image_url?: string;
   kind: string;
   detail: string;
   score: number | null;
@@ -64,4 +66,10 @@ export const validationApi = {
       method: "POST",
       body: JSON.stringify({ val_image_path: valImagePath }),
     }),
+
+  removeMatchBatch: (valImagePaths: string[]) =>
+    request<{ ok: boolean; removed: number; errors: string[] }>(
+      "/validation/match/remove-batch",
+      { method: "POST", body: JSON.stringify({ val_image_paths: valImagePaths }) },
+    ),
 };

@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import random
 import threading
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 
 class DPOService(SingletonMixin):
+
+    _ELO_K = 32.0
+    _ELO_BASE = 1500.0
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -35,9 +39,15 @@ class DPOService(SingletonMixin):
         self._groups_shown = 0
         self._current_group: dict | None = None
         self._remaining_images: list[str] = []
+        self._mode: str = "selection"  # "selection" | "elo"
         self._selection_phase = "best"  # "best" or "worst"
         self._selected_best: str | None = None
         self._pairs_created_in_group = 0
+
+        # ELO mode state (per-group)
+        self._elo_ratings: dict[str, float] = {}
+        self._elo_done: int = 0
+        self._elo_pair: tuple[str, str] | None = None
 
     def set_ws_broadcast(self, fn: Callable[[dict], None]) -> None:
         self._ws_broadcast = fn
@@ -168,8 +178,17 @@ class DPOService(SingletonMixin):
 
     # ---- Curation Session ----
 
-    def start_session(self, source_folder: str, output_dir: str, pairs_per_group: int = 1) -> dict:
+    def start_session(
+        self,
+        source_folder: str,
+        output_dir: str,
+        pairs_per_group: int = 1,
+        mode: str = "selection",
+    ) -> dict:
         from modules.util.dpo_curation_util import load_manifest, prune_orphaned_pairs
+
+        if mode not in ("selection", "elo"):
+            return {"ok": False, "error": "mode must be 'selection' or 'elo'"}
 
         with self._lock:
             if self._session_active:
@@ -179,6 +198,7 @@ class DPOService(SingletonMixin):
         self._source_folder = source_folder
         self._output_dir = output_dir
         self._pairs_per_group = max(1, pairs_per_group)
+        self._mode = mode
         self._manifest = load_manifest(output_dir)
         pruned = prune_orphaned_pairs(output_dir, self._manifest)
         existing = len(self._manifest.get("pairs", []))
@@ -240,6 +260,10 @@ class DPOService(SingletonMixin):
             self._selection_phase = "best"
             self._selected_best = None
 
+            if self._mode == "elo":
+                self._elo_init(self._remaining_images)
+                self._elo_next_pair()
+
             return {
                 "group": {
                     "prompt": group["prompt"],
@@ -249,6 +273,7 @@ class DPOService(SingletonMixin):
                     "total_groups": self._groups_queued,
                     "pairs_done": pairs_done,
                     "pairs_target": self._pairs_per_group,
+                    "mode": self._mode,
                 },
             }
 
@@ -349,6 +374,156 @@ class DPOService(SingletonMixin):
         if not os.path.isfile(path):
             return None
         return os.path.abspath(path)
+
+    # ---- ELO mode ----
+
+    def _elo_init(self, images: list[str]) -> None:
+        """Initialize ELO ratings for a group of images."""
+        self._elo_ratings = {p: self._ELO_BASE for p in images}
+        self._elo_done = 0
+        self._elo_pair = None
+
+    def _elo_suggested_count(self, n: int | None = None) -> int:
+        """Suggested number of comparisons: max(15, ceil(n * log2(n)))."""
+        if n is None:
+            n = len(self._elo_ratings)
+        return max(15, math.ceil(n * math.log2(max(n, 2))))
+
+    def _elo_next_pair(self) -> tuple[str, str] | None:
+        """Pick two consecutive images from the rating-sorted list."""
+        if len(self._elo_ratings) < 2:
+            self._elo_pair = None
+            return None
+        sorted_imgs = sorted(
+            self._elo_ratings, key=lambda x: self._elo_ratings[x]
+        )
+        idx = random.randint(0, len(sorted_imgs) - 2)
+        self._elo_pair = (sorted_imgs[idx], sorted_imgs[idx + 1])
+        return self._elo_pair
+
+    def _elo_vote(self, a: str, b: str, winner: str) -> None:
+        """Apply an ELO update for a single pairwise vote.
+
+        winner: "a" | "b" | "tie"
+        """
+        if a not in self._elo_ratings or b not in self._elo_ratings:
+            raise ValueError("Both images must be initialised in ELO ratings")
+        ra = self._elo_ratings[a]
+        rb = self._elo_ratings[b]
+
+        if winner == "a":
+            sa, sb = 1.0, 0.0
+        elif winner == "b":
+            sa, sb = 0.0, 1.0
+        else:
+            sa, sb = 0.5, 0.5
+
+        ea = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+        eb = 1.0 - ea
+        self._elo_ratings[a] = ra + self._ELO_K * (sa - ea)
+        self._elo_ratings[b] = rb + self._ELO_K * (sb - eb)
+        self._elo_done += 1
+
+    def _elo_finish_round(self) -> tuple[str, str] | None:
+        """Return (best, worst) by final ratings; None if fewer than 2 images."""
+        if len(self._elo_ratings) < 2:
+            return None
+        sorted_imgs = sorted(
+            self._elo_ratings, key=lambda x: self._elo_ratings[x], reverse=True
+        )
+        return sorted_imgs[0], sorted_imgs[-1]
+
+    def elo_current_pair(self) -> dict:
+        """Return the current ELO pair plus progress, or {finished: True} when done."""
+        if not self._current_group or self._mode != "elo":
+            return {"ok": False, "error": "No active ELO group"}
+
+        # Lazy init if no pair yet
+        if self._elo_pair is None and self._elo_ratings:
+            self._elo_next_pair()
+
+        suggested = self._elo_suggested_count()
+        if self._elo_pair is None:
+            return {
+                "ok": True,
+                "finished": True,
+                "done": self._elo_done,
+                "suggested": suggested,
+                "ratings": dict(self._elo_ratings),
+            }
+        a, b = self._elo_pair
+        return {
+            "ok": True,
+            "finished": False,
+            "pair": [a, b],
+            "ratings": {a: self._elo_ratings[a], b: self._elo_ratings[b]},
+            "done": self._elo_done,
+            "suggested": suggested,
+        }
+
+    def elo_vote(self, a: str, b: str, winner: str) -> dict:
+        """Public ELO vote endpoint. Picks the next pair and returns updated state."""
+        if not self._current_group or self._mode != "elo":
+            return {"ok": False, "error": "No active ELO group"}
+        if winner not in ("a", "b", "tie"):
+            return {"ok": False, "error": "winner must be 'a', 'b', or 'tie'"}
+        try:
+            self._elo_vote(a, b, winner)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        self._elo_next_pair()
+        return self.elo_current_pair()
+
+    def elo_accept_pair(self, continue_scoring: bool = False) -> dict:
+        """Finalize the current ELO round into a chosen/rejected pair on disk."""
+        from modules.util.dpo_curation_util import export_single_pair
+
+        if not self._current_group or self._mode != "elo":
+            return {"ok": False, "error": "No active ELO group"}
+        result = self._elo_finish_round()
+        if result is None:
+            return {"ok": False, "error": "Need at least 2 images to accept pair"}
+        chosen, rejected = result
+        group = self._current_group
+
+        export_single_pair(
+            self._output_dir, self._manifest,
+            chosen, rejected,
+            group["prompt"], group["aspectratio"],
+        )
+
+        self._remaining_images = [
+            i for i in self._remaining_images if i not in {chosen, rejected}
+        ]
+        self._pairs_created_in_group += 1
+
+        is_unconditional = group["prompt"] == "UNCONDITIONAL"
+        keep_going = (
+            continue_scoring
+            or is_unconditional
+            or self._pairs_created_in_group < self._pairs_per_group
+        )
+        can_continue = len(self._remaining_images) >= 2
+
+        if keep_going and can_continue:
+            self._elo_init(self._remaining_images)
+            self._elo_next_pair()
+            return {
+                "ok": True,
+                "pair_created": True,
+                "chosen": chosen,
+                "rejected": rejected,
+                "continue_group": True,
+                "pairs_done": self._pairs_created_in_group,
+            }
+        return {
+            "ok": True,
+            "pair_created": True,
+            "chosen": chosen,
+            "rejected": rejected,
+            "continue_group": False,
+            "pairs_done": self._pairs_created_in_group,
+        }
 
     # ---- Background worker ----
 

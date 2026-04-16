@@ -167,3 +167,66 @@ def cache_gc_clean():
         return CacheActionResponse(ok=True)
     except Exception as e:
         return CacheActionResponse(ok=False, error=str(e))
+
+
+# ---- Profiling ----
+
+class ProfilingDumpResponse(BaseModel):
+    ok: bool
+    path: str | None = None
+    error: str | None = None
+
+
+class ProfilingToggleResponse(BaseModel):
+    ok: bool
+    active: bool = False
+    error: str | None = None
+
+
+_profiling_active = False
+
+
+@router.post("/profiling/dump-stacks", response_model=ProfilingDumpResponse)
+def profiling_dump_stacks():
+    """Dump current Python thread stacks to <workspace>/profiling/stacks_<ts>.txt."""
+    import datetime
+    import pathlib
+    import sys
+    import traceback
+
+    from web.backend.services.config_service import ConfigService
+
+    try:
+        config_service = ConfigService.get_instance()
+        config = config_service.get_config_for_training()
+        workspace = getattr(config, "workspace_dir", "") or "workspace"
+        out_dir = pathlib.Path(workspace) / "profiling"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"stacks_{ts}.txt"
+
+        with out_path.open("w", encoding="utf-8") as fh:
+            fh.write(f"Stack dump captured at {datetime.datetime.now().isoformat()}\n")
+            for tid, frame in sys._current_frames().items():
+                fh.write(f"\n--- thread {tid} ---\n")
+                traceback.print_stack(frame, file=fh)
+
+        return ProfilingDumpResponse(ok=True, path=str(out_path))
+    except Exception as exc:
+        return ProfilingDumpResponse(ok=False, error=str(exc))
+
+
+@router.post("/profiling/toggle", response_model=ProfilingToggleResponse)
+def profiling_toggle():
+    """Toggle Scalene profiling. Requires OneTrainer to be launched with --profile."""
+    global _profiling_active
+    try:
+        import scalene  # noqa: F401
+    except ImportError:
+        return ProfilingToggleResponse(
+            ok=False,
+            active=False,
+            error="Scalene not installed - launch OneTrainer with --profile to enable profiling",
+        )
+    _profiling_active = not _profiling_active
+    return ProfilingToggleResponse(ok=True, active=_profiling_active)
