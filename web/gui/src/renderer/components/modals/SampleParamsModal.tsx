@@ -3,6 +3,7 @@ import { Dice5 } from "lucide-react";
 import { Button, FilePicker, FormEntry, Select, Toggle } from "@/components/shared";
 import { useConfigField } from "@/hooks/useConfigField";
 import { NoiseSchedulerValues } from "@/types/generated/enums";
+import { MODEL_TYPE_GROUPS } from "@/types/generated/modelTypeInfo";
 import { TEXTAREA_FULL } from "@/utils/inputStyles";
 
 import { ModalBase } from "./ModalBase";
@@ -18,6 +19,10 @@ export function SampleParamsModal({ open, onClose, sampleIndex }: SampleParamsMo
   const [prompt, setPrompt] = useConfigField<string>(`${p}.prompt`);
   const [negativePrompt, setNegativePrompt] = useConfigField<string>(`${p}.negative_prompt`);
   const [, setSeed] = useConfigField<number>(`${p}.seed`);
+  const [modelType] = useConfigField<string>("model_type");
+  const isFlowMatching = modelType
+    ? (MODEL_TYPE_GROUPS.is_flow_matching as readonly string[]).includes(modelType)
+    : false;
 
   const rerollSeed = () => setSeed(Math.floor(Math.random() * 2 ** 30));
 
@@ -58,7 +63,9 @@ export function SampleParamsModal({ open, onClose, sampleIndex }: SampleParamsMo
         <Toggle configPath={`${p}.random_seed`} label="Random Seed" />
         <FormEntry label="Diffusion Steps" configPath={`${p}.diffusion_steps`} type="number" />
         <FormEntry label="CFG Scale" configPath={`${p}.cfg_scale`} type="number" />
-        <Select label="Noise Scheduler" configPath={`${p}.noise_scheduler`} options={[...NoiseSchedulerValues]} />
+        {!isFlowMatching && (
+          <Select label="Noise Scheduler" configPath={`${p}.noise_scheduler`} options={[...NoiseSchedulerValues]} />
+        )}
 
         <FormEntry label="Frames" configPath={`${p}.frames`} type="number" tooltip="Frame count for video models" />
         <FormEntry

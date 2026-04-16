@@ -36,6 +36,7 @@ class ParsedField:
     adv_command: str | None = None
     preset_var: str | None = None
     regex_var: str | None = None
+    dtype_subset: str | None = None
     required: bool = False
     nullable: bool = False
 
@@ -179,6 +180,29 @@ def _extract_kv_options(node: ast.expr) -> list[dict[str, str]] | None:
                     value = value.split(".")[-1]
                 options.append({"label": label, "value": value})
     return options if options else None
+
+
+def _extract_dtype_subset(node: ast.expr) -> str | None:
+    """Detect calls like ``self.__create_dtype_options(include_gguf=?, include_a8=?)``
+    and map them to a named subset in ``DTYPE_SUBSETS``.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func_name = _get_name(node.func)
+    if not func_name:
+        return None
+    # Accept both ``self.__create_dtype_options`` and the name-mangled form.
+    if not func_name.endswith("__create_dtype_options") and not func_name.endswith("_create_dtype_options"):
+        return None
+
+    include_gguf = _get_kwarg_bool(node, "include_gguf") or False
+    include_a8 = _get_kwarg_bool(node, "include_a8") or False
+
+    if include_gguf:
+        return "with_gguf_a8"
+    if include_a8:
+        return "with_a8"
+    return "base"
 
 
 def _extract_adv_command_name(call: ast.Call) -> str | None:
@@ -900,6 +924,8 @@ class CtkTabParser:
             if len(call.args) >= 6:
                 field.key = _get_str(call.args[5]) or ""
                 field.kv_options = _extract_kv_options(call.args[3])
+                if field.kv_options is None:
+                    field.dtype_subset = _extract_dtype_subset(call.args[3])
             field.widget_type = "select-kv"
 
         elif widget == "path_entry":
