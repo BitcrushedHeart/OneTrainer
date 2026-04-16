@@ -5,8 +5,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from PIL import Image, ImageDraw
-
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.validation_checker_util import (
@@ -22,6 +20,8 @@ from modules.util.validation_checker_util import (
     scan_basic_validation_matches,
     scan_clip_similarity_matches,
 )
+
+from PIL import Image, ImageDraw
 
 
 class ValidationCheckerUtilTest(unittest.TestCase):
@@ -269,9 +269,11 @@ class ValidationCheckerUtilTest(unittest.TestCase):
         self.assertEqual(command, ["explorer", "/select,", os.path.normpath(path)])
 
     def test_deep_scan_gracefully_fails_without_clip_support(self):
-        with mock.patch("modules.util.validation_checker_util.load_clip_components", return_value=(None, None, None, None)):
-            with self.assertRaisesRegex(RuntimeError, "Deep Scan requires"):
-                scan_clip_similarity_matches([mock.Mock()], [mock.Mock()])
+        with (
+            mock.patch("modules.util.validation_checker_util.load_clip_components", return_value=(None, None, None, None)),
+            self.assertRaisesRegex(RuntimeError, "Deep Scan requires"),
+        ):
+            scan_clip_similarity_matches([mock.Mock()], [mock.Mock()])
 
     def test_deep_scan_returns_no_matches_for_empty_inputs(self):
         self.assertEqual(scan_clip_similarity_matches([], []), [])

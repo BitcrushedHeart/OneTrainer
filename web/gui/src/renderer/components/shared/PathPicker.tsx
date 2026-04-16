@@ -7,67 +7,73 @@ import { INPUT_FLEX, SIDE_BUTTON } from "@/utils/inputStyles";
 import { FormFieldWrapper } from "./FormFieldWrapper";
 
 export interface PathPickerProps {
-  label: string;
-  mode: "file" | "directory";
-  configPath?: string;
-  value?: string;
-  onChange?: (value: string) => void;
-  filters?: Array<{ name: string; extensions: string[] }>;
-  tooltip?: string;
-  disabled?: boolean;
+    label: string;
+    mode: "file" | "directory";
+    configPath?: string;
+    value?: string;
+    onChange?: (value: string) => void;
+    filters?: Array<{ name: string; extensions: string[] }>;
+    tooltip?: string;
+    disabled?: boolean;
 }
 
 export function PathPicker({
-  label,
-  mode,
-  configPath,
-  value: controlledValue,
-  onChange,
-  filters,
-  tooltip,
-  disabled,
+    label,
+    mode,
+    configPath,
+    value: controlledValue,
+    onChange,
+    filters,
+    tooltip,
+    disabled,
 }: PathPickerProps) {
-  const [configValue, setConfigValue] = useConfigField<string>(configPath);
+    const [configValue, setConfigValue] = useConfigField<string>(configPath);
 
-  const externalValue = configPath ? (configValue ?? "") : (controlledValue ?? "");
-  const [localValue, setLocalValue] = useState(externalValue);
+    const externalValue = configPath ? (configValue ?? "") : (controlledValue ?? "");
+    const [localValue, setLocalValue] = useState(externalValue);
 
-  useEffect(() => {
-    setLocalValue(externalValue);
-  }, [externalValue]);
+    useEffect(() => {
+        setLocalValue(externalValue);
+    }, [externalValue]);
 
-  const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const val = e.target.value;
-    setLocalValue(val);
-    if (configPath && setConfigValue) setConfigValue(val);
-    if (onChange) onChange(val);
-  };
+    const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
+        const val = e.target.value;
+        setLocalValue(val);
+        if (configPath && setConfigValue) setConfigValue(val);
+        if (onChange) onChange(val);
+    };
 
-  const handleBrowse = async () => {
-    const api = window.electronAPI;
-    if (!api) return;
-    const result = mode === "file" ? await api.openFile(filters) : await api.openDirectory();
-    if (result) {
-      setLocalValue(result);
-      if (configPath && setConfigValue) setConfigValue(result);
-      if (onChange) onChange(result);
-    }
-  };
+    const handleBrowse = async () => {
+        const api = window.electronAPI;
+        if (!api) return;
+        const result = mode === "file" ? await api.openFile(filters) : await api.openDirectory();
+        if (result) {
+            setLocalValue(result);
+            if (configPath && setConfigValue) setConfigValue(result);
+            if (onChange) onChange(result);
+        }
+    };
 
-  return (
-    <FormFieldWrapper label={label} tooltip={tooltip} configPath={configPath}>
-      <div className="flex gap-1">
-        <input type="text" value={localValue} onChange={handleChange} disabled={disabled} className={INPUT_FLEX} />
-        <button
-          type="button"
-          onClick={handleBrowse}
-          disabled={disabled}
-          className={SIDE_BUTTON}
-          aria-label={mode === "file" ? "Browse files" : "Browse directory"}
-        >
-          <FolderOpen className="w-4 h-4" />
-        </button>
-      </div>
-    </FormFieldWrapper>
-  );
+    return (
+        <FormFieldWrapper label={label} tooltip={tooltip} configPath={configPath}>
+            <div className="flex gap-1">
+                <input
+                    type="text"
+                    value={localValue}
+                    onChange={handleChange}
+                    disabled={disabled}
+                    className={INPUT_FLEX}
+                />
+                <button
+                    type="button"
+                    onClick={handleBrowse}
+                    disabled={disabled}
+                    className={SIDE_BUTTON}
+                    aria-label={mode === "file" ? "Browse files" : "Browse directory"}
+                >
+                    <FolderOpen className="w-4 h-4" />
+                </button>
+            </div>
+        </FormFieldWrapper>
+    );
 }

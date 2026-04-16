@@ -16,20 +16,20 @@ const params = new URLSearchParams(window.location.search);
 const route = params.get("route");
 
 if (route === "mask-editor") {
-  const MaskEditorPage = lazy(() => import("./pages/MaskEditorPage"));
-  const initialFolder = params.get("folder") ?? undefined;
+    const MaskEditorPage = lazy(() => import("./pages/MaskEditorPage"));
+    const initialFolder = params.get("folder") ?? undefined;
 
-  createRoot(root).render(
-    <StrictMode>
-      <Suspense fallback={<div className="flex items-center justify-center h-screen">Loading editor...</div>}>
-        <MaskEditorPage initialFolder={initialFolder} />
-      </Suspense>
-    </StrictMode>,
-  );
+    createRoot(root).render(
+        <StrictMode>
+            <Suspense fallback={<div className="flex items-center justify-center h-screen">Loading editor...</div>}>
+                <MaskEditorPage initialFolder={initialFolder} />
+            </Suspense>
+        </StrictMode>,
+    );
 } else {
-  createRoot(root).render(
-    <StrictMode>
-      <App />
-    </StrictMode>,
-  );
+    createRoot(root).render(
+        <StrictMode>
+            <App />
+        </StrictMode>,
+    );
 }

@@ -7,7 +7,6 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import suppress
 from queue import Empty, Full, Queue
-from typing import Any
 
 from web.backend.services._singleton import SingletonMixin
 from web.backend.services.config_service import ConfigService
@@ -75,6 +74,8 @@ class DPOService(SingletonMixin):
         return {"ok": True, "result": result}
 
     def remove_strays(self) -> dict:
+        import os
+
         from modules.util.dpo_curation_util import (
             check_dpo_pairs,
             dpo_concept_pairs,
@@ -82,7 +83,6 @@ class DPOService(SingletonMixin):
             remove_finalized_pair,
         )
         from modules.util.path_util import supported_image_extensions
-        import os
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
@@ -131,20 +131,18 @@ class DPOService(SingletonMixin):
         return {"ok": True, "removed": removed}
 
     def review_pairs(self) -> dict:
+        import contextlib
+
         from modules.util.dpo_curation_util import dpo_concept_pairs, scan_finalized_pairs
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
 
         all_pairs: list[tuple[str, str]] = []
-        try:
+        with contextlib.suppress(RuntimeError):
             all_pairs.extend(dpo_concept_pairs(concepts, is_validation=False))
-        except RuntimeError:
-            pass
-        try:
+        with contextlib.suppress(RuntimeError):
             all_pairs.extend(dpo_concept_pairs(concepts, is_validation=True))
-        except RuntimeError:
-            pass
 
         if not all_pairs:
             return {"ok": False, "error": "No DPO concept pairs found"}
@@ -158,20 +156,18 @@ class DPOService(SingletonMixin):
         return {"ok": True}
 
     def fix_multiline_captions(self) -> dict:
+        import contextlib
+
         from modules.util.dpo_curation_util import dpo_concept_pairs, fix_multiline_captions
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
 
         all_pairs: list[tuple[str, str]] = []
-        try:
+        with contextlib.suppress(RuntimeError):
             all_pairs.extend(dpo_concept_pairs(concepts, is_validation=False))
-        except RuntimeError:
-            pass
-        try:
+        with contextlib.suppress(RuntimeError):
             all_pairs.extend(dpo_concept_pairs(concepts, is_validation=True))
-        except RuntimeError:
-            pass
 
         fixed = fix_multiline_captions(all_pairs)
         return {"ok": True, "fixed": fixed}
@@ -379,7 +375,7 @@ class DPOService(SingletonMixin):
 
     def _elo_init(self, images: list[str]) -> None:
         """Initialize ELO ratings for a group of images."""
-        self._elo_ratings = {p: self._ELO_BASE for p in images}
+        self._elo_ratings = dict.fromkeys(images, self._ELO_BASE)
         self._elo_done = 0
         self._elo_pair = None
 
@@ -528,13 +524,11 @@ class DPOService(SingletonMixin):
     # ---- Background worker ----
 
     def _background_scan(self) -> None:
-        from collections import defaultdict
 
         from modules.util import path_util
         from modules.util.dpo_curation_util import manifest_pair_counts
         from modules.util.image_metadata_util import extract_metadata, strip_angle_bracket_segments
 
-        from PIL import Image
 
         supported = path_util.supported_image_extensions()
         groups_dict: defaultdict[tuple[str, str], list[str]] = defaultdict(list)

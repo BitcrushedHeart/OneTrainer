@@ -4,14 +4,12 @@ from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, Literal
 
-from web.backend.services._singleton import SingletonMixin
-from web.backend.services.config_service import ConfigService
-
 from modules.util.config.QueueConfig import QueueEntry, QueueSettings
-from modules.util.enum.QueueEntryStatus import QueueEntryStatus
 from modules.util.queue.QueueExecutor import QueueExecutor
 from modules.util.queue.QueueManager import QueueManager
 from modules.util.queue.QueueValidator import QueueValidator
+from web.backend.services._singleton import SingletonMixin
+from web.backend.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
 
@@ -175,8 +173,8 @@ class QueueService(SingletonMixin):
     def import_queue(self, data: dict) -> dict:
         # Write to temp file and import
         import json
-        import tempfile
         import os
+        import tempfile
         fd, tmp_path = tempfile.mkstemp(suffix=".json")
         try:
             with os.fdopen(fd, "w") as f:

@@ -64,6 +64,7 @@ class CacheActionResponse(BaseModel):
 @router.get("/cache/status", response_model=CacheStatusResponse)
 def get_cache_status():
     import os
+
     from web.backend.services.config_service import ConfigService
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
@@ -92,6 +93,7 @@ def get_cache_status():
 def clear_cache():
     import os
     import shutil
+
     from web.backend.services.config_service import ConfigService
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
@@ -122,6 +124,7 @@ class GcPreviewResponse(BaseModel):
 @router.post("/cache/gc-preview", response_model=GcPreviewResponse)
 def cache_gc_preview():
     import os
+
     from web.backend.services.config_service import ConfigService
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
@@ -152,6 +155,7 @@ def cache_gc_preview():
 @router.post("/cache/gc-clean", response_model=CacheActionResponse)
 def cache_gc_clean():
     import os
+
     from web.backend.services.config_service import ConfigService
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()

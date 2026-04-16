@@ -3,10 +3,8 @@ import queue
 import threading
 from tkinter import messagebox
 
-import customtkinter as ctk
-from PIL import Image, ImageOps
-
 from modules.util.config.ConceptConfig import ConceptConfig
+from modules.util.ui.ui_utils import set_window_icon
 from modules.util.validation_checker_util import (
     BasicScanResult,
     CaptionMatch,
@@ -19,7 +17,9 @@ from modules.util.validation_checker_util import (
     scan_basic_validation_matches,
     scan_clip_similarity_matches,
 )
-from modules.util.ui.ui_utils import set_window_icon
+
+import customtkinter as ctk
+from PIL import Image, ImageOps
 
 
 class ValidationCheckerWindow(ctk.CTkToplevel):

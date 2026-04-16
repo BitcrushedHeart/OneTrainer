@@ -1,9 +1,9 @@
 """Unit tests for ELO ranking math in DPOService."""
 import math
 
-import pytest
-
 from web.backend.services.dpo_service import DPOService
+
+import pytest
 
 
 @pytest.fixture

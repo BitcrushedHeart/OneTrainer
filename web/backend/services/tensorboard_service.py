@@ -155,7 +155,7 @@ class TensorboardService(SingletonMixin):
                 with urllib.request.urlopen(url, timeout=1.0) as resp:
                     if resp.status == 200:
                         return True
-            except Exception:
+            except Exception:  # noqa: BLE001, PERF203
                 time.sleep(0.3)
         return False
 

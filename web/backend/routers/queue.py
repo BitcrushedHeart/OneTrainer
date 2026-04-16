@@ -126,7 +126,7 @@ def entry_diff(entry_id: str):
 
 
 @router.post("/queue/entry/from-file")
-async def entry_from_file(file: UploadFile = File(...), name: str = ""):
+async def entry_from_file(file: UploadFile = File(...), name: str = ""):  # noqa: B008
     """Upload a training config JSON; diff against defaults; add as queue entry."""
     raw = await file.read()
     try:

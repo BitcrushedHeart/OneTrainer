@@ -53,13 +53,15 @@ def _pick_thumbnail(dir_path: str, include_subdirectories: bool = False) -> str 
                 for root, dirs, files in os.walk(dir_path):
                     # Skip hidden directories
                     dirs[:] = [d for d in dirs if not d.startswith('.')]
-                    for fname in files:
-                        if _is_valid_image(fname):
-                            candidates.append(os.path.join(root, fname))
+                    candidates.extend(
+                        os.path.join(root, fname) for fname in files if _is_valid_image(fname)
+                    )
             else:
-                for entry in os.scandir(dir_path):
-                    if entry.is_file() and _is_valid_image(entry.name):
-                        candidates.append(entry.path)
+                candidates.extend(
+                    entry.path
+                    for entry in os.scandir(dir_path)
+                    if entry.is_file() and _is_valid_image(entry.name)
+                )
         except PermissionError:
             result = None
         else:
@@ -379,9 +381,7 @@ def _apply_image_augmentations(img, image_cfg: dict, rng: random.Random):
         return 0.0
 
     # Flip
-    if image_cfg.get("enable_random_flip") and rng.random() < 0.5:
-        img = ImageOps.mirror(img)
-    elif image_cfg.get("enable_fixed_flip"):
+    if image_cfg.get("enable_random_flip") and rng.random() < 0.5 or image_cfg.get("enable_fixed_flip"):
         img = ImageOps.mirror(img)
 
     # Rotate

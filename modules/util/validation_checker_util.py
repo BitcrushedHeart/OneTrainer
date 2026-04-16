@@ -4,19 +4,17 @@ import os
 import shutil
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
-
-import huggingface_hub
-
-from PIL import Image, ImageOps
 
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.path_util import canonical_join, is_supported_image_extension
 from modules.util.torch_util import default_device, torch_gc
 
+import huggingface_hub
+from PIL import Image, ImageOps
 
 TRAIN_CONCEPT_TYPES = {
     ConceptType.STANDARD.value,
@@ -369,14 +367,11 @@ def scan_clip_similarity_matches(
         matches.sort(key=lambda match: match.score if match.score is not None else 0.0, reverse=True)
         return matches
     finally:
-        try:
+        import contextlib
+        with contextlib.suppress(UnboundLocalError):
             del model
-        except UnboundLocalError:
-            pass
-        try:
+        with contextlib.suppress(UnboundLocalError):
             del processor
-        except UnboundLocalError:
-            pass
         torch_gc()
 
 

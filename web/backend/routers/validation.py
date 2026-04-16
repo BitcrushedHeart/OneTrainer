@@ -1,7 +1,7 @@
 from web.backend.services.validation_service import ValidationService
 from web.backend.utils.path_security import validate_path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 

@@ -70,7 +70,6 @@ class ValidationService(SingletonMixin):
 
     def remove_match(self, val_image_path: str) -> dict:
         from modules.util.validation_checker_util import (
-            ValidationCheckerImage,
             remove_validation_image,
         )
 
@@ -215,7 +214,7 @@ class ValidationService(SingletonMixin):
             self._results["summary"] = summary
 
             self._broadcast({"type": "validation:scan_complete", "scan_type": "deep"})
-        except Exception as e:
+        except Exception:
             logger.exception("Deep scan failed")
         finally:
             with self._lock:
