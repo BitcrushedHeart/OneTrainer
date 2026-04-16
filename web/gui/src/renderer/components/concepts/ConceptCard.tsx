@@ -90,10 +90,10 @@ export function ConceptCard({ concept, index, onOpen, onRemove, onClone, onToggl
       setThumbnailError(false);
       return;
     }
-    const url = `${API_BASE}/concepts/thumbnail?path=${encodeURIComponent(concept.path)}`;
+    const url = `${API_BASE}/concepts/thumbnail?path=${encodeURIComponent(concept.path)}&include_subdirectories=${concept.include_subdirectories ?? false}`;
     setThumbnailUrl(url);
     setThumbnailError(false);
-  }, [concept.path]);
+  }, [concept.path, concept.include_subdirectories]);
 
   return (
     <div
