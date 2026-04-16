@@ -206,6 +206,18 @@ export const useConfigStore = create<ConfigState>()(
           draft._sampleSaveTimer = saveTimer;
         });
       }
+
+      // Patience requires validation — auto-enable it (matches tkinter behavior)
+      if (path === "patience" && value === true) {
+        const cfg = get().config;
+        if (cfg && !cfg.validation) {
+          set((draft) => {
+            if (draft.config) {
+              draft.config.validation = true;
+            }
+          });
+        }
+      }
     },
 
     updateConfig: (partial: Partial<TrainConfig>) => {

@@ -1,4 +1,4 @@
-import { Activity, Database, Image, RefreshCw, Video, Wand2 } from "lucide-react";
+import { Activity, Database, Heart, Image, ListOrdered, RefreshCw, Video, Wand2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 
@@ -6,9 +6,11 @@ import { CaptionToolModal } from "@/components/modals/CaptionToolModal";
 import { ConvertModelModal } from "@/components/modals/ConvertModelModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
+import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { StandaloneSamplingModal } from "@/components/modals/StandaloneSamplingModal";
 import { VideoToolModal } from "@/components/modals/VideoToolModal";
 import { Button, Card } from "@/components/shared";
+import { useUiStore } from "@/store/uiStore";
 
 interface ToolCardProps {
   icon: ReactNode;
@@ -39,6 +41,8 @@ export default function ToolsPage() {
   const [videoOpen, setVideoOpen] = useState(false);
   const [convertOpen, setConvertOpen] = useState(false);
   const [samplingOpen, setSamplingOpen] = useState(false);
+  const [dpoOpen, setDpoOpen] = useState(false);
+  const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   return (
     <>
@@ -79,6 +83,18 @@ export default function ToolsPage() {
           description="Profile training performance"
           onLaunch={() => setProfilingOpen(true)}
         />
+        <ToolCard
+          icon={<ListOrdered className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Queue"
+          description="Batch training with multiple configurations"
+          onLaunch={() => setActiveTab("queue")}
+        />
+        <ToolCard
+          icon={<Heart className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="DPO Pair Tool"
+          description="Manage chosen/rejected preference pairs for DPO training"
+          onLaunch={() => setDpoOpen(true)}
+        />
       </div>
 
       <ProfilingPanel open={profilingOpen} onClose={() => setProfilingOpen(false)} />
@@ -87,6 +103,7 @@ export default function ToolsPage() {
       <VideoToolModal open={videoOpen} onClose={() => setVideoOpen(false)} />
       <ConvertModelModal open={convertOpen} onClose={() => setConvertOpen(false)} />
       <StandaloneSamplingModal open={samplingOpen} onClose={() => setSamplingOpen(false)} />
+      <DPOToolModal open={dpoOpen} onClose={() => setDpoOpen(false)} />
     </>
   );
 }

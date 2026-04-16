@@ -664,7 +664,7 @@ def generate_optimizer_key_details_ts() -> str:
         "export interface OptimizerKeyDetail {",
         "  title: string;",
         "  tooltip: string;",
-        "  type: \"bool\" | \"float\" | \"int\" | \"str\" | \"dict\";",
+        "  type: \"bool\" | \"float\" | \"int\" | \"str\" | \"dict\" | string;",
         "}",
         "",
         "export const OPTIMIZER_KEY_DETAILS: Record<string, OptimizerKeyDetail> = {",

@@ -76,6 +76,33 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "STANDARD": "Standard",
         "VALIDATION": "Validation",
         "PRIOR_PREDICTION": "Prior Prediction",
+        "DPO_CHOSEN": "DPO Chosen",
+        "DPO_REJECTED": "DPO Rejected",
+        "DPO_CHOSEN_VAL": "DPO Chosen (Validation)",
+        "DPO_REJECTED_VAL": "DPO Rejected (Validation)",
+    },
+    "RLHFMode": {
+        "DPO": "DPO (Direct Preference Optimization)",
+    },
+    "DPOExecutionMode": {
+        "SEQUENTIAL": "Sequential",
+        "POLICY_CONCURRENT": "Policy Concurrent",
+        "FULL_CONCURRENT": "Full Concurrent",
+    },
+    "DPOPatienceMode": {
+        "EITHER": "Either (Accuracy or Loss)",
+        "BOTH": "Both (Accuracy and Loss)",
+    },
+    "DPORefMode": {
+        "NEW_ADAPTER": "New Adapter",
+        "EXISTING_ADAPTER": "Existing Adapter",
+    },
+    "QueueEntryStatus": {
+        "PENDING": "Pending",
+        "RUNNING": "Running",
+        "COMPLETED": "Completed",
+        "FAILED": "Failed",
+        "SKIPPED": "Skipped",
     },
     "ConfigPart": {
         "NONE": "None",

@@ -6,6 +6,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dpo_curation_util import check_dpo_pairs, dpo_concept_pairs, fix_multiline_captions, remove_finalized_pair
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DPOExecutionMode import DPOExecutionMode
+from modules.util.enum.DPOPatienceMode import DPOPatienceMode
 from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
@@ -93,19 +94,27 @@ class RLHFTab:
                          tooltip="How many validation checks can pass without improvement before training stops.")
         components.entry(self.scroll_frame, 5, 4, self.ui_state, "rlhf_dpo_patience_value")
 
+        patience_mode_options = [
+            ("Either", DPOPatienceMode.EITHER),
+            ("Both", DPOPatienceMode.BOTH),
+        ]
+        components.label(self.scroll_frame, 6, 0, "Patience Trigger",
+                         tooltip="Which metric must improve to reset the patience counter: accuracy, loss, or both.")
+        components.options_kv(self.scroll_frame, 6, 1, patience_mode_options, self.ui_state, "rlhf_dpo_patience_mode")
+
         components.label(self.scroll_frame, 6, 3, "Save Best",
                          tooltip="Saves a checkpoint when validation accuracy hits a new high. "
                                  "The best checkpoint is restored at the end of training.")
         components.switch(self.scroll_frame, 6, 4, self.ui_state, "rlhf_dpo_save_best")
 
-        components.button(self.scroll_frame, 7, 0, "Check Pairs", command=self._check_pairs,
+        components.button(self.scroll_frame, 8, 0, "Check Pairs", command=self._check_pairs,
                           tooltip="Check that your chosen and rejected concept folders line up before training.")
-        components.button(self.scroll_frame, 7, 1, "Review Pairs", command=self._review_pairs,
+        components.button(self.scroll_frame, 8, 1, "Review Pairs", command=self._review_pairs,
                           tooltip="Visually review your chosen/rejected image pairs. Remove bad pairs and their counterparts.")
 
-        components.label(self.scroll_frame, 8, 0, "Training Type:",
+        components.label(self.scroll_frame, 9, 0, "Training Type:",
                          tooltip="Shows whether DPO is starting from a fresh adapter or refining a loaded adapter. The output is always an adapter file.")
-        components.label(self.scroll_frame, 8, 1, training_type,
+        components.label(self.scroll_frame, 9, 1, training_type,
                          tooltip="DPO always writes an adapter file. New Adapter means the adapter starts from scratch. Existing Adapter means DPO refines a loaded adapter.")
 
     def _check_pairs(self):

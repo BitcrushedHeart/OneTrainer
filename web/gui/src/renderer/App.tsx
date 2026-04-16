@@ -18,6 +18,7 @@ const ToolsPage = lazy(() => import("./pages/ToolsPage"));
 const PerformancePage = lazy(() => import("./pages/PerformancePage"));
 const RunPage = lazy(() => import("./pages/RunPage"));
 const HelpPage = lazy(() => import("./pages/HelpPage"));
+const QueuePage = lazy(() => import("./pages/QueuePage"));
 
 const CUSTOM_TAB_COMPONENTS: Record<string, React.LazyExoticComponent<React.ComponentType>> = {
   concepts: ConceptsPage,
@@ -25,6 +26,7 @@ const CUSTOM_TAB_COMPONENTS: Record<string, React.LazyExoticComponent<React.Comp
   performance: PerformancePage,
   run: RunPage,
   help: HelpPage,
+  queue: QueuePage,
 };
 
 function TabContent() {

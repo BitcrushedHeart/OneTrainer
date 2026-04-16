@@ -47,6 +47,34 @@ const typeStyles: Record<
     overlay: "var(--color-warning-500-alpha-06)",
     label: "Prior",
   },
+  DPO_CHOSEN: {
+    border: "#22c55e",
+    badgeBg: "rgba(34, 197, 94, 0.15)",
+    badgeText: "#22c55e",
+    overlay: "rgba(34, 197, 94, 0.06)",
+    label: "DPO Chosen",
+  },
+  DPO_REJECTED: {
+    border: "#ef4444",
+    badgeBg: "rgba(239, 68, 68, 0.15)",
+    badgeText: "#ef4444",
+    overlay: "rgba(239, 68, 68, 0.06)",
+    label: "DPO Rejected",
+  },
+  DPO_CHOSEN_VAL: {
+    border: "#4ade80",
+    badgeBg: "rgba(74, 222, 128, 0.15)",
+    badgeText: "#4ade80",
+    overlay: "rgba(74, 222, 128, 0.06)",
+    label: "DPO Chosen (Val)",
+  },
+  DPO_REJECTED_VAL: {
+    border: "#f87171",
+    badgeBg: "rgba(248, 113, 113, 0.15)",
+    badgeText: "#f87171",
+    overlay: "rgba(248, 113, 113, 0.06)",
+    label: "DPO Rejected (Val)",
+  },
 };
 
 export function ConceptCard({ concept, index, onOpen, onRemove, onClone, onToggle }: ConceptCardProps) {

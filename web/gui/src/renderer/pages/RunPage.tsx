@@ -48,6 +48,10 @@ const STATUS_CLASSES: Record<TrainingStatus, { badge: string; label: string }> =
 
 function getLineColor(tag: string): string {
   const lower = tag.toLowerCase();
+  if (lower.includes("dpo/loss")) return "#f59e0b";
+  if (lower.includes("dpo/accuracy")) return "#22c55e";
+  if (lower.includes("dpo/chosen_reward")) return "#3b82f6";
+  if (lower.includes("dpo/rejected_reward")) return "#ef4444";
   if (lower.includes("loss") || lower.includes("smooth_loss")) {
     return "var(--color-cobalt-600)";
   }

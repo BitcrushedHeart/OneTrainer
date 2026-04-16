@@ -1,7 +1,9 @@
+import { Search, Trash2 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { lazy, Suspense } from "react";
 
-import { SchemaField, SectionCard } from "@/components/shared";
+import { request } from "@/api/request";
+import { Button, SchemaField, SectionCard } from "@/components/shared";
 import { useConfigStore } from "@/store/configStore";
 import { useUiSchemaStore } from "@/store/uiSchemaStore";
 import type { FieldDef, SectionDef, TabDef } from "@/types/uiSchema";
@@ -21,6 +23,9 @@ const TimestepDistModal = lazy(() =>
 const OffloadingModal = lazy(() =>
   import("@/components/modals/OffloadingModal").then((m) => ({ default: m.OffloadingModal })),
 );
+const ValidationCheckerModal = lazy(() =>
+  import("@/components/modals/ValidationCheckerModal").then((m) => ({ default: m.ValidationCheckerModal })),
+);
 
 const CUSTOM_MODAL_RENDERERS: Record<
   string,
@@ -30,6 +35,7 @@ const CUSTOM_MODAL_RENDERERS: Record<
   "scheduler-params": SchedulerParamsModal,
   "timestep-dist": TimestepDistModal,
   offloading: OffloadingModal,
+  "validation-checker": ValidationCheckerModal,
 };
 
 interface SchemaTabRendererProps {
@@ -136,6 +142,49 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
               resolveKvOptions={resolveKvOptions}
             />
           ))}
+          {tab.id === "general" && fields.some((f) => f.key === "validation") && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setActiveModal("validation-checker")}
+                disabled={!configRecord.validation}
+              >
+                <Search className="w-4 h-4 mr-1" />
+                Check Validation
+              </Button>
+            </div>
+          )}
+          {tab.id === "data" && fields.some((f) => f.key === "clear_cache_before_training") && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={async () => {
+                  const preview = await request<{
+                    ok: boolean;
+                    total_files: number;
+                    total_mb: number;
+                    error?: string;
+                  }>("/system/cache/gc-preview", { method: "POST" });
+                  if (!preview.ok) {
+                    alert(preview.error ?? "Failed to preview cache");
+                    return;
+                  }
+                  if (preview.total_files === 0) {
+                    alert("No orphaned cache files found.");
+                    return;
+                  }
+                  if (confirm(`Remove ${preview.total_files} orphaned cache files (${preview.total_mb} MB)?`)) {
+                    await request("/system/cache/gc-clean", { method: "POST" });
+                  }
+                }}
+              >
+                <Trash2 className="w-4 h-4 mr-1" />
+                Clean Cache
+              </Button>
+            </div>
+          )}
         </div>
       </SectionCard>
     );

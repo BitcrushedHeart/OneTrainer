@@ -484,6 +484,7 @@ def _iter_all_sections(tab: dict):
 TAB_LABEL_OVERRIDES = {
     "additionalembeddings": "Additional Embeddings",
     "lora": "LoRA",
+    "rlhf": "RLHF",
 }
 
 CUSTOM_TABS = [
@@ -491,12 +492,13 @@ CUSTOM_TABS = [
     {"id": "performance", "label": "Performance", "renderer": "custom"},
     {"id": "run", "label": "Run", "renderer": "custom"},
     {"id": "tools", "label": "Tools", "renderer": "custom"},
+    {"id": "queue", "label": "Queue", "renderer": "custom"},
     {"id": "help", "label": "Help", "renderer": "custom"},
 ]
 
 TAB_ORDER = [
-    "general", "model", "data", "concepts", "training", "sampling",
-    "backup", "tools", "lora", "embedding",
+    "general", "model", "data", "concepts", "training", "rlhf", "sampling",
+    "backup", "tools", "queue", "lora", "embedding",
     "additionalembeddings", "cloud", "performance", "run", "help",
 ]
 
@@ -542,6 +544,8 @@ def generate_schema() -> dict:
                 section["visibility"] = {"field": "peft_type", "in": ["LORA", "LOHA"]}
             elif sid == "lora_oft_2":
                 section["visibility"] = {"field": "peft_type", "eq": "OFT_2"}
+    if "rlhf" in tab_dicts:
+        tab_dicts["rlhf"]["visibility"] = {"field": "training_method", "eq": "LORA"}
     if "embedding" in tab_dicts:
         tab_dicts["embedding"]["visibility"] = {"field": "training_method", "eq": "EMBEDDING"}
     if "additionalembeddings" in tab_dicts:

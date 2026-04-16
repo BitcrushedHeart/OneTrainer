@@ -1,3 +1,5 @@
+import { AlertTriangle } from "lucide-react";
+
 import { FormEntry, SliderEntry, Toggle } from "@/components/shared";
 import type { ConceptConfig, ConceptImageConfig } from "@/types/generated/config";
 
@@ -78,9 +80,17 @@ const AUG_ROWS: AugRow[] = [
 ];
 
 export function ConceptImageAugTab({ draft, updateImage }: ConceptImageAugTabProps) {
+  const isDpo = draft.type.startsWith("DPO_");
+
   return (
     <div className="flex gap-6">
       <div className="flex-1 min-w-0 flex flex-col gap-2">
+        {isDpo && (
+          <div className="flex items-center gap-2 p-3 rounded-lg bg-[rgba(234,179,8,0.1)] text-[var(--color-warning-500)] text-sm mb-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            Image augmentations are disabled for DPO concepts. Chosen/rejected pairs must be processed identically.
+          </div>
+        )}
         <div className="grid grid-cols-[minmax(160px,auto)_48px_48px_1fr] gap-x-3 gap-y-0 items-center text-xs font-semibold text-[var(--color-on-surface-secondary)] uppercase">
           <span>Augmentation</span>
           <span className="text-center">Random</span>
@@ -99,7 +109,7 @@ export function ConceptImageAugTab({ draft, updateImage }: ConceptImageAugTabPro
 
               <div className="flex justify-center">
                 {random ? (
-                  <Toggle value={draft.image[random] as boolean} onChange={(v) => updateImage(random, v)} />
+                  <Toggle value={draft.image[random] as boolean} onChange={(v) => updateImage(random, v)} disabled={isDpo} />
                 ) : (
                   <span />
                 )}
@@ -107,7 +117,7 @@ export function ConceptImageAugTab({ draft, updateImage }: ConceptImageAugTabPro
 
               <div className="flex justify-center">
                 {fixed ? (
-                  <Toggle value={draft.image[fixed] as boolean} onChange={(v) => updateImage(fixed, v)} />
+                  <Toggle value={draft.image[fixed] as boolean} onChange={(v) => updateImage(fixed, v)} disabled={isDpo} />
                 ) : (
                   <span />
                 )}
@@ -122,6 +132,7 @@ export function ConceptImageAugTab({ draft, updateImage }: ConceptImageAugTabPro
                     min={row.slider.min}
                     max={row.slider.max}
                     step={row.slider.step}
+                    disabled={isDpo}
                   />
                 ) : value ? (
                   <FormEntry
@@ -130,6 +141,7 @@ export function ConceptImageAugTab({ draft, updateImage }: ConceptImageAugTabPro
                     value={draft.image[value] as string | number}
                     onChange={(v) => updateImage(value, v)}
                     placeholder={row.valuePlaceholder}
+                    disabled={isDpo}
                   />
                 ) : (
                   <span />

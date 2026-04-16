@@ -499,6 +499,15 @@ class CtkTabParser:
             if section and section.fields:
                 sections[section.id] = section
 
+        # If __init__ yielded no fields, try refresh_ui() — some tabs
+        # (e.g. RLHFTab) build all widgets in refresh_ui() instead.
+        if not sections:
+            refresh = self._find_method("refresh_ui")
+            if refresh:
+                section = self._extract_section_from_body(refresh.body, tab_id, refresh)
+                if section and section.fields:
+                    sections[section.id] = section
+
         if not sections:
             widget_sections = self._parse_nested_widget_class(tab_id)
             sections.update(widget_sections)
