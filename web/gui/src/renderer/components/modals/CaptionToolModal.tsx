@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { type ApiCaptionRequest, type PreviewResponse, toolsApi } from "@/api/toolsApi";
 import { Button, DirPicker, FormEntry, ProgressBar, Select, SliderEntry, Toggle, Tooltip } from "@/components/shared";
 import { useToolPolling } from "@/hooks/useToolPolling";
+import { CAPTION_MODELS, CAPTION_MODES } from "@/types/generated/dropdownSources";
 import { INPUT_FLEX, TEXTAREA_FULL } from "@/utils/inputStyles";
 
 import { ModalBase } from "./ModalBase";
@@ -13,16 +14,8 @@ export interface CaptionToolModalProps {
   onClose: () => void;
 }
 
-const ALL_MODELS = ["Blip", "Blip2", "WD14 VIT v2", "OpenAI Compatible", "Gemini API"];
 const LOCAL_MODELS = new Set(["Blip", "Blip2", "WD14 VIT v2"]);
 const API_MODELS = new Set(["OpenAI Compatible", "Gemini API"]);
-
-const CAPTION_MODES = ["replace", "fill", "add"];
-const CAPTION_MODE_LABELS: Record<string, string> = {
-  replace: "Replace all captions",
-  fill: "Create if absent",
-  add: "Add as new line",
-};
 
 interface CaptionState {
   model: string;
@@ -231,11 +224,10 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
       <div className="flex flex-col gap-4 max-h-[70vh] overflow-y-auto pr-1">
         <Select
           label="Model"
-          options={ALL_MODELS}
+          options={CAPTION_MODELS}
           value={state.model}
           onChange={(v) => update("model", v)}
           disabled={isRunning}
-          formatLabel={(v) => v}
         />
 
         <DirPicker label="Folder" value={state.folder} onChange={(v) => update("folder", v)} disabled={isRunning} />
@@ -446,7 +438,6 @@ export function CaptionToolModal({ open, onClose }: CaptionToolModalProps) {
           value={state.mode}
           onChange={(v) => update("mode", v)}
           disabled={isRunning}
-          formatLabel={(v) => CAPTION_MODE_LABELS[v] ?? v}
         />
 
         <Toggle

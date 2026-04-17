@@ -1112,6 +1112,191 @@ def generate_tooltips_ts(configs: list[tuple[str, type]]) -> str:
     return "\n".join(lines)
 
 
+# --- Dropdown sources ---------------------------------------------------------
+# Any `<Select>` whose options are not covered by the enum / dtypeSubset / layer-
+# preset pipelines is sourced here: CTk `components.options_kv(...)` calls for
+# Convert & Concept modals (authoritative Python source), plus curated tool-modal
+# lists from `ui_metadata.TOOL_DROPDOWN_OPTIONS`. The generator AST-parses the CTk
+# calls, resolves `Enum.MEMBER` references via the runtime enum registry, and
+# emits plain `{ label, value }[]` arrays.
+
+
+def _resolve_ast_value_as_str(node: ast.AST, enum_lookup: dict[str, type]) -> str | None:
+    """Resolve an AST expression to its string value.
+
+    Handles two shapes used by CTk `options_kv` calls:
+    - `ast.Constant` string literals → the literal value.
+    - `ast.Attribute` of the form `EnumClass.MEMBER` → the member's `.value`.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        cls = enum_lookup.get(node.value.id)
+        if cls is None:
+            return None
+        member = getattr(cls, node.attr, None)
+        if member is None:
+            return None
+        val = getattr(member, "value", None)
+        return val if isinstance(val, str) else None
+    return None
+
+
+def _extract_options_kv_calls(
+    filepath: str, enum_lookup: dict[str, type]
+) -> dict[str, list[tuple[str, str]]]:
+    """AST-parse a CTk UI file for `options_kv(..., [(label, value), ...], state, "field")` calls.
+
+    Returns `{field_name: [(label, value), ...]}`. Tuples whose label isn't a string
+    literal or whose value can't be resolved are skipped.
+    """
+    with open(filepath, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=filepath)
+
+    results: dict[str, list[tuple[str, str]]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        func_name = (
+            func.attr if isinstance(func, ast.Attribute)
+            else func.id if isinstance(func, ast.Name)
+            else None
+        )
+        if func_name != "options_kv":
+            continue
+        # components.options_kv(master, row, col, list, state, field_name, ...)
+        if len(node.args) < 6:
+            continue
+        options_node, field_node = node.args[3], node.args[5]
+        if not isinstance(options_node, ast.List):
+            continue
+        if not (isinstance(field_node, ast.Constant) and isinstance(field_node.value, str)):
+            continue
+
+        pairs: list[tuple[str, str]] = []
+        for item in options_node.elts:
+            if not (isinstance(item, ast.Tuple) and len(item.elts) == 2):
+                continue
+            label_node, value_node = item.elts
+            if not (isinstance(label_node, ast.Constant) and isinstance(label_node.value, str)):
+                continue
+            value = _resolve_ast_value_as_str(value_node, enum_lookup)
+            if value is None:
+                continue
+            pairs.append((label_node.value, value))
+
+        if pairs:
+            results[field_node.value] = pairs
+
+    return results
+
+
+def _emit_kv_array(name: str, pairs: list[tuple[str, str]]) -> list[str]:
+    """Emit `export const NAME: DropdownOption[] = [...];` with Prettier-safe wrapping."""
+    lines = [f"export const {name}: DropdownOption[] = ["]
+    for label, value in pairs:
+        lines.append(f"  {{ label: {_ts_string(label)}, value: {_ts_string(value)} }},")
+    lines.append("];")
+    return lines
+
+
+def generate_dropdown_sources_ts() -> str:
+    """Emit `dropdownSources.ts` — every non-schema dropdown option list.
+
+    Sources:
+    - `modules/ui/ConvertModelUI.py`: Convert-model modal dropdowns (CTk `options_kv`).
+    - `modules/ui/ConceptWindow.py`: Concept modal dropdowns (CTk `options_kv`).
+    - `web/scripts/ui_metadata.TOOL_DROPDOWN_OPTIONS`: Caption/Mask tool modals
+      (web-specific; backend VALID_*_MODES are unordered `set`s, so ordering is
+      curated here rather than AST-parsed).
+    """
+    global _incomplete_generation
+
+    from web.scripts.ui_metadata import TOOL_DROPDOWN_OPTIONS
+
+    enum_lookup = dict(collect_enums())
+
+    convert_path = os.path.join(PROJECT_ROOT, "modules", "ui", "ConvertModelUI.py")
+    concept_path = os.path.join(PROJECT_ROOT, "modules", "ui", "ConceptWindow.py")
+
+    try:
+        convert_calls = _extract_options_kv_calls(convert_path, enum_lookup)
+    except OSError as e:
+        print(f"  WARNING: Could not read {convert_path} ({e})")
+        convert_calls = {}
+        _incomplete_generation = True
+
+    try:
+        concept_calls = _extract_options_kv_calls(concept_path, enum_lookup)
+    except OSError as e:
+        print(f"  WARNING: Could not read {concept_path} ({e})")
+        concept_calls = {}
+        _incomplete_generation = True
+
+    # Field -> exported constant name. Order here controls file layout.
+    convert_map = [
+        ("model_type", "CONVERT_MODEL_TYPES"),
+        ("training_method", "CONVERT_TRAINING_METHODS"),
+        ("output_dtype", "CONVERT_OUTPUT_DTYPES"),
+        ("output_model_format", "CONVERT_OUTPUT_FORMATS"),
+    ]
+    concept_map = [
+        ("prompt_source", "PROMPT_SOURCES"),
+        ("tag_dropout_mode", "TAG_DROPOUT_MODES"),
+        ("tag_dropout_special_tags_mode", "TAG_DROPOUT_SPECIAL_TAGS_MODES"),
+    ]
+
+    lines = [
+        "// Auto-generated by web/scripts/generate_types.py",
+        "// Do not edit manually. Regenerate when CTk options_kv calls or",
+        "// ui_metadata.TOOL_DROPDOWN_OPTIONS change.",
+        "",
+        "/** Label/value pair consumed by `<Select options={...}>` (matches SelectKVOption). */",
+        "export interface DropdownOption {",
+        "  label: string;",
+        "  value: string;",
+        "}",
+        "",
+        "// --- Convert Model modal (modules/ui/ConvertModelUI.py) ----------------------",
+        "",
+    ]
+
+    for field, const_name in convert_map:
+        pairs = convert_calls.get(field)
+        if not pairs:
+            print(f"  WARNING: No options_kv for {field!r} in ConvertModelUI.py")
+            _incomplete_generation = True
+            pairs = []
+        lines.extend(_emit_kv_array(const_name, pairs))
+        lines.append("")
+
+    lines.append("// --- Concept modal (modules/ui/ConceptWindow.py) -----------------------------")
+    lines.append("")
+
+    for field, const_name in concept_map:
+        pairs = concept_calls.get(field)
+        if not pairs:
+            print(f"  WARNING: No options_kv for {field!r} in ConceptWindow.py")
+            _incomplete_generation = True
+            pairs = []
+        lines.extend(_emit_kv_array(const_name, pairs))
+        lines.append("")
+
+    lines.append("// --- Caption / Mask tool modals (web/scripts/ui_metadata.py) -----------------")
+    lines.append("")
+
+    for const_name in ("CAPTION_MODELS", "CAPTION_MODES", "MASK_MODELS", "MASK_MODES"):
+        pairs = TOOL_DROPDOWN_OPTIONS.get(const_name, [])
+        if not pairs:
+            print(f"  WARNING: TOOL_DROPDOWN_OPTIONS missing {const_name!r}")
+            _incomplete_generation = True
+        lines.extend(_emit_kv_array(const_name, pairs))
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def write_file(filename: str, content: str) -> str:
     filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "w", encoding="utf-8", newline="\n") as f:
@@ -1150,6 +1335,7 @@ def main():
         ("tooltips.ts", lambda: generate_tooltips_ts(configs)),
         ("layerPresets.ts", lambda: generate_layer_presets_ts()),
         ("lossWeightInfo.ts", lambda: generate_loss_weight_info_ts()),
+        ("dropdownSources.ts", lambda: generate_dropdown_sources_ts()),
     ]
 
     global _incomplete_generation
@@ -1201,7 +1387,7 @@ def main():
     print("\nSummary:")
     print(f"  {len(enums)} enum types with {total_enum_values} total values")
     print(f"  {len(configs)} config interfaces with {total_config_fields} total fields")
-    print("  11 generated TypeScript files")
+    print("  12 generated TypeScript files")
 
     if _incomplete_generation:
         print("\nWARNING: Some files were not generated successfully.")

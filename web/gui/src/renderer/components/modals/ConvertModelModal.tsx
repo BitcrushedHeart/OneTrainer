@@ -1,7 +1,13 @@
 import { useState } from "react";
 
 import { toolsApi } from "@/api/toolsApi";
-import { Button, FilePicker, Select, type SelectKVOption } from "@/components/shared";
+import { Button, FilePicker, Select } from "@/components/shared";
+import {
+  CONVERT_MODEL_TYPES,
+  CONVERT_OUTPUT_DTYPES,
+  CONVERT_OUTPUT_FORMATS,
+  CONVERT_TRAINING_METHODS,
+} from "@/types/generated/dropdownSources";
 
 import { ModalBase } from "./ModalBase";
 
@@ -9,44 +15,6 @@ export interface ConvertModelModalProps {
   open: boolean;
   onClose: () => void;
 }
-
-const MODEL_TYPES: SelectKVOption[] = [
-  { label: "Stable Diffusion 1.5", value: "STABLE_DIFFUSION_15" },
-  { label: "Stable Diffusion 1.5 Inpainting", value: "STABLE_DIFFUSION_15_INPAINTING" },
-  { label: "Stable Diffusion 2.0", value: "STABLE_DIFFUSION_20" },
-  { label: "Stable Diffusion 2.0 Inpainting", value: "STABLE_DIFFUSION_20_INPAINTING" },
-  { label: "Stable Diffusion 2.1", value: "STABLE_DIFFUSION_21" },
-  { label: "Stable Diffusion 3", value: "STABLE_DIFFUSION_3" },
-  { label: "Stable Diffusion 3.5", value: "STABLE_DIFFUSION_35" },
-  { label: "Stable Diffusion XL 1.0 Base", value: "STABLE_DIFFUSION_XL_10_BASE" },
-  { label: "Stable Diffusion XL 1.0 Base Inpainting", value: "STABLE_DIFFUSION_XL_10_BASE_INPAINTING" },
-  { label: "Wuerstchen v2", value: "WUERSTCHEN_2" },
-  { label: "Stable Cascade", value: "STABLE_CASCADE_1" },
-  { label: "PixArt Alpha", value: "PIXART_ALPHA" },
-  { label: "PixArt Sigma", value: "PIXART_SIGMA" },
-  { label: "Flux Dev", value: "FLUX_DEV_1" },
-  { label: "Flux Fill Dev", value: "FLUX_FILL_DEV_1" },
-  { label: "Hunyuan Video", value: "HUNYUAN_VIDEO" },
-  { label: "Chroma1", value: "CHROMA_1" },
-  { label: "QwenImage", value: "QWEN" },
-];
-
-const TRAINING_METHODS: SelectKVOption[] = [
-  { label: "Base Model", value: "FINE_TUNE" },
-  { label: "LoRA", value: "LORA" },
-  { label: "Embedding", value: "EMBEDDING" },
-];
-
-const OUTPUT_DTYPES: SelectKVOption[] = [
-  { label: "float32", value: "FLOAT_32" },
-  { label: "float16", value: "FLOAT_16" },
-  { label: "bfloat16", value: "BFLOAT_16" },
-];
-
-const OUTPUT_FORMATS: SelectKVOption[] = [
-  { label: "Safetensors", value: "SAFETENSORS" },
-  { label: "Diffusers", value: "DIFFUSERS" },
-];
 
 type StatusKind = "ready" | "converting" | "success" | "error";
 
@@ -118,7 +86,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
       <div className="flex flex-col gap-4">
         <Select
           label="Model Type"
-          options={MODEL_TYPES}
+          options={CONVERT_MODEL_TYPES}
           value={modelType}
           onChange={setModelType}
           disabled={isConverting}
@@ -127,7 +95,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
 
         <Select
           label="Training Method"
-          options={TRAINING_METHODS}
+          options={CONVERT_TRAINING_METHODS}
           value={trainingMethod}
           onChange={setTrainingMethod}
           disabled={isConverting}
@@ -144,7 +112,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
 
         <Select
           label="Output Data Type"
-          options={OUTPUT_DTYPES}
+          options={CONVERT_OUTPUT_DTYPES}
           value={outputDtype}
           onChange={setOutputDtype}
           disabled={isConverting}
@@ -153,7 +121,7 @@ export function ConvertModelModal({ open, onClose }: ConvertModelModalProps) {
 
         <Select
           label="Output Format"
-          options={OUTPUT_FORMATS}
+          options={CONVERT_OUTPUT_FORMATS}
           value={outputFormat}
           onChange={setOutputFormat}
           disabled={isConverting}

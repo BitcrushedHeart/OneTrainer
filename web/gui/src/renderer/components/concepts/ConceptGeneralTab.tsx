@@ -1,13 +1,7 @@
 import { DirPicker, FilePicker, FormEntry, Select, Toggle } from "@/components/shared";
 import type { ConceptConfig } from "@/types/generated/config";
+import { PROMPT_SOURCES } from "@/types/generated/dropdownSources";
 import { BalancingStrategyValues, ConceptTypeValues } from "@/types/generated/enums";
-
-const PROMPT_SOURCE_OPTIONS = ["sample", "concept", "filename"];
-const PROMPT_SOURCE_LABELS: Record<string, string> = {
-  sample: "From text file per sample",
-  concept: "From single text file",
-  filename: "From image file name",
-};
 
 export interface ConceptGeneralTabProps {
   draft: ConceptConfig;
@@ -38,10 +32,9 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Prompt Source</span>
       <Select
         label=""
-        options={PROMPT_SOURCE_OPTIONS}
+        options={PROMPT_SOURCES}
         value={draft.text.prompt_source}
         onChange={(v) => updateText("prompt_source", v)}
-        formatLabel={(v) => PROMPT_SOURCE_LABELS[v] ?? v}
       />
 
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Prompt Path</span>

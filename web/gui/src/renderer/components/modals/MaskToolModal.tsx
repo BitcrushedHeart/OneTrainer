@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { toolsApi } from "@/api/toolsApi";
 import { Button, DirPicker, FilePicker, FormEntry, ProgressBar, Select, Toggle } from "@/components/shared";
 import { useToolPolling } from "@/hooks/useToolPolling";
+import { MASK_MODELS, MASK_MODES } from "@/types/generated/dropdownSources";
 
 import { ModalBase } from "./ModalBase";
 
@@ -10,17 +11,6 @@ export interface MaskToolModalProps {
   open: boolean;
   onClose: () => void;
 }
-
-const MASK_MODELS = ["ClipSeg", "Rembg", "Rembg-Human", "Hex Color", "YOLO"];
-
-const MASK_MODES = ["replace", "fill", "add", "subtract", "blend"];
-const MASK_MODE_LABELS: Record<string, string> = {
-  replace: "Replace all masks",
-  fill: "Create if absent",
-  add: "Add to existing",
-  subtract: "Subtract from existing",
-  blend: "Blend with existing",
-};
 
 interface MaskState {
   model: string;
@@ -132,7 +122,6 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
           value={state.model}
           onChange={(v) => update("model", v)}
           disabled={isRunning}
-          formatLabel={(v) => v}
         />
 
         {state.model === "YOLO" && (
@@ -173,7 +162,6 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
           value={state.mode}
           onChange={(v) => update("mode", v)}
           disabled={isRunning}
-          formatLabel={(v) => MASK_MODE_LABELS[v] ?? v}
         />
 
         <div className="grid grid-cols-2 gap-3">

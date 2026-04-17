@@ -1,8 +1,6 @@
 import { FormEntry, Select, Toggle } from "@/components/shared";
 import type { ConceptConfig } from "@/types/generated/config";
-
-const TAG_DROPOUT_MODE_OPTIONS = ["FULL", "RANDOM", "RANDOM WEIGHTED"];
-const TAG_DROPOUT_SPECIAL_TAGS_MODE_OPTIONS = ["NONE", "BLACKLIST", "WHITELIST"];
+import { TAG_DROPOUT_MODES, TAG_DROPOUT_SPECIAL_TAGS_MODES } from "@/types/generated/dropdownSources";
 
 export interface ConceptTextAugTabProps {
   draft: ConceptConfig;
@@ -42,7 +40,7 @@ export function ConceptTextAugTab({ draft, updateText }: ConceptTextAugTabProps)
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Dropout Mode</span>
       <Select
         label=""
-        options={TAG_DROPOUT_MODE_OPTIONS}
+        options={TAG_DROPOUT_MODES}
         value={draft.text.tag_dropout_mode}
         onChange={(v) => updateText("tag_dropout_mode", v)}
       />
@@ -57,7 +55,7 @@ export function ConceptTextAugTab({ draft, updateText }: ConceptTextAugTabProps)
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Special Tags</span>
       <Select
         label=""
-        options={TAG_DROPOUT_SPECIAL_TAGS_MODE_OPTIONS}
+        options={TAG_DROPOUT_SPECIAL_TAGS_MODES}
         value={draft.text.tag_dropout_special_tags_mode}
         onChange={(v) => updateText("tag_dropout_special_tags_mode", v)}
       />
