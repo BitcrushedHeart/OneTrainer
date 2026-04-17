@@ -1,5 +1,5 @@
 import { type ChildProcess, execSync, spawn } from "child_process";
-import { randomBytes } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 import { app, BrowserWindow, dialog, type FileFilter, ipcMain, Menu, shell } from "electron";
 import * as fs from "fs";
 import * as http from "http";
@@ -281,6 +281,37 @@ async function waitForBackend(onProgress?: (attempt: number, maxAttempts: number
   return false;
 }
 
+function flushWindow(win: BrowserWindow, timeoutMs = 3000): Promise<void> {
+  if (win.isDestroyed() || win.webContents.isDestroyed()) return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    const requestId = randomUUID();
+
+    const timer = setTimeout(() => {
+      ipcMain.removeListener(IPC_CHANNELS.FLUSH_COMPLETE, onComplete);
+      console.warn(`[Electron] Flush timed out after ${timeoutMs}ms for window ${win.id}`);
+      resolve();
+    }, timeoutMs);
+
+    const onComplete = (_event: Electron.IpcMainEvent, id: string) => {
+      if (id !== requestId) return;
+      clearTimeout(timer);
+      ipcMain.removeListener(IPC_CHANNELS.FLUSH_COMPLETE, onComplete);
+      resolve();
+    };
+
+    ipcMain.on(IPC_CHANNELS.FLUSH_COMPLETE, onComplete);
+    try {
+      win.webContents.send(IPC_CHANNELS.FLUSH_REQUEST, requestId);
+    } catch (err) {
+      console.warn(`[Electron] Failed to send flush request: ${String(err)}`);
+      clearTimeout(timer);
+      ipcMain.removeListener(IPC_CHANNELS.FLUSH_COMPLETE, onComplete);
+      resolve();
+    }
+  });
+}
+
 function createWindow(): Promise<BrowserWindow> {
   return new Promise((resolve) => {
     const win = new BrowserWindow({
@@ -351,6 +382,20 @@ function createWindow(): Promise<BrowserWindow> {
 
     win.on("closed", () => {
       mainWindow = null;
+    });
+
+    let didFlush = false;
+    win.on("close", (event) => {
+      if (didFlush) return;
+      event.preventDefault();
+      void (async () => {
+        try {
+          await flushWindow(win);
+        } finally {
+          didFlush = true;
+          if (!win.isDestroyed()) win.destroy();
+        }
+      })();
     });
   });
 }
