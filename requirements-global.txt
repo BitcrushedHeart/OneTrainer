@@ -34,7 +34,7 @@ pooch==1.8.2
 open-clip-torch==2.32.0
 
 # data loader
--e git+https://github.com/BitcrushedHeart/mgds.git@5476612#egg=mgds
+-e git+https://github.com/BitcrushedHeart/mgds.git@a2c6bc9#egg=mgds
 xxhash
 
 # optimizers
