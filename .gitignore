@@ -51,3 +51,6 @@ web/gui/src/renderer/types/generated/
 web/backend/__pycache__/
 web/backend/**/__pycache__/
 web/backend/generated/
+
+# local worktrees
+.worktrees/
