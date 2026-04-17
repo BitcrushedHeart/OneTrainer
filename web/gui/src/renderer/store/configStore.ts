@@ -98,6 +98,7 @@ interface ConfigState {
   loadDefaults: () => Promise<void>;
   exportConfig: () => Promise<TrainConfig>;
   fetchOptimizerParams: () => Promise<void>;
+  flushPendingChanges: () => Promise<void>;
   clearError: () => void;
   destroy: () => void;
 }
@@ -248,6 +249,54 @@ export const useConfigStore = create<ConfigState>()(
           });
         }
       }
+    },
+
+    flushPendingChanges: async () => {
+      const { _syncTimer, _conceptSaveTimer, _sampleSaveTimer } = get();
+
+      const tasks: Array<Promise<unknown>> = [];
+
+      if (_syncTimer !== null) {
+        clearTimeout(_syncTimer);
+        set((draft) => {
+          draft._syncTimer = null;
+        });
+      }
+      if (get().isDirty) {
+        tasks.push(get().syncToBackend());
+      }
+
+      if (_conceptSaveTimer !== null) {
+        clearTimeout(_conceptSaveTimer);
+        set((draft) => {
+          draft._conceptSaveTimer = null;
+        });
+        const concepts = get().config?.concepts;
+        if (concepts != null) {
+          tasks.push(
+            configApi.saveConcepts(concepts).catch((err) => {
+              console.error("[configStore] flush: failed to save concepts:", err);
+            }),
+          );
+        }
+      }
+
+      if (_sampleSaveTimer !== null) {
+        clearTimeout(_sampleSaveTimer);
+        set((draft) => {
+          draft._sampleSaveTimer = null;
+        });
+        const samples = get().config?.samples;
+        if (samples != null) {
+          tasks.push(
+            configApi.saveSamples(samples).catch((err) => {
+              console.error("[configStore] flush: failed to save samples:", err);
+            }),
+          );
+        }
+      }
+
+      await Promise.all(tasks);
     },
 
     loadConcepts: async () => {
