@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 import { trainingApi } from "@/api/trainingApi";
+import { useUiStore } from "@/store/uiStore";
 
 export type TrainingStatus = "idle" | "preparing" | "training" | "error";
 
@@ -97,6 +98,11 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   startTraining: async (options?: { reattach?: boolean }) => {
     const { status } = get();
     if (status === "training" || status === "preparing") return;
+
+    // Open the backend log panel so the terminal WebSocket mounts before the
+    // trainer emits its first output — otherwise early logs are dropped until
+    // the user opens the panel manually.
+    useUiStore.getState().setTerminalOpen(true);
 
     set({
       status: "preparing",
