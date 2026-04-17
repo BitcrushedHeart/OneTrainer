@@ -62,6 +62,7 @@ export default function App() {
   const backendConnected = useUiStore((s) => s.backendConnected);
   const terminalOpen = useUiStore((s) => s.terminalOpen);
   const loadConfig = useConfigStore((s) => s.loadConfig);
+  const flushPendingChanges = useConfigStore((s) => s.flushPendingChanges);
   const fetchTrainingStatus = useTrainingStore((s) => s.fetchStatus);
   const loadSchema = useUiSchemaStore((s) => s.loadSchema);
 
@@ -101,6 +102,21 @@ export default function App() {
       console.error("App initialization failed:", err);
     });
   }, [backendConnected, loadConfig, fetchTrainingStatus]);
+
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api) return;
+
+    return api.onFlushRequest(async (requestId) => {
+      try {
+        await flushPendingChanges();
+      } catch (err) {
+        console.error("[App] flush failed:", err);
+      } finally {
+        api.signalFlushComplete(requestId);
+      }
+    });
+  }, [flushPendingChanges]);
 
   return (
     <div className="app-shell">
