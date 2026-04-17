@@ -1,7 +1,7 @@
 // Handles CJS/ESM split: main files -> .cjs, preload stays .js, shared duplicated as both.
 // Electron's sandbox loader only resolves .js for preload scripts.
-import { readdirSync, renameSync, copyFileSync, readFileSync, writeFileSync, existsSync } from "fs";
-import { join, basename, dirname } from "path";
+import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { basename, dirname, join } from "path";
 
 const distMain = new URL("../dist/main", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
 
@@ -39,7 +39,7 @@ for (const file of mainFiles) {
   content = content.replace(/require\("(\.[^"]+?)"\)/g, (match, p1) => {
     if (p1.endsWith(".json") || p1.endsWith(".html") || p1.endsWith(".node")) return match;
     const target = p1.split("/").pop();
-    if (KEEP_JS.has(target + ".js")) return match;
+    if (KEEP_JS.has(`${target}.js`)) return match;
     return `require("${p1}.cjs")`;
   });
   writeFileSync(file, content, "utf8");
@@ -56,6 +56,6 @@ for (const file of mainFiles) {
 
 console.log(
   `Main: ${mainFiles.length} renamed to .cjs | ` +
-  `Shared: ${sharedFiles.length} duplicated (.js + .cjs) | ` +
-  `Preload: ${preloadFiles.length} kept as .js`
+    `Shared: ${sharedFiles.length} duplicated (.js + .cjs) | ` +
+    `Preload: ${preloadFiles.length} kept as .js`,
 );

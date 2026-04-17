@@ -1,161 +1,156 @@
 import { request } from "./request";
 
 export interface PairCheckResult {
-    total_matched: number;
-    total_chosen_stray: number;
-    total_rejected_stray: number;
-    format_stats: Record<string, number>;
-    multiline_captions: number;
-    pairs: Array<{
-        chosen_path: string;
-        rejected_path: string;
-        matched: number;
-        chosen_stray: number;
-        rejected_stray: number;
-    }>;
+  total_matched: number;
+  total_chosen_stray: number;
+  total_rejected_stray: number;
+  format_stats: Record<string, number>;
+  multiline_captions: number;
+  pairs: Array<{
+    chosen_path: string;
+    rejected_path: string;
+    matched: number;
+    chosen_stray: number;
+    rejected_stray: number;
+  }>;
 }
 
 export interface ReviewPair {
-    chosen_path: string;
-    rejected_path: string;
-    caption: string;
-    prompt_key: string;
+  chosen_path: string;
+  rejected_path: string;
+  caption: string;
+  prompt_key: string;
 }
 
 export interface SessionStatus {
-    active: boolean;
-    scan_count: number;
-    groups_queued: number;
-    groups_shown: number;
-    worker_finished: boolean;
-    has_group: boolean;
-    total_pairs: number;
+  active: boolean;
+  scan_count: number;
+  groups_queued: number;
+  groups_shown: number;
+  worker_finished: boolean;
+  has_group: boolean;
+  total_pairs: number;
 }
 
 export interface GroupData {
-    prompt: string;
-    aspectratio: string;
-    images: string[];
-    group_index: number;
-    total_groups: number;
-    pairs_done: number;
-    pairs_target: number;
-    mode?: "selection" | "elo";
+  prompt: string;
+  aspectratio: string;
+  images: string[];
+  group_index: number;
+  total_groups: number;
+  pairs_done: number;
+  pairs_target: number;
+  mode?: "selection" | "elo";
 }
 
 export interface EloPairResponse {
-    ok: boolean;
-    finished?: boolean;
-    pair?: [string, string];
-    ratings?: Record<string, number>;
-    done?: number;
-    suggested?: number;
-    error?: string;
+  ok: boolean;
+  finished?: boolean;
+  pair?: [string, string];
+  ratings?: Record<string, number>;
+  done?: number;
+  suggested?: number;
+  error?: string;
 }
 
 export interface NextGroupResponse {
-    group?: GroupData;
-    done?: boolean;
-    waiting?: boolean;
-    total_pairs?: number;
+  group?: GroupData;
+  done?: boolean;
+  waiting?: boolean;
+  total_pairs?: number;
 }
 
 export interface SelectResponse {
-    ok: boolean;
-    error?: string;
-    phase?: string;
-    best?: string;
-    pair_created?: boolean;
-    chosen?: string;
-    rejected?: string;
-    continue_group?: boolean;
-    remaining_images?: string[];
-    pairs_done?: number;
+  ok: boolean;
+  error?: string;
+  phase?: string;
+  best?: string;
+  pair_created?: boolean;
+  chosen?: string;
+  rejected?: string;
+  continue_group?: boolean;
+  remaining_images?: string[];
+  pairs_done?: number;
 }
 
 export const dpoApi = {
-    checkPairs: () =>
-        request<{ ok: boolean; result?: PairCheckResult; error?: string }>("/dpo/check-pairs", {
-            method: "POST",
-        }),
+  checkPairs: () =>
+    request<{ ok: boolean; result?: PairCheckResult; error?: string }>("/dpo/check-pairs", {
+      method: "POST",
+    }),
 
-    removeStrays: () =>
-        request<{ ok: boolean; removed?: number }>("/dpo/remove-strays", {
-            method: "POST",
-        }),
+  removeStrays: () =>
+    request<{ ok: boolean; removed?: number }>("/dpo/remove-strays", {
+      method: "POST",
+    }),
 
-    reviewPairs: () => request<{ ok: boolean; pairs?: ReviewPair[]; error?: string }>("/dpo/review"),
+  reviewPairs: () => request<{ ok: boolean; pairs?: ReviewPair[]; error?: string }>("/dpo/review"),
 
-    removePair: (chosenPath: string | null, rejectedPath: string | null) =>
-        request<{ ok: boolean }>("/dpo/remove-pair", {
-            method: "POST",
-            body: JSON.stringify({ chosen_path: chosenPath, rejected_path: rejectedPath }),
-        }),
+  removePair: (chosenPath: string | null, rejectedPath: string | null) =>
+    request<{ ok: boolean }>("/dpo/remove-pair", {
+      method: "POST",
+      body: JSON.stringify({ chosen_path: chosenPath, rejected_path: rejectedPath }),
+    }),
 
-    fixCaptions: () =>
-        request<{ ok: boolean; fixed?: number }>("/dpo/fix-captions", {
-            method: "POST",
-        }),
+  fixCaptions: () =>
+    request<{ ok: boolean; fixed?: number }>("/dpo/fix-captions", {
+      method: "POST",
+    }),
 
-    // Curation session
-    startSession: (
-        sourceFolder: string,
-        outputDir: string,
-        pairsPerGroup = 1,
-        mode: "selection" | "elo" = "selection",
-    ) =>
-        request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
-            method: "POST",
-            body: JSON.stringify({
-                source_folder: sourceFolder,
-                output_dir: outputDir,
-                pairs_per_group: pairsPerGroup,
-                mode,
-            }),
-        }),
+  // Curation session
+  startSession: (sourceFolder: string, outputDir: string, pairsPerGroup = 1, mode: "selection" | "elo" = "selection") =>
+    request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
+      method: "POST",
+      body: JSON.stringify({
+        source_folder: sourceFolder,
+        output_dir: outputDir,
+        pairs_per_group: pairsPerGroup,
+        mode,
+      }),
+    }),
 
-    sessionStatus: () => request<SessionStatus>("/dpo/session/status"),
+  sessionStatus: () => request<SessionStatus>("/dpo/session/status"),
 
-    nextGroup: () => request<NextGroupResponse>("/dpo/session/next-group", { method: "POST" }),
+  nextGroup: () => request<NextGroupResponse>("/dpo/session/next-group", { method: "POST" }),
 
-    selectImage: (path: string) =>
-        request<SelectResponse>("/dpo/session/select", {
-            method: "POST",
-            body: JSON.stringify({ path }),
-        }),
+  selectImage: (path: string) =>
+    request<SelectResponse>("/dpo/session/select", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
 
-    skipGroup: () => request<{ ok: boolean }>("/dpo/session/skip-group", { method: "POST" }),
+  skipGroup: () => request<{ ok: boolean }>("/dpo/session/skip-group", { method: "POST" }),
 
-    finalizeSession: (valPercentage = 0) =>
-        request<{ ok: boolean; total_pairs?: number; train_count?: number; val_count?: number }>(
-            "/dpo/session/finalize",
-            { method: "POST", body: JSON.stringify({ val_percentage: valPercentage }) },
-        ),
+  finalizeSession: (valPercentage = 0) =>
+    request<{ ok: boolean; total_pairs?: number; train_count?: number; val_count?: number }>("/dpo/session/finalize", {
+      method: "POST",
+      body: JSON.stringify({ val_percentage: valPercentage }),
+    }),
 
-    cancelSession: () => request<{ ok: boolean }>("/dpo/session/cancel", { method: "POST" }),
+  cancelSession: () => request<{ ok: boolean }>("/dpo/session/cancel", { method: "POST" }),
 
-    // ELO mode
-    eloPair: () => request<EloPairResponse>("/dpo/session/elo-pair"),
+  // ELO mode
+  eloPair: () => request<EloPairResponse>("/dpo/session/elo-pair"),
 
-    eloVote: (a: string, b: string, winner: "a" | "b" | "tie") =>
-        request<EloPairResponse>("/dpo/session/elo-vote", {
-            method: "POST",
-            body: JSON.stringify({ a, b, winner }),
-        }),
+  eloVote: (a: string, b: string, winner: "a" | "b" | "tie") =>
+    request<EloPairResponse>("/dpo/session/elo-vote", {
+      method: "POST",
+      body: JSON.stringify({ a, b, winner }),
+    }),
 
-    eloAccept: (continueScoring = false) =>
-        request<{
-            ok: boolean;
-            pair_created?: boolean;
-            chosen?: string;
-            rejected?: string;
-            continue_group?: boolean;
-            pairs_done?: number;
-            error?: string;
-        }>("/dpo/session/elo-accept", {
-            method: "POST",
-            body: JSON.stringify({ continue_scoring: continueScoring }),
-        }),
+  eloAccept: (continueScoring = false) =>
+    request<{
+      ok: boolean;
+      pair_created?: boolean;
+      chosen?: string;
+      rejected?: string;
+      continue_group?: boolean;
+      pairs_done?: number;
+      error?: string;
+    }>("/dpo/session/elo-accept", {
+      method: "POST",
+      body: JSON.stringify({ continue_scoring: continueScoring }),
+    }),
 
-    imageUrl: (path: string) => `/api/dpo/session/image?path=${encodeURIComponent(path)}`,
+  imageUrl: (path: string) => `/api/dpo/session/image?path=${encodeURIComponent(path)}`,
 };
