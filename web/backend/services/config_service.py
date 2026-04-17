@@ -27,16 +27,57 @@ class ConfigService(SingletonMixin):
         self._load_default_preset()
 
     def _load_default_preset(self) -> None:
-        if not os.path.isfile(_DEFAULT_PRESET_PATH):
+        if os.path.isfile(_DEFAULT_PRESET_PATH):
+            try:
+                with open(_DEFAULT_PRESET_PATH, "r", encoding="utf-8") as fh:
+                    loaded_dict: dict = json.load(fh)
+                loaded_dict["__version"] = self.config.config_version
+                self.config.from_dict(loaded_dict)
+                logger.info("Restored config from %s", _DEFAULT_PRESET_PATH)
+                return
+            except Exception:
+                logger.warning(
+                    "Failed to load default preset %s, attempting first-run seed",
+                    _DEFAULT_PRESET_PATH,
+                    exc_info=True,
+                )
+
+        seed_path = self._find_first_run_seed_preset()
+        if seed_path is None:
             return
+
         try:
-            with open(_DEFAULT_PRESET_PATH, "r", encoding="utf-8") as fh:
-                loaded_dict: dict = json.load(fh)
+            with open(seed_path, "r", encoding="utf-8") as fh:
+                loaded_dict = json.load(fh)
             loaded_dict["__version"] = self.config.config_version
             self.config.from_dict(loaded_dict)
-            logger.info("Restored config from %s", _DEFAULT_PRESET_PATH)
+            logger.info("First-run: seeded config from %s", seed_path)
+            self._save_default_preset()
         except Exception:
-            logger.warning("Failed to load default preset %s, using defaults", _DEFAULT_PRESET_PATH, exc_info=True)
+            logger.warning("Failed to seed first-run config from %s", seed_path, exc_info=True)
+
+    def _find_first_run_seed_preset(self) -> str | None:
+        if not os.path.isdir(PRESETS_DIR):
+            return None
+
+        try:
+            entries = sorted(os.listdir(PRESETS_DIR))
+        except OSError:
+            return None
+
+        def is_builtin(name: str) -> bool:
+            return name.startswith("#") and name.endswith(".json") and name != "#.json"
+
+        builtins = [name for name in entries if is_builtin(name)]
+        if not builtins:
+            return None
+
+        for name in builtins:
+            lowered = name.lower()
+            if "z-image" in lowered or "z_image" in lowered:
+                return os.path.join(PRESETS_DIR, name)
+
+        return os.path.join(PRESETS_DIR, builtins[0])
 
     def _save_default_preset(self) -> None:
         try:
