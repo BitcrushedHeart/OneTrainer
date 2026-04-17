@@ -16,4 +16,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getPlatformInfo: () => ipcRenderer.invoke(IPC_CHANNELS.GET_PLATFORM_INFO),
   getBackendPort: () => ipcRenderer.invoke(IPC_CHANNELS.GET_BACKEND_PORT),
   openMaskEditor: (folder?) => ipcRenderer.invoke(IPC_CHANNELS.OPEN_MASK_EDITOR, folder),
+  onFlushRequest: (handler) => {
+    const listener = (_event: Electron.IpcRendererEvent, requestId: string) => {
+      void Promise.resolve(handler(requestId));
+    };
+    ipcRenderer.on(IPC_CHANNELS.FLUSH_REQUEST, listener);
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.FLUSH_REQUEST, listener);
+    };
+  },
+  signalFlushComplete: (requestId) => {
+    ipcRenderer.send(IPC_CHANNELS.FLUSH_COMPLETE, requestId);
+  },
 } satisfies ElectronAPI);

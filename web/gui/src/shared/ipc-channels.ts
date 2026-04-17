@@ -7,6 +7,8 @@ export const IPC_CHANNELS = {
   GET_PLATFORM_INFO: "app:getPlatformInfo",
   GET_BACKEND_PORT: "backend:getPort",
   OPEN_MASK_EDITOR: "tools:openMaskEditor",
+  FLUSH_REQUEST: "lifecycle:flushRequest",
+  FLUSH_COMPLETE: "lifecycle:flushComplete",
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

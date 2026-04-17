@@ -21,4 +21,6 @@ export interface ElectronAPI {
   getPlatformInfo: () => Promise<PlatformInfo>;
   getBackendPort: () => Promise<number>;
   openMaskEditor: (folder?: string) => Promise<boolean>;
+  onFlushRequest: (handler: (requestId: string) => Promise<void> | void) => () => void;
+  signalFlushComplete: (requestId: string) => void;
 }
