@@ -45,9 +45,11 @@ web/gui/dist/
 web/gui/release/
 web/gui/node_modules/
 web/gui/package-lock.json
-web/gui/.prettierrc.json
 web/gui/public/ui-schema.json
 web/gui/src/renderer/types/generated/
 web/backend/__pycache__/
 web/backend/**/__pycache__/
 web/backend/generated/
+
+# local worktrees
+.worktrees/

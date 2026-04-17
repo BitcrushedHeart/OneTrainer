@@ -456,6 +456,37 @@ class ToolService(SingletonMixin):
             return "\n".join(hints) + "\n\n" + base_prompt
         return base_prompt
 
+    def _post_with_retry(
+        self, session: requests.Session, url: str, payload: dict,
+        headers: dict, *, max_retries: int = 6, timeout: int = 120, label: str = "API",
+    ) -> dict:
+        r_json: dict = {}
+        for attempt in range(max_retries):
+            if self._cancel_flag:
+                raise InterruptedError("Cancelled")
+            try:
+                response = session.post(url, json=payload, headers=headers, timeout=timeout)
+            except requests.exceptions.ConnectionError:
+                if attempt < max_retries - 1:
+                    wait = min(5 * (2 ** attempt), 60)
+                    time.sleep(wait)
+                    continue
+                raise
+            if response.status_code == 429 and attempt < 1:
+                wait = min(int(response.headers.get("Retry-After", 10)), 30)
+                time.sleep(wait)
+                continue
+            if response.status_code in (500, 502, 503) and attempt < max_retries - 1:
+                wait = min(5 * (attempt + 1), 30)
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            r_json = response.json()
+            break
+        else:
+            raise RuntimeError(f"{label} retries exhausted after {max_retries} attempts")
+        return r_json
+
     def _call_openai_api(
         self, image_path: Path, prompt: str, config: Any, session: requests.Session,
     ) -> str:
@@ -495,32 +526,10 @@ class ToolService(SingletonMixin):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        max_retries = 6
-        r_json: dict = {}
-        for attempt in range(max_retries):
-            if self._cancel_flag:
-                raise InterruptedError("Cancelled")
-            try:
-                response = session.post(api_url, json=payload, headers=headers, timeout=timeout)
-            except requests.exceptions.ConnectionError:
-                if attempt < max_retries - 1:
-                    wait = min(5 * (2 ** attempt), 60)
-                    time.sleep(wait)
-                    continue
-                raise
-            if response.status_code == 429 and attempt < 1:
-                wait = min(int(response.headers.get("Retry-After", 10)), 30)
-                time.sleep(wait)
-                continue
-            if response.status_code in (500, 502, 503) and attempt < max_retries - 1:
-                wait = min(5 * (attempt + 1), 30)
-                time.sleep(wait)
-                continue
-            response.raise_for_status()
-            r_json = response.json()
-            break
-        else:
-            raise RuntimeError(f"OpenAI API retries exhausted after {max_retries} attempts")
+        r_json = self._post_with_retry(
+            session, api_url, payload, headers,
+            max_retries=6, timeout=timeout, label="OpenAI API",
+        )
 
         if "choices" not in r_json or not r_json["choices"]:
             error_detail = r_json.get("error", {})
@@ -563,32 +572,10 @@ class ToolService(SingletonMixin):
 
         headers = {"Content-Type": "application/json"}
 
-        max_retries = 5
-        r_json: dict = {}
-        for attempt in range(max_retries):
-            if self._cancel_flag:
-                raise InterruptedError("Cancelled")
-            try:
-                response = session.post(url, json=payload, headers=headers, timeout=timeout)
-            except requests.exceptions.ConnectionError:
-                if attempt < max_retries - 1:
-                    wait = min(5 * (2 ** attempt), 60)
-                    time.sleep(wait)
-                    continue
-                raise
-            if response.status_code == 429 and attempt < 1:
-                wait = min(int(response.headers.get("Retry-After", 10)), 30)
-                time.sleep(wait)
-                continue
-            if response.status_code in (500, 502, 503) and attempt < max_retries - 1:
-                wait = min(5 * (attempt + 1), 30)
-                time.sleep(wait)
-                continue
-            response.raise_for_status()
-            r_json = response.json()
-            break
-        else:
-            raise RuntimeError(f"Gemini API retries exhausted after {max_retries} attempts")
+        r_json = self._post_with_retry(
+            session, url, payload, headers,
+            max_retries=5, timeout=timeout, label="Gemini API",
+        )
 
         try:
             candidate = r_json["candidates"][0]
@@ -676,60 +663,27 @@ class ToolService(SingletonMixin):
         logger.warning("Tool error processing file: %s", filename)
 
     def _load_captioning_model(self, model_name: str) -> Any:
+        class_name = CAPTION_MODEL_MAP.get(model_name)
+        if class_name is None:
+            return None
+
+        current_type = type(self._captioning_model).__name__ if self._captioning_model else None
+        if current_type == class_name:
+            return self._captioning_model
+
         from modules.util.torch_util import default_device
 
         import torch
 
-        current_type = type(self._captioning_model).__name__ if self._captioning_model else None
-
-        if model_name == "Blip" and current_type != "BlipModel":
-            self._release_models()
-            logger.info("Loading Blip captioning model...")
-            from modules.module.BlipModel import BlipModel
-            self._captioning_model = BlipModel(default_device, torch.float16)
-        elif model_name == "Blip2" and current_type != "Blip2Model":
-            self._release_models()
-            logger.info("Loading Blip2 captioning model...")
-            from modules.module.Blip2Model import Blip2Model
-            self._captioning_model = Blip2Model(default_device, torch.float16)
-        elif model_name == "WD14 VIT v2" and current_type != "WDModel":
-            self._release_models()
-            logger.info("Loading WD14 VIT v2 captioning model...")
-            from modules.module.WDModel import WDModel
-            self._captioning_model = WDModel(default_device, torch.float16)
-        elif model_name not in CAPTION_MODEL_MAP:
-            return None
-
+        self._release_models()
+        logger.info("Loading %s captioning model...", model_name)
+        module = importlib.import_module(f"modules.module.{class_name}")
+        cls = getattr(module, class_name)
+        self._captioning_model = cls(default_device, torch.float16)
         return self._captioning_model
 
     def _load_masking_model(self, model_name: str, model_path: str | None = None) -> Any:
-        from modules.util.torch_util import default_device
-
-        import torch
-
-        current_type = type(self._masking_model).__name__ if self._masking_model else None
-
-        if model_name == "ClipSeg" and current_type != "ClipSegModel":
-            self._release_models()
-            logger.info("Loading ClipSeg masking model...")
-            from modules.module.ClipSegModel import ClipSegModel
-            self._masking_model = ClipSegModel(default_device, torch.float32)
-        elif model_name == "Rembg" and current_type != "RembgModel":
-            self._release_models()
-            logger.info("Loading Rembg masking model...")
-            from modules.module.RembgModel import RembgModel
-            self._masking_model = RembgModel(default_device, torch.float32)
-        elif model_name == "Rembg-Human" and current_type != "RembgHumanModel":
-            self._release_models()
-            logger.info("Loading Rembg-Human masking model...")
-            from modules.module.RembgHumanModel import RembgHumanModel
-            self._masking_model = RembgHumanModel(default_device, torch.float32)
-        elif model_name == "Hex Color" and current_type != "MaskByColor":
-            self._release_models()
-            logger.info("Loading Hex Color masking model...")
-            from modules.module.MaskByColor import MaskByColor
-            self._masking_model = MaskByColor(default_device, torch.float32)
-        elif model_name == "YOLO":
+        if model_name == "YOLO":
             if not importlib.util.find_spec("ultralytics"):
                 raise ImportError(
                     "Ultralytics is not installed. Install it with: pip install ultralytics\n"
@@ -738,14 +692,31 @@ class ToolService(SingletonMixin):
                 )
             if not model_path:
                 raise ValueError("YOLO model requires a .pt model file path")
+            current_type = type(self._masking_model).__name__ if self._masking_model else None
             cached_path = getattr(self._masking_model, "_yolo_model_path", None)
             if current_type != "YOLOMaskAdapter" or cached_path != model_path:
                 self._release_models()
                 logger.info("Loading YOLO masking model from %s...", model_path)
                 self._masking_model = YOLOMaskAdapter(model_path)
-        elif model_name not in MASK_MODEL_MAP:
+            return self._masking_model
+
+        class_name = MASK_MODEL_MAP.get(model_name)
+        if class_name is None:
             return None
 
+        current_type = type(self._masking_model).__name__ if self._masking_model else None
+        if current_type == class_name:
+            return self._masking_model
+
+        from modules.util.torch_util import default_device
+
+        import torch
+
+        self._release_models()
+        logger.info("Loading %s masking model...", model_name)
+        module = importlib.import_module(f"modules.module.{class_name}")
+        cls = getattr(module, class_name)
+        self._masking_model = cls(default_device, torch.float32)
         return self._masking_model
 
     def _release_models(self) -> None:

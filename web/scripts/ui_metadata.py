@@ -269,6 +269,41 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
     },
 }
 
+# Tool-modal dropdown options that don't map 1:1 to a Python enum.
+# The caption/mask tool modals show backend-supported models/modes; the web
+# frontend extends the CTk list (OpenAI/Gemini/YOLO), and backend mode keys are
+# declared as unordered sets (`VALID_CAPTION_MODES`, `VALID_MASK_MODES`) in
+# `web/backend/services/tool_service.py`, so a curated ordering lives here.
+# Entries are (display_label, backend_value) pairs; order determines UI order.
+TOOL_DROPDOWN_OPTIONS: dict[str, list[tuple[str, str]]] = {
+    "CAPTION_MODELS": [
+        ("Blip", "Blip"),
+        ("Blip2", "Blip2"),
+        ("WD14 VIT v2", "WD14 VIT v2"),
+        ("OpenAI Compatible", "OpenAI Compatible"),
+        ("Gemini API", "Gemini API"),
+    ],
+    "CAPTION_MODES": [
+        ("Replace all captions", "replace"),
+        ("Create if absent", "fill"),
+        ("Add as new line", "add"),
+    ],
+    "MASK_MODELS": [
+        ("ClipSeg", "ClipSeg"),
+        ("Rembg", "Rembg"),
+        ("Rembg-Human", "Rembg-Human"),
+        ("Hex Color", "Hex Color"),
+        ("YOLO", "YOLO"),
+    ],
+    "MASK_MODES": [
+        ("Replace all masks", "replace"),
+        ("Create if absent", "fill"),
+        ("Add to existing", "add"),
+        ("Subtract from existing", "subtract"),
+        ("Blend with existing", "blend"),
+    ],
+}
+
 DTYPE_SUBSETS: dict[str, list[tuple[str, str]]] = {
     "base": [
         ("float32", "FLOAT_32"),
