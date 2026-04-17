@@ -246,7 +246,6 @@ def save_concepts(concepts: list[dict]) -> dict:
     try:
         concept_service.save_concepts(concept_path, concepts)
     except Exception as exc:
-        invalidate_thumbnail_cache()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     invalidate_thumbnail_cache()
 
