@@ -93,7 +93,6 @@ interface ConfigState {
   loadSamples: () => Promise<void>;
   loadPreset: (presetPath: string, presetName?: string) => Promise<void>;
   savePreset: (name: string) => Promise<void>;
-  autoLoadPreset: () => Promise<void>;
   changeOptimizer: (optimizer: string) => Promise<void>;
   loadDefaults: () => Promise<void>;
   exportConfig: () => Promise<TrainConfig>;
@@ -337,11 +336,6 @@ export const useConfigStore = create<ConfigState>()(
           draft.isDirty = false;
           draft.loadedPresetName = name;
         });
-        try {
-          localStorage.setItem("onetrainer_last_preset", presetPath);
-        } catch {
-          /* ignore */
-        }
       });
       await Promise.all([get().loadConcepts(), get().loadSamples()]);
     },
@@ -357,37 +351,6 @@ export const useConfigStore = create<ConfigState>()(
       await withLoading(set, async () => {
         await configApi.savePreset(name);
       });
-    },
-
-    autoLoadPreset: async () => {
-      try {
-        const presets = await configApi.listPresets();
-        if (presets.length === 0) return;
-
-        const lastPath = localStorage.getItem("onetrainer_last_preset");
-        if (lastPath) {
-          const match = presets.find((p) => p.path === lastPath);
-          if (match) {
-            await get().loadPreset(match.path, match.name);
-            return;
-          }
-        }
-
-        const zImage = presets.find(
-          (p) => p.name.toLowerCase().includes("z-image") || p.name.toLowerCase().includes("z_image"),
-        );
-        if (zImage) {
-          await get().loadPreset(zImage.path, zImage.name);
-          return;
-        }
-
-        const builtin = presets.find((p) => p.is_builtin);
-        if (builtin) {
-          await get().loadPreset(builtin.path, builtin.name);
-        }
-      } catch {
-        // best-effort; don't fail startup
-      }
     },
 
     changeOptimizer: async (optimizer: string) => {

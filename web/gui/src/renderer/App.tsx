@@ -62,7 +62,6 @@ export default function App() {
   const backendConnected = useUiStore((s) => s.backendConnected);
   const terminalOpen = useUiStore((s) => s.terminalOpen);
   const loadConfig = useConfigStore((s) => s.loadConfig);
-  const autoLoadPreset = useConfigStore((s) => s.autoLoadPreset);
   const fetchTrainingStatus = useTrainingStore((s) => s.fetchStatus);
   const loadSchema = useUiSchemaStore((s) => s.loadSchema);
 
@@ -96,13 +95,12 @@ export default function App() {
     if (!backendConnected) return;
     const init = async () => {
       await loadConfig();
-      await autoLoadPreset();
       await fetchTrainingStatus();
     };
     init().catch((err) => {
       console.error("App initialization failed:", err);
     });
-  }, [backendConnected, loadConfig, autoLoadPreset, fetchTrainingStatus]);
+  }, [backendConnected, loadConfig, fetchTrainingStatus]);
 
   return (
     <div className="app-shell">
