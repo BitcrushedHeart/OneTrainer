@@ -56,14 +56,20 @@ class TensorboardService(SingletonMixin):
             return []
 
         base = Path(resolved)
-        runs: list[str] = []
+        runs: list[tuple[float, str]] = []
         for dirpath, _dirnames, filenames in os.walk(resolved):
-            if any(f.startswith("events.out.tfevents") for f in filenames):
-                rel = Path(dirpath).relative_to(base).as_posix()
-                runs.append(rel)
+            event_files = [f for f in filenames if f.startswith("events.out.tfevents")]
+            if not event_files:
+                continue
+            try:
+                newest_mtime = max(os.path.getmtime(os.path.join(dirpath, f)) for f in event_files)
+            except OSError:
+                continue
+            rel = Path(dirpath).relative_to(base).as_posix()
+            runs.append((newest_mtime, rel))
 
-        runs.sort(reverse=True)
-        return runs
+        runs.sort(key=lambda item: (-item[0], item[1]))
+        return [rel for _, rel in runs]
 
     def _maybe_evict(self) -> None:
         while len(self._accumulators) > MAX_CACHED_ACCUMULATORS:
