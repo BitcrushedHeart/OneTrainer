@@ -721,9 +721,14 @@ def generate_optimizer_info_ts(enums: list[tuple[str, type]]) -> str:
 
     def opt_array(name: str, description: str, opts: list) -> None:
         lines.append(f"/** {description} */")
-        lines.append(f"export const {name}: Optimizer[] = [")
-        lines.extend(f'  "{opt.value}",' for opt in opts)
-        lines.append("];")
+        quoted = [_ts_string(opt.value) for opt in opts]
+        prefix = f"export const {name}: Optimizer[] = "
+        block = _emit_array(quoted, prefix)
+        if len(block) == 1:
+            lines.append(f"{block[0]};")
+        else:
+            block[-1] = f"{block[-1]};"
+            lines.extend(block)
         lines.append("")
 
     opt_array("ADAPTIVE_OPTIMIZERS", "Optimizers with adaptive learning rates.", adaptive)
