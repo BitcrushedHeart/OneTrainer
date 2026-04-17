@@ -3,6 +3,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import sys
 from enum import Enum
 from typing import Any, get_args, get_origin
@@ -14,6 +15,96 @@ from modules.util.config.BaseConfig import BaseConfig
 from modules.util.type_util import issubclass_safe
 
 _incomplete_generation = False
+
+# --- Prettier-compliant emit helpers -----------------------------------------
+# These produce TypeScript that Prettier (printWidth 120, double quotes,
+# trailingComma: all, quoteProps: as-needed) treats as a no-op, so the generated
+# files stay consistent with the project's formatter without a post-format pass.
+
+_PRETTIER_WIDTH = 120
+
+_JS_RESERVED = frozenset({
+    "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+    "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
+    "function", "if", "import", "in", "instanceof", "new", "null", "return", "super",
+    "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
+    "yield", "let", "static", "implements", "interface", "package", "private",
+    "protected", "public", "await", "async",
+})
+
+_JS_IDENT_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def _js_key(key: str) -> str:
+    """Quote object-literal keys only when required (matches Prettier quoteProps: as-needed)."""
+    if _JS_IDENT_RE.match(key) and key not in _JS_RESERVED:
+        return key
+    return json.dumps(key)
+
+
+def _ts_string(s: str) -> str:
+    """Quote a string the way Prettier does: prefer double quotes, switch to single when the
+    string contains more double quotes than single (to minimise backslash escapes)."""
+    double = s.count('"')
+    single = s.count("'")
+    if double > single:
+        # Emit single-quoted with escaping for backslashes and single quotes.
+        escaped = s.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{escaped}'"
+    return json.dumps(s, ensure_ascii=False)
+
+
+def _ts_number(value: float) -> str:
+    """Format a number the way Prettier normalises it (strip leading zero in exponent, keep int-like
+    floats with trailing .0 exactly as JSON emits them)."""
+    rendered = json.dumps(value)
+    # Prettier normalises `1e-08` -> `1e-8`, `3e+06` -> `3e6`, `2.5e+01` -> `2.5e1`.
+    return re.sub(r"e([+-]?)0*(\d)", r"e\1\2", rendered).replace("e+", "e")
+
+
+def _emit_entry(key: str, value: str, indent: str = "  ") -> list[str]:
+    """Emit a single object-literal `key: value,` entry, wrapping if the line exceeds 120 chars."""
+    single = f"{indent}{_js_key(key)}: {value},"
+    if len(single) <= _PRETTIER_WIDTH:
+        return [single]
+    return [f"{indent}{_js_key(key)}:", f"{indent}  {value},"]
+
+
+def _emit_array(items: list[str], prefix: str, indent: str = "") -> list[str]:
+    """Emit an array literal — single-line if the full `{prefix}[{items}]` fits, else multi-line.
+    `indent` is the whitespace prefix on the line where `prefix` starts; items are indented +2."""
+    single = f"{prefix}[{', '.join(items)}]"
+    if len(single) <= _PRETTIER_WIDTH:
+        return [single]
+    lines = [f"{prefix}["]
+    item_indent = indent + "  "
+    lines.extend(f"{item_indent}{item}," for item in items)
+    lines.append(f"{indent}]")
+    return lines
+
+
+def _emit_union_type(name: str, values: list[str]) -> list[str]:
+    """Emit `export type Name = "a" | "b";` on one line if it fits, else multi-line with leading pipes."""
+    quoted = [_ts_string(v) for v in values]
+    single = f"export type {name} = {' | '.join(quoted)};"
+    if len(single) <= _PRETTIER_WIDTH:
+        return [single]
+    lines = [f"export type {name} ="]
+    for i, q in enumerate(quoted):
+        suffix = ";" if i == len(quoted) - 1 else ""
+        lines.append(f"  | {q}{suffix}")
+    return lines
+
+
+def _emit_values_const(name: str, values: list[str]) -> list[str]:
+    """Emit `export const NameValues: Name[] = [...];` single-line if it fits, else multi-line."""
+    quoted = [_ts_string(v) for v in values]
+    prefix = f"export const {name}Values: {name}[] = "
+    block = _emit_array(quoted, prefix)
+    if len(block) == 1:
+        return [f"{block[0]};"]
+    block[-1] = f"{block[-1]};"
+    return block
 
 OUTPUT_DIR = os.path.join(
     PROJECT_ROOT, "web", "gui", "src", "renderer", "types", "generated"
@@ -129,9 +220,10 @@ def python_type_to_ts(py_type: type, nullable: bool, enum_names: set[str]) -> st
                 if dict_args and len(dict_args) == 2:
                     key_ts = python_type_to_ts(dict_args[0], False, enum_names)
                     val_ts = python_type_to_ts(dict_args[1], False, enum_names)
-                    ts = f"Record<{key_ts}, {val_ts}>[]"
+                    # array-type: array-simple requires Array<T> when T is a complex type
+                    ts = f"Array<Record<{key_ts}, {val_ts}>>"
                 else:
-                    ts = "Record<string, unknown>[]"
+                    ts = "Array<Record<string, unknown>>"
             else:
                 ts = "unknown[]"
         else:
@@ -161,16 +253,10 @@ def generate_enums_ts(enums: list[tuple[str, type]]) -> str:
     ]
 
     for name, enum_cls in sorted(enums, key=lambda x: x[0]):
-        members = list(enum_cls)
-        lines.append(f"export type {name} =")
-        for i, member in enumerate(members):
-            separator = ";" if i == len(members) - 1 else ""
-            lines.append(f"  | '{member.value}'{separator}")
+        values = [member.value for member in enum_cls]
+        lines.extend(_emit_union_type(name, values))
         lines.append("")
-
-        lines.append(f"export const {name}Values: {name}[] = [")
-        lines.extend(f"  '{member.value}'," for member in members)
-        lines.append("];")
+        lines.extend(_emit_values_const(name, values))
         lines.append("")
 
     return "\n".join(lines)
@@ -203,8 +289,9 @@ def generate_config_ts(
                         if issubclass_safe(arg, Enum):
                             used_enums.add(arg.__name__)
 
-    lines.extend(f"  {enum_name}," for enum_name in sorted(used_enums))
-    lines.append("} from './enums';")
+    # simple-import-sort/imports uses case-insensitive ordering within a named-import block.
+    lines.extend(f"  {enum_name}," for enum_name in sorted(used_enums, key=str.lower))
+    lines.append('} from "./enums";')
     lines.append("")
 
     generated = set()
@@ -274,7 +361,7 @@ def generate_metadata_ts(
         "// Do not edit manually. Regenerate when backend config classes change.",
         "",
         "export interface FieldMetadata {",
-        "  type: 'string' | 'number' | 'boolean' | 'enum' | 'config' | 'list' | 'dict';",
+        '  type: "string" | "number" | "boolean" | "enum" | "config" | "list" | "dict";',
         "  nullable: boolean;",
         "  enumType?: string;",
         "  configType?: string;",
@@ -343,9 +430,9 @@ def generate_metadata_ts(
                 elif default_value == float("-inf"):
                     default_json = '"-Infinity"'
                 else:
-                    default_json = json.dumps(default_value)
+                    default_json = _ts_number(default_value)
             elif isinstance(default_value, str):
-                default_json = json.dumps(default_value)
+                default_json = _ts_string(default_value)
             elif isinstance(default_value, Enum):
                 default_json = json.dumps(str(default_value))
             elif isinstance(default_value, BaseConfig):
@@ -357,13 +444,20 @@ def generate_metadata_ts(
             else:
                 default_json = "null"
 
-            enum_str = f', enumType: "{enum_type}"' if enum_type else ""
-            config_str = f', configType: "{config_type}"' if config_type else ""
+            parts = [f'type: "{meta_type}"', f"nullable: {str(nullable).lower()}"]
+            if enum_type:
+                parts.append(f'enumType: "{enum_type}"')
+            if config_type:
+                parts.append(f'configType: "{config_type}"')
+            parts.append(f"defaultValue: {default_json}")
 
-            lines.append(
-                f'  {field_name}: {{ type: "{meta_type}", nullable: {str(nullable).lower()}'
-                f"{enum_str}{config_str}, defaultValue: {default_json} }},"
-            )
+            single = f"  {_js_key(field_name)}: {{ {', '.join(parts)} }},"
+            if len(single) <= _PRETTIER_WIDTH:
+                lines.append(single)
+            else:
+                lines.append(f"  {_js_key(field_name)}: {{")
+                lines.extend(f"    {part}," for part in parts)
+                lines.append("  },")
 
         lines.append("};")
         lines.append("")
@@ -386,7 +480,7 @@ def generate_model_type_info_ts(enums: list[tuple[str, type]]) -> str:
         "// Auto-generated by web/scripts/generate_types.py",
         "// Do not edit manually. Regenerate when backend ModelType or TopBar logic changes.",
         "",
-        "import type { ModelType, TrainingMethod } from './enums';",
+        'import type { ModelType, TrainingMethod } from "./enums";',
         "",
     ]
 
@@ -404,8 +498,11 @@ def generate_model_type_info_ts(enums: list[tuple[str, type]]) -> str:
             mt.value for mt in ModelType if _safe_call_method(mt, method_name)
         ]
         if members_in_group:
-            members_str = ", ".join(f'"{m}"' for m in members_in_group)
-            lines.append(f"  {method_name}: [{members_str}],")
+            quoted = [json.dumps(m) for m in members_in_group]
+            prefix = f"  {_js_key(method_name)}: "
+            block = _emit_array(quoted, prefix, indent="  ")
+            block[-1] = f"{block[-1]},"
+            lines.extend(block)
     lines.append("};")
     lines.append("")
 
@@ -416,8 +513,11 @@ def generate_model_type_info_ts(enums: list[tuple[str, type]]) -> str:
             method_name for method_name in group_methods
             if _safe_call_method(mt, method_name)
         ]
-        flags_str = ", ".join(f'"{f}"' for f in flags)
-        lines.append(f'  "{mt.value}": [{flags_str}],')
+        quoted = [json.dumps(f) for f in flags]
+        prefix = f"  {_js_key(mt.value)}: "
+        block = _emit_array(quoted, prefix, indent="  ")
+        block[-1] = f"{block[-1]},"
+        lines.extend(block)
     lines.append("};")
     lines.append("")
 
@@ -434,8 +534,11 @@ def generate_model_type_info_ts(enums: list[tuple[str, type]]) -> str:
             methods = [TrainingMethod.FINE_TUNE, TrainingMethod.LORA]
         else:
             methods = [TrainingMethod.FINE_TUNE, TrainingMethod.LORA, TrainingMethod.EMBEDDING]
-        methods_str = ", ".join(f'"{m.value}"' for m in methods)
-        lines.append(f'  "{mt.value}": [{methods_str}],')
+        quoted = [json.dumps(m.value) for m in methods]
+        prefix = f"  {_js_key(mt.value)}: "
+        block = _emit_array(quoted, prefix, indent="  ")
+        block[-1] = f"{block[-1]},"
+        lines.extend(block)
     lines.append("};")
     lines.append("")
 
@@ -506,7 +609,7 @@ def generate_layer_presets_ts() -> str:
         "// Auto-generated by web/scripts/generate_types.py",
         "// Do not edit manually. Regenerate when backend Base*Setup.LAYER_PRESETS change.",
         "",
-        "import type { ModelType } from './enums';",
+        'import type { ModelType } from "./enums";',
         "",
         "export interface LayerPresetDef {",
         "  patterns: string[];",
@@ -530,14 +633,24 @@ def generate_layer_presets_ts() -> str:
 
     for mt_value in sorted(presets_by_model.keys()):
         preset_map = presets_by_model[mt_value]
-        lines.append(f"  {json.dumps(mt_value)}: {{")
+        lines.append(f"  {_js_key(mt_value)}: {{")
         for preset_name in preset_map:
             defn = preset_map[preset_name]
-            patterns_str = ", ".join(json.dumps(p) for p in defn["patterns"])
+            quoted_patterns = [json.dumps(p) for p in defn["patterns"]]
             regex_str = "true" if defn["regex"] else "false"
-            lines.append(
-                f"    {json.dumps(preset_name)}: {{ patterns: [{patterns_str}], regex: {regex_str} }},"
-            )
+            patterns_inline = f"[{', '.join(quoted_patterns)}]"
+            value = f"{{ patterns: {patterns_inline}, regex: {regex_str} }}"
+            single = f"    {_js_key(preset_name)}: {value},"
+            if len(single) <= _PRETTIER_WIDTH:
+                lines.append(single)
+            else:
+                lines.append(f"    {_js_key(preset_name)}: {{")
+                patterns_prefix = "      patterns: "
+                patterns_block = _emit_array(quoted_patterns, patterns_prefix, indent="      ")
+                patterns_block[-1] = f"{patterns_block[-1]},"
+                lines.extend(patterns_block)
+                lines.append(f"      regex: {regex_str},")
+                lines.append("    },")
         lines.append("  },")
 
     lines.append("};")
@@ -559,7 +672,7 @@ def generate_loss_weight_info_ts() -> str:
         "// Auto-generated by web/scripts/generate_types.py",
         "// Do not edit manually. Regenerate when LossWeight.supports_flow_matching changes.",
         "",
-        "import type { LossWeight } from './enums';",
+        'import type { LossWeight } from "./enums";',
         "",
         "/**",
         " * Maps each LossWeight value to whether it supports flow-matching models.",
@@ -572,7 +685,7 @@ def generate_loss_weight_info_ts() -> str:
 
     for member in LossWeight:
         flag = "true" if member.supports_flow_matching() else "false"
-        lines.append(f'  "{member.value}": {flag},')
+        lines.append(f"  {_js_key(member.value)}: {flag},")
 
     lines.append("};")
     lines.append("")
@@ -598,7 +711,7 @@ def generate_optimizer_info_ts(enums: list[tuple[str, type]]) -> str:
         "// Auto-generated by web/scripts/generate_types.py",
         "// Do not edit manually. Regenerate when backend optimizer definitions change.",
         "",
-        "import type { Optimizer } from './enums';",
+        'import type { Optimizer } from "./enums";',
         "",
     ]
 
@@ -617,17 +730,22 @@ def generate_optimizer_info_ts(enums: list[tuple[str, type]]) -> str:
     opt_array("SCHEDULE_FREE_OPTIMIZERS", "Schedule-free optimizers.", schedule_free)
     opt_array("FUSED_BACK_PASS_OPTIMIZERS", "Optimizers that support fused backward pass.", fused_back_pass)
 
+    # Prettier reformats a Record<K, { ... multi-line inline object ... }> into this 5-line
+    # wrapper form, so emit that shape directly.
     lines.append("/** Per-optimizer boolean property flags. */")
-    lines.append("export const OPTIMIZER_FLAGS: Record<Optimizer, {")
-    lines.append("  isAdaptive: boolean;")
-    lines.append("  isScheduleFree: boolean;")
-    lines.append("  supportsFusedBackPass: boolean;")
-    lines.append("}> = {")
+    lines.append("export const OPTIMIZER_FLAGS: Record<")
+    lines.append("  Optimizer,")
+    lines.append("  {")
+    lines.append("    isAdaptive: boolean;")
+    lines.append("    isScheduleFree: boolean;")
+    lines.append("    supportsFusedBackPass: boolean;")
+    lines.append("  }")
+    lines.append("> = {")
     for opt in Optimizer:
         a = "true" if opt.is_adaptive else "false"
         sf = "true" if opt.is_schedule_free else "false"
         fb = "true" if opt.supports_fused_back_pass() else "false"
-        lines.append(f'  "{opt.value}": {{ isAdaptive: {a}, isScheduleFree: {sf}, supportsFusedBackPass: {fb} }},')
+        lines.append(f"  {_js_key(opt.value)}: {{ isAdaptive: {a}, isScheduleFree: {sf}, supportsFusedBackPass: {fb} }},")
     lines.append("};")
     lines.append("")
 
@@ -641,13 +759,13 @@ def generate_optimizer_info_ts(enums: list[tuple[str, type]]) -> str:
                 return "Infinity"
             elif v == float("-inf"):
                 return "-Infinity"
-            return json.dumps(v)
+            return _ts_number(v)
         elif isinstance(v, str):
-            return json.dumps(v)
+            return _ts_string(v)
         elif isinstance(v, dict):
             if not v:
                 return "{}"
-            pairs = ", ".join(f"{json.dumps(str(k))}: {serialize_value(vv)}" for k, vv in v.items())
+            pairs = ", ".join(f"{_js_key(str(k))}: {serialize_value(vv)}" for k, vv in v.items())
             return f"{{ {pairs} }}"
         elif isinstance(v, list):
             if not v:
@@ -655,21 +773,20 @@ def generate_optimizer_info_ts(enums: list[tuple[str, type]]) -> str:
             items = ", ".join(serialize_value(item) for item in v)
             return f"[{items}]"
         elif isinstance(v, Enum):
-            return json.dumps(str(v))
+            return _ts_string(str(v))
         else:
-            return json.dumps(str(v))
+            return _ts_string(str(v))
 
     lines.append("/** Default parameter values per optimizer (from optimizer_util.py). */")
-    lines.append("// eslint-disable-next-line @typescript-eslint/no-explicit-any")
-    lines.append("export const OPTIMIZER_DEFAULTS: Record<Optimizer, Record<string, any>> = {")
+    lines.append("export const OPTIMIZER_DEFAULTS: Record<Optimizer, Record<string, unknown>> = {")
     for opt in Optimizer:
         defaults = OPTIMIZER_DEFAULT_PARAMETERS.get(opt, {})
         if not defaults:
-            lines.append(f'  "{opt.value}": {{}},')
+            lines.append(f"  {_js_key(opt.value)}: {{}},")
             continue
-        lines.append(f'  "{opt.value}": {{')
+        lines.append(f"  {_js_key(opt.value)}: {{")
         for key, val in defaults.items():
-            lines.append(f"    {json.dumps(key)}: {serialize_value(val)},")
+            lines.extend(_emit_entry(key, serialize_value(val), indent="    "))
         lines.append("  },")
     lines.append("};")
     lines.append("")
@@ -802,7 +919,7 @@ def generate_optimizer_key_details_ts() -> str:
         "export interface OptimizerKeyDetail {",
         "  title: string;",
         "  tooltip: string;",
-        "  type: \"bool\" | \"float\" | \"int\" | \"str\" | \"dict\";",
+        '  type: "bool" | "float" | "int" | "str" | "dict";',
         "}",
         "",
         "export const OPTIMIZER_KEY_DETAILS: Record<string, OptimizerKeyDetail> = {",
@@ -810,10 +927,19 @@ def generate_optimizer_key_details_ts() -> str:
 
     for key in sorted(key_detail_map.keys()):
         detail = key_detail_map[key]
-        title = json.dumps(detail["title"])
-        tooltip = json.dumps(detail["tooltip"])
-        detail_type = json.dumps(detail["type"])
-        lines.append(f"  {json.dumps(key)}: {{ title: {title}, tooltip: {tooltip}, type: {detail_type} }},")
+        title = _ts_string(detail["title"])
+        tooltip = _ts_string(detail["tooltip"])
+        detail_type = _ts_string(detail["type"])
+        inline = f"{{ title: {title}, tooltip: {tooltip}, type: {detail_type} }}"
+        single = f"  {_js_key(key)}: {inline},"
+        if len(single) <= _PRETTIER_WIDTH:
+            lines.append(single)
+        else:
+            lines.append(f"  {_js_key(key)}: {{")
+            lines.append(f"    title: {title},")
+            lines.extend(_emit_entry("tooltip", tooltip, indent="    "))
+            lines.append(f"    type: {detail_type},")
+            lines.append("  },")
 
     lines.append("};")
     lines.append("")
@@ -876,18 +1002,19 @@ def generate_enum_labels_ts(enums: list[tuple[str, type]]) -> str:
             flat_labels[member.value] = overrides.get(member.value, _auto_label(member.value))
 
     lines.append("const labels: Record<string, string> = {")
-    lines.extend(
-        f"  {json.dumps(value)}: {json.dumps(flat_labels[value])},"
-        for value in sorted(flat_labels.keys())
-    )
+    for value in sorted(flat_labels.keys()):
+        lines.extend(_emit_entry(value, _ts_string(flat_labels[value])))
     lines.append("};")
     lines.append("")
 
     lines.append("function formatFallback(value: string): string {")
     lines.append("  return value")
     lines.append('    .replace(/_/g, " ")')
-    lines.append('    .replace(/\\b([A-Za-z])([A-Za-z]*)\\b/g, (_match, first: string, rest: string) =>')
-    lines.append("      first.toUpperCase() + rest.toLowerCase(),")
+    lines.append("    .replace(")
+    lines.append("      /\\b([A-Za-z])([A-Za-z]*)\\b/g,")
+    lines.append(
+        "      (_match, first: string, rest: string) => first.toUpperCase() + rest.toLowerCase(),"
+    )
     lines.append("    );")
     lines.append("}")
     lines.append("")
@@ -911,7 +1038,7 @@ def generate_data_type_subsets_ts() -> str:
         "// Auto-generated by web/scripts/generate_types.py",
         "// Do not edit manually. Update subsets in web/scripts/ui_metadata.py.",
         "",
-        "import type { DataType } from './enums';",
+        'import type { DataType } from "./enums";',
         "",
         "export interface DTypeOption {",
         "  label: string;",
@@ -922,7 +1049,7 @@ def generate_data_type_subsets_ts() -> str:
 
     lines.append("export const DTYPE_SUBSETS: Record<string, DTypeOption[]> = {")
     for subset_name, options in DTYPE_SUBSETS.items():
-        lines.append(f"  {subset_name}: [")
+        lines.append(f"  {_js_key(subset_name)}: [")
         for label, value in options:
             lines.append(f"    {{ label: {json.dumps(label)}, value: {json.dumps(value)} }},")
         lines.append("  ],")
@@ -961,12 +1088,12 @@ def generate_tooltips_ts(configs: list[tuple[str, type]]) -> str:
     lines.append("export const FIELD_TOOLTIPS: Record<string, string> = {")
     for key in sorted(all_tooltips.keys()):
         tooltip = all_tooltips[key]
-        lines.append(f"  {json.dumps(key)}: {json.dumps(tooltip)},")
+        lines.extend(_emit_entry(key, _ts_string(tooltip)))
     lines.append("};")
     lines.append("")
 
     lines.append("/** Field keys that require wide tooltip display. */")
-    lines.append("export const WIDE_TOOLTIP_KEYS: Set<string> = new Set([")
+    lines.append("export const WIDE_TOOLTIP_KEYS = new Set<string>([")
     lines.extend(f"  {json.dumps(key)}," for key in sorted(WIDE_TOOLTIPS))
     lines.append("]);")
     lines.append("")
