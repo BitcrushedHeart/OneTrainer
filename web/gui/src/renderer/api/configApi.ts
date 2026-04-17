@@ -98,7 +98,9 @@ export const configApi = {
       total: number;
       offset: number;
       images: Array<{ filename: string; path: string; caption: string | null }>;
-    }>(`/concepts/images?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}&include_subdirectories=${includeSubdirectories}`),
+    }>(
+      `/concepts/images?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}&include_subdirectories=${includeSubdirectories}`,
+    ),
 
   conceptTextFile: (path: string) =>
     request<{ content: string }>(`/concepts/text-file?path=${encodeURIComponent(path)}`),
