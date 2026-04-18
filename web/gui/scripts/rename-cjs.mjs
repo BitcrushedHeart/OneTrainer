@@ -1,7 +1,9 @@
-// Handles CJS/ESM split: main files -> .cjs, preload stays .js, shared duplicated as both.
-// Electron's sandbox loader only resolves .js for preload scripts.
-import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { basename, dirname, join } from "path";
+// Renames tsc's .js output to .cjs so Node loads it as CommonJS — package.json
+// sets "type": "module", which would otherwise treat .js as ESM and refuse the
+// emitted require()/exports syntax. Shared files are duplicated (.js kept for
+// any future ESM consumer, .cjs produced for the main/preload loader).
+import { copyFileSync, readdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { join } from "path";
 
 const distMain = new URL("../dist/main", import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1");
 
@@ -16,51 +18,31 @@ function walk(dir) {
 }
 
 const allJsFiles = walk(distMain).filter((f) => f.endsWith(".js"));
-
-const KEEP_JS = new Set(["preload.js"]);
 const sharedDir = join(distMain, "shared");
 
 const mainFiles = [];
 const sharedFiles = [];
-const preloadFiles = [];
 
 for (const f of allJsFiles) {
-  if (KEEP_JS.has(basename(f))) {
-    preloadFiles.push(f);
-  } else if (f.startsWith(sharedDir)) {
-    sharedFiles.push(f);
-  } else {
-    mainFiles.push(f);
-  }
+  if (f.startsWith(sharedDir)) sharedFiles.push(f);
+  else mainFiles.push(f);
 }
 
-// Rewrite relative requires in main AND preload to reference the .cjs duplicates
-// we emit below for shared files. Without this, Electron's sandboxed preloadRequire
-// fails to resolve "../shared/ipc-channels" (package.json "type": "module" means the
-// bare .js file is treated as ESM, which the sandbox can't load), so the preload
-// crashes and window.electronAPI is never defined — every folder/file picker dies.
-for (const file of [...mainFiles, ...preloadFiles]) {
+for (const file of mainFiles) {
   let content = readFileSync(file, "utf8");
   content = content.replace(/require\("(\.[^"]+?)"\)/g, (match, p1) => {
     if (p1.endsWith(".json") || p1.endsWith(".html") || p1.endsWith(".node")) return match;
-    const target = p1.split("/").pop();
-    if (KEEP_JS.has(`${target}.js`)) return match;
     return `require("${p1}.cjs")`;
   });
   writeFileSync(file, content, "utf8");
 }
 
 for (const file of sharedFiles) {
-  const cjsPath = file.replace(/\.js$/, ".cjs");
-  copyFileSync(file, cjsPath);
+  copyFileSync(file, file.replace(/\.js$/, ".cjs"));
 }
 
 for (const file of mainFiles) {
   renameSync(file, file.replace(/\.js$/, ".cjs"));
 }
 
-console.log(
-  `Main: ${mainFiles.length} renamed to .cjs | ` +
-    `Shared: ${sharedFiles.length} duplicated (.js + .cjs) | ` +
-    `Preload: ${preloadFiles.length} kept as .js`,
-);
+console.log(`Main: ${mainFiles.length} renamed to .cjs | Shared: ${sharedFiles.length} duplicated (.js + .cjs)`);

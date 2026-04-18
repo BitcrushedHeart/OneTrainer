@@ -323,9 +323,14 @@ function createWindow(): Promise<BrowserWindow> {
       icon: getAppIcon(),
       show: false,
       webPreferences: {
-        preload: path.join(__dirname, "preload.js"),
+        preload: path.join(__dirname, "preload.cjs"),
         contextIsolation: true,
         nodeIntegration: false,
+        // Electron's default sandboxed preload loader can't require() relative
+        // files — it'd break our shared/ipc-channels import. contextIsolation
+        // plus nodeIntegration:false is still the real renderer security
+        // boundary; disabling sandbox just lets the preload use full Node.
+        sandbox: false,
       },
     });
     mainWindow = win;
@@ -470,9 +475,10 @@ function registerIpcHandlers(): void {
       title: "Mask Editor - OneTrainer",
       icon: getAppIcon(),
       webPreferences: {
-        preload: path.join(__dirname, "preload.js"),
+        preload: path.join(__dirname, "preload.cjs"),
         contextIsolation: true,
         nodeIntegration: false,
+        sandbox: false,
       },
     });
 
