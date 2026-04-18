@@ -34,7 +34,12 @@ for (const f of allJsFiles) {
   }
 }
 
-for (const file of mainFiles) {
+// Rewrite relative requires in main AND preload to reference the .cjs duplicates
+// we emit below for shared files. Without this, Electron's sandboxed preloadRequire
+// fails to resolve "../shared/ipc-channels" (package.json "type": "module" means the
+// bare .js file is treated as ESM, which the sandbox can't load), so the preload
+// crashes and window.electronAPI is never defined — every folder/file picker dies.
+for (const file of [...mainFiles, ...preloadFiles]) {
   let content = readFileSync(file, "utf8");
   content = content.replace(/require\("(\.[^"]+?)"\)/g, (match, p1) => {
     if (p1.endsWith(".json") || p1.endsWith(".html") || p1.endsWith(".node")) return match;
