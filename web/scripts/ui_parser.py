@@ -167,7 +167,17 @@ def _extract_enum_ref(node: ast.expr) -> str | None:
     return None
 
 
-def _extract_kv_options(node: ast.expr) -> list[dict[str, str]] | None:
+def _extract_kv_options(
+    node: ast.expr,
+    local_lists: dict[str, ast.List] | None = None,
+) -> list[dict[str, str]] | None:
+    # Resolve `options_kv(..., my_var, ...)` where `my_var = [(label, Enum.X), ...]`
+    # is assigned at the top of the enclosing method (e.g. RLHFTab.refresh_ui).
+    if isinstance(node, ast.Name) and local_lists:
+        resolved = local_lists.get(node.id)
+        if resolved is None:
+            return None
+        node = resolved
     if not isinstance(node, ast.List):
         return None
     options = []
@@ -221,6 +231,25 @@ class CtkTabParser:
         self._tree: ast.Module | None = None
         self._source: str = ""
         self._class_node: ast.ClassDef | None = None
+        # Populated per section: top-level `name = [...]` assignments in the
+        # method being walked, so options_kv calls that reference a local list
+        # variable (e.g. RLHFTab.refresh_ui) can resolve it.
+        self._local_lists: dict[str, ast.List] = {}
+
+    @staticmethod
+    def _collect_local_list_assignments(stmts: list[ast.stmt]) -> dict[str, ast.List]:
+        result: dict[str, ast.List] = {}
+        for stmt in stmts:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            if not isinstance(stmt.value, ast.List):
+                continue
+            if len(stmt.targets) != 1:
+                continue
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name):
+                result[target.id] = stmt.value
+        return result
 
     def parse_file(self, filepath: str | Path) -> ParsedTab | None:
         filepath = Path(filepath)
@@ -654,7 +683,12 @@ class CtkTabParser:
         fields: list[ParsedField] = []
         subframe_map: dict[str, tuple[str, int, int]] = {}
 
-        self._walk_for_components(stmts, labels, fields, "frame", method, None, subframe_map)
+        prev_locals = self._local_lists
+        self._local_lists = self._collect_local_list_assignments(stmts)
+        try:
+            self._walk_for_components(stmts, labels, fields, "frame", method, None, subframe_map)
+        finally:
+            self._local_lists = prev_locals
 
         if not fields:
             return None
@@ -763,7 +797,12 @@ class CtkTabParser:
         fields: list[ParsedField] = []
         subframe_map: dict[str, tuple[str, int, int]] = {}
 
-        self._walk_for_components(method.body, labels, fields, "frame", method, call_kwargs, subframe_map)
+        prev_locals = self._local_lists
+        self._local_lists = self._collect_local_list_assignments(method.body)
+        try:
+            self._walk_for_components(method.body, labels, fields, "frame", method, call_kwargs, subframe_map)
+        finally:
+            self._local_lists = prev_locals
 
         self._correlate_labels_to_fields(labels, fields, subframe_map)
 
@@ -923,7 +962,7 @@ class CtkTabParser:
         elif widget == "options_kv":
             if len(call.args) >= 6:
                 field.key = _get_str(call.args[5]) or ""
-                field.kv_options = _extract_kv_options(call.args[3])
+                field.kv_options = _extract_kv_options(call.args[3], self._local_lists)
                 if field.kv_options is None:
                     field.dtype_subset = _extract_dtype_subset(call.args[3])
             field.widget_type = "select-kv"

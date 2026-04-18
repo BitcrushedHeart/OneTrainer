@@ -26,8 +26,8 @@ const python =
 console.log(`[generate-types] Using Python: ${python}`);
 console.log(`[generate-types] Project root: ${projectRoot}`);
 
-try {
-  execFileSync(python, ["-m", "web.scripts.generate_types"], {
+const runModule = (mod, label) => {
+  execFileSync(python, ["-m", mod], {
     cwd: projectRoot,
     stdio: "inherit",
     env: { ...process.env, PYTHONUNBUFFERED: "1" },
@@ -38,7 +38,12 @@ try {
     // false, eliminating shell interpretation entirely.
     shell: isWindows,
   });
-  console.log("[generate-types] Complete.");
+  console.log(`[${label}] Complete.`);
+};
+
+try {
+  runModule("web.scripts.generate_types", "generate-types");
+  runModule("web.scripts.generate_ui_schema", "generate-ui-schema");
 } catch (err) {
   console.error("[generate-types] Failed:", err.message);
   process.exit(1);
