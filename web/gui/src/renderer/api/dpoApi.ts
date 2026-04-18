@@ -65,12 +65,34 @@ export interface SelectResponse {
   error?: string;
   phase?: string;
   best?: string;
+  // pair_pending: user picked best+worst but backend held the write so the UI
+  // can offer Confirm / Pick More / Cancel. Resolve with confirmPair/cancelPair.
+  pair_pending?: boolean;
+  // pair_created: backend auto-committed (final pair in the group — no Cancel
+  // option would be meaningful, matches Ctk).
   pair_created?: boolean;
   chosen?: string;
   rejected?: string;
   continue_group?: boolean;
   remaining_images?: string[];
   pairs_done?: number;
+}
+
+export interface ConfirmPairResponse {
+  ok: boolean;
+  error?: string;
+  committed?: boolean;
+  continue_group?: boolean;
+  remaining_images?: string[];
+  pairs_done?: number;
+}
+
+export interface CancelPairResponse {
+  ok: boolean;
+  error?: string;
+  phase?: string;
+  best?: string;
+  remaining_images?: string[];
 }
 
 export const dpoApi = {
@@ -118,6 +140,14 @@ export const dpoApi = {
       method: "POST",
       body: JSON.stringify({ path }),
     }),
+
+  confirmPair: (continueScoring: boolean) =>
+    request<ConfirmPairResponse>("/dpo/session/confirm-pair", {
+      method: "POST",
+      body: JSON.stringify({ continue_scoring: continueScoring }),
+    }),
+
+  cancelPair: () => request<CancelPairResponse>("/dpo/session/cancel-pair", { method: "POST" }),
 
   skipGroup: () => request<{ ok: boolean }>("/dpo/session/skip-group", { method: "POST" }),
 

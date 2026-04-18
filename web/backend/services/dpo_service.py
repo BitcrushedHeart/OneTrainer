@@ -42,6 +42,11 @@ class DPOService(SingletonMixin):
         self._selection_phase = "best"  # "best" or "worst"
         self._selected_best: str | None = None
         self._pairs_created_in_group = 0
+        # Held when the user has picked both best and worst but has not yet
+        # confirmed the pair. No file is written and no counters advance
+        # until confirm_pair commits or cancel_pending_pair discards it —
+        # matches the Ctk yes/no/cancel dialog semantics.
+        self._pending_pair: dict | None = None
 
         # ELO mode state (per-group)
         self._elo_ratings: dict[str, float] = {}
@@ -255,6 +260,7 @@ class DPOService(SingletonMixin):
             self._remaining_images = list(group["images"])
             self._selection_phase = "best"
             self._selected_best = None
+            self._pending_pair = None
 
             if self._mode == "elo":
                 self._elo_init(self._remaining_images)
@@ -295,6 +301,61 @@ class DPOService(SingletonMixin):
             rejected = path
             group = self._current_group
 
+            # If there'd still be ≥2 images left in the group after this pair,
+            # defer the write so the UI can offer Confirm / Pick More / Cancel
+            # (matches Ctk). Cancel must be a real undo — so we don't mutate
+            # _remaining_images, _pairs_created_in_group, _selection_phase, or
+            # _selected_best until confirm_pair commits. On the last-possible
+            # pair (can_continue == False) there's no meaningful Cancel, so
+            # commit inline — same as Ctk, which also skips the dialog there.
+            potential_remaining = [
+                i for i in self._remaining_images if i not in {chosen, rejected}
+            ]
+            can_continue = len(potential_remaining) >= 2
+
+            if can_continue:
+                self._pending_pair = {"chosen": chosen, "rejected": rejected}
+                return {
+                    "ok": True,
+                    "pair_pending": True,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                }
+
+            export_single_pair(
+                self._output_dir, self._manifest,
+                chosen, rejected,
+                group["prompt"], group["aspectratio"],
+            )
+            self._remaining_images = potential_remaining
+            self._pairs_created_in_group += 1
+            self._selection_phase = "best"
+            self._selected_best = None
+            return {
+                "ok": True,
+                "pair_created": True,
+                "chosen": chosen,
+                "rejected": rejected,
+                "continue_group": False,
+                "pairs_done": self._pairs_created_in_group,
+            }
+
+    def confirm_pair(self, continue_scoring: bool) -> dict:
+        """Commit the pending pair picked via select_image and decide whether to
+        stay in the current group or advance. Mirrors Ctk Yes (keep scoring) /
+        No (next group) from the askyesnocancel dialog."""
+        from modules.util.dpo_curation_util import export_single_pair
+
+        with self._lock:
+            if not self._pending_pair:
+                return {"ok": False, "error": "No pending pair to confirm"}
+            if not self._current_group:
+                return {"ok": False, "error": "No active group"}
+
+            chosen = self._pending_pair["chosen"]
+            rejected = self._pending_pair["rejected"]
+            group = self._current_group
+
             export_single_pair(
                 self._output_dir, self._manifest,
                 chosen, rejected,
@@ -305,10 +366,13 @@ class DPOService(SingletonMixin):
                 i for i in self._remaining_images if i not in {chosen, rejected}
             ]
             self._pairs_created_in_group += 1
+            self._pending_pair = None
 
             is_unconditional = group["prompt"] == "UNCONDITIONAL"
             keep_going = (
-                is_unconditional or self._pairs_created_in_group < self._pairs_per_group
+                continue_scoring
+                or is_unconditional
+                or self._pairs_created_in_group < self._pairs_per_group
             )
             can_continue = len(self._remaining_images) >= 2
 
@@ -317,25 +381,45 @@ class DPOService(SingletonMixin):
                 self._selected_best = None
                 return {
                     "ok": True,
-                    "pair_created": True,
-                    "chosen": chosen,
-                    "rejected": rejected,
+                    "committed": True,
                     "continue_group": True,
                     "remaining_images": self._remaining_images,
                     "pairs_done": self._pairs_created_in_group,
                 }
-            else:
-                return {
-                    "ok": True,
-                    "pair_created": True,
-                    "chosen": chosen,
-                    "rejected": rejected,
-                    "continue_group": False,
-                    "pairs_done": self._pairs_created_in_group,
-                }
+            return {
+                "ok": True,
+                "committed": True,
+                "continue_group": False,
+                "pairs_done": self._pairs_created_in_group,
+            }
+
+    def cancel_pending_pair(self) -> dict:
+        """Discard the pending pair without writing it. _selection_phase stays
+        'worst' and _selected_best is preserved, so the user returns to the
+        worst-pick UI with the same best image and can try a different worst —
+        same as Ctk's Cancel branch (messagebox.askyesnocancel result is None)."""
+        with self._lock:
+            if not self._pending_pair:
+                return {"ok": False, "error": "No pending pair to cancel"}
+            self._pending_pair = None
+            remaining_for_worst = [
+                i for i in self._remaining_images if i != self._selected_best
+            ]
+            return {
+                "ok": True,
+                "phase": self._selection_phase,
+                "best": self._selected_best,
+                "remaining_images": remaining_for_worst,
+            }
 
     def skip_group(self) -> dict:
+        # Clear per-group selection state so a stale _pending_pair or
+        # _selected_best can't leak into the next group if, for any reason,
+        # fetch_next_group isn't the immediate next call.
         self._current_group = None
+        self._pending_pair = None
+        self._selected_best = None
+        self._selection_phase = "best"
         return {"ok": True}
 
     def finalize_session(self, val_percentage: float = 0.0) -> dict:
@@ -343,6 +427,10 @@ class DPOService(SingletonMixin):
 
         if not self._output_dir:
             return {"ok": False, "error": "No session active"}
+        if self._pending_pair is not None:
+            # Refuse to finalize while a pair is waiting on the user —
+            # otherwise that selection would be silently dropped.
+            return {"ok": False, "error": "Confirm or cancel the pending pair first"}
 
         train_count, val_count = finalize_export(
             self._output_dir, self._manifest, val_percentage=val_percentage
@@ -363,6 +451,7 @@ class DPOService(SingletonMixin):
         self._worker_stop.set()
         self._session_active = False
         self._current_group = None
+        self._pending_pair = None
         return {"ok": True}
 
     def serve_image(self, path: str) -> str | None:

@@ -92,7 +92,7 @@ export function DPOToolModal({ open, onClose }: Props) {
           group={group}
           onPick={actions.pickImage}
           onAcceptPair={(keepScoring) => void actions.confirmPair(keepScoring)}
-          onDismissPair={actions.cancelPendingPair}
+          onDismissPair={() => void actions.cancelPendingPair()}
           onSkipGroup={() => void actions.skipGroup()}
           onCancel={() => void actions.cancelSession()}
           phase={phase}

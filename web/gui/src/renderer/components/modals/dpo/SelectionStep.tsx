@@ -42,18 +42,20 @@ export function SelectionStep({
     }
   }, [previewPath, remainingImages]);
 
-  // Esc inside the accept-pair dialog should dismiss (treat as "advance").
+  // Esc inside the accept-pair dialog is Cancel — discards the pending pair
+  // (no file written) and returns to the worst-pick UI. Matches Ctk's Cancel
+  // branch of askyesnocancel. Capture-phase stopPropagation so ModalBase's
+  // document-level Escape handler doesn't also close the whole modal.
   useEffect(() => {
     if (!showAcceptDialog) return;
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onAcceptPair(false);
-      }
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onDismissPair();
     };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [showAcceptDialog, onAcceptPair]);
+    window.addEventListener("keydown", handleKey, true);
+    return () => window.removeEventListener("keydown", handleKey, true);
+  }, [showAcceptDialog, onDismissPair]);
 
   const handleThumbClick = (path: string) => {
     setPreviewPath(path);
@@ -184,7 +186,7 @@ export function SelectionStep({
               className="bg-[var(--color-surface-container)] border border-[var(--color-border-subtle)] rounded-lg p-6 max-w-2xl w-full shadow-xl"
               onClick={(e) => e.stopPropagation()}
             >
-              <h3 className="text-lg font-bold text-[var(--color-on-surface)] mb-4 text-center">Pair Created</h3>
+              <h3 className="text-lg font-bold text-[var(--color-on-surface)] mb-4 text-center">Accept Pair</h3>
               <div className="grid grid-cols-2 gap-4 mb-4">
                 <div className="flex flex-col items-center gap-2">
                   <div className="rounded border-2 overflow-hidden w-full" style={{ borderColor: "#22c55e" }}>
@@ -220,15 +222,19 @@ export function SelectionStep({
               <div className="text-xs text-[var(--color-on-surface-secondary)] text-center mb-4 font-mono break-all">
                 Best: {basename(pendingBest)} / Worst: {basename(pendingWorst)}
               </div>
+              <div className="text-[11px] text-[var(--color-on-surface-secondary)] text-center mb-2">
+                Confirm = accept and move to next group · Pick More = accept and keep scoring this
+                group · Cancel = discard this pair (nothing written)
+              </div>
               <div className="flex items-center justify-center gap-2 flex-wrap">
-                <Button variant="primary" size="sm" onClick={() => onAcceptPair(true)}>
-                  Accept &amp; keep scoring
+                <Button variant="primary" size="sm" onClick={() => onAcceptPair(false)}>
+                  Confirm
                 </Button>
-                <Button variant="secondary" size="sm" onClick={() => onAcceptPair(false)}>
-                  Accept &amp; next group
+                <Button variant="secondary" size="sm" onClick={() => onAcceptPair(true)}>
+                  Pick More
                 </Button>
                 <Button variant="ghost" size="sm" onClick={onDismissPair}>
-                  Close
+                  Cancel
                 </Button>
               </div>
             </div>

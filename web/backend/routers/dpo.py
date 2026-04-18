@@ -44,6 +44,10 @@ class EloAcceptRequest(BaseModel):
     continue_scoring: bool = False
 
 
+class ConfirmPairRequest(BaseModel):
+    continue_scoring: bool = False
+
+
 @router.post("/dpo/check-pairs")
 def check_pairs():
     service = DPOService.get_instance()
@@ -100,6 +104,18 @@ def next_group():
 def select_image(req: SelectImageRequest):
     service = DPOService.get_instance()
     return service.select_image(req.path)
+
+
+@router.post("/dpo/session/confirm-pair")
+def confirm_pair(req: ConfirmPairRequest):
+    service = DPOService.get_instance()
+    return service.confirm_pair(req.continue_scoring)
+
+
+@router.post("/dpo/session/cancel-pair")
+def cancel_pair():
+    service = DPOService.get_instance()
+    return service.cancel_pending_pair()
 
 
 @router.post("/dpo/session/skip-group", response_model=ActionResponse)

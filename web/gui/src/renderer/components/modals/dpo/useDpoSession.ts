@@ -91,7 +91,6 @@ export function useDpoSession(): UseDpoSessionResult {
   const [showAcceptDialog, setShowAcceptDialog] = useState(false);
   const [pendingBest, setPendingBest] = useState<string | null>(null);
   const [pendingWorst, setPendingWorst] = useState<string | null>(null);
-  const [pendingRemaining, setPendingRemaining] = useState<string[]>([]);
 
   const [totalPairs, setTotalPairs] = useState(0);
   const [finalResult, setFinalResult] = useState<FinalResult | null>(null);
@@ -241,27 +240,24 @@ export function useDpoSession(): UseDpoSessionResult {
         return;
       }
 
-      // Phase "worst": backend `selectImage` auto-registers the pair.
-      // Ctk offers a yes/no/cancel dialog BEFORE registering so users can back out;
-      // the web backend has no "unregister" endpoint, so we register first and then
-      // let the user decide continuation. Cancel becomes "advance to next group".
-      const remainingAfter = remainingImages.filter((i) => i !== path);
-      const canContinue = remainingAfter.length >= 2;
+      // Phase "worst": backend returns `pair_pending` and holds the write so
+      // we can offer Confirm / Pick More / Cancel. On the last-possible pair
+      // of a group backend auto-commits (pair_created) since Cancel would be
+      // meaningless — match Ctk, which skips the dialog in that case too.
       const res = await dpoApi.selectImage(path);
       if (!res.ok) {
         setError(res.error ?? "Selection failed");
         return;
       }
-      if (res.pair_created) {
-        setPairsDone(res.pairs_done ?? pairsDone + 1);
+      if (res.pair_pending) {
         setPendingBest(res.chosen ?? bestImage);
         setPendingWorst(res.rejected ?? path);
-        setPendingRemaining(res.remaining_images ?? remainingAfter);
-        if (canContinue && res.continue_group) {
-          setShowAcceptDialog(true);
-        } else {
-          await fetchNextGroup();
-        }
+        setShowAcceptDialog(true);
+        return;
+      }
+      if (res.pair_created) {
+        setPairsDone(res.pairs_done ?? pairsDone + 1);
+        await fetchNextGroup();
       }
     },
     [group, phase, remainingImages, bestImage, pairsDone, fetchNextGroup],
@@ -269,30 +265,41 @@ export function useDpoSession(): UseDpoSessionResult {
 
   const confirmPair = useCallback(
     async (keepScoring: boolean) => {
+      const res = await dpoApi.confirmPair(keepScoring);
+      if (!res.ok) {
+        setError(res.error ?? "Confirm failed");
+        return;
+      }
       setShowAcceptDialog(false);
       setPendingBest(null);
       setPendingWorst(null);
-      if (keepScoring) {
-        // Backend already advanced internal state (phase=best, selected_best=null)
-        // and updated remaining_images when select_image returned continue_group=true.
-        // Sync local state — DO NOT call nextGroup, which would advance past this group.
+      setPairsDone(res.pairs_done ?? pairsDone + 1);
+      if (res.continue_group) {
         setPhase("best");
         setBestImage(null);
-        setRemainingImages(pendingRemaining);
-        setPendingRemaining([]);
+        setRemainingImages(res.remaining_images ?? []);
       } else {
-        setPendingRemaining([]);
         await fetchNextGroup();
       }
     },
-    [fetchNextGroup, pendingRemaining],
+    [fetchNextGroup, pairsDone],
   );
 
-  const cancelPendingPair = useCallback(() => {
+  const cancelPendingPair = useCallback(async () => {
+    const res = await dpoApi.cancelPair();
+    if (!res.ok) {
+      setError(res.error ?? "Cancel failed");
+      return;
+    }
     setShowAcceptDialog(false);
     setPendingBest(null);
     setPendingWorst(null);
-    setPendingRemaining([]);
+    // Backend kept phase="worst" and preserved _selected_best, so the user
+    // returns to the worst-pick UI with the same best image and the original
+    // pool minus that best — identical to Ctk's Cancel branch.
+    setPhase("worst");
+    if (res.best) setBestImage(res.best);
+    if (res.remaining_images) setRemainingImages(res.remaining_images);
   }, []);
 
   const skipGroup = useCallback(async () => {
@@ -318,7 +325,6 @@ export function useDpoSession(): UseDpoSessionResult {
     setShowAcceptDialog(false);
     setPendingBest(null);
     setPendingWorst(null);
-    setPendingRemaining([]);
     setScanCount(0);
     setTotalPairs(0);
     setFinalResult(null);
