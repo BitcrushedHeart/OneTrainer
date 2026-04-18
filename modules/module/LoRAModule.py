@@ -542,7 +542,12 @@ class DoRAOFTModule(OFTModule):
             result = result - bias_view
 
         # Apply DoRA Scaling
-        scale = (self.dora_scale) / (self.initial_norm)
+        # Clamp the denominator so rows with zero-norm base weights (which can
+        # arise from pruning, quantization, or fp16-underflow during a prior
+        # merge) don't produce 0/0 = NaN. dora_scale is init-cloned from
+        # initial_norm, so clamping here keeps scale=0 for those rows, which
+        # is safe: the row's contribution to the output is zero anyway.
+        scale = self.dora_scale / self.initial_norm.clamp(min=1e-8)
 
         if isinstance(self.orig_module, nn.Linear):
             scale = scale.view(1, -1)
