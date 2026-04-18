@@ -494,14 +494,19 @@ CUSTOM_TABS = [
     {"id": "performance", "label": "Performance", "renderer": "custom"},
     {"id": "run", "label": "Run", "renderer": "custom"},
     {"id": "tools", "label": "Tools", "renderer": "custom"},
-    {"id": "queue", "label": "Queue", "renderer": "custom"},
     {"id": "help", "label": "Help", "renderer": "custom"},
 ]
 
+# Matches the desktop Ctk TrainUI tab order: base tabs (general…cloud), then
+# the training-method-conditional tabs (lora/embedding/rlhf) that Ctk appends
+# via switch_training_method, then web-only aux tabs (performance/run/help).
+# Queue is intentionally excluded from the top-level bar — it's reached via
+# the Tools tab instead (matches Ctk, which has QueueWindow as a tool popup).
 TAB_ORDER = [
-    "general", "model", "data", "concepts", "training", "rlhf", "sampling",
-    "backup", "tools", "queue", "lora", "embedding",
-    "additionalembeddings", "cloud", "performance", "run", "help",
+    "general", "model", "data", "concepts", "training", "sampling",
+    "backup", "tools", "additionalembeddings", "cloud",
+    "lora", "embedding", "rlhf",
+    "performance", "run", "help",
 ]
 
 
