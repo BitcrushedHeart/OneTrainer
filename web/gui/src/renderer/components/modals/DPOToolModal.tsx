@@ -15,7 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { dpoApi, type GroupData, type PairCheckResult, type ReviewPair } from "@/api/dpoApi";
 import { API_BASE } from "@/api/request";
-import { Button, FormEntry } from "@/components/shared";
+import { Button, DirPicker, FormEntry } from "@/components/shared";
 
 import { ModalBase } from "./ModalBase";
 
@@ -333,14 +333,8 @@ function SelectionCuration({ onDone }: { onDone: () => void }) {
           best and worst from each group to create chosen/rejected pairs.
         </p>
         <div className="space-y-3">
-          <div>
-            <label className="block text-sm text-[var(--color-on-surface)] mb-1">Source Folder</label>
-            <FormEntry label="" value={sourceFolder} onChange={(v) => setSourceFolder(String(v))} />
-          </div>
-          <div>
-            <label className="block text-sm text-[var(--color-on-surface)] mb-1">Output Folder</label>
-            <FormEntry label="" value={outputDir} onChange={(v) => setOutputDir(String(v))} />
-          </div>
+          <DirPicker label="Source Folder" value={sourceFolder} onChange={(v) => setSourceFolder(v)} />
+          <DirPicker label="Output Folder" value={outputDir} onChange={(v) => setOutputDir(v)} />
           <div>
             <label className="block text-sm text-[var(--color-on-surface)] mb-1">Pairs per Group</label>
             <FormEntry

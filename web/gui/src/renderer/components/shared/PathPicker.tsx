@@ -1,5 +1,5 @@
 import { FolderOpen } from "lucide-react";
-import { type ChangeEvent, useEffect, useState } from "react";
+import { type ChangeEvent, type MouseEvent, useEffect, useState } from "react";
 
 import { useConfigField } from "@/hooks/useConfigField";
 import { INPUT_FLEX, SIDE_BUTTON } from "@/utils/inputStyles";
@@ -43,9 +43,18 @@ export function PathPicker({
     if (onChange) onChange(val);
   };
 
-  const handleBrowse = async () => {
+  const handleBrowse = async (e: MouseEvent<HTMLButtonElement>) => {
+    // Stop the click from propagating to any ancestor label/form that might
+    // swallow it — this bug recurred with the FormFieldWrapper <label> and
+    // defensively guarding it here keeps the picker working even if a caller
+    // wraps it in a new label layer later.
+    e.preventDefault();
+    e.stopPropagation();
     const api = window.electronAPI;
-    if (!api) return;
+    if (!api) {
+      console.warn("[PathPicker] window.electronAPI is unavailable; browse aborted.");
+      return;
+    }
     const result = mode === "file" ? await api.openFile(filters) : await api.openDirectory();
     if (result) {
       setLocalValue(result);
