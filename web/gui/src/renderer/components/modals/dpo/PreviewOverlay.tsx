@@ -12,11 +12,16 @@ export interface PreviewOverlayProps {
 
 export function PreviewOverlay({ path, onClose, onPick, caption }: PreviewOverlayProps) {
   useEffect(() => {
+    // Capture phase + stopPropagation so the enclosing ModalBase's
+    // document-level Escape listener doesn't also fire and close the
+    // whole DPO modal. Only the preview should dismiss on Esc.
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      onClose();
     };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
+    window.addEventListener("keydown", handleKey, true);
+    return () => window.removeEventListener("keydown", handleKey, true);
   }, [onClose]);
 
   const src = `${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`;
@@ -42,7 +47,10 @@ export function PreviewOverlay({ path, onClose, onPick, caption }: PreviewOverla
       onClick={handleBackdropClick}
       onContextMenu={handleContextMenu}
     >
-      <div className="flex-1 flex items-center justify-center w-full overflow-hidden px-6 py-6">
+      <div
+        className="flex-1 flex items-center justify-center w-full overflow-hidden px-6 py-6"
+        onClick={handleBackdropClick}
+      >
         <img
           src={src}
           alt={fileName}
