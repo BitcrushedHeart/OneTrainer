@@ -675,8 +675,8 @@ class DPOService(SingletonMixin):
     def _dedup_by_dhash(images: list[str]) -> list[str]:
         from PIL import Image
 
-        seen: dict[int, str] = {}
-        unique = []
+        seen: dict[int, int] = {}
+        unique: list[str] = []
         for path in images:
             try:
                 with Image.open(path) as img:
@@ -693,6 +693,13 @@ class DPOService(SingletonMixin):
                 unique.append(path)
                 continue
             if h not in seen:
-                seen[h] = path
+                seen[h] = len(unique)
                 unique.append(path)
+            else:
+                existing_idx = seen[h]
+                try:
+                    if os.path.getmtime(path) > os.path.getmtime(unique[existing_idx]):
+                        unique[existing_idx] = path
+                except OSError:
+                    continue
         return unique
