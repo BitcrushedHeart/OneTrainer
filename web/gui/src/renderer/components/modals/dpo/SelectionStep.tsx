@@ -18,6 +18,27 @@ function imageUrl(path: string): string {
   return `${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`;
 }
 
+function parseAspectRatio(ar: string): { ratio: number; css: string } | null {
+  const m = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(ar.trim());
+  if (!m) return null;
+  const w = parseFloat(m[1]);
+  const h = parseFloat(m[2]);
+  if (!w || !h) return null;
+  return { ratio: w / h, css: `${m[1]} / ${m[2]}` };
+}
+
+function columnsForRatio(ratio: number | null, count: number): number {
+  // Pick a grid column count that lets wide images breathe while keeping tall
+  // images at a reasonable size. Never exceed the image count.
+  let cols: number;
+  if (ratio === null) cols = 4;
+  else if (ratio >= 1.7) cols = 2;
+  else if (ratio >= 1.15) cols = 3;
+  else if (ratio >= 0.85) cols = 4;
+  else cols = 5;
+  return Math.max(1, Math.min(cols, count));
+}
+
 export function SelectionStep({
   group,
   onPick,
@@ -79,10 +100,19 @@ export function SelectionStep({
           bg: "rgba(239,68,68,0.1)",
         };
 
-  const hasEnoughImages = remainingImages.length >= 2;
+  // Phase "best": need ≥2 images to form a pair. Phase "worst": a best is
+  // already chosen, so ≥1 remaining image is enough to complete the pair —
+  // matches Ctk, which renders the grid minus `selected_best` regardless of
+  // count. Using ≥2 here broke the 2-image-group case: after picking best,
+  // exactly 1 image remains and the UI falsely reported "not enough images".
+  const minRemaining = phase === "worst" ? 1 : 2;
+  const hasEnoughImages = remainingImages.length >= minRemaining;
+  const ar = parseAspectRatio(group.aspectratio);
+  const arStyle: React.CSSProperties | undefined = ar ? { aspectRatio: ar.css } : undefined;
+  const gridCols = columnsForRatio(ar?.ratio ?? null, remainingImages.length);
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3 h-full min-h-0">
       {/* Header row */}
       <div className="flex items-center justify-between gap-3">
         <div className="text-xs text-[var(--color-on-surface-secondary)] flex items-center gap-3 flex-wrap">
@@ -121,7 +151,10 @@ export function SelectionStep({
 
       {/* Thumbnail grid */}
       {hasEnoughImages ? (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 max-h-[500px] overflow-y-auto">
+        <div
+          className="grid gap-2 flex-1 min-h-0 overflow-y-auto auto-rows-min content-start"
+          style={{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }}
+        >
           {remainingImages.map((imgPath) => {
             const isBest = imgPath === bestImage;
             return (
@@ -130,9 +163,16 @@ export function SelectionStep({
                 type="button"
                 onClick={() => handleThumbClick(imgPath)}
                 onContextMenu={(e) => handleThumbContextMenu(e, imgPath)}
-                className="relative rounded border-2 overflow-hidden transition-all hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)]"
+                className="group relative rounded border-2 overflow-hidden transition-all hover:shadow-lg hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] bg-black/30"
                 style={{
                   borderColor: isBest ? "#22c55e" : "var(--color-border-subtle)",
+                  ...arStyle,
+                }}
+                onMouseEnter={(e) => {
+                  if (!isBest) e.currentTarget.style.borderColor = "var(--color-cobalt-600)";
+                }}
+                onMouseLeave={(e) => {
+                  if (!isBest) e.currentTarget.style.borderColor = "var(--color-border-subtle)";
                 }}
               >
                 <img
@@ -140,8 +180,16 @@ export function SelectionStep({
                   alt={basename(imgPath)}
                   loading="lazy"
                   draggable={false}
-                  className="object-cover h-40 w-full"
+                  className={`${arStyle ? "object-contain w-full h-full" : "object-contain w-full h-40"} transition-[filter] group-hover:brightness-110`}
                 />
+                {isBest && (
+                  <div
+                    className="absolute top-1 left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                    style={{ background: "#22c55e", color: "#0b2c13" }}
+                  >
+                    BEST
+                  </div>
+                )}
                 <div
                   className="absolute bottom-0 left-0 right-0 text-[10px] text-white/90 bg-black/60 px-1 py-0.5 truncate text-left font-mono"
                   title={basename(imgPath)}
@@ -183,18 +231,21 @@ export function SelectionStep({
             }}
           >
             <div
-              className="bg-[var(--color-surface-container)] border border-[var(--color-border-subtle)] rounded-lg p-6 max-w-2xl w-full shadow-xl"
+              className="bg-[var(--color-surface-container)] border border-[var(--color-border-subtle)] rounded-lg p-6 max-w-6xl w-full max-h-[90vh] overflow-y-auto shadow-xl"
               onClick={(e) => e.stopPropagation()}
             >
               <h3 className="text-lg font-bold text-[var(--color-on-surface)] mb-4 text-center">Accept Pair</h3>
               <div className="grid grid-cols-2 gap-4 mb-4">
                 <div className="flex flex-col items-center gap-2">
-                  <div className="rounded border-2 overflow-hidden w-full" style={{ borderColor: "#22c55e" }}>
+                  <div
+                    className="rounded border-2 overflow-hidden w-full bg-black/30"
+                    style={{ borderColor: "#22c55e", ...arStyle }}
+                  >
                     {pendingBest && (
                       <img
                         src={imageUrl(pendingBest)}
                         alt="Chosen"
-                        className="object-cover w-full h-48"
+                        className={arStyle ? "object-contain w-full h-full" : "object-contain w-full h-48"}
                         draggable={false}
                       />
                     )}
@@ -204,12 +255,15 @@ export function SelectionStep({
                   </div>
                 </div>
                 <div className="flex flex-col items-center gap-2">
-                  <div className="rounded border-2 overflow-hidden w-full" style={{ borderColor: "#ef4444" }}>
+                  <div
+                    className="rounded border-2 overflow-hidden w-full bg-black/30"
+                    style={{ borderColor: "#ef4444", ...arStyle }}
+                  >
                     {pendingWorst && (
                       <img
                         src={imageUrl(pendingWorst)}
                         alt="Rejected"
-                        className="object-cover w-full h-48"
+                        className={arStyle ? "object-contain w-full h-full" : "object-contain w-full h-48"}
                         draggable={false}
                       />
                     )}
