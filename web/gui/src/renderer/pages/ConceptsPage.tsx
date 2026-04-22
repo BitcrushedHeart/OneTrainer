@@ -40,7 +40,7 @@ const DEFAULT_CONCEPT: ConceptConfig = {
     enable_fixed_hue: false,
     random_hue_max_strength: 0,
     enable_resolution_override: false,
-    resolution_override: "",
+    resolution_override: "512",
     enable_random_circular_mask_shrink: false,
     enable_random_mask_rotate_crop: false,
   },
