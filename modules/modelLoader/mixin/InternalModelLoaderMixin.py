@@ -28,6 +28,19 @@ class InternalModelLoaderMixin(metaclass=ABCMeta):
                     epoch_sample=meta['train_progress']['epoch_sample'],
                     global_step=meta['train_progress']['global_step'],
                 )
+                if 'last_action_epoch' in meta:
+                    train_progress.last_action_epoch = dict(meta['last_action_epoch'])
+                elif train_progress.epoch_step > 0:
+                    # Legacy backup taken mid-epoch: start-of-epoch actions
+                    # already fired in the pre-fix session. Pre-fill markers
+                    # to prevent a duplicate fire on the first resumed batch.
+                    train_progress.last_action_epoch = {
+                        'validate': train_progress.epoch,
+                        'sample': train_progress.epoch,
+                    }
+                else:
+                    train_progress.last_action_epoch = {}
+                resumed_tb_subdir = meta.get('tensorboard_subdir', None)
 
             # optimizer
             with contextlib.suppress(FileNotFoundError):
@@ -40,3 +53,4 @@ class InternalModelLoaderMixin(metaclass=ABCMeta):
 
             # meta
             model.train_progress = train_progress
+            model.resumed_tensorboard_subdir = resumed_tb_subdir
