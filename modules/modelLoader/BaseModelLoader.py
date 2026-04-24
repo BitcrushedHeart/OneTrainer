@@ -28,6 +28,8 @@ class BaseModelLoader(metaclass=ABCMeta):
                 epoch_sample=meta['train_progress']['epoch_sample'],
                 global_step=meta['train_progress']['global_step'],
             )
+            train_progress.last_action_epoch = dict(meta.get('last_action_epoch', {}))
+            resumed_tb_subdir = meta.get('tensorboard_subdir', None)
 
         # optimizer
         with contextlib.suppress(FileNotFoundError):
@@ -40,6 +42,7 @@ class BaseModelLoader(metaclass=ABCMeta):
 
         # meta
         model.train_progress = train_progress
+        model.resumed_tensorboard_subdir = resumed_tb_subdir
 
 
     @abstractmethod

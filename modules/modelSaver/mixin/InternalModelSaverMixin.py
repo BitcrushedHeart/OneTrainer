@@ -31,6 +31,7 @@ class InternalModelSaverMixin(metaclass=ABCMeta):
             torch.save(model.ema.state_dict(), os.path.join(destination, "ema", "ema.pt"))
 
         # meta
+        tensorboard_subdir = getattr(model, "tensorboard_subdir", None)
         with open(os.path.join(destination, "meta.json"), "w") as meta_file:
             json.dump({
                 'train_progress': {
@@ -39,4 +40,6 @@ class InternalModelSaverMixin(metaclass=ABCMeta):
                     'epoch_sample': model.train_progress.epoch_sample,
                     'global_step': model.train_progress.global_step,
                 },
+                'last_action_epoch': dict(getattr(model.train_progress, 'last_action_epoch', {})),
+                'tensorboard_subdir': tensorboard_subdir,
             }, meta_file)
