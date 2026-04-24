@@ -3,6 +3,7 @@ import os
 from modules.util.dpo_curation_util import dpo_pair_key
 
 from mgds.PipelineModule import PipelineModule
+from mgds.pipelineModules.CollectPaths import CollectPaths
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 import torch
@@ -34,18 +35,34 @@ class PairByFilename(
     def __canonical_path(path: str) -> str:
         return os.path.normcase(os.path.abspath(path))
 
+    def __find_collect_paths(self) -> CollectPaths:
+        # Why: SmartDiskCache exposes 'image_path' as an aggregate output and its
+        # blank-sentinel fallback returns a fixed, unrelated path for any item
+        # whose cache build failed. Going through `_get_previous_item` would
+        # stop at the cache and yield that fixed path, collapsing many distinct
+        # pair_NNNN stems into one key per side and falsely reporting missing
+        # pairs. Pull image_path + concept directly from the CollectPaths
+        # module that owns the filesystem enumeration.
+        for module in self.pipeline.modules:
+            if isinstance(module, CollectPaths):
+                return module
+        raise RuntimeError("PairByFilename could not locate the CollectPaths module in the pipeline.")
+
     def __build_pair_indices(self):
         chosen_indices = {}
         rejected_indices = {}
 
-        for index in range(self._get_previous_length('image_path')):
-            concept_path = self.__canonical_path(self._get_previous_item(0, 'concept.path', index))
+        collect_paths = self.__find_collect_paths()
+        for index in range(collect_paths.length()):
+            item = collect_paths.get_item(0, index)
+            concept = item['concept']
+            image_path = item['image_path']
+            concept_path = self.__canonical_path(concept['path'])
             pair_info = self.concept_lookup.get(concept_path)
             if pair_info is None:
                 continue
 
             pair_id, is_chosen = pair_info
-            image_path = self._get_previous_item(0, 'image_path', index)
             key = (pair_id, dpo_pair_key(image_path, concept_path))
 
             if is_chosen:
