@@ -1,9 +1,10 @@
-import { Activity, Database, Heart, Image, ListOrdered, RefreshCw, Video, Wand2 } from "lucide-react";
+import { Activity, Database, Grid3x3, Heart, Image, ListOrdered, RefreshCw, Video, Wand2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 
 import { CaptionToolModal } from "@/components/modals/CaptionToolModal";
 import { ConvertModelModal } from "@/components/modals/ConvertModelModal";
+import { BucketAnalysisModal } from "@/components/modals/BucketAnalysisModal";
 import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
@@ -42,6 +43,7 @@ export default function ToolsPage() {
   const [convertOpen, setConvertOpen] = useState(false);
   const [samplingOpen, setSamplingOpen] = useState(false);
   const [dpoOpen, setDpoOpen] = useState(false);
+  const [bucketOpen, setBucketOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   return (
@@ -95,6 +97,12 @@ export default function ToolsPage() {
           description="Manage chosen/rejected preference pairs for DPO training"
           onLaunch={() => setDpoOpen(true)}
         />
+        <ToolCard
+          icon={<Grid3x3 className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="DPO Bucket Analysis"
+          description="Analyze aspect-bucket counts and clean-up targets for your batch size"
+          onLaunch={() => setBucketOpen(true)}
+        />
       </div>
 
       <ProfilingPanel open={profilingOpen} onClose={() => setProfilingOpen(false)} />
@@ -104,6 +112,7 @@ export default function ToolsPage() {
       <ConvertModelModal open={convertOpen} onClose={() => setConvertOpen(false)} />
       <StandaloneSamplingModal open={samplingOpen} onClose={() => setSamplingOpen(false)} />
       <DPOToolModal open={dpoOpen} onClose={() => setDpoOpen(false)} />
+      <BucketAnalysisModal open={bucketOpen} onClose={() => setBucketOpen(false)} />
     </>
   );
 }

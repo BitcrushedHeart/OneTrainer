@@ -48,6 +48,13 @@ class ConfirmPairRequest(BaseModel):
     continue_scoring: bool = False
 
 
+class BucketAnalysisRequest(BaseModel):
+    concept_path: str
+    batch_size: int
+    target_resolutions: list[int]
+    quantization: int
+
+
 @router.post("/dpo/check-pairs")
 def check_pairs():
     service = DPOService.get_instance()
@@ -76,6 +83,17 @@ def remove_pair(req: RemovePairRequest):
 def fix_multiline_captions():
     service = DPOService.get_instance()
     return service.fix_multiline_captions()
+
+
+@router.post("/dpo/bucket-analysis")
+def bucket_analysis(req: BucketAnalysisRequest):
+    service = DPOService.get_instance()
+    return service.bucket_analysis(
+        concept_path=req.concept_path,
+        batch_size=req.batch_size,
+        target_resolutions=req.target_resolutions,
+        quantization=req.quantization,
+    )
 
 
 # ---- Curation Session ----

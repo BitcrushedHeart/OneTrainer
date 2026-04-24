@@ -95,6 +95,34 @@ export interface CancelPairResponse {
   remaining_images?: string[];
 }
 
+export interface BucketAnalysisRow {
+  h: number;
+  w: number;
+  count: number;
+  drops: number;
+  add: number;
+  remove: number;
+  aspect_label: string;
+}
+
+export interface BucketAnalysisTarget {
+  target: number;
+  total_pairs: number;
+  total_drops: number;
+  total_add: number;
+  total_remove: number;
+  buckets: BucketAnalysisRow[];
+}
+
+export interface BucketAnalysisResult {
+  concept_path: string;
+  batch_size: number;
+  quantization: number;
+  scanned: number;
+  unreadable: number;
+  targets: BucketAnalysisTarget[];
+}
+
 export const dpoApi = {
   checkPairs: () =>
     request<{ ok: boolean; result?: PairCheckResult; error?: string }>("/dpo/check-pairs", {
@@ -180,6 +208,12 @@ export const dpoApi = {
     }>("/dpo/session/elo-accept", {
       method: "POST",
       body: JSON.stringify({ continue_scoring: continueScoring }),
+    }),
+
+  bucketAnalysis: (concept_path: string, batch_size: number, target_resolutions: number[], quantization: number) =>
+    request<{ ok: boolean; result?: BucketAnalysisResult; error?: string }>("/dpo/bucket-analysis", {
+      method: "POST",
+      body: JSON.stringify({ concept_path, batch_size, target_resolutions, quantization }),
     }),
 
   imageUrl: (path: string) => `/api/dpo/session/image?path=${encodeURIComponent(path)}`,

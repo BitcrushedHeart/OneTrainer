@@ -177,6 +177,26 @@ class DPOService(SingletonMixin):
         fixed = fix_multiline_captions(all_pairs)
         return {"ok": True, "fixed": fixed}
 
+    def bucket_analysis(
+        self,
+        concept_path: str,
+        batch_size: int,
+        target_resolutions: list[int],
+        quantization: int,
+    ) -> dict:
+        from modules.util.dpo_bucket_analysis_util import analyze_concept
+
+        try:
+            result = analyze_concept(
+                concept_path=concept_path,
+                batch_size=batch_size,
+                target_resolutions=target_resolutions,
+                quantization=quantization,
+            )
+        except (ValueError, FileNotFoundError) as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "result": result}
+
     # ---- Curation Session ----
 
     def start_session(
