@@ -227,7 +227,7 @@ export function ReviewStep({ onBack, onClose }: ReviewStepProps) {
   const pair = pairs[safeIndex];
 
   return (
-    <div className="flex flex-col gap-3 min-h-[560px] relative">
+    <div className="flex flex-col gap-3 h-full min-h-0 relative">
       {/* Header */}
       <div className="flex items-center gap-4 pb-2 border-b border-[var(--color-border-subtle)]">
         <div className="text-sm font-bold text-[var(--color-on-surface)]">
@@ -243,12 +243,12 @@ export function ReviewStep({ onBack, onClose }: ReviewStepProps) {
       <PromptExpander prompt={pair.caption || "(no caption)"} />
 
       {/* Images */}
-      <div className="grid grid-cols-2 gap-3 flex-1 min-h-[400px]">
+      <div className="grid grid-cols-2 gap-3 flex-1 min-h-0">
         <div className="flex flex-col gap-1 min-h-0">
           <div className="text-sm font-semibold text-[var(--color-success-500)]">Chosen</div>
           <button
             type="button"
-            className="flex-1 min-h-[300px] relative rounded overflow-hidden border border-[var(--color-border-subtle)] cursor-zoom-in bg-black/30 p-0"
+            className="flex-1 min-h-0 relative rounded overflow-hidden border border-[var(--color-border-subtle)] cursor-zoom-in bg-black/30 p-0"
             onClick={() => setPreviewPath(pair.chosen_path)}
           >
             {pair.chosen_path ? (
@@ -273,7 +273,7 @@ export function ReviewStep({ onBack, onClose }: ReviewStepProps) {
           <div className="text-sm font-semibold text-[var(--color-error-500)]">Rejected</div>
           <button
             type="button"
-            className="flex-1 min-h-[300px] relative rounded overflow-hidden border border-[var(--color-border-subtle)] cursor-zoom-in bg-black/30 p-0"
+            className="flex-1 min-h-0 relative rounded overflow-hidden border border-[var(--color-border-subtle)] cursor-zoom-in bg-black/30 p-0"
             onClick={() => setPreviewPath(pair.rejected_path)}
           >
             {pair.rejected_path ? (

@@ -23,6 +23,12 @@ function formatRating(value: number | undefined): string {
   return value.toFixed(0);
 }
 
+function aspectRatioStyle(ar: string): React.CSSProperties | undefined {
+  const m = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(ar.trim());
+  if (!m) return undefined;
+  return { aspectRatio: `${m[1]} / ${m[2]}` };
+}
+
 export function EloStep({
   group,
   pair,
@@ -137,8 +143,10 @@ export function EloStep({
     ? undefined
     : `Do at least ${acceptThreshold} comparisons before accepting (currently ${done}).`;
 
+  const arStyle = aspectRatioStyle(group.aspectratio);
+
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-3 h-full min-h-0">
       {/* Header row */}
       <div className="flex items-center justify-between gap-3">
         <div className="text-xs text-[var(--color-on-surface-secondary)] flex items-center gap-3 flex-wrap">
@@ -173,16 +181,21 @@ export function EloStep({
 
       {/* Main area: comparison vs. accept panel */}
       {showAcceptPanel ? (
-        <div className="flex flex-col gap-4 p-4 rounded border border-[var(--color-border-subtle)] bg-[var(--color-surface-container)]">
+        <div className="flex flex-col gap-4 p-4 rounded border border-[var(--color-border-subtle)] bg-[var(--color-surface-container)] flex-1 min-h-0">
           <h3 className="text-lg font-bold text-[var(--color-on-surface)] text-center">Accept Pair</h3>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="flex flex-col items-center gap-2">
+          <div className="grid grid-cols-2 gap-4 flex-1 min-h-0">
+            <div className="flex flex-col items-center gap-2 min-h-0">
               <div
-                className="rounded border-2 overflow-hidden w-full bg-black/30"
-                style={{ borderColor: "var(--color-success-500)" }}
+                className="rounded border-2 overflow-hidden w-full bg-black/30 flex-1 min-h-0"
+                style={{ borderColor: "var(--color-success-500)", ...arStyle }}
               >
                 {bestPath && (
-                  <img src={imageUrl(bestPath)} alt="Best" className="object-contain w-full h-64" draggable={false} />
+                  <img
+                    src={imageUrl(bestPath)}
+                    alt="Best"
+                    className="object-contain w-full h-full"
+                    draggable={false}
+                  />
                 )}
               </div>
               <div
@@ -199,13 +212,18 @@ export function EloStep({
                 {bestPath ? basename(bestPath) : ""}
               </div>
             </div>
-            <div className="flex flex-col items-center gap-2">
+            <div className="flex flex-col items-center gap-2 min-h-0">
               <div
-                className="rounded border-2 overflow-hidden w-full bg-black/30"
-                style={{ borderColor: "var(--color-error-500)" }}
+                className="rounded border-2 overflow-hidden w-full bg-black/30 flex-1 min-h-0"
+                style={{ borderColor: "var(--color-error-500)", ...arStyle }}
               >
                 {worstPath && (
-                  <img src={imageUrl(worstPath)} alt="Worst" className="object-contain w-full h-64" draggable={false} />
+                  <img
+                    src={imageUrl(worstPath)}
+                    alt="Worst"
+                    className="object-contain w-full h-full"
+                    draggable={false}
+                  />
                 )}
               </div>
               <div
@@ -244,14 +262,14 @@ export function EloStep({
       ) : pair ? (
         <>
           {/* Image comparison grid */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 gap-3 flex-1 min-h-0">
             {pair.map((path, idx) => (
               <button
                 key={path}
                 type="button"
                 onClick={() => handleImageClick(path)}
                 onContextMenu={(e) => handleImageContextMenu(e, idx)}
-                className="relative rounded border-2 overflow-hidden transition-all hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)]"
+                className="relative rounded border-2 overflow-hidden transition-all hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] min-h-0"
                 style={{ borderColor: "var(--color-border-subtle)" }}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.borderColor = "var(--color-cobalt-600)";
@@ -264,7 +282,7 @@ export function EloStep({
                   src={imageUrl(path)}
                   alt={basename(path)}
                   draggable={false}
-                  className="w-full h-80 object-contain bg-black/30"
+                  className="w-full h-full object-contain bg-black/30"
                 />
                 <div
                   className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-2 text-[10px] text-white/90 bg-black/60 px-2 py-1 font-mono"

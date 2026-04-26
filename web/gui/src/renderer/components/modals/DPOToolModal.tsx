@@ -24,6 +24,15 @@ const titleByStep: Record<CurationStep, string> = {
   export: "DPO Pair Tool — Finalize",
 };
 
+const sizeByStep: Record<CurationStep, "lg" | "full"> = {
+  setup: "lg",
+  scanning: "lg",
+  selecting: "full",
+  elo: "full",
+  review: "full",
+  export: "lg",
+};
+
 export function DPOToolModal({ open, onClose }: Props) {
   const session = useDpoSession();
   const {
@@ -67,7 +76,7 @@ export function DPOToolModal({ open, onClose }: Props) {
   );
 
   return (
-    <ModalBase open={open} onClose={handleClose} title={titleByStep[step]} size="2xl">
+    <ModalBase open={open} onClose={handleClose} title={titleByStep[step]} size={sizeByStep[step]}>
       {step === "setup" && (
         <SetupStep
           sourceFolder={sourceFolder}

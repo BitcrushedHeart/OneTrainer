@@ -9,7 +9,7 @@ export interface ModalBaseProps {
   onClose: () => void;
   title: string;
   children: ReactNode;
-  size?: "sm" | "md" | "lg" | "xl" | "2xl";
+  size?: "sm" | "md" | "lg" | "xl" | "2xl" | "full";
   closeOnBackdrop?: boolean;
 }
 
@@ -19,6 +19,7 @@ const sizeClasses: Record<string, string> = {
   lg: "max-w-[800px]",
   xl: "max-w-[1000px]",
   "2xl": "max-w-[1200px]",
+  full: "max-w-none w-[calc(100vw-32px)]",
 };
 
 export function ModalBase({ open, onClose, title, children, size = "md", closeOnBackdrop = true }: ModalBaseProps) {
@@ -98,7 +99,7 @@ export function ModalBase({ open, onClose, title, children, size = "md", closeOn
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className={`w-full ${sizeClasses[size]} max-h-[90vh] flex flex-col rounded-[var(--radius-md)]
+        className={`w-full ${sizeClasses[size]} ${size === "full" ? "h-[calc(100vh-32px)]" : "max-h-[90vh]"} flex flex-col rounded-[var(--radius-md)]
           bg-[var(--color-surface)] border border-[var(--color-border-subtle)]
           shadow-[var(--shadow-3)] animate-[rowFade_200ms_ease-out]`}
       >
