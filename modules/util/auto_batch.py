@@ -55,17 +55,47 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def _load_standard_concepts(concept_file_path: str) -> list[dict]:
-    """Load the concept file and return enabled STANDARD concepts as dicts."""
-    if not concept_file_path:
-        return []
-    from web.backend.services.concept_service import ConceptService
+def _normalize_concept(c: object) -> dict | None:
+    """Coerce a concept to a dict shape regardless of whether it came in as a
+    ConceptConfig instance (when concepts is overridden inline on the entry)
+    or a plain dict (after to_dict round-trips)."""
+    if c is None:
+        return None
+    if isinstance(c, dict):
+        return c
+    if hasattr(c, "to_dict"):
+        try:
+            return c.to_dict()
+        except Exception:
+            return None
+    return None
 
-    try:
-        concepts = ConceptService().load_concepts(concept_file_path)
-    except (OSError, ValueError) as exc:
-        logger.warning("Auto-batch: failed to load concept file %s: %s", concept_file_path, exc)
-        return []
+
+def _load_standard_concepts(merged_config: TrainConfig) -> list[dict]:
+    """Resolve enabled STANDARD concepts for Auto-Batch from the merged config.
+
+    The trainer reads `config.concepts` if it is set (inline override path),
+    otherwise it loads `config.concept_file_name` from disk. Auto-Batch must
+    follow the same precedence so that per-entry concept overrides are honoured.
+    """
+    inline = getattr(merged_config, "concepts", None)
+    concepts: list[dict] = []
+    if inline:
+        for c in inline:
+            normalized = _normalize_concept(c)
+            if normalized is not None:
+                concepts.append(normalized)
+    else:
+        concept_file_path = getattr(merged_config, "concept_file_name", "") or ""
+        if not concept_file_path:
+            return []
+        from web.backend.services.concept_service import ConceptService
+
+        try:
+            concepts = ConceptService().load_concepts(concept_file_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("Auto-batch: failed to load concept file %s: %s", concept_file_path, exc)
+            return []
 
     out: list[dict] = []
     for c in concepts:
@@ -125,8 +155,10 @@ def compute_auto_batch(
         )
 
     # Concept loading ---------------------------------------------------------
-    concept_file_name = getattr(merged_config, "concept_file_name", "") or ""
-    concepts = _load_standard_concepts(concept_file_name)
+    # Honour inline `concepts` override on the merged config (set when the user
+    # overrides concepts via the queue's Concepts tab) before falling back to
+    # the concept_file_name path.
+    concepts = _load_standard_concepts(merged_config)
     if not concepts:
         warnings.append("No enabled STANDARD concepts found")
         return AutoBatchResult(
