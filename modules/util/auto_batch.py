@@ -152,7 +152,13 @@ def compute_auto_batch(
             if not path:
                 continue
             try:
-                result = analyze_concept(path, bs, target_resolutions, quantization)
+                result = analyze_concept(
+                    path,
+                    bs,
+                    target_resolutions,
+                    quantization,
+                    include_subdirectories=bool(concept.get("include_subdirectories", False)),
+                )
             except (OSError, ValueError) as exc:
                 warnings.append(f"concept {concept.get('name') or path}: {exc}")
                 continue
@@ -234,8 +240,10 @@ def compute_auto_batch(
             warning="; ".join(warnings),
         )
 
-    target_required = max(1, round(effective * target_pct / 100.0))
-    accum = max(1, round(target_required / chosen.batch_size))
+    # Round DOWN: target_pct is treated as a hard ceiling on effective batch size.
+    # If target_required floors to 0 (e.g. tiny dataset with low %), clamp at 1.
+    target_required = max(1, int(effective * target_pct / 100.0))
+    accum = max(1, int(target_required / chosen.batch_size))
 
     return AutoBatchResult(
         batch_size=chosen.batch_size,

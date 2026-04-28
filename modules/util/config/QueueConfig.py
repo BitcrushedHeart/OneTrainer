@@ -9,7 +9,7 @@ class AutoBatchSettings:
     enabled: bool = False
     min_batch_size: int = 1
     max_batch_size: int = 8
-    target_pct: float = 100.0
+    target_pct: float = 10.0
     max_drop_pct: float = 5.0
     last_batch_size: int | None = None
     last_accum: int | None = None
@@ -37,7 +37,7 @@ class AutoBatchSettings:
             enabled=bool(data.get("enabled", False)),
             min_batch_size=int(data.get("min_batch_size", 1)),
             max_batch_size=int(data.get("max_batch_size", 8)),
-            target_pct=float(data.get("target_pct", 100.0)),
+            target_pct=float(data.get("target_pct", 10.0)),
             max_drop_pct=float(data.get("max_drop_pct", 5.0)),
             last_batch_size=data.get("last_batch_size"),
             last_accum=data.get("last_accum"),

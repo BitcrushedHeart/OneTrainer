@@ -21,7 +21,7 @@ interface FormState {
 const DEFAULT_FORM: FormState = {
   min_batch_size: 1,
   max_batch_size: 4,
-  target_pct: 100,
+  target_pct: 10,
   max_drop_pct: 5,
 };
 

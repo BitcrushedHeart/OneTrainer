@@ -31,7 +31,7 @@ export function QueueAutoBatchPanel({ entryId }: QueueAutoBatchPanelProps) {
   const [draft, setDraft] = useState<Draft>(() => ({
     min_batch_size: settings?.min_batch_size ?? 1,
     max_batch_size: settings?.max_batch_size ?? 8,
-    target_pct: settings?.target_pct ?? 100,
+    target_pct: settings?.target_pct ?? 10,
     max_drop_pct: settings?.max_drop_pct ?? 5,
   }));
   const [isCalculating, setIsCalculating] = useState(false);
