@@ -3,6 +3,7 @@ from util.import_util import script_imports
 script_imports()
 
 import json
+import os
 
 from modules.util import create
 from modules.util.args.TrainArgs import TrainArgs
@@ -14,6 +15,10 @@ from modules.util.config.TrainConfig import TrainConfig
 
 def main():
     args = TrainArgs.parse_args()
+
+    if args.skip_cache_validation:
+        os.environ["OT_SKIP_CACHE_VALIDATION"] = "1"
+
     callbacks = TrainCallbacks()
     commands = TrainCommands()
 
