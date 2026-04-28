@@ -108,15 +108,15 @@ class QueueManager:
 
     def get_next_runnable(self) -> QueueEntry | None:
         for e in self.entries:
-            if e.status == QueueEntryStatus.RUNNING:
+            if e.included and e.status == QueueEntryStatus.RUNNING:
                 return e
         for e in self.entries:
-            if e.status == QueueEntryStatus.PENDING:
+            if e.included and e.status == QueueEntryStatus.PENDING:
                 return e
         return None
 
     def get_run_index(self, entry_id: str) -> int | None:
-        runnable = [e for e in self.entries if e.status in (
+        runnable = [e for e in self.entries if e.included and e.status in (
             QueueEntryStatus.PENDING, QueueEntryStatus.RUNNING, QueueEntryStatus.COMPLETED,
         )]
         for i, e in enumerate(runnable):
@@ -125,7 +125,7 @@ class QueueManager:
         return None
 
     def total_runnable(self) -> int:
-        return sum(1 for e in self.entries if e.status in (
+        return sum(1 for e in self.entries if e.included and e.status in (
             QueueEntryStatus.PENDING, QueueEntryStatus.RUNNING, QueueEntryStatus.COMPLETED,
         ))
 

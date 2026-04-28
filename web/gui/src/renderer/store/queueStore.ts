@@ -33,7 +33,10 @@ interface QueueStore {
 
   loadQueue: () => Promise<void>;
   addEntry: (name?: string) => Promise<void>;
-  updateEntry: (id: string, data: { name?: string; overrides?: Record<string, unknown> }) => Promise<void>;
+  updateEntry: (
+    id: string,
+    data: { name?: string; overrides?: Record<string, unknown>; included?: boolean },
+  ) => Promise<void>;
   removeEntry: (id: string) => Promise<void>;
   duplicateEntry: (id: string) => Promise<void>;
   reorder: (id: string, direction: "up" | "down") => Promise<void>;

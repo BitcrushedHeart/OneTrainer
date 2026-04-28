@@ -54,6 +54,7 @@ class QueueEntry:
     status: QueueEntryStatus = QueueEntryStatus.PENDING
     failure_history: list[dict] = field(default_factory=list)
     auto_batch: AutoBatchSettings = field(default_factory=AutoBatchSettings)
+    included: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -63,6 +64,7 @@ class QueueEntry:
             "status": str(self.status),
             "failure_history": self.failure_history,
             "auto_batch": self.auto_batch.to_dict(),
+            "included": self.included,
         }
 
     @staticmethod
@@ -74,6 +76,7 @@ class QueueEntry:
             status=QueueEntryStatus(data.get("status", "PENDING")),
             failure_history=data.get("failure_history", []),
             auto_batch=AutoBatchSettings.from_dict(data.get("auto_batch", {})),
+            included=bool(data.get("included", True)),
         )
 
 

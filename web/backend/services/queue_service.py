@@ -170,7 +170,7 @@ class QueueService(SingletonMixin):
     def auto_batch_calculate_all(self) -> dict:
         results: list[dict] = []
         for entry in list(self._manager.entries):
-            if not entry.auto_batch.enabled:
+            if not entry.included or not entry.auto_batch.enabled:
                 continue
             res = self.auto_batch_calculate(entry.id)
             results.append({"entry_id": entry.id, **res})
@@ -244,6 +244,8 @@ class QueueService(SingletonMixin):
         """
         events: list[dict] = []
         for entry in list(self._manager.entries):
+            if not entry.included:
+                continue
             if not entry.auto_batch.enabled:
                 continue
             res = self.auto_batch_calculate(entry.id)

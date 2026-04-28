@@ -57,6 +57,7 @@ export interface QueueEntryData {
   status: string;
   failure_history: Array<{ step: number; error: string; timestamp: string }>;
   auto_batch: AutoBatchSettingsData;
+  included: boolean;
 }
 
 export interface QueueSettingsData {
@@ -101,7 +102,7 @@ export const queueApi = {
       body: JSON.stringify({ name, overrides }),
     }),
 
-  updateEntry: (entryId: string, data: { name?: string; overrides?: Record<string, unknown> }) =>
+  updateEntry: (entryId: string, data: { name?: string; overrides?: Record<string, unknown>; included?: boolean }) =>
     request<QueueEntryData>(`/queue/entry/${entryId}`, {
       method: "PATCH",
       body: JSON.stringify(data),

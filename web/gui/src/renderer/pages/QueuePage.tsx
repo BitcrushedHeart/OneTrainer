@@ -138,26 +138,52 @@ function EntryList() {
           </div>
         )}
         {entries.map((entry, i) => (
-          <button
+          <div
             key={entry.id}
-            className="w-full text-left px-3 py-2 border-b border-[var(--color-border-subtle)] transition-colors"
+            role="button"
+            tabIndex={0}
+            className="w-full text-left px-3 py-2 border-b border-[var(--color-border-subtle)] transition-colors cursor-pointer flex items-start gap-2"
             style={{
               background: entry.id === selectedEntryId ? "var(--color-cobalt-600-alpha-15)" : "transparent",
+              opacity: entry.included ? 1 : 0.5,
             }}
             onClick={() => selectEntry(entry.id)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                selectEntry(entry.id);
+              }
+            }}
           >
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-sm font-medium text-[var(--color-on-surface)] truncate">
-                {entry.name || `Entry ${i + 1}`}
-              </span>
-              <StatusBadge status={entry.status} />
-            </div>
-            {Object.keys(entry.overrides).length > 0 && (
-              <div className="text-xs text-[var(--color-on-surface-secondary)] mt-0.5">
-                {Object.keys(entry.overrides).length} override(s)
+            <input
+              type="checkbox"
+              checked={entry.included}
+              disabled={isRunning}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                e.stopPropagation();
+                void useQueueStore.getState().updateEntry(entry.id, { included: e.target.checked });
+              }}
+              title={entry.included ? "Included in next run" : "Excluded from next run"}
+              className="mt-0.5 cursor-pointer accent-[var(--color-cobalt-600)]"
+            />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between gap-2">
+                <span
+                  className="text-sm font-medium text-[var(--color-on-surface)] truncate"
+                  style={{ textDecoration: entry.included ? "none" : "line-through" }}
+                >
+                  {entry.name || `Entry ${i + 1}`}
+                </span>
+                <StatusBadge status={entry.status} />
               </div>
-            )}
-          </button>
+              {Object.keys(entry.overrides).length > 0 && (
+                <div className="text-xs text-[var(--color-on-surface-secondary)] mt-0.5">
+                  {Object.keys(entry.overrides).length} override(s)
+                </div>
+              )}
+            </div>
+          </div>
         ))}
       </div>
     </div>
@@ -397,6 +423,11 @@ export default function QueuePage() {
           <Sparkles className="w-4 h-4 mr-1" />
           Auto-Batch All
         </Button>
+        {!isRunning && entries.length > 0 && (
+          <span className="text-sm text-[var(--color-on-surface-secondary)]">
+            {entries.filter((e) => e.included).length} of {entries.length} included
+          </span>
+        )}
         <div className="flex-1" />
         <Button variant="ghost" onClick={handleExport} title="Export queue">
           <Download className="w-4 h-4" />

@@ -28,6 +28,7 @@ class CreateEntryRequest(BaseModel):
 class UpdateEntryRequest(BaseModel):
     name: str | None = None
     overrides: dict | None = None
+    included: bool | None = None
 
 
 class ReorderRequest(BaseModel):
@@ -59,6 +60,8 @@ def update_entry(entry_id: str, req: UpdateEntryRequest):
         kwargs["name"] = req.name
     if req.overrides is not None:
         kwargs["overrides"] = req.overrides
+    if req.included is not None:
+        kwargs["included"] = req.included
     return service.update_entry(entry_id, **kwargs)
 
 
