@@ -238,22 +238,6 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       case "queue:complete":
         set({ status: "idle", currentEntryId: null });
         break;
-
-      case "queue:auto_batch_failed":
-      case "queue:auto_batch_warning": {
-        const kind: AutoBatchEvent["kind"] = type === "queue:auto_batch_failed" ? "failed" : "warning";
-        const entryId = (msg.entry_id as string) ?? "";
-        const message = (msg.error as string) ?? (msg.warning as string) ?? "Auto-Batch event";
-        const event: AutoBatchEvent = {
-          id: Date.now() + Math.floor(Math.random() * 1000),
-          entryId,
-          kind,
-          message,
-          timestamp: Date.now(),
-        };
-        set((s) => ({ autoBatchEvents: [...s.autoBatchEvents.slice(-9), event] }));
-        break;
-      }
     }
   },
 }));

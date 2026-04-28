@@ -139,10 +139,14 @@ def compute_auto_batch(
         )
 
     # Per-batch-size candidates ----------------------------------------------
+    # analyze_concept returns one entry per target resolution and counts every
+    # image once per resolution. To avoid inflating denominators when multiple
+    # resolutions are configured, aggregate per-resolution and take the worst
+    # (highest) drop_pct across resolutions for tolerance checks.
     candidates: list[AutoBatchCandidate] = []
     for bs in range(min_batch_size, max_batch_size + 1):
-        total_pairs = 0
-        total_drops = 0
+        per_target_pairs: dict[int, int] = dict.fromkeys(target_resolutions, 0)
+        per_target_drops: dict[int, int] = dict.fromkeys(target_resolutions, 0)
         for concept in concepts:
             path = concept.get("path", "")
             if not path:
@@ -153,13 +157,32 @@ def compute_auto_batch(
                 warnings.append(f"concept {concept.get('name') or path}: {exc}")
                 continue
             for target in result.get("targets", []):
-                total_pairs += int(target.get("total_pairs", 0))
-                total_drops += int(target.get("total_drops", 0))
-        drop_pct = (total_drops / total_pairs) if total_pairs > 0 else 1.0
+                tres = int(target.get("target", 0))
+                per_target_pairs[tres] = per_target_pairs.get(tres, 0) + int(target.get("total_pairs", 0))
+                per_target_drops[tres] = per_target_drops.get(tres, 0) + int(target.get("total_drops", 0))
+
+        per_target_drop_pcts = [
+            (per_target_drops[t] / per_target_pairs[t]) if per_target_pairs[t] > 0 else 1.0
+            for t in per_target_pairs
+        ]
+        drop_pct = max(per_target_drop_pcts) if per_target_drop_pcts else 1.0
+        # Effective sample count = images per resolution (the same images bucket
+        # at every target). Take the max so a missing/empty resolution doesn't
+        # zero out the count.
+        effective_pairs = max(per_target_pairs.values(), default=0)
+        # dropped reported to the UI = drops at the worst-affected resolution
+        worst_idx = max(
+            range(len(per_target_drop_pcts)) if per_target_drop_pcts else range(0),
+            key=lambda i: per_target_drop_pcts[i],
+            default=0,
+        )
+        worst_target = list(per_target_pairs.keys())[worst_idx] if per_target_pairs else None
+        worst_drops = per_target_drops[worst_target] if worst_target is not None else 0
+
         candidates.append(AutoBatchCandidate(
             batch_size=bs,
-            total_pairs=total_pairs,
-            total_drops=total_drops,
+            total_pairs=effective_pairs,
+            total_drops=worst_drops,
             drop_pct=drop_pct,
             valid=drop_pct <= tolerance,
         ))
@@ -199,8 +222,8 @@ def compute_auto_batch(
 
     if chosen.batch_size > effective:
         warnings.append(
-            f"min batch size {chosen.batch_size} exceeds dataset size {effective}; "
-            "forcing accum=1."
+            f"chosen batch size {chosen.batch_size} exceeds dataset size {effective}; "
+            f"falling back to min batch size {min_batch_size} with accum=1."
         )
         return AutoBatchResult(
             batch_size=min_batch_size,

@@ -240,7 +240,7 @@ class QueueService(SingletonMixin):
         On success, writes batch_size + gradient_accumulation_steps into the entry's
         overrides dict. On failure for an individual entry, records the event and
         continues with the rest of the queue. Returns a list of events that the
-        caller can surface to the user.
+        caller surfaces to the UI in the /queue/execute response.
         """
         events: list[dict] = []
         for entry in list(self._manager.entries):
@@ -248,26 +248,22 @@ class QueueService(SingletonMixin):
                 continue
             res = self.auto_batch_calculate(entry.id)
             if not res.get("ok"):
-                event = {
+                events.append({
                     "type": "queue:auto_batch_failed",
                     "entry_id": entry.id,
                     "error": res.get("error", "Auto-Batch calculation failed"),
-                }
-                events.append(event)
-                self._broadcast(event)
+                })
                 continue
             result = res.get("result") or {}
             bs = result.get("batch_size")
             accum = result.get("accum")
             warning = result.get("warning")
             if not isinstance(bs, int) or not isinstance(accum, int):
-                event = {
+                events.append({
                     "type": "queue:auto_batch_failed",
                     "entry_id": entry.id,
                     "error": "Auto-Batch returned no batch size",
-                }
-                events.append(event)
-                self._broadcast(event)
+                })
                 continue
             entry.overrides["batch_size"] = bs
             entry.overrides["gradient_accumulation_steps"] = accum
@@ -279,13 +275,11 @@ class QueueService(SingletonMixin):
                 f" — warning: {warning}" if warning else "",
             )
             if warning:
-                event = {
+                events.append({
                     "type": "queue:auto_batch_warning",
                     "entry_id": entry.id,
                     "warning": warning,
-                }
-                events.append(event)
-                self._broadcast(event)
+                })
         self._manager.save()
         return events
 
