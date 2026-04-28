@@ -8,18 +8,23 @@ import {
   FilePlus,
   Loader2,
   Pause,
+  Pencil,
   Play,
   Plus,
   SkipForward,
+  Sparkles,
   Square,
   Trash2,
   Upload,
+  X,
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { queueApi } from "@/api/queueApi";
 import { DiffPanel } from "@/components/queue/DiffPanel";
+import { QueueAutoBatchAllModal } from "@/components/queue/QueueAutoBatchAllModal";
+import { QueueOverrideModal } from "@/components/queue/QueueOverrideModal";
 import { Button, Card, FormEntry, Toggle } from "@/components/shared";
 import { useQueueStore } from "@/store/queueStore";
 
@@ -159,7 +164,18 @@ function EntryList() {
   );
 }
 
-function EntryEditor() {
+function countLeaves(node: unknown): number {
+  if (node === undefined || node === null) return 0;
+  if (Array.isArray(node)) return node.length > 0 ? 1 : 0;
+  if (typeof node !== "object") return 1;
+  let total = 0;
+  for (const value of Object.values(node as Record<string, unknown>)) {
+    total += countLeaves(value);
+  }
+  return total;
+}
+
+function EntryEditor({ onEditOverrides }: { onEditOverrides: (entryId: string) => void }) {
   const entries = useQueueStore((s) => s.entries);
   const selectedEntryId = useQueueStore((s) => s.selectedEntryId);
   const updateEntry = useQueueStore((s) => s.updateEntry);
@@ -168,16 +184,10 @@ function EntryEditor() {
   const entry = entries.find((e) => e.id === selectedEntryId);
 
   const [draftName, setDraftName] = useState("");
-  const [draftOverridesJson, setDraftOverridesJson] = useState("");
-  const [jsonError, setJsonError] = useState<string | null>(null);
   const nameTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
-    if (entry) {
-      setDraftName(entry.name);
-      setDraftOverridesJson(JSON.stringify(entry.overrides, null, 2));
-      setJsonError(null);
-    }
+    if (entry) setDraftName(entry.name);
   }, [entry?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleNameChange = useCallback(
@@ -192,17 +202,6 @@ function EntryEditor() {
     [selectedEntryId, updateEntry],
   );
 
-  const handleOverridesBlur = useCallback(() => {
-    if (!selectedEntryId) return;
-    try {
-      const parsed = JSON.parse(draftOverridesJson);
-      setJsonError(null);
-      updateEntry(selectedEntryId, { overrides: parsed });
-    } catch (e) {
-      setJsonError(String(e));
-    }
-  }, [selectedEntryId, draftOverridesJson, updateEntry]);
-
   if (!entry) {
     return (
       <div className="flex items-center justify-center h-full text-[var(--color-on-surface-secondary)]">
@@ -212,6 +211,7 @@ function EntryEditor() {
   }
 
   const validation = validationResults[entry.id];
+  const overrideCount = countLeaves(entry.overrides);
 
   return (
     <div className="p-4 space-y-4 overflow-y-auto h-full">
@@ -220,16 +220,19 @@ function EntryEditor() {
         <FormEntry label="" value={draftName} onChange={handleNameChange} />
       </div>
 
-      <div>
-        <label className="block text-sm font-medium text-[var(--color-on-surface)] mb-1">Config Overrides (JSON)</label>
-        <textarea
-          className="w-full h-64 p-2 rounded-md text-sm font-mono border border-[var(--color-border-subtle)] bg-[var(--color-surface-container)] text-[var(--color-on-surface)] resize-y"
-          value={draftOverridesJson}
-          onChange={(e) => setDraftOverridesJson(e.target.value)}
-          onBlur={handleOverridesBlur}
-          spellCheck={false}
-        />
-        {jsonError && <p className="text-xs text-[var(--color-error-500)] mt-1">{jsonError}</p>}
+      <div className="flex items-center justify-between gap-3 rounded-[var(--radius-sm)] border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] px-3 py-2">
+        <div className="flex flex-col">
+          <span className="text-sm font-medium text-[var(--color-on-surface)]">Config Overrides</span>
+          <span className="text-xs text-[var(--color-on-surface-secondary)]">
+            {overrideCount === 0
+              ? "Inheriting all global settings"
+              : `${overrideCount} field${overrideCount === 1 ? "" : "s"} overridden`}
+          </span>
+        </div>
+        <Button variant="primary" size="sm" onClick={() => onEditOverrides(entry.id)}>
+          <Pencil className="w-4 h-4 mr-1" />
+          Edit Overrides
+        </Button>
       </div>
 
       <DiffPanel entryId={entry.id} />
@@ -320,6 +323,18 @@ export default function QueuePage() {
   const totalEntries = useQueueStore((s) => s.totalEntries);
   const loading = useQueueStore((s) => s.loading);
 
+  const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
+  const [autoBatchAllOpen, setAutoBatchAllOpen] = useState(false);
+  const handleOpenOverrides = useCallback((entryId: string) => setEditingEntryId(entryId), []);
+  const handleCloseOverrides = useCallback(() => {
+    setEditingEntryId(null);
+    void loadQueue();
+  }, [loadQueue]);
+
+  const autoBatchEvents = useQueueStore((s) => s.autoBatchEvents);
+  const dismissAutoBatchEvent = useQueueStore((s) => s.dismissAutoBatchEvent);
+  const entries = useQueueStore((s) => s.entries);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -378,6 +393,10 @@ export default function QueuePage() {
           <AlertTriangle className="w-4 h-4 mr-1" />
           Validate
         </Button>
+        <Button variant="secondary" onClick={() => setAutoBatchAllOpen(true)} disabled={isRunning}>
+          <Sparkles className="w-4 h-4 mr-1" />
+          Auto-Batch All
+        </Button>
         <div className="flex-1" />
         <Button variant="ghost" onClick={handleExport} title="Export queue">
           <Download className="w-4 h-4" />
@@ -401,11 +420,48 @@ export default function QueuePage() {
         </Card>
         <div className="flex-1 flex flex-col gap-4 min-h-0">
           <Card className="flex-1 p-0 overflow-hidden">
-            <EntryEditor />
+            <EntryEditor onEditOverrides={handleOpenOverrides} />
           </Card>
           <QueueSettings />
         </div>
       </div>
+
+      <QueueOverrideModal open={editingEntryId !== null} entryId={editingEntryId} onClose={handleCloseOverrides} />
+      <QueueAutoBatchAllModal open={autoBatchAllOpen} onClose={() => setAutoBatchAllOpen(false)} />
+
+      {autoBatchEvents.length > 0 && (
+        <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50 max-w-md" aria-live="polite">
+          {autoBatchEvents.map((evt) => {
+            const entryName = entries.find((e) => e.id === evt.entryId)?.name || "Entry";
+            const isFailed = evt.kind === "failed";
+            const toneClasses = isFailed
+              ? "border-[var(--color-error-500-alpha-40)] bg-[var(--color-error-500-alpha-08)] text-[var(--color-error-500)]"
+              : "border-[var(--color-warning-500-alpha-15)] bg-[var(--color-warning-500-alpha-06)] text-[var(--color-warning-500)]";
+            return (
+              <div
+                key={evt.id}
+                className={`flex items-start gap-2 px-3 py-2 rounded-[var(--radius-sm)] border ${toneClasses} shadow-[var(--shadow-md)]`}
+              >
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <div className="flex-1 text-[var(--text-caption)] leading-snug">
+                  <div className="font-semibold">
+                    Auto-Batch {isFailed ? "failed" : "warning"} — {entryName}
+                  </div>
+                  <div>{evt.message}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => dismissAutoBatchEvent(evt.id)}
+                  className="shrink-0 opacity-60 hover:opacity-100"
+                  aria-label="Dismiss"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

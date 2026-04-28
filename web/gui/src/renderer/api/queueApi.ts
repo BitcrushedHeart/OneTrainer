@@ -14,12 +14,49 @@ export interface QueueDiffResponse {
   error?: string;
 }
 
+export interface AutoBatchSettingsData {
+  enabled: boolean;
+  min_batch_size: number;
+  max_batch_size: number;
+  target_pct: number;
+  max_drop_pct: number;
+  last_batch_size: number | null;
+  last_accum: number | null;
+  last_effective_samples: number | null;
+  last_dropped: number | null;
+}
+
+export interface AutoBatchCandidate {
+  batch_size: number;
+  total_pairs: number;
+  total_drops: number;
+  drop_pct: number;
+  valid: boolean;
+}
+
+export interface AutoBatchResultData {
+  batch_size: number;
+  accum: number;
+  effective_sample_count: number;
+  dropped: number;
+  candidates: AutoBatchCandidate[];
+  warning: string | null;
+}
+
+export interface AutoBatchCalculateResponse {
+  ok: boolean;
+  error?: string;
+  result?: AutoBatchResultData;
+  entry?: QueueEntryData;
+}
+
 export interface QueueEntryData {
   id: string;
   name: string;
   overrides: Record<string, unknown>;
   status: string;
   failure_history: Array<{ step: number; error: string; timestamp: string }>;
+  auto_batch: AutoBatchSettingsData;
 }
 
 export interface QueueSettingsData {
@@ -42,6 +79,17 @@ export interface QueueState {
 export interface ActionResponse {
   ok: boolean;
   error?: string;
+}
+
+export interface AutoBatchWsEvent {
+  type: "queue:auto_batch_failed" | "queue:auto_batch_warning";
+  entry_id: string;
+  error?: string;
+  warning?: string;
+}
+
+export interface QueueExecuteResponse extends ActionResponse {
+  auto_batch_events?: AutoBatchWsEvent[];
 }
 
 export const queueApi = {
@@ -77,7 +125,7 @@ export const queueApi = {
       method: "POST",
     }),
 
-  execute: () => request<ActionResponse>("/queue/execute", { method: "POST" }),
+  execute: () => request<QueueExecuteResponse>("/queue/execute", { method: "POST" }),
 
   stopCurrent: () => request<ActionResponse>("/queue/stop", { method: "POST" }),
 
@@ -98,6 +146,37 @@ export const queueApi = {
     }),
 
   entryDiff: (entryId: string) => request<QueueDiffResponse>(`/queue/entry/${entryId}/diff`),
+
+  updateAutoBatch: (
+    entryId: string,
+    settings: Partial<
+      Omit<AutoBatchSettingsData, "last_batch_size" | "last_accum" | "last_effective_samples" | "last_dropped">
+    >,
+  ) =>
+    request<{ ok: boolean; entry?: QueueEntryData; error?: string }>(`/queue/entry/${entryId}/auto-batch`, {
+      method: "PATCH",
+      body: JSON.stringify(settings),
+    }),
+
+  calculateAutoBatch: (entryId: string) =>
+    request<AutoBatchCalculateResponse>(`/queue/entry/${entryId}/auto-batch-calculate`, { method: "POST" }),
+
+  bulkAutoBatch: (settings: {
+    min_batch_size: number;
+    max_batch_size: number;
+    target_pct: number;
+    max_drop_pct: number;
+  }) =>
+    request<{ ok: boolean; count?: number; error?: string }>("/queue/auto-batch-bulk", {
+      method: "POST",
+      body: JSON.stringify(settings),
+    }),
+
+  calculateAutoBatchAll: () =>
+    request<{
+      ok: boolean;
+      results: Array<{ entry_id: string; ok: boolean; result?: AutoBatchResultData; error?: string }>;
+    }>("/queue/auto-batch-calculate-all", { method: "POST" }),
 
   entryFromFile: async (file: File, name?: string): Promise<{ ok: boolean; entry?: QueueEntryData }> => {
     const fd = new FormData();

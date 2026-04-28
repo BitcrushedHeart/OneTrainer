@@ -1,6 +1,21 @@
 import { create } from "zustand";
 
-import { queueApi, type QueueEntryData, type QueueSettingsData, type QueueState } from "@/api/queueApi";
+import {
+  type AutoBatchResultData,
+  type AutoBatchSettingsData,
+  queueApi,
+  type QueueEntryData,
+  type QueueSettingsData,
+  type QueueState,
+} from "@/api/queueApi";
+
+export interface AutoBatchEvent {
+  id: number;
+  entryId: string;
+  kind: "failed" | "warning";
+  message: string;
+  timestamp: number;
+}
 
 interface QueueStore {
   entries: QueueEntryData[];
@@ -12,6 +27,9 @@ interface QueueStore {
   selectedEntryId: string | null;
   validationResults: Record<string, { errors: string[]; warnings: string[] }>;
   loading: boolean;
+  autoBatchEvents: AutoBatchEvent[];
+  dismissAutoBatchEvent: (id: number) => void;
+  clearAutoBatchEvents: () => void;
 
   loadQueue: () => Promise<void>;
   addEntry: (name?: string) => Promise<void>;
@@ -25,6 +43,14 @@ interface QueueStore {
   execute: () => Promise<void>;
   stopCurrent: () => Promise<void>;
   stopAll: () => Promise<void>;
+  updateAutoBatch: (id: string, settings: Partial<AutoBatchSettingsData>) => Promise<void>;
+  calculateAutoBatch: (id: string) => Promise<AutoBatchResultData | null>;
+  bulkAutoBatch: (settings: {
+    min_batch_size: number;
+    max_batch_size: number;
+    target_pct: number;
+    max_drop_pct: number;
+  }) => Promise<void>;
   handleWsMessage: (msg: Record<string, unknown>) => void;
 }
 
@@ -44,6 +70,14 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   selectedEntryId: null,
   validationResults: {},
   loading: false,
+  autoBatchEvents: [],
+
+  dismissAutoBatchEvent: (id) =>
+    set((s) => ({
+      autoBatchEvents: s.autoBatchEvents.filter((e) => e.id !== id),
+    })),
+
+  clearAutoBatchEvents: () => set({ autoBatchEvents: [] }),
 
   loadQueue: async () => {
     set({ loading: true });
@@ -111,6 +145,17 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     const result = await queueApi.execute();
     if (result.ok) {
       set({ status: "running" });
+      if (result.auto_batch_events && result.auto_batch_events.length > 0) {
+        const ts = Date.now();
+        const events: AutoBatchEvent[] = result.auto_batch_events.map((e, i) => ({
+          id: ts + i,
+          entryId: e.entry_id,
+          kind: e.type === "queue:auto_batch_failed" ? "failed" : "warning",
+          message: e.error ?? e.warning ?? "Auto-Batch event",
+          timestamp: ts,
+        }));
+        set((s) => ({ autoBatchEvents: [...s.autoBatchEvents, ...events].slice(-10) }));
+      }
       await get().loadQueue();
     }
   },
@@ -122,6 +167,38 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   stopAll: async () => {
     await queueApi.stopAll();
     set({ status: "stopping" });
+  },
+
+  updateAutoBatch: async (id, settings) => {
+    const result = await queueApi.updateAutoBatch(id, settings);
+    if (result.ok && result.entry) {
+      const updated = result.entry;
+      set((s) => ({
+        entries: s.entries.map((e) => (e.id === id ? updated : e)),
+      }));
+    } else if (result.error) {
+      throw new Error(result.error);
+    }
+  },
+
+  calculateAutoBatch: async (id) => {
+    const result = await queueApi.calculateAutoBatch(id);
+    if (result.ok && result.entry) {
+      const updated = result.entry;
+      set((s) => ({
+        entries: s.entries.map((e) => (e.id === id ? updated : e)),
+      }));
+    }
+    if (!result.ok) {
+      throw new Error(result.error ?? "Auto-Batch calculation failed");
+    }
+    return result.result ?? null;
+  },
+
+  bulkAutoBatch: async (settings) => {
+    const result = await queueApi.bulkAutoBatch(settings);
+    if (!result.ok) throw new Error(result.error ?? "Bulk Auto-Batch failed");
+    await get().loadQueue();
   },
 
   handleWsMessage: (msg) => {
@@ -161,6 +238,22 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       case "queue:complete":
         set({ status: "idle", currentEntryId: null });
         break;
+
+      case "queue:auto_batch_failed":
+      case "queue:auto_batch_warning": {
+        const kind: AutoBatchEvent["kind"] = type === "queue:auto_batch_failed" ? "failed" : "warning";
+        const entryId = (msg.entry_id as string) ?? "";
+        const message = (msg.error as string) ?? (msg.warning as string) ?? "Auto-Batch event";
+        const event: AutoBatchEvent = {
+          id: Date.now() + Math.floor(Math.random() * 1000),
+          entryId,
+          kind,
+          message,
+          timestamp: Date.now(),
+        };
+        set((s) => ({ autoBatchEvents: [...s.autoBatchEvents.slice(-9), event] }));
+        break;
+      }
     }
   },
 }));

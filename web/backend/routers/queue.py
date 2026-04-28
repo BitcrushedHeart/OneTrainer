@@ -14,6 +14,12 @@ class QueueActionResponse(BaseModel):
     error: str | None = None
 
 
+class QueueExecuteResponse(BaseModel):
+    ok: bool
+    error: str | None = None
+    auto_batch_events: list[dict] | None = None
+
+
 class CreateEntryRequest(BaseModel):
     name: str = ""
     overrides: dict = {}
@@ -80,11 +86,15 @@ def validate_queue():
     return service.validate()
 
 
-@router.post("/queue/execute", response_model=QueueActionResponse)
+@router.post("/queue/execute", response_model=QueueExecuteResponse)
 def execute_queue():
     service = QueueService.get_instance()
     result = service.execute()
-    return QueueActionResponse(**result)
+    return QueueExecuteResponse(
+        ok=result.get("ok", False),
+        error=result.get("error"),
+        auto_batch_events=result.get("auto_batch_events"),
+    )
 
 
 @router.post("/queue/stop", response_model=QueueActionResponse)
@@ -123,6 +133,52 @@ def import_queue(req: ImportQueueRequest):
 def entry_diff(entry_id: str):
     service = QueueService.get_instance()
     return service.entry_diff(entry_id)
+
+
+class AutoBatchSettingsRequest(BaseModel):
+    enabled: bool | None = None
+    min_batch_size: int | None = None
+    max_batch_size: int | None = None
+    target_pct: float | None = None
+    max_drop_pct: float | None = None
+
+
+class BulkAutoBatchRequest(BaseModel):
+    min_batch_size: int
+    max_batch_size: int
+    target_pct: float
+    max_drop_pct: float = 5.0
+
+
+@router.patch("/queue/entry/{entry_id}/auto-batch")
+def update_auto_batch(entry_id: str, req: AutoBatchSettingsRequest):
+    service = QueueService.get_instance()
+    payload = {k: v for k, v in req.model_dump().items() if v is not None}
+    result = service.update_auto_batch(entry_id, payload)
+    if not result.get("ok"):
+        raise HTTPException(status_code=422, detail=result.get("error", "Invalid Auto-Batch settings"))
+    return result
+
+
+@router.post("/queue/entry/{entry_id}/auto-batch-calculate")
+def calculate_auto_batch(entry_id: str):
+    service = QueueService.get_instance()
+    return service.auto_batch_calculate(entry_id)
+
+
+@router.post("/queue/auto-batch-bulk")
+def bulk_auto_batch(req: BulkAutoBatchRequest):
+    service = QueueService.get_instance()
+    result = service.bulk_set_auto_batch(req.model_dump())
+    if not result.get("ok"):
+        raise HTTPException(status_code=422, detail=result.get("error", "Invalid bulk Auto-Batch payload"))
+    return result
+
+
+@router.post("/queue/auto-batch-calculate-all")
+def calculate_auto_batch_all():
+    service = QueueService.get_instance()
+    return service.auto_batch_calculate_all()
 
 
 @router.post("/queue/entry/from-file")

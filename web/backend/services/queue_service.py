@@ -4,7 +4,8 @@ from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, Literal
 
-from modules.util.config.QueueConfig import QueueEntry, QueueSettings
+from modules.util.auto_batch import compute_auto_batch
+from modules.util.config.QueueConfig import AutoBatchSettings, QueueEntry, QueueSettings
 from modules.util.queue.QueueExecutor import QueueExecutor
 from modules.util.queue.QueueManager import QueueManager
 from modules.util.queue.QueueValidator import QueueValidator
@@ -109,6 +110,90 @@ class QueueService(SingletonMixin):
         self._manager.save()
         return self._manager.settings.to_dict()
 
+    # --- Auto-Batch ---
+
+    @staticmethod
+    def _input_fields_changed(new: AutoBatchSettings, old: AutoBatchSettings) -> bool:
+        return (
+            new.min_batch_size != old.min_batch_size
+            or new.max_batch_size != old.max_batch_size
+            or new.target_pct != old.target_pct
+            or new.max_drop_pct != old.max_drop_pct
+        )
+
+    def update_auto_batch(self, entry_id: str, settings: dict) -> dict:
+        entry = self._manager.get_entry(entry_id)
+        if entry is None:
+            return {"ok": False, "error": "Entry not found"}
+        merged = {**entry.auto_batch.to_dict(), **(settings or {})}
+        new_settings = AutoBatchSettings.from_dict(merged)
+        if new_settings.min_batch_size > new_settings.max_batch_size:
+            return {"ok": False, "error": "min_batch_size must be <= max_batch_size"}
+        if self._input_fields_changed(new_settings, entry.auto_batch):
+            new_settings.last_batch_size = None
+            new_settings.last_accum = None
+            new_settings.last_effective_samples = None
+            new_settings.last_dropped = None
+        entry.auto_batch = new_settings
+        self._manager.save()
+        return {"ok": True, "entry": entry.to_dict()}
+
+    def auto_batch_calculate(self, entry_id: str) -> dict:
+        entry = self._manager.get_entry(entry_id)
+        if entry is None:
+            return {"ok": False, "error": "Entry not found"}
+        config_service = ConfigService.get_instance()
+        global_config = config_service.get_config_for_training()
+        try:
+            merged = QueueExecutor.merge_config(global_config, entry.overrides or {})
+        except Exception as exc:
+            logger.exception("Auto-batch: failed to merge config for entry %s", entry_id)
+            return {"ok": False, "error": f"Failed to merge config: {exc}"}
+        try:
+            result = compute_auto_batch(
+                merged_config=merged,
+                min_batch_size=entry.auto_batch.min_batch_size,
+                max_batch_size=entry.auto_batch.max_batch_size,
+                target_pct=entry.auto_batch.target_pct,
+                max_drop_pct=entry.auto_batch.max_drop_pct,
+            )
+        except Exception as exc:
+            logger.exception("Auto-batch: compute failed for entry %s", entry_id)
+            return {"ok": False, "error": str(exc)}
+        entry.auto_batch.last_batch_size = result.batch_size
+        entry.auto_batch.last_accum = result.accum
+        entry.auto_batch.last_effective_samples = result.effective_sample_count
+        entry.auto_batch.last_dropped = result.dropped
+        self._manager.save()
+        return {"ok": True, "result": result.to_dict(), "entry": entry.to_dict()}
+
+    def auto_batch_calculate_all(self) -> dict:
+        results: list[dict] = []
+        for entry in list(self._manager.entries):
+            if not entry.auto_batch.enabled:
+                continue
+            res = self.auto_batch_calculate(entry.id)
+            results.append({"entry_id": entry.id, **res})
+        return {"ok": True, "results": results}
+
+    def bulk_set_auto_batch(self, settings: dict) -> dict:
+        if not isinstance(settings, dict):
+            return {"ok": False, "error": "Invalid payload"}
+        min_bs = int(settings.get("min_batch_size", 1))
+        max_bs = int(settings.get("max_batch_size", 8))
+        if min_bs < 1 or max_bs < min_bs:
+            return {"ok": False, "error": "min_batch_size must be >= 1 and <= max_batch_size"}
+        for entry in self._manager.entries:
+            entry.auto_batch = AutoBatchSettings(
+                enabled=True,
+                min_batch_size=min_bs,
+                max_batch_size=max_bs,
+                target_pct=float(settings.get("target_pct", 100.0)),
+                max_drop_pct=float(settings.get("max_drop_pct", 5.0)),
+            )
+        self._manager.save()
+        return {"ok": True, "count": len(self._manager.entries)}
+
     # --- Validation ---
 
     def validate(self) -> dict:
@@ -131,6 +216,7 @@ class QueueService(SingletonMixin):
         config_service = ConfigService.get_instance()
         global_config = config_service.get_config_for_training()
 
+        auto_batch_events = self._resolve_auto_batch_for_run()
         self._manager.reset_all_to_pending()
         self._executor = QueueExecutor(
             queue_manager=self._manager,
@@ -146,7 +232,62 @@ class QueueService(SingletonMixin):
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        return {"ok": True}
+        return {"ok": True, "auto_batch_events": auto_batch_events}
+
+    def _resolve_auto_batch_for_run(self) -> list[dict]:
+        """Compute Auto-Batch overrides for every enabled entry just before launch.
+
+        On success, writes batch_size + gradient_accumulation_steps into the entry's
+        overrides dict. On failure for an individual entry, records the event and
+        continues with the rest of the queue. Returns a list of events that the
+        caller can surface to the user.
+        """
+        events: list[dict] = []
+        for entry in list(self._manager.entries):
+            if not entry.auto_batch.enabled:
+                continue
+            res = self.auto_batch_calculate(entry.id)
+            if not res.get("ok"):
+                event = {
+                    "type": "queue:auto_batch_failed",
+                    "entry_id": entry.id,
+                    "error": res.get("error", "Auto-Batch calculation failed"),
+                }
+                events.append(event)
+                self._broadcast(event)
+                continue
+            result = res.get("result") or {}
+            bs = result.get("batch_size")
+            accum = result.get("accum")
+            warning = result.get("warning")
+            if not isinstance(bs, int) or not isinstance(accum, int):
+                event = {
+                    "type": "queue:auto_batch_failed",
+                    "entry_id": entry.id,
+                    "error": "Auto-Batch returned no batch size",
+                }
+                events.append(event)
+                self._broadcast(event)
+                continue
+            entry.overrides["batch_size"] = bs
+            entry.overrides["gradient_accumulation_steps"] = accum
+            logger.info(
+                "Auto-Batch resolved entry %s: batch_size=%d accum=%d (effective=%s, drops=%s)%s",
+                entry.id, bs, accum,
+                result.get("effective_sample_count"),
+                result.get("dropped"),
+                f" — warning: {warning}" if warning else "",
+            )
+            if warning:
+                event = {
+                    "type": "queue:auto_batch_warning",
+                    "entry_id": entry.id,
+                    "warning": warning,
+                }
+                events.append(event)
+                self._broadcast(event)
+        self._manager.save()
+        return events
 
     def stop_current(self) -> dict:
         if self._executor:
