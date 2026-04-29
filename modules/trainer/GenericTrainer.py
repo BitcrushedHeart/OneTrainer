@@ -924,7 +924,7 @@ class GenericTrainer(BaseTrainer):
                         # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
                         micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
                         if accumulated_dpo_metrics is None:
-                            accumulated_dpo_metrics = {k: 0.0 for k in micro_dpo_metrics}
+                            accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
                             accumulated_dpo_metrics['_count'] = 0
                         for _k, _v in micro_dpo_metrics.items():
                             accumulated_dpo_metrics[_k] += _v
@@ -1108,10 +1108,27 @@ class GenericTrainer(BaseTrainer):
             self.model.to(self.temp_device)
 
         if multi.is_master():
-            self.tensorboard.close()
+            if self.tensorboard is not None:
+                self.tensorboard.close()
 
             if self.config.tensorboard and not self.config.tensorboard_always_on:
                 super()._stop_tensorboard()
 
         for handle in self.grad_hook_handles:
             handle.remove()
+        self.grad_hook_handles = []
+
+        # Drop large object references so the next queue run starts from a clean slate.
+        # Without this, model weights / optimizer state / dataloader caches live on the
+        # trainer instance until the GC reclaims it, which can take multiple cycles when
+        # cyclic refs are involved (callbacks ↔ trainer, hooks ↔ params).
+        self.model = None
+        self.model_loader = None
+        self.model_setup = None
+        self.model_saver = None
+        self.model_sampler = None
+        self.data_loader = None
+        self.validation_data_loader = None
+        self.parameters = None
+        self.tensorboard = None
+        self.sample_queue = []
