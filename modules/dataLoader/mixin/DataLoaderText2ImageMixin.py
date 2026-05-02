@@ -205,8 +205,13 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if config.aspect_ratio_bucketing:
             modules.append(aspect_bucketing_quantization)
+            # Stash the instance so _cache_modules_from_names can wire it
+            # into SmartDiskCache for bucket-method drift detection and
+            # aspect-derived re-bucketing without an image decode.
+            self._aspect_bucketing_for_cache = aspect_bucketing_quantization
         else:
             modules.append(single_aspect_calculation)
+            self._aspect_bucketing_for_cache = None
 
         return modules
 
@@ -396,10 +401,30 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         def stop_check():
             return self.stop_check_fun()
 
+        # If _aspect_bucketing_in ran first and stashed an AspectBucketing
+        # instance, wire bucket-method drift detection into the image cache.
+        # Sourceless training and non-bucketing flows leave this None — the
+        # cache then behaves as a single-variant store with drift detection
+        # disabled.
+        aspect_bucketing = getattr(self, '_aspect_bucketing_for_cache', None)
+        if aspect_bucketing is not None:
+            bucket_method_provider = aspect_bucketing.compute_bucket_method_hash
+
+            def rebucket_provider(aspect, _ab=aspect_bucketing):
+                keys = []
+                for tr in _ab.bucket_resolutions:
+                    h, w = _ab.bucket_for_aspect(aspect, tr)
+                    keys.append(f"{h}x{w}")
+                return keys
+        else:
+            bucket_method_provider = None
+            rebucket_provider = None
+
         image_disk_cache = SmartDiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
                                          balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'],
                                          group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun, stop_check_fun=stop_check,
-                                         modeltype=config.model_type.value, source_path_in_name='image_path', sourceless=sourceless)
+                                         modeltype=config.model_type.value, source_path_in_name='image_path', sourceless=sourceless,
+                                         bucket_method_provider=bucket_method_provider, rebucket_provider=rebucket_provider)
 
         text_disk_cache = SmartDiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                         variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun, stop_check_fun=stop_check,
@@ -439,7 +464,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             vae_frame_dim: bool=False,
             supports_inpainting: bool=True, #TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
     ):
-        cache_modules = self._cache_modules(config, model, model_setup)
+        # Reset before each invocation; _aspect_bucketing_in stashes the
+        # current AspectBucketing instance here so _cache_modules can wire
+        # bucket-method drift detection into SmartDiskCache.
+        self._aspect_bucketing_for_cache = None
+
         output_modules = self._output_modules(config, model, model_setup, is_validation=is_validation)
 
         if config.sourceless_training and config.latent_caching:
@@ -448,6 +477,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                     "Sourceless training cannot be used with text encoder training. "
                     "Disable sourceless_training or disable text encoder training."
                 )
+            cache_modules = self._cache_modules(config, model, model_setup)
             return self._create_mgds(
                 config,
                 [cache_modules, output_modules],
@@ -458,7 +488,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
+        # Build aspect-bucketing first so its instance is stashed on self
+        # before _cache_modules constructs SmartDiskCache.
         aspect_bucketing_in = self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled)
+        cache_modules = self._cache_modules(config, model, model_setup)
         crop_modules = self._crop_modules(config)
         augmentation_modules = self._augmentation_modules(config)
         if supports_inpainting:

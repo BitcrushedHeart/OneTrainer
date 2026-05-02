@@ -129,8 +129,10 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         if config.aspect_ratio_bucketing:
             modules.append(aspect_bucketing)
+            self._aspect_bucketing_for_cache = aspect_bucketing
         else:
             modules.append(single_aspect_calculation)
+            self._aspect_bucketing_for_cache = None
 
         return modules
 
@@ -190,10 +192,25 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         def before_cache_fun():
             self._setup_cache_device(model, self.train_device, self.temp_device, config)
 
+        aspect_bucketing = getattr(self, '_aspect_bucketing_for_cache', None)
+        if aspect_bucketing is not None:
+            bucket_method_provider = aspect_bucketing.compute_bucket_method_hash
+
+            def rebucket_provider(aspect, _ab=aspect_bucketing):
+                keys = []
+                for tr in _ab.bucket_resolutions:
+                    h, w = _ab.bucket_for_aspect(aspect, tr)
+                    keys.append(f"{h}x{w}")
+                return keys
+        else:
+            bucket_method_provider = None
+            rebucket_provider = None
+
         disk_cache = SmartDiskCache(cache_dir=config.cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun, stop_check_fun=lambda: self.stop_check_fun(),
                                    modeltype=config.model_type.value, source_path_in_name='image_path',
-                                   sourceless=config.sourceless_training and config.latent_caching)
+                                   sourceless=config.sourceless_training and config.latent_caching,
+                                   bucket_method_provider=bucket_method_provider, rebucket_provider=rebucket_provider)
         variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
                                group_enabled_in_name='concept.enabled')
 
@@ -265,10 +282,15 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             train_progress: TrainProgress,
             is_validation: bool = False,
     ):
-        cache_modules = self.__cache_modules(config, model)
+        # Reset before each invocation; __aspect_bucketing_in stashes the
+        # current AspectBucketing instance here so __cache_modules can wire
+        # bucket-method drift detection into SmartDiskCache.
+        self._aspect_bucketing_for_cache = None
+
         output_modules = self.__output_modules(config)
 
         if config.sourceless_training and config.latent_caching:
+            cache_modules = self.__cache_modules(config, model)
             return self._create_mgds(
                 config,
                 [cache_modules, output_modules],
@@ -279,7 +301,10 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         enumerate_input = self.__enumerate_input_modules(config)
         load_input = self.__load_input_modules(config)
         mask_augmentation = self.__mask_augmentation_modules(config)
+        # Build aspect-bucketing first so its instance is stashed on self
+        # before __cache_modules constructs SmartDiskCache.
         aspect_bucketing_in = self.__aspect_bucketing_in(config)
+        cache_modules = self.__cache_modules(config, model)
         crop_modules = self.__crop_modules(config)
         augmentation_modules = self.__augmentation_modules(config)
         preparation_modules = self.__preparation_modules(config, model)
