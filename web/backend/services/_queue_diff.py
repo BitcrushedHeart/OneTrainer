@@ -54,6 +54,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "layer_filter_regex": "Regex Filter",
     "offset_noise_weight": "Offset Noise Weight", "generalized_offset_noise": "Generalized Offset Noise",
     "perturbation_noise_weight": "Perturbation Noise Weight",
+    "ciop_noise_weight": "I/O Noise Weight", "ciop_p": "I/O Noise Probability",
     "rescale_noise_scheduler_to_zero_terminal_snr": "Rescale Noise to Zero Terminal SNR",
     "force_v_prediction": "Force V-Prediction", "force_epsilon_prediction": "Force Epsilon Prediction",
     "timestep_distribution": "Timestep Distribution",
@@ -130,6 +131,7 @@ SECTION_MAP: "OrderedDict[str, list[str]]" = OrderedDict([
     ("Layer Filter", ["layer_filter", "layer_filter_preset", "layer_filter_regex"]),
     ("Noise", [
         "offset_noise_weight", "generalized_offset_noise", "perturbation_noise_weight",
+        "ciop_noise_weight", "ciop_p",
         "rescale_noise_scheduler_to_zero_terminal_snr",
         "force_v_prediction", "force_epsilon_prediction",
         "timestep_distribution", "min_noising_strength", "max_noising_strength",

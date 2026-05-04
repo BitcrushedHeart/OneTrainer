@@ -589,6 +589,14 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Compatible with V-pred and Eps-pred. Start with 0.02 and adjust as needed."
     ),
     "perturbation_noise_weight": "The weight of perturbation noise added to each training step",
+    "ciop_noise_weight": (
+        "Applies Coordinated Input-Output Perturbation (CIOP) to each training step."
+        " Recommended 0.01-0.1."
+    ),
+    "ciop_p": (
+        "The probability of applying I/O perturbation noise per training step."
+        " Recommended 0.5-0.8."
+    ),
     "timestep_distribution": "Selects the function to sample timesteps during training",
     "min_noising_strength": (
         "Specifies the minimum noising strength used during training."
