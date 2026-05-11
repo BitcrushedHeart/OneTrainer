@@ -4,6 +4,7 @@ opencv-python==4.11.0.86
 pillow==12.1.1
 imagehash==4.3.2
 imagesize==1.4.1 #for concept statistics
+blake3==1.0.8 # fast content hashing for DPO dedup
 tqdm==4.67.1
 PyYAML==6.0.2
 huggingface-hub==0.34.4
@@ -34,7 +35,7 @@ pooch==1.8.2
 open-clip-torch==2.32.0
 
 # data loader
--e git+https://github.com/BitcrushedHeart/mgds.git@ae59e1c#egg=mgds
+-e git+https://github.com/BitcrushedHeart/mgds.git@de9d2dd#egg=mgds
 xxhash
 
 # optimizers

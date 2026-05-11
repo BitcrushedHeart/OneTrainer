@@ -206,11 +206,20 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             bucket_method_provider = None
             rebucket_provider = None
 
+        # Sidecars whose edits should invalidate the bundled image entry.
+        # Must match the ModifyPath stages registered in
+        # __enumerate_input_modules — only mask_path is wired here (no
+        # custom_conditioning_image in the VAE-only flow).
+        extra_watched: list[str] = []
+        if config.masked_training:
+            extra_watched.append('mask_path')
+
         disk_cache = SmartDiskCache(cache_dir=config.cache_dir, split_names=split_names, aggregate_names=aggregate_names, variations_in_name='concept.image_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_fun, stop_check_fun=lambda: self.stop_check_fun(),
                                    modeltype=config.model_type.value, source_path_in_name='image_path',
                                    sourceless=config.sourceless_training and config.latent_caching,
-                                   bucket_method_provider=bucket_method_provider, rebucket_provider=rebucket_provider)
+                                   bucket_method_provider=bucket_method_provider, rebucket_provider=rebucket_provider,
+                                   extra_watched_paths_in_names=extra_watched or None)
         variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
                                group_enabled_in_name='concept.enabled')
 
