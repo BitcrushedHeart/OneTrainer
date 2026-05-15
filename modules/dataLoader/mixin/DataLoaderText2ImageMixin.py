@@ -436,6 +436,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                                          group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun, stop_check_fun=stop_check,
                                          modeltype=config.model_type.value, source_path_in_name='image_path', sourceless=sourceless,
                                          bucket_method_provider=bucket_method_provider, rebucket_provider=rebucket_provider,
+                                         aspect_bucketing=aspect_bucketing,
                                          extra_watched_paths_in_names=image_extra_watched or None)
 
         text_disk_cache = SmartDiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',

@@ -219,6 +219,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
                                    modeltype=config.model_type.value, source_path_in_name='image_path',
                                    sourceless=config.sourceless_training and config.latent_caching,
                                    bucket_method_provider=bucket_method_provider, rebucket_provider=rebucket_provider,
+                                   aspect_bucketing=aspect_bucketing,
                                    extra_watched_paths_in_names=extra_watched or None)
         variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text'],
                                group_enabled_in_name='concept.enabled')
