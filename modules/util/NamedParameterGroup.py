@@ -32,6 +32,20 @@ class NamedParameterGroupCollection:
     def parameters(self) -> list[Parameter]:
         return [p for group in self.__groups for p in group.parameters]
 
+    def iter_named_parameters(self) -> Iterable[tuple[str, Parameter]]:
+        """Yield (stable_key, parameter) pairs in deterministic order.
+
+        Key format is ``"{group.unique_name}.{index}"`` so the same key
+        identifies the same parameter across stop/resume as long as
+        ``unique_name`` and the group's parameter ordering are stable
+        (both are byte-for-byte reproducible at construction time).
+        Used by the accumulator-state save/load path to map saved
+        ``.grad`` tensors back onto live parameters.
+        """
+        for group in self.__groups:
+            for i, p in enumerate(group.parameters):
+                yield f"{group.unique_name}.{i}", p
+
     def parameters_for_optimizer(self, config: TrainConfig) -> list[dict]:
         parameters = []
 

@@ -51,6 +51,18 @@ class InternalModelLoaderMixin(metaclass=ABCMeta):
             with contextlib.suppress(FileNotFoundError):
                 model.ema_state_dict = torch.load(os.path.join(model_name, "ema", "ema.pt"), weights_only=True)
 
+            # accumulator state (Fix B): contains the in-flight gradient-
+            # accumulation snapshot from the save side. Optional -- legacy
+            # backups won't have it, and the trainer falls back to today's
+            # behavior. weights_only=False because the payload mixes
+            # tensors with python dicts/tuples (RNG state); the file lives
+            # in the same trust boundary as optimizer.pt.
+            with contextlib.suppress(FileNotFoundError):
+                model.accumulator_state = torch.load(
+                    os.path.join(model_name, "accumulator", "accumulator.pt"),
+                    weights_only=False,
+                )
+
             # meta
             model.train_progress = train_progress
             model.resumed_tensorboard_subdir = resumed_tb_subdir

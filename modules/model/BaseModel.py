@@ -78,6 +78,7 @@ class BaseModel(metaclass=ABCMeta):
     train_dtype: DataType
     resumed_tensorboard_subdir: str | None
     tensorboard_subdir: str | None
+    accumulator_state: dict | None
 
     def __init__(
             self,
@@ -97,6 +98,7 @@ class BaseModel(metaclass=ABCMeta):
         self.train_dtype = DataType.FLOAT_32
         self.resumed_tensorboard_subdir = None
         self.tensorboard_subdir = None
+        self.accumulator_state = None
 
     @abstractmethod
     def to(self, device: torch.device):

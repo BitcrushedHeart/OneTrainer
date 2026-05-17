@@ -43,3 +43,16 @@ class InternalModelSaverMixin(metaclass=ABCMeta):
                 'last_action_epoch': dict(getattr(model.train_progress, 'last_action_epoch', {})),
                 'tensorboard_subdir': tensorboard_subdir,
             }, meta_file)
+
+        # accumulator state (Fix B): persists in-flight gradient-accumulation
+        # state so a stop mid-window can be resumed without losing the
+        # partial loss/grads. The trainer stages model.accumulator_state
+        # immediately before save; non-training save paths leave it None
+        # and we skip writing the file entirely.
+        accumulator_state = getattr(model, "accumulator_state", None)
+        if accumulator_state is not None:
+            os.makedirs(os.path.join(destination, "accumulator"), exist_ok=True)
+            torch.save(
+                accumulator_state,
+                os.path.join(destination, "accumulator", "accumulator.pt"),
+            )

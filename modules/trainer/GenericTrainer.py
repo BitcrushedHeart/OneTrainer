@@ -3,10 +3,13 @@ import copy
 import json
 import math
 import os
+import random
 import shutil
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+
+import numpy as np
 
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
@@ -18,6 +21,7 @@ from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
 from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_rounding_set_seed
+from modules.util.dataset_fingerprint import compute_concept_fingerprint
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.SampleConfig import SampleConfig
@@ -80,6 +84,19 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+
+        # Loop-local state mirrored on the trainer instance so the
+        # save path (__backup / __save) can read it without having to
+        # be threaded through the training loop. Written by the loop
+        # at lines around the accumulator-reset and update-step
+        # boundaries; consumed by _stage_accumulator_state().
+        self._loop_accumulated_loss: float = 0.0
+        # Live tensor reference -- preferred over the float when present,
+        # because the tensor lives on train_device and we only need to
+        # .item() it at save time (rare event, one host sync each).
+        self._loop_accumulated_loss_tensor: torch.Tensor | None = None
+        self._loop_accumulated_dpo_metrics: dict | None = None
+        self._loop_scaler = None
 
     def start(self):
         if multi.is_master():
@@ -625,6 +642,7 @@ class GenericTrainer(BaseTrainer):
             if print_msg:
                 print_cb("Creating Backup " + backup_path)
 
+            self._stage_accumulator_state_for_save()
             self.model_saver.save(
                 self.model,
                 self.config.model_type,
@@ -644,6 +662,7 @@ class GenericTrainer(BaseTrainer):
                 traceback.print_exc()
                 print("Could not delete partial backup")
         finally:
+            self._clear_staged_accumulator_state()
             if self.config.rolling_backup:
                 self.__prune_backups(self.config.rolling_backup_count)
 
@@ -676,6 +695,7 @@ class GenericTrainer(BaseTrainer):
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.eval()
+            self._stage_accumulator_state_for_save()
             self.model_saver.save(
                 model=self.model,
                 model_type=self.config.model_type,
@@ -683,10 +703,12 @@ class GenericTrainer(BaseTrainer):
                 output_model_destination=save_path,
                 dtype=self.config.output_dtype.torch_dtype()
             )
+            self._clear_staged_accumulator_state()
             if self.config.optimizer.optimizer.is_schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.train()
         except Exception:
+            self._clear_staged_accumulator_state()
             traceback.print_exc()
             print("Could not save model. Check your disk space!")
             try:
@@ -732,6 +754,203 @@ class GenericTrainer(BaseTrainer):
         return self.repeating_action_needed(
             "update_step", self.config.gradient_accumulation_steps, TimeUnit.STEP, train_progress, start_at_zero=False
         )
+
+    # ------------------------------------------------------------------
+    # Fix B: accumulator-state staging for save, and restore on resume.
+    # ------------------------------------------------------------------
+
+    def _stage_accumulator_state_for_save(self):
+        """Build the in-flight accumulator snapshot and attach it to the
+        model so ``InternalModelSaverMixin._save_internal_data`` writes
+        it out alongside the optimizer/EMA state.
+
+        Captures:
+          - accumulated_loss / accumulated_dpo_metrics from the loop locals
+            mirrored on self at lines around the accumulator-reset block
+          - per-trainable-parameter ``.grad`` tensors (CPU copies) keyed
+            by the stable identifier from ``NamedParameterGroupCollection.iter_named_parameters``
+          - scaler ``state_dict`` if AMP is in use
+          - RNG state for torch / torch.cuda / python / numpy
+          - fingerprint (acc_steps + dataset hash) for warn-only on resume
+
+        Idempotent w.r.t. clean boundaries: at a fresh accumulator boundary
+        the loop locals are zeroed and ``.grad`` is None, so the payload
+        is an empty-by-construction snapshot -- correct to write and
+        cheap to load.
+        """
+        if not multi.is_master():
+            # The saver is master-only; non-master ranks have nothing to stage.
+            self.model.accumulator_state = None
+            return
+
+        # Loop-local accumulators (mirrored from train()).
+        if self._loop_accumulated_loss_tensor is not None and \
+                isinstance(self._loop_accumulated_loss_tensor, torch.Tensor):
+            try:
+                acc_loss_f = float(self._loop_accumulated_loss_tensor.item())
+            except Exception:
+                acc_loss_f = float(self._loop_accumulated_loss)
+        else:
+            acc_loss_f = float(self._loop_accumulated_loss)
+
+        # Per-parameter .grad CPU copies. Skip params with no grad to keep
+        # the payload tight; an absent key on load means "no grad to restore".
+        param_grads: dict[str, torch.Tensor] = {}
+        if self.model is not None and self.model.parameters is not None:
+            for key, p in self.model.parameters.iter_named_parameters():
+                if not p.requires_grad or p.grad is None:
+                    continue
+                param_grads[key] = p.grad.detach().to(
+                    device="cpu", copy=True
+                )
+
+        # Scaler state (None if AMP off).
+        scaler_state = None
+        if self._loop_scaler is not None:
+            try:
+                scaler_state = self._loop_scaler.state_dict()
+            except Exception:
+                scaler_state = None
+
+        # RNG snapshots -- all four sources. CUDA list is None when CUDA
+        # isn't available, e.g. CPU-only tests.
+        rng: dict = {
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python": random.getstate(),
+            "numpy": np.random.get_state(legacy=True),
+        }
+
+        # Dataset fingerprint for warn-only on resume.
+        fp_hash, fp_count = compute_concept_fingerprint(
+            getattr(self.config, "concepts", None)
+        )
+        fingerprint = {
+            "gradient_accumulation_steps": int(self.config.gradient_accumulation_steps),
+            "dataset_hash": fp_hash,
+            "concept_count": fp_count,
+        }
+
+        self.model.accumulator_state = {
+            "accumulated_loss": acc_loss_f,
+            "accumulated_dpo_metrics": (
+                dict(self._loop_accumulated_dpo_metrics)
+                if self._loop_accumulated_dpo_metrics is not None else None
+            ),
+            "param_grads": param_grads,
+            "scaler": scaler_state,
+            "rng": rng,
+            "fingerprint": fingerprint,
+        }
+
+    def _clear_staged_accumulator_state(self):
+        if self.model is not None:
+            self.model.accumulator_state = None
+
+    def _restore_accumulator_state(
+            self,
+            accumulated_loss: torch.Tensor,
+            train_device: torch.device,
+            scaler,
+    ) -> tuple[torch.Tensor, dict | None, bool]:
+        """Apply a previously-saved accumulator snapshot to the live trainer.
+
+        Returns (accumulated_loss_tensor, accumulated_dpo_metrics, has_gradient).
+        If no snapshot is attached to the model, returns the inputs unchanged
+        and has_gradient=False. Mismatched fingerprints emit a warning but
+        do NOT discard the snapshot -- losing in-flight gradient state from
+        hours of training is worse than an off-spec effective batch.
+        """
+        if not multi.is_master():
+            return accumulated_loss, None, False
+
+        state = getattr(self.model, "accumulator_state", None)
+        if state is None:
+            return accumulated_loss, None, False
+
+        # Fingerprint comparison (warn-only).
+        fp = state.get("fingerprint", {})
+        saved_acc = fp.get("gradient_accumulation_steps")
+        if saved_acc is not None and saved_acc != self.config.gradient_accumulation_steps:
+            print(
+                f"Warning: gradient_accumulation_steps mismatch on resume: "
+                f"saved={saved_acc} current={self.config.gradient_accumulation_steps}; "
+                f"restoring partial accumulator state anyway (one off-spec optimizer step is "
+                f"cheaper than discarding accumulated gradients)."
+            )
+        current_hash, current_count = compute_concept_fingerprint(
+            getattr(self.config, "concepts", None)
+        )
+        if fp.get("dataset_hash") and fp.get("dataset_hash") != current_hash:
+            delta = current_count - int(fp.get("concept_count", current_count))
+            print(
+                f"Warning: dataset fingerprint mismatch on resume: "
+                f"saved_concepts={fp.get('concept_count')} current_concepts={current_count} "
+                f"(delta={delta}); restoring partial accumulator state anyway."
+            )
+
+        # Accumulators.
+        acc_loss_f = float(state.get("accumulated_loss", 0.0) or 0.0)
+        accumulated_loss = torch.tensor(acc_loss_f, device=train_device)
+        accumulated_dpo_metrics = state.get("accumulated_dpo_metrics")
+        if accumulated_dpo_metrics is not None:
+            accumulated_dpo_metrics = dict(accumulated_dpo_metrics)
+
+        # Per-parameter grads.
+        saved_grads: dict = state.get("param_grads", {}) or {}
+        if self.model is not None and self.model.parameters is not None:
+            current_keys = {k for k, _ in self.model.parameters.iter_named_parameters()}
+            missing = [k for k in saved_grads if k not in current_keys]
+            if saved_grads and len(missing) / len(saved_grads) > 0.10:
+                print(
+                    f"Warning: {len(missing)} of {len(saved_grads)} saved grad keys are "
+                    f"absent in the current model; skipping those grads."
+                )
+            applied = 0
+            for key, p in self.model.parameters.iter_named_parameters():
+                if not p.requires_grad:
+                    continue
+                if key in saved_grads:
+                    g = saved_grads[key]
+                    p.grad = g.to(device=p.device, dtype=p.dtype, non_blocking=True)
+                    applied += 1
+                else:
+                    p.grad = None
+            has_gradient = applied > 0
+        else:
+            has_gradient = False
+
+        # Scaler.
+        if scaler is not None and state.get("scaler") is not None:
+            try:
+                scaler.load_state_dict(state["scaler"])
+            except Exception:
+                # Backwards-compat: an older scaler state from a different
+                # torch version isn't worth crashing over -- the next
+                # optimizer step will re-establish a sane scale.
+                print("Warning: could not restore GradScaler state; continuing with a fresh scaler.")
+
+        # RNG -- restore all four; tolerate missing keys.
+        rng = state.get("rng", {}) or {}
+        if "torch_cpu" in rng and rng["torch_cpu"] is not None:
+            torch.set_rng_state(rng["torch_cpu"])
+        if rng.get("torch_cuda") is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(rng["torch_cuda"])
+            except Exception:
+                pass
+        if "python" in rng and rng["python"] is not None:
+            random.setstate(rng["python"])
+        if rng.get("numpy") is not None:
+            try:
+                np.random.set_state(rng["numpy"])
+            except Exception:
+                pass
+
+        # Consumed -- clear so a subsequent backup-without-stop doesn't
+        # double-apply on a third session.
+        self.model.accumulator_state = None
+        return accumulated_loss, accumulated_dpo_metrics, has_gradient
 
     def __apply_fused_back_pass(self, scaler):
         fused_optimizer_step = self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass
@@ -801,6 +1020,8 @@ class GenericTrainer(BaseTrainer):
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
+        # Mirror the scaler so the save-side staging can capture its state_dict.
+        self._loop_scaler = scaler
 
         self.__apply_fused_back_pass(scaler)
 
@@ -814,6 +1035,21 @@ class GenericTrainer(BaseTrainer):
         ema_loss = None
         ema_loss_steps = 0
         epochs = range(train_progress.epoch, self.config.epochs, 1)
+
+        # Fix B: if a previous run was stopped mid-window and a backup was
+        # written via end()'s backup_before_save path, restore the in-flight
+        # gradient-accumulation state now. No-op for fresh runs and for
+        # backups written at clean accumulation boundaries.
+        accumulated_loss, restored_dpo_metrics, restored_has_grad = \
+            self._restore_accumulator_state(accumulated_loss, train_device, scaler)
+        if restored_dpo_metrics is not None:
+            accumulated_dpo_metrics = restored_dpo_metrics
+        if restored_has_grad:
+            has_gradient = True
+        # Sync the mirrored tensor reference for the next save.
+        self._loop_accumulated_loss_tensor = accumulated_loss
+        self._loop_accumulated_loss = float(accumulated_loss.item()) if accumulated_loss is not None else 0.0
+        self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
 
         for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
             multi.sync_commands(self.commands)
@@ -929,6 +1165,8 @@ class GenericTrainer(BaseTrainer):
                         for _k, _v in micro_dpo_metrics.items():
                             accumulated_dpo_metrics[_k] += _v
                         accumulated_dpo_metrics['_count'] += 1
+                        # Mirror for Fix B save-side staging.
+                        self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
                     else:
                         # Standard training path
                         prior_pred_indices = [i for i in range(self.config.batch_size)
@@ -960,6 +1198,10 @@ class GenericTrainer(BaseTrainer):
                     detached_loss = loss.detach()
                     multi.reduce_tensor_mean(detached_loss)
                     accumulated_loss += detached_loss
+                    # Mirror the live accumulator tensor reference for the
+                    # save-side staging (Fix B). No host sync here -- the
+                    # .item() only happens at save time, which is rare.
+                    self._loop_accumulated_loss_tensor = accumulated_loss
 
                     if self.__is_update_step(train_progress):
                         if self.config.fused_gradient_reduce:
@@ -1015,6 +1257,12 @@ class GenericTrainer(BaseTrainer):
 
                         accumulated_loss = 0.0
                         accumulated_dpo_metrics = None
+                        # Reset Fix B mirrors at the accumulator boundary so a
+                        # backup taken immediately after this point captures a
+                        # clean zero state.
+                        self._loop_accumulated_loss = 0.0
+                        self._loop_accumulated_loss_tensor = None
+                        self._loop_accumulated_dpo_metrics = None
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
 
                         if self.model.ema:
