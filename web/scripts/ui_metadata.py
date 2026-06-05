@@ -666,14 +666,11 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "lora_decompose_output_axis": ("Apply the weight decomposition on the output axis instead of the input axis."),
     "oft_block_size": "The block size parameter used when creating a new OFT v2",
-    "oft_coft": (
-        "Use the constrained variant of OFT. This constrains the learned rotation"
-        " to stay very close to the identity matrix, limiting adaptation to only"
-        " small changes. This improves training stability, helps prevent overfitting"
-        " on small datasets, and better preserves the base model's original knowledge"
-        " but it may lack expressiveness for tasks requiring substantial adaptation."
+    "oft_scaled": (
+        "Applies a scaling factor to the learned weights. This ensures that the"
+        " effective learning rate remains consistent across different block sizes."
+        " Without this, different block sizes require significantly different learning rates."
     ),
-    "coft_eps": "The control strength of COFT. Only has an effect if COFT is enabled.",
     "oft_block_share": (
         "Share the OFT parameters between blocks. A single rotation matrix is"
         " shared across all blocks within a layer, drastically cutting the number"
