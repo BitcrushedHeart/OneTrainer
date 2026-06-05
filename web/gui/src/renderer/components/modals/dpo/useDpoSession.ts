@@ -30,6 +30,9 @@ export interface UseDpoSessionResult {
   pairsPerGroup: number;
   mode: "selection" | "elo";
   scanCount: number;
+  scanTotal: number;
+  hashCount: number;
+  cacheHits: number;
   group: GroupData | null;
   phase: SelectionPhase;
   bestImage: string | null;
@@ -75,6 +78,9 @@ export function useDpoSession(): UseDpoSessionResult {
   const [pairsPerGroup, setPairsPerGroup] = useState(1);
   const [mode, setMode] = useState<"selection" | "elo">("selection");
   const [scanCount, setScanCount] = useState(0);
+  const [scanTotal, setScanTotal] = useState(0);
+  const [hashCount, setHashCount] = useState(0);
+  const [cacheHits, setCacheHits] = useState(0);
 
   const [group, setGroup] = useState<GroupData | null>(null);
   const [phase, setPhase] = useState<SelectionPhase>("best");
@@ -175,6 +181,9 @@ export function useDpoSession(): UseDpoSessionResult {
         try {
           const status = await dpoApi.sessionStatus();
           setScanCount(status.scan_count);
+          setScanTotal(status.scan_total ?? 0);
+          setHashCount(status.hash_count ?? 0);
+          setCacheHits(status.cache_hits ?? 0);
           if (status.groups_queued > 0 || status.worker_finished) {
             await fetchNextGroup();
             return;
@@ -201,6 +210,9 @@ export function useDpoSession(): UseDpoSessionResult {
       setMode(config.mode);
       setPairsPerGroup(config.pairsPerGroup);
       setScanCount(0);
+      setScanTotal(0);
+      setHashCount(0);
+      setCacheHits(0);
 
       const res = await dpoApi.startSession(config.sourceFolder, config.outputDir, config.pairsPerGroup, config.mode);
       if (!res.ok) {
@@ -326,6 +338,9 @@ export function useDpoSession(): UseDpoSessionResult {
     setPendingBest(null);
     setPendingWorst(null);
     setScanCount(0);
+    setScanTotal(0);
+    setHashCount(0);
+    setCacheHits(0);
     setTotalPairs(0);
     setFinalResult(null);
     setResume(null);
@@ -410,6 +425,9 @@ export function useDpoSession(): UseDpoSessionResult {
     pairsPerGroup,
     mode,
     scanCount,
+    scanTotal,
+    hashCount,
+    cacheHits,
     group,
     phase,
     bestImage,

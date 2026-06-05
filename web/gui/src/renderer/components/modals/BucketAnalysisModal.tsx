@@ -141,12 +141,7 @@ export function BucketAnalysisModal({ open, onClose }: BucketAnalysisModalProps)
           <DirPicker label="Chosen-side concept folder" value={conceptPath} onChange={setConceptPath} />
 
           <div className="grid grid-cols-4 gap-3">
-            <FormEntry
-              label="Batch size"
-              type="number"
-              value={batchSize}
-              onChange={(v) => setBatchSize(Number(v))}
-            />
+            <FormEntry label="Batch size" type="number" value={batchSize} onChange={(v) => setBatchSize(Number(v))} />
             <Select label="Target resolution" options={targetOptions} value={target} onChange={setTarget} />
             <Select label="Quantization" options={QUANT_OPTIONS} value={quant} onChange={setQuant} />
             <div className="flex items-end">

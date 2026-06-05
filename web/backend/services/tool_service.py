@@ -102,9 +102,9 @@ def scan_image_folder(folder: str, include_subdirectories: bool) -> list[Path]:
         return []
     pattern = "**/*" if include_subdirectories else "*"
     return sorted(
-        p for p in root.glob(pattern)
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-        and "-masklabel" not in p.stem
+        p
+        for p in root.glob(pattern)
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS and "-masklabel" not in p.stem
     )
 
 
@@ -150,7 +150,7 @@ def _extract_image_metadata(image_path: Path) -> dict[str, str]:
         start_idx = raw.find(start_marker)
         end_idx = raw.find(end_marker)
         if start_idx >= 0 and end_idx > start_idx:
-            xmp_bytes = raw[start_idx:end_idx + len(end_marker)]
+            xmp_bytes = raw[start_idx : end_idx + len(end_marker)]
             xmp_str = xmp_bytes.decode("utf-8", errors="replace")
             root_el = ET.fromstring(xmp_str)
             ns = {
@@ -177,7 +177,6 @@ def _extract_image_metadata(image_path: Path) -> dict[str, str]:
 
 
 class _RateLimiter:
-
     def __init__(self, rpm: int):
         self._interval = 60.0 / rpm if rpm > 0 else 0
         self._lock = threading.Lock()
@@ -204,7 +203,6 @@ class _RateLimiter:
 
 
 class ToolService(SingletonMixin):
-
     def __init__(self) -> None:
         self._status: ToolStatus = "idle"
         self._progress: int = 0
@@ -251,8 +249,10 @@ class ToolService(SingletonMixin):
             self._cancel_flag = False
 
         thread = threading.Thread(
-            target=target, args=(*args, task_id),
-            daemon=True, name=thread_name,
+            target=target,
+            args=(*args, task_id),
+            daemon=True,
+            name=thread_name,
         )
         self._thread = thread
         thread.start()
@@ -260,7 +260,9 @@ class ToolService(SingletonMixin):
 
     def generate_captions(self, request: Any) -> dict:
         return self._start_background_task(
-            self._caption_thread_fn, (request,), "OneTrainerWeb-caption-tool",
+            self._caption_thread_fn,
+            (request,),
+            "OneTrainerWeb-caption-tool",
         )
 
     def _caption_thread_fn(self, request: Any, task_id: str) -> None:
@@ -299,7 +301,9 @@ class ToolService(SingletonMixin):
 
     def generate_masks(self, request: Any) -> dict:
         return self._start_background_task(
-            self._mask_thread_fn, (request,), "OneTrainerWeb-mask-tool",
+            self._mask_thread_fn,
+            (request,),
+            "OneTrainerWeb-mask-tool",
         )
 
     def _mask_thread_fn(self, request: Any, task_id: str) -> None:
@@ -342,7 +346,9 @@ class ToolService(SingletonMixin):
 
     def generate_captions_api(self, request: Any) -> dict:
         return self._start_background_task(
-            self._caption_api_thread_fn, (request,), "OneTrainerWeb-caption-api-tool",
+            self._caption_api_thread_fn,
+            (request,),
+            "OneTrainerWeb-caption-api-tool",
         )
 
     def _caption_api_thread_fn(self, request: Any, task_id: str) -> None:
@@ -403,7 +409,11 @@ class ToolService(SingletonMixin):
                         self._update_progress(processed, total)
                         return
 
-                    final = (getattr(request, "caption_prefix", "") or "") + caption + (getattr(request, "caption_postfix", "") or "")
+                    final = (
+                        (getattr(request, "caption_prefix", "") or "")
+                        + caption
+                        + (getattr(request, "caption_postfix", "") or "")
+                    )
 
                     if mode == "replace" or not txt_path.exists():
                         txt_path.write_text(final, encoding="utf-8")
@@ -457,8 +467,15 @@ class ToolService(SingletonMixin):
         return base_prompt
 
     def _post_with_retry(
-        self, session: requests.Session, url: str, payload: dict,
-        headers: dict, *, max_retries: int = 6, timeout: int = 120, label: str = "API",
+        self,
+        session: requests.Session,
+        url: str,
+        payload: dict,
+        headers: dict,
+        *,
+        max_retries: int = 6,
+        timeout: int = 120,
+        label: str = "API",
     ) -> dict:
         r_json: dict = {}
         for attempt in range(max_retries):
@@ -468,7 +485,7 @@ class ToolService(SingletonMixin):
                 response = session.post(url, json=payload, headers=headers, timeout=timeout)
             except requests.exceptions.ConnectionError:
                 if attempt < max_retries - 1:
-                    wait = min(5 * (2 ** attempt), 60)
+                    wait = min(5 * (2**attempt), 60)
                     time.sleep(wait)
                     continue
                 raise
@@ -488,7 +505,11 @@ class ToolService(SingletonMixin):
         return r_json
 
     def _call_openai_api(
-        self, image_path: Path, prompt: str, config: Any, session: requests.Session,
+        self,
+        image_path: Path,
+        prompt: str,
+        config: Any,
+        session: requests.Session,
     ) -> str:
         api_url = _normalize_openai_url(getattr(config, "api_url", "http://localhost:1234/v1/chat/completions"))
         api_key = getattr(config, "api_key", "") or ""
@@ -504,13 +525,15 @@ class ToolService(SingletonMixin):
         messages: list[dict] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ],
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        )
 
         payload: dict[str, Any] = {
             "model": model,
@@ -527,20 +550,31 @@ class ToolService(SingletonMixin):
             headers["Authorization"] = f"Bearer {api_key}"
 
         r_json = self._post_with_retry(
-            session, api_url, payload, headers,
-            max_retries=6, timeout=timeout, label="OpenAI API",
+            session,
+            api_url,
+            payload,
+            headers,
+            max_retries=6,
+            timeout=timeout,
+            label="OpenAI API",
         )
 
         if "choices" not in r_json or not r_json["choices"]:
             error_detail = r_json.get("error", {})
-            msg = error_detail.get("message", str(error_detail)) if isinstance(error_detail, dict) else str(error_detail)
+            msg = (
+                error_detail.get("message", str(error_detail)) if isinstance(error_detail, dict) else str(error_detail)
+            )
             raise ValueError(f"API error: {msg}" if msg else f"Unexpected response: {str(r_json)[:300]}")
 
         caption = r_json["choices"][0]["message"]["content"]
         return _clean_model_output(caption)
 
     def _call_gemini_api(
-        self, image_path: Path, prompt: str, config: Any, session: requests.Session,
+        self,
+        image_path: Path,
+        prompt: str,
+        config: Any,
+        session: requests.Session,
     ) -> str:
         api_key = getattr(config, "api_key", "") or ""
         if not api_key:
@@ -557,12 +591,14 @@ class ToolService(SingletonMixin):
         b64 = _encode_image_base64(image_path)
 
         payload: dict[str, Any] = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                ],
-            }],
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                    ],
+                }
+            ],
             "generationConfig": {"temperature": temperature},
         }
         if system_prompt:
@@ -573,8 +609,13 @@ class ToolService(SingletonMixin):
         headers = {"Content-Type": "application/json"}
 
         r_json = self._post_with_retry(
-            session, url, payload, headers,
-            max_retries=5, timeout=timeout, label="Gemini API",
+            session,
+            url,
+            payload,
+            headers,
+            max_retries=5,
+            timeout=timeout,
+            label="Gemini API",
         )
 
         try:
@@ -731,13 +772,14 @@ class ToolService(SingletonMixin):
         if freed:
             with suppress(Exception):
                 from modules.util.torch_util import torch_gc
+
                 torch_gc()
 
 
 class YOLOMaskAdapter:
-
     def __init__(self, model_path: str):
         from ultralytics import YOLO
+
         self._model = YOLO(model_path)
         self._yolo_model_path = model_path
 
@@ -786,7 +828,9 @@ class YOLOMaskAdapter:
                     ksize = smooth_pixels * 2 + 1
                     combined_mask = cv2.GaussianBlur(combined_mask, (ksize, ksize), 0)
                 if expand_pixels > 0:
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expand_pixels * 2 + 1, expand_pixels * 2 + 1))
+                    kernel = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (expand_pixels * 2 + 1, expand_pixels * 2 + 1)
+                    )
                     combined_mask = cv2.dilate(combined_mask, kernel)
                 _, combined_mask = cv2.threshold(combined_mask, 128, 255, cv2.THRESH_BINARY)
 

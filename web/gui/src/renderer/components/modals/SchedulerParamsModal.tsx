@@ -2,7 +2,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { Button, FormEntry } from "@/components/shared";
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 
 import { ModalBase } from "./ModalBase";
 
@@ -17,8 +17,8 @@ export interface SchedulerParamsModalProps {
 }
 
 export function SchedulerParamsModal({ open, onClose }: SchedulerParamsModalProps) {
-  const [storedParams, setStoredParams] = useConfigField<Array<Record<string, string>> | null>("scheduler_params");
-  const [scheduler] = useConfigField<string>("learning_rate_scheduler");
+  const [storedParams, setStoredParams] = useBoundField<Array<Record<string, string>> | null>("scheduler_params");
+  const [scheduler] = useBoundField<string>("learning_rate_scheduler");
   const isCustom = scheduler === "CUSTOM";
   const [params, setParams] = useState<SchedulerParam[]>([]);
 

@@ -38,6 +38,28 @@ export interface ConvertModelResponse {
   error: string | null;
 }
 
+export interface MergeOFTRequest {
+  oft_adapter_path: string;
+  output_path: string;
+  output_dtype: string;
+  output_model_format: string;
+  strength: number;
+  // Inherited from the active Train UI's Model tab (TrainConfig fields).
+  base_model_name: string;
+  transformer_model_name?: string;
+  vae_model_name?: string;
+  compute_device?: string | null;
+}
+
+export interface MergeOFTResponse {
+  ok: boolean;
+  error: string | null;
+  modules_merged: number;
+  orthogonality_max_err: Record<string, number> | null;
+  pre_zero_rows: Record<string, number> | null;
+  post_zero_rows: Record<string, number> | null;
+}
+
 export interface CaptionRequest {
   model?: string;
   folder: string;
@@ -148,6 +170,12 @@ export interface YoloPredictResponse {
 export const toolsApi = {
   convertModel: (params: ConvertModelRequest) =>
     request<ConvertModelResponse>("/tools/convert", {
+      method: "POST",
+      body: JSON.stringify(params),
+    }),
+
+  mergeOft: (params: MergeOFTRequest) =>
+    request<MergeOFTResponse>("/tools/merge-oft", {
       method: "POST",
       body: JSON.stringify(params),
     }),

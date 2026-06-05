@@ -55,6 +55,12 @@ class BucketAnalysisRequest(BaseModel):
     quantization: int
 
 
+class ApplyCaptionRequest(BaseModel):
+    chosen_image: str
+    rejected_image: str
+    caption: str
+
+
 @router.post("/dpo/check-pairs")
 def check_pairs():
     service = DPOService.get_instance()
@@ -85,6 +91,30 @@ def fix_multiline_captions():
     return service.fix_multiline_captions()
 
 
+@router.post("/dpo/check-caption-mismatches")
+def check_caption_mismatches():
+    service = DPOService.get_instance()
+    return service.check_caption_mismatches()
+
+
+@router.post("/dpo/correct-all-to-chosen")
+def correct_all_to_chosen():
+    service = DPOService.get_instance()
+    return service.correct_all_captions_to_chosen()
+
+
+@router.post("/dpo/apply-caption", response_model=ActionResponse)
+def apply_caption(req: ApplyCaptionRequest):
+    service = DPOService.get_instance()
+    return ActionResponse(
+        **service.apply_caption(
+            req.chosen_image,
+            req.rejected_image,
+            req.caption,
+        )
+    )
+
+
 @router.post("/dpo/bucket-analysis")
 def bucket_analysis(req: BucketAnalysisRequest):
     service = DPOService.get_instance()
@@ -98,12 +128,11 @@ def bucket_analysis(req: BucketAnalysisRequest):
 
 # ---- Curation Session ----
 
+
 @router.post("/dpo/session/start")
 def start_session(req: StartSessionRequest):
     service = DPOService.get_instance()
-    return service.start_session(
-        req.source_folder, req.output_dir, req.pairs_per_group, req.mode
-    )
+    return service.start_session(req.source_folder, req.output_dir, req.pairs_per_group, req.mode)
 
 
 @router.get("/dpo/session/status")
@@ -164,6 +193,7 @@ def serve_image(path: str):
 
 
 # ---- ELO mode endpoints ----
+
 
 @router.get("/dpo/session/elo-pair")
 def elo_pair():

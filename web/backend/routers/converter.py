@@ -51,7 +51,6 @@ def convert_model(req: ConvertModelRequest) -> ConvertModelResponse:
     if not _convert_lock.acquire(blocking=False):
         return ConvertModelResponse(ok=False, error="A conversion is already in progress")
     try:
-
         from modules.util import create
         from modules.util.config.TrainConfig import QuantizationConfig
         from modules.util.enum.DataType import DataType
@@ -125,6 +124,7 @@ def convert_model(req: ConvertModelRequest) -> ConvertModelResponse:
         logger.exception("Model conversion failed")
         try:
             from modules.util.torch_util import torch_gc
+
             torch_gc()
         except Exception:
             pass

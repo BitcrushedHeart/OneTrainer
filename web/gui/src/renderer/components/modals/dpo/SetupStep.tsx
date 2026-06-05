@@ -1,9 +1,10 @@
-import { AlertTriangle, CheckCircle2, Eye, MousePointer2, Scissors, Search, Wrench } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Eye, FileWarning, MousePointer2, Scissors, Search, Wrench } from "lucide-react";
 import { useCallback, useState } from "react";
 
-import { dpoApi, type PairCheckResult } from "@/api/dpoApi";
+import { type CaptionMismatch, dpoApi, type PairCheckResult } from "@/api/dpoApi";
 import { Button, DirPicker, FormEntry, SectionCard } from "@/components/shared";
 
+import { CaptionMismatchModal } from "./CaptionMismatchModal";
 import type { SetupStepProps } from "./types";
 
 function CheckResults({ result }: { result: PairCheckResult }) {
@@ -60,6 +61,8 @@ export function SetupStep({
   const [checkResult, setCheckResult] = useState<PairCheckResult | null>(null);
   const [toolMessage, setToolMessage] = useState<string | null>(null);
   const [toolError, setToolError] = useState<string | null>(null);
+  const [mismatches, setMismatches] = useState<CaptionMismatch[] | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
 
   const canStart = sourceFolder.trim() !== "" && outputDir.trim() !== "";
 
@@ -68,6 +71,15 @@ export function SetupStep({
     setToolError(null);
   };
 
+  const refreshMismatches = useCallback(async () => {
+    const res = await dpoApi.checkCaptionMismatches();
+    if (res.ok) {
+      setMismatches(res.mismatches ?? []);
+    } else {
+      setMismatches(null);
+    }
+  }, []);
+
   const handleCheckPairs = useCallback(async () => {
     clearToolState();
     setLoading(true);
@@ -75,6 +87,7 @@ export function SetupStep({
       const res = await dpoApi.checkPairs();
       if (res.ok && res.result) {
         setCheckResult(res.result);
+        await refreshMismatches();
       } else {
         setToolError(res.error ?? "Check failed");
       }
@@ -83,7 +96,37 @@ export function SetupStep({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [refreshMismatches]);
+
+  const handleCorrectAllToChosen = useCallback(async () => {
+    clearToolState();
+    setLoading(true);
+    try {
+      const res = await dpoApi.correctAllToChosen();
+      if (res.ok) {
+        setToolMessage(`Corrected ${res.corrected ?? 0} caption(s) to chosen.`);
+        await refreshMismatches();
+      } else {
+        setToolError(res.error ?? "Correction failed");
+      }
+    } catch (e) {
+      setToolError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [refreshMismatches]);
+
+  const handleManualReviewClose = useCallback(async () => {
+    setReviewOpen(false);
+    setLoading(true);
+    try {
+      const check = await dpoApi.checkPairs();
+      if (check.ok && check.result) setCheckResult(check.result);
+      await refreshMismatches();
+    } finally {
+      setLoading(false);
+    }
+  }, [refreshMismatches]);
 
   const handleRemoveStrays = useCallback(async () => {
     clearToolState();
@@ -243,8 +286,36 @@ export function SetupStep({
             </div>
           )}
           {checkResult && <CheckResults result={checkResult} />}
+          {mismatches && mismatches.length > 0 && (
+            <div className="space-y-2 rounded border border-[var(--color-warning-500)]/40 bg-[var(--color-warning-500)]/10 p-3">
+              <div className="flex items-center gap-2 text-sm text-[var(--color-warning-500)]">
+                <FileWarning className="w-4 h-4" />
+                <span className="font-medium">
+                  {mismatches.length} pair(s) have caption mismatches between chosen and rejected.
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="primary" onClick={handleCorrectAllToChosen} disabled={loading}>
+                  Correct All to Chosen Pair Caption
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setReviewOpen(true)} disabled={loading}>
+                  Manually Review Pairs
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setMismatches(null)} disabled={loading}>
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       </details>
+      {reviewOpen && mismatches && mismatches.length > 0 && (
+        <CaptionMismatchModal
+          open={reviewOpen}
+          mismatches={mismatches}
+          onClose={() => void handleManualReviewClose()}
+        />
+      )}
     </div>
   );
 }

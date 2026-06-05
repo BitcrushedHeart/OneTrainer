@@ -16,6 +16,7 @@ from web.backend.routers import (
     dpo,
     health,
     mask_editor,
+    merge_oft,
     presets,
     queue,
     samples,
@@ -57,7 +58,9 @@ _default_origins = [
 ]
 if os.environ.get("OT_ELECTRON") == "1":
     _default_origins.append("null")
-_cors_origins = os.environ.get("OT_CORS_ORIGINS", "").split(",") if os.environ.get("OT_CORS_ORIGINS") else _default_origins
+_cors_origins = (
+    os.environ.get("OT_CORS_ORIGINS", "").split(",") if os.environ.get("OT_CORS_ORIGINS") else _default_origins
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,6 +85,7 @@ _routers = [
     system.router,
     tools.router,
     converter.router,
+    merge_oft.router,
     video_tools.router,
     sampling.router,
     mask_editor.router,

@@ -1,7 +1,7 @@
 import { FolderOpen } from "lucide-react";
 import { type ChangeEvent, type MouseEvent, useEffect, useState } from "react";
 
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import { INPUT_FLEX, SIDE_BUTTON } from "@/utils/inputStyles";
 
 import { FormFieldWrapper } from "./FormFieldWrapper";
@@ -27,7 +27,7 @@ export function PathPicker({
   tooltip,
   disabled,
 }: PathPickerProps) {
-  const [configValue, setConfigValue] = useConfigField<string>(configPath);
+  const [configValue, setConfigValue] = useBoundField<string>(configPath);
 
   const externalValue = configPath ? (configValue ?? "") : (controlledValue ?? "");
   const [localValue, setLocalValue] = useState(externalValue);

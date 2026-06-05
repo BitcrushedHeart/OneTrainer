@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class DPOService(SingletonMixin):
-
     _ELO_K = 32.0
     _ELO_BASE = 1500.0
 
@@ -34,6 +33,15 @@ class DPOService(SingletonMixin):
         self._worker_stop = threading.Event()
         self._worker_finished = False
         self._scan_count = 0
+        self._scan_total = 0
+        self._hash_count = 0
+        # Persistent per-file scan cache (DpoScanCache, created per session) and
+        # the set of pixel hashes already committed to the output dataset.
+        # The set is read/updated from both the scan worker and API threads;
+        # individual set add/contains ops are atomic under the GIL, matching
+        # the lock-free style of the other counters here.
+        self._hash_cache = None
+        self._used_pixel_hashes: set[str] = set()
         self._groups_queued = 0
         self._groups_shown = 0
         self._current_group: dict | None = None
@@ -157,6 +165,7 @@ class DPOService(SingletonMixin):
 
     def remove_pair(self, chosen_path: str | None, rejected_path: str | None) -> dict:
         from modules.util.dpo_curation_util import remove_finalized_pair
+
         remove_finalized_pair(chosen_path, rejected_path)
         return {"ok": True}
 
@@ -176,6 +185,83 @@ class DPOService(SingletonMixin):
 
         fixed = fix_multiline_captions(all_pairs)
         return {"ok": True, "fixed": fixed}
+
+    def _all_concept_pairs(self) -> list[tuple[str, str]]:
+        import contextlib
+
+        from modules.util.dpo_curation_util import dpo_concept_pairs
+
+        config_service = ConfigService.get_instance()
+        concepts = config_service.get_config_for_training().concepts or []
+        all_pairs: list[tuple[str, str]] = []
+        with contextlib.suppress(RuntimeError):
+            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=False))
+        with contextlib.suppress(RuntimeError):
+            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=True))
+        return all_pairs
+
+    def _is_path_in_concept_pairs(self, path: str, concept_pairs: list[tuple[str, str]]) -> bool:
+        """Verify `path` is inside one of the configured DPO concept folders.
+        Prevents an arbitrary-filesystem write via /dpo/apply-caption."""
+        try:
+            target = os.path.realpath(path)
+        except (OSError, ValueError):
+            return False
+        for chosen_path, rejected_path in concept_pairs:
+            for base in (chosen_path, rejected_path):
+                try:
+                    base_real = os.path.realpath(base)
+                except (OSError, ValueError):
+                    continue
+                # Use commonpath so a sibling-prefix match (e.g. /a/foo vs /a/foobar)
+                # does not falsely allow access.
+                try:
+                    if os.path.commonpath([target, base_real]) == base_real:
+                        return True
+                except ValueError:
+                    continue
+        return False
+
+    def check_caption_mismatches(self) -> dict:
+        from modules.util.dpo_curation_util import find_caption_mismatches
+
+        all_pairs = self._all_concept_pairs()
+        if not all_pairs:
+            return {"ok": False, "error": "No DPO concept pairs found"}
+        mismatches = find_caption_mismatches(all_pairs)
+        return {"ok": True, "mismatches": mismatches}
+
+    def correct_all_captions_to_chosen(self) -> dict:
+        from modules.util.dpo_curation_util import (
+            correct_all_captions_to_chosen,
+            find_caption_mismatches,
+        )
+
+        all_pairs = self._all_concept_pairs()
+        if not all_pairs:
+            return {"ok": False, "error": "No DPO concept pairs found"}
+        mismatches = find_caption_mismatches(all_pairs)
+        corrected = correct_all_captions_to_chosen(mismatches)
+        return {"ok": True, "corrected": corrected}
+
+    def apply_caption(self, chosen_image: str, rejected_image: str, caption: str) -> dict:
+        from modules.util.dpo_curation_util import apply_caption_to_pair
+
+        all_pairs = self._all_concept_pairs()
+        if not all_pairs:
+            return {"ok": False, "error": "No DPO concept pairs found"}
+
+        for image_path in (chosen_image, rejected_image):
+            if not image_path:
+                continue
+            if not self._is_path_in_concept_pairs(image_path, all_pairs):
+                return {"ok": False, "error": f"Path is outside configured DPO concept folders: {image_path}"}
+
+        try:
+            apply_caption_to_pair(chosen_image, rejected_image, caption)
+        except OSError as ex:
+            return {"ok": False, "error": str(ex)}
+        return {"ok": True}
 
     def bucket_analysis(
         self,
@@ -206,7 +292,7 @@ class DPOService(SingletonMixin):
         pairs_per_group: int = 1,
         mode: str = "selection",
     ) -> dict:
-        from modules.util.dpo_curation_util import load_manifest, prune_orphaned_pairs
+        from modules.util.dpo_curation_util import DpoScanCache, load_manifest, prune_orphaned_pairs
 
         if mode not in ("selection", "elo"):
             return {"ok": False, "error": "mode must be 'selection' or 'elo'"}
@@ -224,7 +310,12 @@ class DPOService(SingletonMixin):
         pruned = prune_orphaned_pairs(output_dir, self._manifest)
         existing = len(self._manifest.get("pairs", []))
 
+        self._hash_cache = DpoScanCache(os.path.join(output_dir, ".dpo_hash_cache.json"))
+        self._used_pixel_hashes = set()
+
         self._scan_count = 0
+        self._scan_total = 0
+        self._hash_count = 0
         self._groups_queued = 0
         self._groups_shown = 0
         self._worker_finished = False
@@ -233,9 +324,7 @@ class DPOService(SingletonMixin):
         self._ready_queue = Queue(maxsize=10)
         self._worker_stop = threading.Event()
 
-        self._worker_thread = threading.Thread(
-            target=self._background_scan, daemon=True
-        )
+        self._worker_thread = threading.Thread(target=self._background_scan, daemon=True)
         self._worker_thread.start()
 
         return {
@@ -248,6 +337,9 @@ class DPOService(SingletonMixin):
         return {
             "active": self._session_active,
             "scan_count": self._scan_count,
+            "scan_total": self._scan_total,
+            "hash_count": self._hash_count,
+            "cache_hits": self._hash_cache.hits if self._hash_cache is not None else 0,
             "groups_queued": self._groups_queued,
             "groups_shown": self._groups_shown,
             "worker_finished": self._worker_finished,
@@ -257,7 +349,7 @@ class DPOService(SingletonMixin):
 
     def next_group(self) -> dict:
         """Advance to the next group. Returns the group data with image paths."""
-        from modules.util.dpo_curation_util import manifest_pair_counts
+        from modules.util.dpo_curation_util import is_source_used, manifest_pair_counts, manifest_used_sources
 
         while True:
             try:
@@ -274,10 +366,25 @@ class DPOService(SingletonMixin):
             if not is_unconditional and pairs_done >= self._pairs_per_group:
                 continue
 
+            # Re-filter against the manifest at present-time. The scan-time
+            # filter is best-effort (the manifest may have grown since), and
+            # for groups that are already partway through pairs_per_group we
+            # need to drop any sources that were committed in earlier passes.
+            # The pixel-hash check additionally drops byte/pixel-identical
+            # copies committed under a different path (e.g. a duplicate that
+            # lives in another group); these lookups hit the in-memory cache
+            # because the scan worker already hashed every queued image.
+            used_sources = manifest_used_sources(self._manifest)
+            available_images = [
+                i for i in group["images"] if not is_source_used(used_sources, i) and not self._is_pixel_hash_used(i)
+            ]
+            if len(available_images) < 2:
+                continue
+
             self._current_group = group
             self._groups_shown += 1
             self._pairs_created_in_group = pairs_done
-            self._remaining_images = list(group["images"])
+            self._remaining_images = available_images
             self._selection_phase = "best"
             self._selected_best = None
             self._pending_pair = None
@@ -290,7 +397,7 @@ class DPOService(SingletonMixin):
                 "group": {
                     "prompt": group["prompt"],
                     "aspectratio": group["aspectratio"],
-                    "images": group["images"],
+                    "images": available_images,
                     "group_index": self._groups_shown,
                     "total_groups": self._groups_queued,
                     "pairs_done": pairs_done,
@@ -319,6 +426,11 @@ class DPOService(SingletonMixin):
         else:
             chosen = self._selected_best
             rejected = path
+            # Defensive: never let the same image land on both sides of a
+            # pair. The frontend filters the best out of the worst-pick grid,
+            # but a bug there shouldn't be able to corrupt the export.
+            if chosen == rejected:
+                return {"ok": False, "error": "Chosen and rejected images must differ"}
             group = self._current_group
 
             # If there'd still be ≥2 images left in the group after this pair,
@@ -328,9 +440,7 @@ class DPOService(SingletonMixin):
             # _selected_best until confirm_pair commits. On the last-possible
             # pair (can_continue == False) there's no meaningful Cancel, so
             # commit inline — same as Ctk, which also skips the dialog there.
-            potential_remaining = [
-                i for i in self._remaining_images if i not in {chosen, rejected}
-            ]
+            potential_remaining = [i for i in self._remaining_images if i not in {chosen, rejected}]
             can_continue = len(potential_remaining) >= 2
 
             if can_continue:
@@ -343,10 +453,14 @@ class DPOService(SingletonMixin):
                 }
 
             export_single_pair(
-                self._output_dir, self._manifest,
-                chosen, rejected,
-                group["prompt"], group["aspectratio"],
+                self._output_dir,
+                self._manifest,
+                chosen,
+                rejected,
+                group["prompt"],
+                group["aspectratio"],
             )
+            self._mark_pair_used(chosen, rejected)
             self._remaining_images = potential_remaining
             self._pairs_created_in_group += 1
             self._selection_phase = "best"
@@ -377,23 +491,21 @@ class DPOService(SingletonMixin):
             group = self._current_group
 
             export_single_pair(
-                self._output_dir, self._manifest,
-                chosen, rejected,
-                group["prompt"], group["aspectratio"],
+                self._output_dir,
+                self._manifest,
+                chosen,
+                rejected,
+                group["prompt"],
+                group["aspectratio"],
             )
+            self._mark_pair_used(chosen, rejected)
 
-            self._remaining_images = [
-                i for i in self._remaining_images if i not in {chosen, rejected}
-            ]
+            self._remaining_images = [i for i in self._remaining_images if i not in {chosen, rejected}]
             self._pairs_created_in_group += 1
             self._pending_pair = None
 
             is_unconditional = group["prompt"] == "UNCONDITIONAL"
-            keep_going = (
-                continue_scoring
-                or is_unconditional
-                or self._pairs_created_in_group < self._pairs_per_group
-            )
+            keep_going = continue_scoring or is_unconditional or self._pairs_created_in_group < self._pairs_per_group
             can_continue = len(self._remaining_images) >= 2
 
             if keep_going and can_continue:
@@ -422,9 +534,7 @@ class DPOService(SingletonMixin):
             if not self._pending_pair:
                 return {"ok": False, "error": "No pending pair to cancel"}
             self._pending_pair = None
-            remaining_for_worst = [
-                i for i in self._remaining_images if i != self._selected_best
-            ]
+            remaining_for_worst = [i for i in self._remaining_images if i != self._selected_best]
             return {
                 "ok": True,
                 "phase": self._selection_phase,
@@ -452,13 +562,13 @@ class DPOService(SingletonMixin):
             # otherwise that selection would be silently dropped.
             return {"ok": False, "error": "Confirm or cancel the pending pair first"}
 
-        train_count, val_count = finalize_export(
-            self._output_dir, self._manifest, val_percentage=val_percentage
-        )
+        train_count, val_count = finalize_export(self._output_dir, self._manifest, val_percentage=val_percentage)
         total = len(self._manifest.get("pairs", []))
 
         self._session_active = False
         self._worker_stop.set()
+        if self._hash_cache is not None:
+            self._hash_cache.save()
 
         return {
             "ok": True,
@@ -472,6 +582,10 @@ class DPOService(SingletonMixin):
         self._session_active = False
         self._current_group = None
         self._pending_pair = None
+        # Keep the hash work done so far — a restarted session over the same
+        # output dir resumes from the cache instead of re-decoding everything.
+        if self._hash_cache is not None:
+            self._hash_cache.save()
         return {"ok": True}
 
     def serve_image(self, path: str) -> str | None:
@@ -499,9 +613,7 @@ class DPOService(SingletonMixin):
         if len(self._elo_ratings) < 2:
             self._elo_pair = None
             return None
-        sorted_imgs = sorted(
-            self._elo_ratings, key=lambda x: self._elo_ratings[x]
-        )
+        sorted_imgs = sorted(self._elo_ratings, key=lambda x: self._elo_ratings[x])
         idx = random.randint(0, len(sorted_imgs) - 2)
         self._elo_pair = (sorted_imgs[idx], sorted_imgs[idx + 1])
         return self._elo_pair
@@ -533,9 +645,7 @@ class DPOService(SingletonMixin):
         """Return (best, worst) by final ratings; None if fewer than 2 images."""
         if len(self._elo_ratings) < 2:
             return None
-        sorted_imgs = sorted(
-            self._elo_ratings, key=lambda x: self._elo_ratings[x], reverse=True
-        )
+        sorted_imgs = sorted(self._elo_ratings, key=lambda x: self._elo_ratings[x], reverse=True)
         return sorted_imgs[0], sorted_imgs[-1]
 
     def elo_current_pair(self) -> dict:
@@ -592,22 +702,20 @@ class DPOService(SingletonMixin):
         group = self._current_group
 
         export_single_pair(
-            self._output_dir, self._manifest,
-            chosen, rejected,
-            group["prompt"], group["aspectratio"],
+            self._output_dir,
+            self._manifest,
+            chosen,
+            rejected,
+            group["prompt"],
+            group["aspectratio"],
         )
+        self._mark_pair_used(chosen, rejected)
 
-        self._remaining_images = [
-            i for i in self._remaining_images if i not in {chosen, rejected}
-        ]
+        self._remaining_images = [i for i in self._remaining_images if i not in {chosen, rejected}]
         self._pairs_created_in_group += 1
 
         is_unconditional = group["prompt"] == "UNCONDITIONAL"
-        keep_going = (
-            continue_scoring
-            or is_unconditional
-            or self._pairs_created_in_group < self._pairs_per_group
-        )
+        keep_going = continue_scoring or is_unconditional or self._pairs_created_in_group < self._pairs_per_group
         can_continue = len(self._remaining_images) >= 2
 
         if keep_going and can_continue:
@@ -632,85 +740,224 @@ class DPOService(SingletonMixin):
 
     # ---- Background worker ----
 
-    def _background_scan(self) -> None:
+    @staticmethod
+    def _metadata_worker_count() -> int:
+        # Metadata extraction is I/O-bound (file open + small read + parse), so
+        # oversubscribing the CPU pays off — but cap it so we don't thrash on
+        # HDDs or hit Windows' per-process thread limits.
+        return min(16, (os.cpu_count() or 4) * 2)
 
+    @staticmethod
+    def _hash_worker_count() -> int:
+        # Pixel hashing is CPU-bound (full image decode + BLAKE3); both PIL and
+        # blake3 release the GIL, so threads scale near-linearly up to the core
+        # count. Cap below it to keep the machine responsive while curating.
+        return max(2, min(8, os.cpu_count() or 4))
+
+    def _is_pixel_hash_used(self, path: str) -> bool:
+        if self._hash_cache is None or not self._used_pixel_hashes:
+            return False
+        digest = self._hash_cache.get_pixel_hash(path)
+        return digest is not None and digest in self._used_pixel_hashes
+
+    def _mark_pair_used(self, chosen: str, rejected: str) -> None:
+        """Record the pixel hashes of a just-committed pair so byte/pixel-identical
+        copies elsewhere in the source tree can't be presented again — covers
+        duplicates living in other groups (same pixels, different metadata
+        prompt) that the path-based filter misses. Cache hits make this free:
+        both images were hashed during the scan's dedup pass."""
+        if self._hash_cache is None:
+            return
+        for path in (chosen, rejected):
+            digest = self._hash_cache.get_pixel_hash(path)
+            if digest is not None:
+                self._used_pixel_hashes.add(digest)
+
+    def _exported_image_paths(self) -> list[str]:
+        """All image files already exported under the output dir's chosen/ and
+        rejected/ trees (including train/val splits after finalize)."""
         from modules.util import path_util
-        from modules.util.dpo_curation_util import manifest_pair_counts
-        from modules.util.image_metadata_util import extract_metadata, strip_angle_bracket_segments
-
 
         supported = path_util.supported_image_extensions()
-        groups_dict: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
+        paths: list[str] = []
+        for subdir in ("chosen", "rejected"):
+            base = os.path.join(self._output_dir, subdir)
+            if not os.path.isdir(base):
+                continue
+            for root, _dirs, files in os.walk(base):
+                paths.extend(
+                    os.path.join(root, fname) for fname in files if os.path.splitext(fname)[1].lower() in supported
+                )
+        return paths
 
-        for root, _, files in os.walk(self._source_folder):
+    def _hash_paths(self, pool, paths: list[str]) -> dict[str, str]:
+        """Hash ``paths`` through the persistent cache on ``pool``. Returns
+        ``{path: hash}`` for files that could be hashed; returns early
+        (partial) when the worker is stopped mid-flight."""
+        from concurrent.futures import as_completed
+
+        result: dict[str, str] = {}
+        futures = {pool.submit(self._hash_cache.get_pixel_hash, p): p for p in paths}
+        for future in as_completed(futures):
+            if self._worker_stop.is_set():
+                for f in futures:
+                    f.cancel()
+                break
+            path = futures[future]
+            try:
+                digest = future.result()
+            except Exception:
+                digest = None
+            self._hash_count += 1
+            if digest is not None:
+                result[path] = digest
+        return result
+
+    def _background_scan(self) -> None:
+        try:
+            self._background_scan_inner()
+        finally:
+            # Persist hash work even on cancel/error so the next session over
+            # the same output dir skips straight past everything already done.
+            if self._hash_cache is not None:
+                self._hash_cache.save()
+
+    def _background_scan_inner(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from modules.util import path_util
+        from modules.util.dpo_curation_util import (
+            is_source_used,
+            manifest_pair_counts,
+            manifest_used_sources,
+            normalize_prompt_for_grouping,
+            resolve_aspect_ratio,
+            walk_skipping_dotted,
+        )
+        from modules.util.image_metadata_util import extract_metadata
+
+        supported = path_util.supported_image_extensions()
+
+        # Pass 1: enumerate candidate paths up front. os.walk uses scandir under
+        # the hood so this is cheap even on large trees, and collecting paths
+        # first lets us fan the expensive per-file metadata reads out across a
+        # thread pool (mirrors DPOCurationWindow._background_scan_and_dedup).
+        # Dot-prefixed subdirectories (.thumbnails, .cache, ...) are pruned.
+        candidate_paths: list[str] = []
+        for root, files in walk_skipping_dotted(self._source_folder):
+            if self._worker_stop.is_set():
+                return
             for filename in sorted(files):
-                if self._worker_stop.is_set():
-                    return
                 ext = os.path.splitext(filename)[1].lower()
-                if ext not in supported:
-                    continue
-                path = os.path.join(root, filename)
-                meta = extract_metadata(path)
-                prompt = meta.get("prompt", "").strip()
-                ar = meta.get("aspectratio", "").strip()
-                if prompt:
-                    prompt = strip_angle_bracket_segments(prompt)
-                if not prompt:
-                    prompt = "UNCONDITIONAL"
-                groups_dict[(prompt, ar)].append(path)
-                self._scan_count += 1
+                if ext in supported:
+                    candidate_paths.append(os.path.join(root, filename))
+        self._scan_total = len(candidate_paths)
 
+        def extract_group_key(path: str) -> tuple[str, str]:
+            meta = extract_metadata(path)
+            # The aspect component is the trainer bucket label ("7:4", "4:7",
+            # ...) derived from actual pixel dimensions, so images that crop
+            # to the same AspectBucketing bucket group together even when
+            # their exact ratios differ (1344x768 vs 1680x960, metadata
+            # "16:9" vs derived). Metadata is only a fallback for undecodable
+            # files.
+            ar = resolve_aspect_ratio(meta.get("aspectratio", ""), path)
+            prompt = normalize_prompt_for_grouping(meta.get("prompt", ""))
+            return prompt, ar
+
+        # Pass 2: parallel metadata extraction, served from the persistent
+        # cache for unchanged files — extraction reads (and for unmarked files,
+        # fully scans) each file, so on a rescan this pass collapses to one
+        # os.stat per file. The grouping dict is mutated only on the consumer
+        # side of `as_completed`, so no lock is needed.
+        groups_dict: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
+        if candidate_paths:
+            with ThreadPoolExecutor(max_workers=self._metadata_worker_count()) as pool:
+                future_to_path = {
+                    pool.submit(self._hash_cache.get_group_key, p, extract_group_key): p for p in candidate_paths
+                }
+                for future in as_completed(future_to_path):
+                    if self._worker_stop.is_set():
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        return
+                    try:
+                        group_key = future.result()
+                    except Exception:
+                        group_key = None
+                    self._scan_count += 1
+                    if group_key is not None:
+                        groups_dict[group_key].append(future_to_path[future])
+
+        # as_completed scrambles arrival order; re-sort so group contents (and
+        # therefore dedup keep-order and UI display) stay deterministic.
         raw_groups = [
-            {"prompt": prompt, "aspectratio": ar, "images": images}
+            {"prompt": prompt, "aspectratio": ar, "images": sorted(images)}
             for (prompt, ar), images in groups_dict.items()
             if len(images) >= 2
         ]
         random.shuffle(raw_groups)
 
         existing_counts = manifest_pair_counts(self._manifest)
+        used_sources = manifest_used_sources(self._manifest)
 
-        for group in raw_groups:
+        with ThreadPoolExecutor(max_workers=self._hash_worker_count()) as hash_pool:
+            # Fingerprint everything already exported so a byte/pixel-identical
+            # copy of a used image can never be presented again, no matter how
+            # it was renamed or where it lives in the source tree. The
+            # path-based used_sources filter alone misses those.
+            exported = self._hash_paths(hash_pool, self._exported_image_paths())
+            self._used_pixel_hashes.update(exported.values())
             if self._worker_stop.is_set():
                 return
 
-            group_key = (group["prompt"], group["aspectratio"])
-            is_unconditional = group["prompt"] == "UNCONDITIONAL"
-            if not is_unconditional and existing_counts.get(group_key, 0) >= self._pairs_per_group:
-                continue
+            for group in raw_groups:
+                if self._worker_stop.is_set():
+                    return
 
-            deduped = self._dedup_by_dhash(group["images"])
-            if len(deduped) >= 2:
-                group["images"] = deduped
-                self._groups_queued += 1
-                while not self._worker_stop.is_set():
-                    try:
-                        self._ready_queue.put(group, timeout=0.5)
-                        break
-                    except Full:
-                        continue
+                group_key = (group["prompt"], group["aspectratio"])
+                is_unconditional = group["prompt"] == "UNCONDITIONAL"
+                if not is_unconditional and existing_counts.get(group_key, 0) >= self._pairs_per_group:
+                    continue
+
+                # Drop images already committed in any prior pair before dedup so
+                # the content-hash pass doesn't waste work on sources we'll discard.
+                fresh = [i for i in group["images"] if not is_source_used(used_sources, i)]
+                if len(fresh) < 2:
+                    continue
+
+                deduped = self._dedup_by_content_hash(fresh, hash_pool)
+                if len(deduped) >= 2:
+                    group["images"] = deduped
+                    self._groups_queued += 1
+                    while not self._worker_stop.is_set():
+                        try:
+                            self._ready_queue.put(group, timeout=0.5)
+                            break
+                        except Full:
+                            continue
 
         self._worker_finished = True
 
-    @staticmethod
-    def _dedup_by_dhash(images: list[str]) -> list[str]:
-        from PIL import Image
-
-        seen: dict[int, int] = {}
+    def _dedup_by_content_hash(self, images: list[str], hash_pool) -> list[str]:
+        """Drop pixel-identical files within a group, keeping the latest
+        mtime copy, and drop any image whose pixel content already exists in
+        the output dataset (``_used_pixel_hashes``). DPO is *meant* to
+        discriminate between near-duplicates from different seeds, so the hash
+        covers the decoded pixel buffer rather than the raw file: PNG text
+        chunks, EXIF, ICC profiles, and re-encoded container metadata don't
+        count as a difference, but a single different pixel does (see
+        ``compute_pixel_hash``). Hashes come from the persistent per-output-dir
+        cache, so only new/changed files pay the decode cost; files that can't
+        be hashed at all (unreadable) are kept rather than silently dropped."""
+        hashes = self._hash_paths(hash_pool, images)
+        seen: dict[str, int] = {}
         unique: list[str] = []
         for path in images:
-            try:
-                with Image.open(path) as img:
-                    img = img.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
-                    pixels = list(img.getdata())
-                bits = 0
-                for row in range(8):
-                    for col in range(8):
-                        idx = row * 9 + col
-                        if pixels[idx] < pixels[idx + 1]:
-                            bits |= 1 << (row * 8 + col)
-                h = bits
-            except Exception:
+            h = hashes.get(path)
+            if h is None:
                 unique.append(path)
+                continue
+            if h in self._used_pixel_hashes:
                 continue
             if h not in seen:
                 seen[h] = len(unique)

@@ -1,5 +1,7 @@
+import json
 import math
 from contextlib import nullcontext
+from pathlib import Path
 from random import Random
 
 from modules.model.BaseModel import BaseModel
@@ -21,6 +23,54 @@ from diffusers import (
 from transformers import Qwen2Tokenizer, Qwen3ForCausalLM
 
 PROMPT_MAX_LENGTH = 512
+
+_ZIMAGE_SHIFT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "zimageshift.json"
+_ZIMAGE_VAE_DOWNSCALE = 8  # AutoencoderKL spatial compression
+_zimage_shift_table_cache: list[tuple[int, float]] | None = None
+_zimage_shift_table_loaded = False
+
+
+def _load_zimage_shift_table() -> list[tuple[int, float]]:
+    global _zimage_shift_table_cache, _zimage_shift_table_loaded
+    if _zimage_shift_table_loaded:
+        return _zimage_shift_table_cache or []
+    _zimage_shift_table_loaded = True
+    try:
+        with open(_ZIMAGE_SHIFT_CONFIG_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        print(
+            f"[Z-Image] {_ZIMAGE_SHIFT_CONFIG_PATH.name} not found at repo root; falling back to Flux-default dynamic shift formula."
+        )
+        _zimage_shift_table_cache = None
+        return []
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"[Z-Image] Failed to read {_ZIMAGE_SHIFT_CONFIG_PATH.name}: {e}; falling back to Flux-default dynamic shift formula."
+        )
+        _zimage_shift_table_cache = None
+        return []
+
+    entries: list[tuple[int, float]] = []
+    for k, v in raw.items():
+        if isinstance(k, str) and k.startswith("_"):
+            continue  # allow comment-style keys
+        try:
+            entries.append((int(k), float(v)))
+        except (TypeError, ValueError):
+            print(f"[Z-Image] Ignoring invalid entry in {_ZIMAGE_SHIFT_CONFIG_PATH.name}: {k!r} -> {v!r}")
+    if not entries:
+        print(
+            f"[Z-Image] {_ZIMAGE_SHIFT_CONFIG_PATH.name} has no usable entries; falling back to Flux-default dynamic shift formula."
+        )
+        _zimage_shift_table_cache = None
+        return []
+
+    entries.sort(key=lambda x: x[0])
+    _zimage_shift_table_cache = entries
+    print(f"[Z-Image] Loaded dynamic shift table from {_ZIMAGE_SHIFT_CONFIG_PATH.name}: {entries}")
+    return entries
+
 
 def format_input(text: str):
     return [
@@ -49,9 +99,13 @@ class ZImageModel(BaseModel):
     transformer_lora: LoRAModuleWrapper | None
     lora_state_dict: dict | None
 
+    # distillation teacher (frozen)
+    transformer_teacher_lora: LoRAModuleWrapper | None
+    teacher_lora_state_dict: dict | None
+
     def __init__(
-            self,
-            model_type: ModelType,
+        self,
+        model_type: ModelType,
     ):
         super().__init__(
             model_type=model_type,
@@ -65,7 +119,7 @@ class ZImageModel(BaseModel):
 
         self.text_encoder_autocast_context = nullcontext()
 
-        self.text_encoder_train_dtype = DataType.FLOAT_32 #TODO
+        self.text_encoder_train_dtype = DataType.FLOAT_32  # TODO
 
         self.text_encoder_offload_conductor = None
         self.transformer_offload_conductor = None
@@ -73,31 +127,54 @@ class ZImageModel(BaseModel):
         self.transformer_lora = None
         self.lora_state_dict = None
 
+        self.transformer_teacher_lora = None
+        self.teacher_lora_state_dict = None
+
     def adapters(self) -> list[LoRAModuleWrapper]:
-        return [a for a in [
-            self.transformer_lora,
-        ] if a is not None]
+        return [
+            a
+            for a in [
+                self.transformer_lora,
+            ]
+            if a is not None
+        ]
+
+    def teacher_adapters(self) -> list[LoRAModuleWrapper]:
+        return [
+            a
+            for a in [
+                self.transformer_teacher_lora,
+            ]
+            if a is not None
+        ]
 
     def vae_to(self, device: torch.device):
         self.vae.to(device=device)
 
-    def text_encoder_to(self, device: torch.device): #TODO share more code between models
+    def text_encoder_to(self, device: torch.device):  # TODO share more code between models
         if self.text_encoder is not None:
-            if self.text_encoder_offload_conductor is not None and \
-                    self.text_encoder_offload_conductor.layer_offload_activated():
+            if (
+                self.text_encoder_offload_conductor is not None
+                and self.text_encoder_offload_conductor.layer_offload_activated()
+            ):
                 self.text_encoder_offload_conductor.to(device)
             else:
                 self.text_encoder.to(device=device)
 
     def transformer_to(self, device: torch.device):
-        if self.transformer_offload_conductor is not None and \
-                self.transformer_offload_conductor.layer_offload_activated():
+        if (
+            self.transformer_offload_conductor is not None
+            and self.transformer_offload_conductor.layer_offload_activated()
+        ):
             self.transformer_offload_conductor.to(device)
         else:
             self.transformer.to(device=device)
 
         if self.transformer_lora is not None:
             self.transformer_lora.to(device)
+
+        if self.transformer_teacher_lora is not None:
+            self.transformer_teacher_lora.to(device)
 
     def to(self, device: torch.device):
         self.vae_to(device)
@@ -120,15 +197,15 @@ class ZImageModel(BaseModel):
         )
 
     def encode_text(
-            self,
-            train_device: torch.device,
-            batch_size: int = 1,
-            rand: Random | None = None,
-            text: str | list[str] = None,
-            tokens: Tensor = None,
-            tokens_mask: Tensor = None,
-            text_encoder_dropout_probability: float | None = None,
-            text_encoder_output: Tensor = None,
+        self,
+        train_device: torch.device,
+        batch_size: int = 1,
+        rand: Random | None = None,
+        text: str | list[str] = None,
+        tokens: Tensor = None,
+        tokens_mask: Tensor = None,
+        text_encoder_dropout_probability: float | None = None,
+        text_encoder_output: Tensor = None,
     ) -> tuple[Tensor, Tensor]:
         if tokens is None and text is not None:
             if isinstance(text, str):
@@ -145,11 +222,7 @@ class ZImageModel(BaseModel):
                 text[i] = prompt_item
 
             tokenizer_output = self.tokenizer(
-                text,
-                max_length=PROMPT_MAX_LENGTH,
-                padding='max_length',
-                truncation=True,
-                return_tensors="pt"
+                text, max_length=PROMPT_MAX_LENGTH, padding="max_length", truncation=True, return_tensors="pt"
             )
             tokens = tokenizer_output.input_ids.to(self.text_encoder.device)
             tokens_mask = tokenizer_output.attention_mask.to(self.text_encoder.device)
@@ -165,11 +238,20 @@ class ZImageModel(BaseModel):
                 text_encoder_output = text_encoder_output.hidden_states[-2]
 
         if text_encoder_dropout_probability is not None and text_encoder_dropout_probability > 0.0:
-            raise NotImplementedError #https://github.com/Nerogar/OneTrainer/issues/957
+            raise NotImplementedError  # https://github.com/Nerogar/OneTrainer/issues/957
 
-        embeddings_list = []
         bool_attention_mask = tokens_mask.bool()
-        embeddings_list = [sample[bool_attention_mask[i]] for i, sample in enumerate(text_encoder_output)]
+        embeddings_list = []
+        for i, sample in enumerate(text_encoder_output):
+            kept = sample[bool_attention_mask[i]]
+            if kept.shape[0] == 0:
+                # Zero-token caption (e.g. empty .txt): keep a single zero
+                # embedding so the cap stream has seq >= 1. Without this, an
+                # all-empty batch makes the transformer's cap RoPE reshape
+                # (..., -1, 2) on a 0-element tensor, which fails under
+                # torch.compile fake-tensor tracing.
+                kept = sample.new_zeros((1, sample.shape[-1]))
+            embeddings_list.append(kept)
         return embeddings_list
 
     def scale_latents(self, latents: Tensor) -> Tensor:
@@ -179,7 +261,24 @@ class ZImageModel(BaseModel):
         return latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
 
     def calculate_timestep_shift(self, latent_width: int, latent_height: int):
-        #these values are not defined in the scheduler config of Z-Image. They are therefore taken from the default of FlowMatchEulerDiscreteScheduler - which are Flux settings
+        table = _load_zimage_shift_table()
+        if table:
+            image_w = latent_width * _ZIMAGE_VAE_DOWNSCALE
+            image_h = latent_height * _ZIMAGE_VAE_DOWNSCALE
+            equiv_edge = math.sqrt(image_w * image_h)
+            if equiv_edge <= table[0][0]:
+                return table[0][1]
+            if equiv_edge >= table[-1][0]:
+                return table[-1][1]
+            for i in range(len(table) - 1):
+                lo_res, lo_shift = table[i]
+                hi_res, hi_shift = table[i + 1]
+                if lo_res <= equiv_edge <= hi_res:
+                    frac = (equiv_edge - lo_res) / (hi_res - lo_res)
+                    return lo_shift + frac * (hi_shift - lo_shift)
+
+        # Fallback: Z-Image scheduler has no native shift params, so reuse the
+        # FlowMatchEulerDiscreteScheduler defaults (which are Flux's values).
         base_seq_len = self.noise_scheduler.config.base_image_seq_len
         max_seq_len = self.noise_scheduler.config.max_image_seq_len
         base_shift = self.noise_scheduler.config.base_shift

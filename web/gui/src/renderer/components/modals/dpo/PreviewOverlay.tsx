@@ -31,6 +31,24 @@ export function PreviewOverlay({ path, onClose, onPick, caption }: PreviewOverla
     if (e.target === e.currentTarget) onClose();
   };
 
+  // The img element fills the container (so small images upscale to fit the
+  // display via object-contain), which means letterbox bars are part of the
+  // img itself. Hit-test against the painted image rect so clicking the bars
+  // still closes the preview, matching the backdrop behavior.
+  const handleImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    const img = e.currentTarget;
+    if (!img.naturalWidth || !img.naturalHeight) return;
+    const rect = img.getBoundingClientRect();
+    const scale = Math.min(rect.width / img.naturalWidth, rect.height / img.naturalHeight);
+    const paintedWidth = img.naturalWidth * scale;
+    const paintedHeight = img.naturalHeight * scale;
+    const left = rect.left + (rect.width - paintedWidth) / 2;
+    const top = rect.top + (rect.height - paintedHeight) / 2;
+    if (e.clientX < left || e.clientX > left + paintedWidth || e.clientY < top || e.clientY > top + paintedHeight) {
+      onClose();
+    }
+  };
+
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     if (onPick) {
@@ -54,7 +72,8 @@ export function PreviewOverlay({ path, onClose, onPick, caption }: PreviewOverla
         <img
           src={src}
           alt={fileName}
-          className="max-w-full max-h-full object-contain"
+          className="w-full h-full object-contain"
+          onClick={handleImageClick}
           onContextMenu={handleContextMenu}
           draggable={false}
         />

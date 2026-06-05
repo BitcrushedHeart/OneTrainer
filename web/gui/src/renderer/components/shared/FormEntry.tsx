@@ -1,6 +1,6 @@
-import { type ChangeEvent, forwardRef, useEffect, useState } from "react";
+import { type ChangeEvent, forwardRef, useEffect, useRef, useState } from "react";
 
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import { INPUT_FULL, PLACEHOLDER } from "@/utils/inputStyles";
 
 import { FormFieldWrapper } from "./FormFieldWrapper";
@@ -34,12 +34,19 @@ export const FormEntry = forwardRef<HTMLInputElement, FormEntryProps>(
     },
     ref,
   ) => {
-    const [configValue, setConfigValue] = useConfigField<string | number | null>(configPath);
+    const [configValue, setConfigValue] = useBoundField<string | number | null>(configPath);
 
     const externalValue = configPath ? configValue : controlledValue;
     const [localValue, setLocalValue] = useState<string>(externalValue != null ? String(externalValue) : "");
+    const isFocusedRef = useRef(false);
 
     useEffect(() => {
+      // Don't clobber what the user is actively typing. Pushing a parsed number
+      // to the config makes it flow back here as `externalValue`; re-syncing
+      // mid-type would rewrite the raw text (e.g. "-0" -> "0", "1e-4" -> "0.0001").
+      // External-driven updates (preset load, reset, config switch) still apply
+      // when the field isn't focused.
+      if (isFocusedRef.current) return;
       setLocalValue(externalValue != null ? String(externalValue) : "");
     }, [externalValue]);
 
@@ -64,6 +71,18 @@ export const FormEntry = forwardRef<HTMLInputElement, FormEntryProps>(
       }
     };
 
+    const handleFocus = () => {
+      isFocusedRef.current = true;
+    };
+
+    const handleBlur = () => {
+      isFocusedRef.current = false;
+      // Validate/normalize on blur: snap the display to the canonical stored
+      // value (e.g. "007" -> "7", "5." -> "5"). Incomplete entries like "-" or
+      // "" that were never pushed simply revert to the last valid value.
+      setLocalValue(externalValue != null ? String(externalValue) : "");
+    };
+
     return (
       <FormFieldWrapper label={label} tooltip={tooltip} configPath={configPath} style={width ? { width } : undefined}>
         <input
@@ -71,6 +90,8 @@ export const FormEntry = forwardRef<HTMLInputElement, FormEntryProps>(
           type={type}
           value={localValue}
           onChange={handleChange}
+          onFocus={handleFocus}
+          onBlur={handleBlur}
           placeholder={placeholder}
           disabled={disabled}
           className={`${INPUT_FULL} ${PLACEHOLDER}`}

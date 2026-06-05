@@ -1,6 +1,6 @@
 import { type ChangeEvent, useEffect, useState } from "react";
 
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import type { TimeUnit } from "@/types/generated/enums";
 import { TimeUnitValues } from "@/types/generated/enums";
 import { INPUT_FLEX, SELECT_BASE } from "@/utils/inputStyles";
@@ -16,8 +16,8 @@ export interface TimeEntryProps {
 }
 
 export function TimeEntry({ label, valuePath, unitPath, tooltip, disabled }: TimeEntryProps) {
-  const [numValue, setNumValue] = useConfigField<number>(valuePath);
-  const [unitValue, setUnitValue] = useConfigField<TimeUnit>(unitPath);
+  const [numValue, setNumValue] = useBoundField<number>(valuePath);
+  const [unitValue, setUnitValue] = useBoundField<TimeUnit>(unitPath);
   const [localNum, setLocalNum] = useState(String(numValue ?? ""));
 
   useEffect(() => {

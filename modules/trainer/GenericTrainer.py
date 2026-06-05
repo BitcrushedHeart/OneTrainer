@@ -9,8 +9,6 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-import numpy as np
-
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.model.BaseModel import BaseModel
@@ -21,11 +19,11 @@ from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
 from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_rounding_set_seed
-from modules.util.dataset_fingerprint import compute_concept_fingerprint
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.dataset_fingerprint import compute_concept_fingerprint
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DPOPatienceMode import DPOPatienceMode
@@ -49,6 +47,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
 import huggingface_hub
+import numpy as np
 from requests.exceptions import ConnectionError
 from tqdm import tqdm
 
@@ -136,8 +135,8 @@ class GenericTrainer(BaseTrainer):
             self.callbacks.on_update_status("logging into Hugging Face")
             with contextlib.suppress(ConnectionError):
                 huggingface_hub.login(
-                    token = self.config.secrets.huggingface_token,
-                    new_session = False,
+                    token=self.config.secrets.huggingface_token,
+                    new_session=False,
                 )
 
         self.callbacks.on_update_status("loading the model")
@@ -168,9 +167,7 @@ class GenericTrainer(BaseTrainer):
 
         self.callbacks.on_update_status("creating the data loader/caching")
 
-        self.data_loader = self.create_data_loader(
-            self.model, self.model_setup, self.model.train_progress
-        )
+        self.data_loader = self.create_data_loader(self.model, self.model_setup, self.model.train_progress)
         self.data_loader.stop_check_fun = self.commands.get_stop_command
         self.model_saver = self.create_model_saver()
 
@@ -179,6 +176,30 @@ class GenericTrainer(BaseTrainer):
         self.sample_queue = []
 
         self.parameters = self.model.parameters.parameters()
+
+        # SFT-anchored DPO: when a DPO run also contains STANDARD/PRIOR_PREDICTION
+        # concepts, run those samples through a parallel non-DPO loader and add
+        # a weighted supervised term to the DPO loss. Without this, the DPO
+        # pipeline silently drops standard concepts via PairByFilename's
+        # concept_lookup miss.
+        self.sft_anchor_data_loader = None
+        self.sft_anchor_iter = None
+        if self.config.rlhf_enabled and self.config.rlhf_sft_anchor_weight > 0:
+            sft_anchor_count = self.__count_sft_anchor_concepts()
+            if sft_anchor_count > 0:
+                print(
+                    f"SFT-anchored DPO: {sft_anchor_count} STANDARD/PRIOR_PREDICTION "
+                    f"concept(s) detected; loss = dpo_loss + "
+                    f"{self.config.rlhf_sft_anchor_weight} * sft_loss."
+                )
+                self.callbacks.on_update_status("creating the SFT-anchor data loader/caching")
+                self.sft_anchor_data_loader = self.create_data_loader(
+                    self.model,
+                    self.model_setup,
+                    self.model.train_progress,
+                    is_sft_anchor=True,
+                )
+                self.sft_anchor_data_loader.stop_check_fun = self.commands.get_stop_command
 
         if self.config.validation or self.config.rlhf_dpo_validation:
             self.validation_data_loader = self.create_data_loader(
@@ -193,13 +214,13 @@ class GenericTrainer(BaseTrainer):
             )
 
         self._patience_counter = 0
-        self._patience_best_loss = float('inf')
+        self._patience_best_loss = float("inf")
         self._patience_best_step = -1
         self._patience_best_backup_path: str | None = None
 
         self._dpo_patience_counter = 0
-        self._dpo_best_accuracy = float('-inf')
-        self._dpo_best_loss = float('inf')
+        self._dpo_best_accuracy = float("-inf")
+        self._dpo_best_loss = float("inf")
         self._dpo_best_backup_path: str | None = None
 
         if multi.is_master():
@@ -235,6 +256,46 @@ class GenericTrainer(BaseTrainer):
             self.model.tensorboard_subdir = subdir
             self.tensorboard = SummaryWriter(os.path.join(tensorboard_log_dir, subdir))
 
+    def __next_sft_anchor_batch(self):
+        """Pull the next SFT-anchor batch, cycling the loader if exhausted.
+
+        The SFT and DPO loaders generally have different lengths. When the
+        SFT-anchor iterator runs out mid-DPO-epoch, advance its dataset to the
+        next epoch and restart. A safety counter prevents an infinite loop if
+        the dataset is empty (which shouldn't happen — we gate on a non-zero
+        concept count at startup — but keeps the failure mode loud).
+        """
+        for _ in range(2):
+            if self.sft_anchor_iter is None:
+                self.sft_anchor_iter = iter(self.sft_anchor_data_loader.get_data_loader())
+            try:
+                return next(self.sft_anchor_iter)
+            except StopIteration:
+                self.sft_anchor_data_loader.get_data_set().start_next_epoch()
+                self.sft_anchor_iter = None
+        raise RuntimeError(
+            "SFT-anchor data loader produced no batches after a full epoch restart. "
+            "Check that STANDARD/PRIOR_PREDICTION concepts contain readable images."
+        )
+
+    def __count_sft_anchor_concepts(self) -> int:
+        """Return the number of enabled STANDARD/PRIOR_PREDICTION concepts.
+
+        Used to decide whether the parallel SFT-anchor data loader is needed.
+        Mirrors the loading logic in DataLoaderMgdsMixin._create_mgds.
+        """
+        from modules.util.config.ConceptConfig import ConceptConfig
+
+        concepts = self.config.concepts
+        if concepts is None:
+            concept_file = self.config.concept_file_name
+            if not concept_file or not os.path.isfile(concept_file):
+                return 0
+            with open(concept_file, "r") as f:
+                concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+        anchor_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
+        return sum(1 for c in concepts if c.enabled and ConceptType(c.type) in anchor_types)
+
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
         os.makedirs(Path(path).absolute(), exist_ok=True)
@@ -244,22 +305,25 @@ class GenericTrainer(BaseTrainer):
 
     def __clear_cache(self):
         print(
-            f'Clearing cache directory {self.config.cache_dir}! '
-            f'SmartCache validates files incrementally, so this is usually unnecessary. '
+            f"Clearing cache directory {self.config.cache_dir}! "
+            f"SmartCache validates files incrementally, so this is usually unnecessary. "
             f'Disable "Clear cache before training" to keep your validated cache.'
         )
         if os.path.isdir(self.config.cache_dir):
             for filename in os.listdir(self.config.cache_dir):
                 path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                if os.path.isdir(path) and (filename.startswith("epoch-") or filename in ["image", "text"]):
                     shutil.rmtree(path)
 
     def __prune_backups(self, backups_to_keep: int):
         backup_dirpath = os.path.join(self.config.workspace_dir, "backup")
         if os.path.exists(backup_dirpath):
             backup_directories = sorted(
-                [dirpath for dirpath in os.listdir(backup_dirpath) if
-                 os.path.isdir(os.path.join(backup_dirpath, dirpath))],
+                [
+                    dirpath
+                    for dirpath in os.listdir(backup_dirpath)
+                    if os.path.isdir(os.path.join(backup_dirpath, dirpath))
+                ],
                 reverse=True,
             )
 
@@ -281,17 +345,17 @@ class GenericTrainer(BaseTrainer):
         self.sample_queue = []
 
     def __sample_loop(
-            self,
-            train_progress: TrainProgress,
-            train_device: torch.device,
-            sample_config_list: list[SampleConfig],
-            ema_applied: bool,
-            folder_postfix: str = "",
-            is_custom_sample: bool = False,
+        self,
+        train_progress: TrainProgress,
+        train_device: torch.device,
+        sample_config_list: list[SampleConfig],
+        ema_applied: bool,
+        folder_postfix: str = "",
+        is_custom_sample: bool = False,
     ):
         for i, sample_config in multi.distributed(
             [(i, sample_config) for i, sample_config in enumerate(sample_config_list) if sample_config.enabled],
-            distribute=not self.config.samples_to_tensorboard and not ema_applied
+            distribute=not self.config.samples_to_tensorboard and not ema_applied,
         ):
             try:
                 safe_prompt = path_util.safe_filename(sample_config.prompt)
@@ -311,14 +375,15 @@ class GenericTrainer(BaseTrainer):
 
                 sample_path = os.path.join(
                     sample_dir,
-                    f"{self.config.save_filename_prefix}{get_string_timestamp()}-training-sample-{train_progress.filename_string()}"
+                    f"{self.config.save_filename_prefix}{get_string_timestamp()}-training-sample-{train_progress.filename_string()}",
                 )
 
                 def on_sample_default(sampler_output: ModelSamplerOutput):
                     if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
                         self.tensorboard.add_image(
-                            f"sample{str(i)} - {safe_prompt}", pil_to_tensor(sampler_output.data),  # noqa: B023
-                            train_progress.global_step
+                            f"sample{str(i)} - {safe_prompt}",
+                            pil_to_tensor(sampler_output.data),  # noqa: B023
+                            train_progress.global_step,
                         )
                     self.callbacks.on_sample_default(sampler_output)
 
@@ -326,7 +391,11 @@ class GenericTrainer(BaseTrainer):
                     self.callbacks.on_sample_custom(sampler_output)
 
                 on_sample = on_sample_custom if is_custom_sample else on_sample_default
-                on_update_progress = self.callbacks.on_update_sample_custom_progress if is_custom_sample else self.callbacks.on_update_sample_default_progress
+                on_update_progress = (
+                    self.callbacks.on_update_sample_custom_progress
+                    if is_custom_sample
+                    else self.callbacks.on_update_sample_default_progress
+                )
 
                 self.model.to(self.temp_device)
                 self.model.eval()
@@ -350,10 +419,10 @@ class GenericTrainer(BaseTrainer):
             torch_gc()
 
     def __sample_during_training(
-            self,
-            train_progress: TrainProgress,
-            train_device: torch.device,
-            sample_params_list: list[SampleConfig] = None,
+        self,
+        train_progress: TrainProgress,
+        train_device: torch.device,
+        sample_params_list: list[SampleConfig] = None,
     ):
         # Special case for schedule-free optimizers.
         if self.config.optimizer.optimizer.is_schedule_free:
@@ -370,7 +439,7 @@ class GenericTrainer(BaseTrainer):
             sample_params_list = self.config.samples
         else:
             try:
-                with open(self.config.sample_definition_file_name, 'r') as f:
+                with open(self.config.sample_definition_file_name, "r") as f:
                     samples = json.load(f)
                     for i in range(len(samples)):
                         samples[i] = SampleConfig.default_values(self.config.model_type).from_dict(samples[i])
@@ -382,8 +451,8 @@ class GenericTrainer(BaseTrainer):
                 sample_params_list = []
 
         if self.model.ema:
-            #the EMA model only exists in the master process, so EMA sampling is done on one GPU only
-            #non-EMA sampling is done on all GPUs
+            # the EMA model only exists in the master process, so EMA sampling is done on one GPU only
+            # non-EMA sampling is done on all GPUs
             assert multi.is_master() and self.config.ema != EMAMode.OFF
             self.model.ema.copy_ema_to(self.parameters, store_temp=True)
 
@@ -392,7 +461,7 @@ class GenericTrainer(BaseTrainer):
             train_device=train_device,
             sample_config_list=sample_params_list,
             is_custom_sample=is_custom_sample,
-            ema_applied = self.config.ema != EMAMode.OFF
+            ema_applied=self.config.ema != EMAMode.OFF,
         )
 
         if self.model.ema:
@@ -405,7 +474,7 @@ class GenericTrainer(BaseTrainer):
                 train_device=train_device,
                 sample_config_list=sample_params_list,
                 folder_postfix=" - no-ema",
-                ema_applied = False,
+                ema_applied=False,
             )
 
         self.model_setup.setup_train_device(self.model, self.config)
@@ -432,7 +501,8 @@ class GenericTrainer(BaseTrainer):
             step_tqdm_validation = tqdm(
                 self.validation_data_loader.get_data_loader(),
                 desc="validation_step",
-                total=current_epoch_length_validation)
+                total=current_epoch_length_validation,
+            )
 
             if self.config.rlhf_dpo_validation:
                 dpo_val_loss = []
@@ -445,9 +515,7 @@ class GenericTrainer(BaseTrainer):
                         torch_gc()
 
                     with torch.no_grad():
-                        self.model_setup.calculate_dpo_loss(
-                            self.model, validation_batch, self.config, train_progress
-                        )
+                        self.model_setup.calculate_dpo_loss(self.model, validation_batch, self.config, train_progress)
                     dpo_metrics = self.model_setup.get_last_dpo_metrics()
                     dpo_val_loss.append(dpo_metrics["dpo_loss"])
                     dpo_val_accuracy.append(dpo_metrics["accuracy"])
@@ -463,7 +531,9 @@ class GenericTrainer(BaseTrainer):
                     self.tensorboard.add_scalar("dpo/val_loss", val_loss, train_progress.global_step)
                     self.tensorboard.add_scalar("dpo/val_accuracy", val_accuracy, train_progress.global_step)
                     self.tensorboard.add_scalar("dpo/val_chosen_reward", val_chosen_reward, train_progress.global_step)
-                    self.tensorboard.add_scalar("dpo/val_rejected_reward", val_rejected_reward, train_progress.global_step)
+                    self.tensorboard.add_scalar(
+                        "dpo/val_rejected_reward", val_rejected_reward, train_progress.global_step
+                    )
                     self.__check_dpo_patience(val_accuracy, val_loss, train_progress)
 
                 # DPO validation uses a different data pipeline (paired samples) than
@@ -481,9 +551,11 @@ class GenericTrainer(BaseTrainer):
 
                 with torch.no_grad():
                     model_output_data = self.model_setup.predict(
-                        self.model, validation_batch, self.config, train_progress, deterministic=True)
+                        self.model, validation_batch, self.config, train_progress, deterministic=True
+                    )
                     loss_validation = self.model_setup.calculate_loss(
-                        self.model, validation_batch, model_output_data, self.config)
+                        self.model, validation_batch, model_output_data, self.config
+                    )
 
                 concept_name = validation_batch["concept_name"][0]
                 concept_path = validation_batch["concept_path"][0]
@@ -510,18 +582,16 @@ class GenericTrainer(BaseTrainer):
                 average_loss = total_loss / concept_counts[concept_seed]
                 label = mapping_seed_to_label[concept_seed]
 
-                self.tensorboard.add_scalar(f"loss/validation_step/{label}",
-                                            average_loss,
-                                            train_progress.global_step)
+                self.tensorboard.add_scalar(f"loss/validation_step/{label}", average_loss, train_progress.global_step)
 
             total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
             total_count = sum(concept_counts[key] for key in concept_counts)
             total_average_loss = total_loss / total_count
 
             if len(concept_counts) > 1:
-                self.tensorboard.add_scalar("loss/validation_step/total_average",
-                                            total_average_loss,
-                                            train_progress.global_step)
+                self.tensorboard.add_scalar(
+                    "loss/validation_step/total_average", total_average_loss, train_progress.global_step
+                )
 
             if self.config.patience:
                 self.__check_patience(total_average_loss, train_progress)
@@ -541,9 +611,11 @@ class GenericTrainer(BaseTrainer):
         self.tensorboard.add_scalar("patience/best_val_loss", self._patience_best_loss, train_progress.global_step)
 
         if self._patience_counter >= self.config.patience_epochs:
-            print(f"Patience triggered at step {train_progress.global_step}. "
-                  f"Best checkpoint from step {self._patience_best_step} "
-                  f"(val_loss: {self._patience_best_loss:.6f})")
+            print(
+                f"Patience triggered at step {train_progress.global_step}. "
+                f"Best checkpoint from step {self._patience_best_step} "
+                f"(val_loss: {self._patience_best_loss:.6f})"
+            )
             self.commands.stop()
 
     def __save_patience_best(self, train_progress: TrainProgress) -> str:
@@ -593,8 +665,10 @@ class GenericTrainer(BaseTrainer):
         self.tensorboard.add_scalar("dpo/patience_counter", self._dpo_patience_counter, train_progress.global_step)
 
         if self._dpo_patience_counter >= self.config.rlhf_dpo_patience_value:
-            print(f"DPO early stopping triggered: patience exhausted after {self._dpo_patience_counter} "
-                  f"consecutive checks without improvement.")
+            print(
+                f"DPO early stopping triggered: patience exhausted after {self._dpo_patience_counter} "
+                f"consecutive checks without improvement."
+            )
             self.commands.stop()
 
     def __save_dpo_best(self, val_accuracy: float, val_loss: float, train_progress: TrainProgress) -> str:
@@ -682,7 +756,7 @@ class GenericTrainer(BaseTrainer):
         save_path = os.path.join(
             self.config.workspace_dir,
             "save",
-            f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{train_progress.filename_string()}{self.config.output_model_format.file_extension()}"
+            f"{self.config.save_filename_prefix}{get_string_timestamp()}-save-{train_progress.filename_string()}{self.config.output_model_format.file_extension()}",
         )
         if print_msg:
             print_cb("Saving " + save_path)
@@ -701,7 +775,7 @@ class GenericTrainer(BaseTrainer):
                 model_type=self.config.model_type,
                 output_model_format=self.config.output_model_format,
                 output_model_destination=save_path,
-                dtype=self.config.output_dtype.torch_dtype()
+                dtype=self.config.output_dtype.torch_dtype(),
             )
             self._clear_staged_accumulator_state()
             if self.config.optimizer.optimizer.is_schedule_free:
@@ -784,8 +858,9 @@ class GenericTrainer(BaseTrainer):
             return
 
         # Loop-local accumulators (mirrored from train()).
-        if self._loop_accumulated_loss_tensor is not None and \
-                isinstance(self._loop_accumulated_loss_tensor, torch.Tensor):
+        if self._loop_accumulated_loss_tensor is not None and isinstance(
+            self._loop_accumulated_loss_tensor, torch.Tensor
+        ):
             try:
                 acc_loss_f = float(self._loop_accumulated_loss_tensor.item())
             except Exception:
@@ -800,9 +875,7 @@ class GenericTrainer(BaseTrainer):
             for key, p in self.model.parameters.iter_named_parameters():
                 if not p.requires_grad or p.grad is None:
                     continue
-                param_grads[key] = p.grad.detach().to(
-                    device="cpu", copy=True
-                )
+                param_grads[key] = p.grad.detach().to(device="cpu", copy=True)
 
         # Scaler state (None if AMP off).
         scaler_state = None
@@ -822,9 +895,7 @@ class GenericTrainer(BaseTrainer):
         }
 
         # Dataset fingerprint for warn-only on resume.
-        fp_hash, fp_count = compute_concept_fingerprint(
-            getattr(self.config, "concepts", None)
-        )
+        fp_hash, fp_count = compute_concept_fingerprint(getattr(self.config, "concepts", None))
         fingerprint = {
             "gradient_accumulation_steps": int(self.config.gradient_accumulation_steps),
             "dataset_hash": fp_hash,
@@ -834,8 +905,7 @@ class GenericTrainer(BaseTrainer):
         self.model.accumulator_state = {
             "accumulated_loss": acc_loss_f,
             "accumulated_dpo_metrics": (
-                dict(self._loop_accumulated_dpo_metrics)
-                if self._loop_accumulated_dpo_metrics is not None else None
+                dict(self._loop_accumulated_dpo_metrics) if self._loop_accumulated_dpo_metrics is not None else None
             ),
             "param_grads": param_grads,
             "scaler": scaler_state,
@@ -848,10 +918,10 @@ class GenericTrainer(BaseTrainer):
             self.model.accumulator_state = None
 
     def _restore_accumulator_state(
-            self,
-            accumulated_loss: torch.Tensor,
-            train_device: torch.device,
-            scaler,
+        self,
+        accumulated_loss: torch.Tensor,
+        train_device: torch.device,
+        scaler,
     ) -> tuple[torch.Tensor, dict | None, bool]:
         """Apply a previously-saved accumulator snapshot to the live trainer.
 
@@ -878,9 +948,7 @@ class GenericTrainer(BaseTrainer):
                 f"restoring partial accumulator state anyway (one off-spec optimizer step is "
                 f"cheaper than discarding accumulated gradients)."
             )
-        current_hash, current_count = compute_concept_fingerprint(
-            getattr(self.config, "concepts", None)
-        )
+        current_hash, current_count = compute_concept_fingerprint(getattr(self.config, "concepts", None))
         if fp.get("dataset_hash") and fp.get("dataset_hash") != current_hash:
             delta = current_count - int(fp.get("concept_count", current_count))
             print(
@@ -953,7 +1021,9 @@ class GenericTrainer(BaseTrainer):
         return accumulated_loss, accumulated_dpo_metrics, has_gradient
 
     def __apply_fused_back_pass(self, scaler):
-        fused_optimizer_step = self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass
+        fused_optimizer_step = (
+            self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass
+        )
         fused_reduce = self.config.multi_gpu and self.config.fused_gradient_reduce
         if fused_optimizer_step:
             if self.config.gradient_accumulation_steps > 1:
@@ -969,6 +1039,7 @@ class GenericTrainer(BaseTrainer):
                 #       This will break if the some parameters don't require grad during the first training step.
                 if parameter.requires_grad:
                     if scaler:
+
                         def __optimizer_step(tensor: Tensor, param_group=param_group, i=i):
                             scaler.unscale_parameter_(tensor, self.model.optimizer)
                             if self.config.clip_grad_norm is not None:
@@ -976,6 +1047,7 @@ class GenericTrainer(BaseTrainer):
                             scaler.maybe_opt_step_parameter(tensor, param_group, i, self.model.optimizer)
                             tensor.grad = None
                     else:
+
                         def __optimizer_step(tensor: Tensor, param_group=param_group, i=i):
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
@@ -997,7 +1069,6 @@ class GenericTrainer(BaseTrainer):
 
                     handle = parameter.register_post_accumulate_grad_hook(__grad_hook)
                     self.grad_hook_handles.append(handle)
-
 
     def __before_eval(self):
         # Special case for schedule-free optimizers, which need eval()
@@ -1040,8 +1111,9 @@ class GenericTrainer(BaseTrainer):
         # written via end()'s backup_before_save path, restore the in-flight
         # gradient-accumulation state now. No-op for fresh runs and for
         # backups written at clean accumulation boundaries.
-        accumulated_loss, restored_dpo_metrics, restored_has_grad = \
-            self._restore_accumulator_state(accumulated_loss, train_device, scaler)
+        accumulated_loss, restored_dpo_metrics, restored_has_grad = self._restore_accumulator_state(
+            accumulated_loss, train_device, scaler
+        )
         if restored_dpo_metrics is not None:
             accumulated_dpo_metrics = restored_dpo_metrics
         if restored_has_grad:
@@ -1065,6 +1137,13 @@ class GenericTrainer(BaseTrainer):
                     else:
                         self.model_setup.setup_train_device(self.model, self.config)
                         self.data_loader.get_data_set().start_next_epoch()
+                # Advance the SFT-anchor loader's epoch in lockstep with the
+                # main DPO loader. Mid-epoch exhaustion (when the standard set
+                # is shorter than the DPO pair set) is handled by restarting
+                # the iterator inside __train_step.
+                if self.sft_anchor_data_loader is not None:
+                    self.sft_anchor_data_loader.get_data_set().start_next_epoch()
+                    self.sft_anchor_iter = None
             except CachingStoppedException:
                 return
 
@@ -1092,14 +1171,18 @@ class GenericTrainer(BaseTrainer):
                     approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
                     batch_size=self.config.batch_size,
                     gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-                    global_step=train_progress.global_step
+                    global_step=train_progress.global_step,
                 )
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
 
             if multi.is_master():
-                batches = step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
-                                 initial=train_progress.epoch_step)
+                batches = step_tqdm = tqdm(
+                    self.data_loader.get_data_loader(),
+                    desc="step",
+                    total=current_epoch_length,
+                    initial=train_progress.epoch_step,
+                )
             else:
                 batches = self.data_loader.get_data_loader()
             for batch in batches:
@@ -1107,7 +1190,11 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if not self.commands.get_stop_command() and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                if (
+                    not self.commands.get_stop_command()
+                    and self.__needs_sample(train_progress)
+                    or self.commands.get_and_reset_sample_default_command()
+                ):
                     self.__enqueue_sample_during_training(
                         lambda: self.__sample_during_training(train_progress, train_device)
                     )
@@ -1119,6 +1206,7 @@ class GenericTrainer(BaseTrainer):
 
                 sample_commands = self.commands.get_and_reset_sample_custom_commands()
                 if sample_commands:
+
                     def create_sample_commands_fun(sample_commands):
                         def sample_commands_fun():
                             self.__sample_during_training(train_progress, train_device, sample_commands)
@@ -1146,47 +1234,96 @@ class GenericTrainer(BaseTrainer):
 
                 with (
                     TorchMemoryRecorder(enabled=False, filename=f"memory-step{train_progress.global_step}.pickle"),
-                    TorchProfiler      (enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
+                    TorchProfiler(enabled=False, filename=f"profile-step{train_progress.global_step}.json"),
                 ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
                     if self.config.rlhf_enabled:
-                        loss = self.model_setup.calculate_dpo_loss(
-                            self.model, batch, self.config, train_progress
-                        )
+                        loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
                         # Accumulate per-micro-batch DPO metrics across the grad-accum window.
                         # Without this, only the final micro-batch's metric reaches TensorBoard —
                         # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
                         micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
                         if accumulated_dpo_metrics is None:
                             accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
-                            accumulated_dpo_metrics['_count'] = 0
+                            accumulated_dpo_metrics["_count"] = 0
+                            if self.sft_anchor_data_loader is not None:
+                                accumulated_dpo_metrics.setdefault("sft_anchor_loss", 0.0)
                         for _k, _v in micro_dpo_metrics.items():
                             accumulated_dpo_metrics[_k] += _v
-                        accumulated_dpo_metrics['_count'] += 1
-                        # Mirror for Fix B save-side staging.
+                        accumulated_dpo_metrics["_count"] += 1
+
+                        if self.sft_anchor_data_loader is not None:
+                            sft_batch = self.__next_sft_anchor_batch()
+                            sft_output = self.model_setup.predict(self.model, sft_batch, self.config, train_progress)
+                            sft_loss = self.model_setup.calculate_loss(self.model, sft_batch, sft_output, self.config)
+                            loss = loss + self.config.rlhf_sft_anchor_weight * sft_loss
+                            accumulated_dpo_metrics["sft_anchor_loss"] += sft_loss.detach().item()
+                        # Mirror for Fix B save-side staging (after the SFT-anchor
+                        # block so the mirror reflects the final dpo metrics dict).
                         self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
                     else:
                         # Standard training path
-                        prior_pred_indices = [i for i in range(self.config.batch_size)
-                                              if ConceptType(batch['concept_type'][i]) == ConceptType.PRIOR_PREDICTION]
-                        if len(prior_pred_indices) > 0 \
-                                or (self.config.masked_training
-                                    and self.config.masked_prior_preservation_weight > 0
-                                    and self.config.training_method == TrainingMethod.LORA):
-                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                                #do NOT create a subbatch using the indices, even though it would be more efficient:
-                                #different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                                prior_model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                        prior_pred_indices = [
+                            i
+                            for i in range(self.config.batch_size)
+                            if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
+                        ]
+                        distillation_enabled = bool(self.config.distillation_teacher_lora_model_name)
+
+                        if distillation_enabled and len(prior_pred_indices) > 0:
+                            raise RuntimeError("Distillation and PRIOR_PREDICTION concepts are mutually exclusive.")
+
+                        if distillation_enabled:
+                            with self.model_setup.distillation_teacher_model(self.model, self.config), torch.no_grad():
+                                teacher_output_data = self.model_setup.predict(
+                                    self.model, batch, self.config, train_progress
+                                )
+                            base_output_data = None
+                            if self.config.distillation_base_anchor_weight > 0:
+                                with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                    base_output_data = self.model_setup.predict(
+                                        self.model, batch, self.config, train_progress
+                                    )
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                            prior_model_prediction = prior_model_output_data['predicted'].to(dtype=model_output_data['target'].dtype)
-                            model_output_data['target'][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                            model_output_data['prior_target'] = prior_model_prediction
+                            # Replace the per-sample noise target with the teacher's
+                            # epsilon prediction. Both forwards see identical noisy
+                            # latents and timesteps because predict() seeds RNG from
+                            # train_progress.global_step.
+                            model_output_data["target"] = teacher_output_data["predicted"].to(
+                                dtype=model_output_data["target"].dtype
+                            )
+                            loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                            if base_output_data is not None:
+                                anchor_loss = torch.nn.functional.mse_loss(
+                                    model_output_data["predicted"].float(),
+                                    base_output_data["predicted"]
+                                    .to(dtype=model_output_data["predicted"].dtype)
+                                    .float(),
+                                )
+                                loss = loss + self.config.distillation_base_anchor_weight * anchor_loss
+                        elif len(prior_pred_indices) > 0 or (
+                            self.config.masked_training
+                            and self.config.masked_prior_preservation_weight > 0
+                            and self.config.training_method == TrainingMethod.LORA
+                        ):
+                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                                # do NOT create a subbatch using the indices, even though it would be more efficient:
+                                # different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
+                                prior_model_output_data = self.model_setup.predict(
+                                    self.model, batch, self.config, train_progress
+                                )
+                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+                            prior_model_prediction = prior_model_output_data["predicted"].to(
+                                dtype=model_output_data["target"].dtype
+                            )
+                            model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+                            model_output_data["prior_target"] = prior_model_prediction
+                            loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
                         else:
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                            loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
@@ -1209,7 +1346,11 @@ class GenericTrainer(BaseTrainer):
                         else:
                             multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
 
-                        if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+                        if (
+                            scaler
+                            and self.config.optimizer.optimizer.supports_fused_back_pass()
+                            and self.config.optimizer.fused_back_pass
+                        ):
                             scaler.step_after_unscale_parameter_(self.model.optimizer)
                             scaler.update()
                         elif scaler:
@@ -1234,25 +1375,45 @@ class GenericTrainer(BaseTrainer):
 
                             accumulated_loss_cpu = accumulated_loss.item()
                             if math.isnan(accumulated_loss_cpu):
-                                raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
+                                raise RuntimeError(
+                                    "Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation."
+                                )
 
-                            self.tensorboard.add_scalar("loss/train_step",accumulated_loss_cpu , train_progress.global_step)
+                            self.tensorboard.add_scalar(
+                                "loss/train_step", accumulated_loss_cpu, train_progress.global_step
+                            )
                             if self.config.rlhf_enabled and accumulated_dpo_metrics is not None:
-                                count = accumulated_dpo_metrics.pop('_count')
+                                count = accumulated_dpo_metrics.pop("_count")
                                 dpo_metrics = {k: v / count for k, v in accumulated_dpo_metrics.items()}
-                                self.tensorboard.add_scalar("loss/dpo", dpo_metrics['loss'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/raw_loss", dpo_metrics['dpo_loss'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/chosen_reward", dpo_metrics['chosen_reward'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/rejected_reward", dpo_metrics['rejected_reward'], train_progress.global_step)
-                                self.tensorboard.add_scalar("dpo/accuracy", dpo_metrics['accuracy'], train_progress.global_step)
+                                self.tensorboard.add_scalar("loss/dpo", dpo_metrics["loss"], train_progress.global_step)
+                                self.tensorboard.add_scalar(
+                                    "dpo/raw_loss", dpo_metrics["dpo_loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "dpo/chosen_reward", dpo_metrics["chosen_reward"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "dpo/rejected_reward", dpo_metrics["rejected_reward"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "dpo/accuracy", dpo_metrics["accuracy"], train_progress.global_step
+                                )
+                                if "sft_anchor_loss" in dpo_metrics:
+                                    self.tensorboard.add_scalar(
+                                        "dpo/sft_anchor_loss",
+                                        dpo_metrics["sft_anchor_loss"],
+                                        train_progress.global_step,
+                                    )
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
                             ema_loss = (ema_loss * ema_loss_decay) + (accumulated_loss_cpu * (1 - ema_loss_decay))
-                            step_tqdm.set_postfix({
-                                'loss': accumulated_loss_cpu,
-                                'smooth loss': ema_loss,
-                            })
+                            step_tqdm.set_postfix(
+                                {
+                                    "loss": accumulated_loss_cpu,
+                                    "smooth loss": ema_loss,
+                                }
+                            )
                             self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
 
                         accumulated_loss = 0.0
@@ -1269,14 +1430,9 @@ class GenericTrainer(BaseTrainer):
                             assert multi.is_master()
                             update_step = train_progress.global_step // self.config.gradient_accumulation_steps
                             self.tensorboard.add_scalar(
-                                "ema_decay",
-                                self.model.ema.get_current_decay(update_step),
-                                train_progress.global_step
+                                "ema_decay", self.model.ema.get_current_decay(update_step), train_progress.global_step
                             )
-                            self.model.ema.step(
-                                self.parameters,
-                                update_step
-                            )
+                            self.model.ema.step(self.parameters, update_step)
 
                         self.one_step_trained = True
 
@@ -1313,11 +1469,15 @@ class GenericTrainer(BaseTrainer):
                 if self.model.ema:
                     self.model.ema.copy_ema_to(self.parameters, store_temp=False)
 
-                if (self.config.patience
-                        and self._patience_best_backup_path
-                        and os.path.isfile(self._patience_best_backup_path)):
-                    print(f"Restoring patience best checkpoint from step {self._patience_best_step} "
-                          f"(val_loss: {self._patience_best_loss:.6f})")
+                if (
+                    self.config.patience
+                    and self._patience_best_backup_path
+                    and os.path.isfile(self._patience_best_backup_path)
+                ):
+                    print(
+                        f"Restoring patience best checkpoint from step {self._patience_best_step} "
+                        f"(val_loss: {self._patience_best_loss:.6f})"
+                    )
                     self.callbacks.on_update_status("Restoring best validation checkpoint")
                     best_state = torch.load(self._patience_best_backup_path, map_location=self.temp_device)
                     for param, saved in zip(self.parameters, best_state, strict=True):
@@ -1325,20 +1485,25 @@ class GenericTrainer(BaseTrainer):
                     del best_state
 
                 # Restore DPO best AFTER EMA copy so it takes precedence
-                if (self.config.rlhf_enabled
-                        and self.config.rlhf_dpo_save_best
-                        and self._dpo_best_backup_path
-                        and os.path.isfile(self._dpo_best_backup_path)):
+                if (
+                    self.config.rlhf_enabled
+                    and self.config.rlhf_dpo_save_best
+                    and self._dpo_best_backup_path
+                    and os.path.isfile(self._dpo_best_backup_path)
+                ):
                     print(f"Restoring DPO best checkpoint from {self._dpo_best_backup_path}")
                     self.callbacks.on_update_status("Restoring best DPO checkpoint")
                     best_state = torch.load(self._dpo_best_backup_path, map_location=self.temp_device)
                     for param, saved in zip(self.parameters, best_state, strict=True):
                         param.data.copy_(saved)
                     del best_state
-                if os.path.isdir(self.config.output_model_destination) and self.config.output_model_format.is_single_file():
+                if (
+                    os.path.isdir(self.config.output_model_destination)
+                    and self.config.output_model_format.is_single_file()
+                ):
                     save_path = os.path.join(
                         self.config.output_model_destination,
-                        f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}"
+                        f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}",
                     )
                 else:
                     save_path = self.config.output_model_destination
@@ -1349,7 +1514,7 @@ class GenericTrainer(BaseTrainer):
                     model_type=self.config.model_type,
                     output_model_format=self.config.output_model_format,
                     output_model_destination=save_path,
-                    dtype=self.config.output_dtype.torch_dtype()
+                    dtype=self.config.output_dtype.torch_dtype(),
                 )
 
         if self.model is not None:

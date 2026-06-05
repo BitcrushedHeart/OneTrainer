@@ -11,6 +11,7 @@ export interface ModalBaseProps {
   children: ReactNode;
   size?: "sm" | "md" | "lg" | "xl" | "2xl" | "full";
   closeOnBackdrop?: boolean;
+  closeOnEscape?: boolean;
 }
 
 const sizeClasses: Record<string, string> = {
@@ -22,12 +23,20 @@ const sizeClasses: Record<string, string> = {
   full: "max-w-none w-[calc(100vw-32px)]",
 };
 
-export function ModalBase({ open, onClose, title, children, size = "md", closeOnBackdrop = true }: ModalBaseProps) {
+export function ModalBase({
+  open,
+  onClose,
+  title,
+  children,
+  size = "md",
+  closeOnBackdrop = true,
+  closeOnEscape = true,
+}: ModalBaseProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !closeOnEscape) return;
 
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -35,7 +44,7 @@ export function ModalBase({ open, onClose, title, children, size = "md", closeOn
 
     document.addEventListener("keydown", handleEscape);
     return () => document.removeEventListener("keydown", handleEscape);
-  }, [open, onClose]);
+  }, [open, onClose, closeOnEscape]);
 
   useEffect(() => {
     if (!open) return;

@@ -114,10 +114,10 @@ export const configApi = {
     }),
 
   augmentationPreview: (body: { image_path: string; image: Record<string, unknown>; seed: number }) =>
-    request<{ ok: boolean; image_base64: string; seed: number }>(
-      "/concepts/augmentation-preview",
-      { method: "POST", body: JSON.stringify(body) },
-    ),
+    request<{ ok: boolean; image_base64: string; seed: number }>("/concepts/augmentation-preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   conceptStats: (path: string, includeSubdirectories: boolean, advanced: boolean) =>
     request<Record<string, unknown>>("/concepts/stats", {

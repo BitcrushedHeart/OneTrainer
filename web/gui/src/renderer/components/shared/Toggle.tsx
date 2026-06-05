@@ -1,6 +1,7 @@
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import { getTooltip } from "@/utils/tooltips";
 
+import { FieldStatusAdorner } from "./FieldStatusAdorner";
 import { Tooltip } from "./Tooltip";
 
 export interface ToggleProps {
@@ -23,7 +24,7 @@ export function Toggle({
   tooltip,
 }: ToggleProps) {
   const resolvedTooltip = tooltip ?? (configPath ? getTooltip(configPath) : undefined);
-  const [configValue, setConfigValue] = useConfigField<boolean>(configPath);
+  const [configValue, setConfigValue] = useBoundField<boolean>(configPath);
   const checked = configPath ? (configValue ?? false) : (value ?? false);
   const handleChange = () => {
     const next = !checked;
@@ -53,14 +54,24 @@ export function Toggle({
     </button>
   );
 
+  const labelEl = label ? (
+    <span className="inline-flex items-center gap-1">
+      <FieldStatusAdorner path={configPath} />
+      <span>{label}</span>
+    </span>
+  ) : null;
+
   const content = label ? (
     <label className="inline-flex items-center gap-3 cursor-pointer text-sm text-[var(--color-on-surface)]">
-      {labelPosition === "left" && <span>{label}</span>}
+      {labelPosition === "left" && labelEl}
       {switchEl}
-      {labelPosition === "right" && <span>{label}</span>}
+      {labelPosition === "right" && labelEl}
     </label>
   ) : (
-    switchEl
+    <span className="inline-flex items-center gap-2">
+      <FieldStatusAdorner path={configPath} />
+      {switchEl}
+    </span>
   );
 
   if (resolvedTooltip) return <Tooltip content={resolvedTooltip}>{content}</Tooltip>;

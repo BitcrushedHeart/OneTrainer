@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 class MonitorService(SingletonMixin):
-
     def __init__(self) -> None:
         psutil.cpu_percent(interval=None)
 
@@ -20,8 +19,8 @@ class MonitorService(SingletonMixin):
 
         return {
             "cpu_percent": cpu_percent,
-            "ram_used_gb": round(mem.used / (1024 ** 3), 2),
-            "ram_total_gb": round(mem.total / (1024 ** 3), 2),
+            "ram_used_gb": round(mem.used / (1024**3), 2),
+            "ram_total_gb": round(mem.total / (1024**3), 2),
             "ram_percent": mem.percent,
             "gpus": get_gpu_metrics(),
         }
@@ -31,7 +30,7 @@ class MonitorService(SingletonMixin):
         info: dict = {
             "cpu_count": psutil.cpu_count(logical=True),
             "cpu_count_physical": psutil.cpu_count(logical=False),
-            "ram_total_gb": round(mem.total / (1024 ** 3), 2),
+            "ram_total_gb": round(mem.total / (1024**3), 2),
             "gpus": [],
         }
 

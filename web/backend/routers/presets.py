@@ -77,7 +77,9 @@ def save_preset(body: SavePresetRequest) -> dict:
     if not name:
         raise HTTPException(status_code=422, detail="Preset name must not be empty")
     if name.startswith("#"):
-        raise HTTPException(status_code=403, detail="Cannot save a preset with a name starting with '#' (reserved for built-in presets)")
+        raise HTTPException(
+            status_code=403, detail="Cannot save a preset with a name starting with '#' (reserved for built-in presets)"
+        )
 
     path = os.path.join(PRESETS_DIR, f"{name}.json")
     canonical = _validate_preset_path(path)

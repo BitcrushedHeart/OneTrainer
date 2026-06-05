@@ -52,15 +52,11 @@ def _pick_thumbnail(dir_path: str, include_subdirectories: bool = False) -> str 
             if include_subdirectories:
                 for root, dirs, files in os.walk(dir_path):
                     # Skip hidden directories
-                    dirs[:] = [d for d in dirs if not d.startswith('.')]
-                    candidates.extend(
-                        os.path.join(root, fname) for fname in files if _is_valid_image(fname)
-                    )
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    candidates.extend(os.path.join(root, fname) for fname in files if _is_valid_image(fname))
             else:
                 candidates.extend(
-                    entry.path
-                    for entry in os.scandir(dir_path)
-                    if entry.is_file() and _is_valid_image(entry.name)
+                    entry.path for entry in os.scandir(dir_path) if entry.is_file() and _is_valid_image(entry.name)
                 )
         except PermissionError:
             result = None
@@ -108,7 +104,7 @@ def list_images(
         if include_subdirectories:
             for root, dirs, files in os.walk(path):
                 # Skip hidden directories
-                dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
                 for fname in sorted(files):
                     if _is_valid_image(fname):
                         full_path = os.path.join(root, fname)
@@ -121,11 +117,13 @@ def list_images(
                                     caption = fh.read().strip()
                             except Exception:
                                 caption = None
-                        entries.append({
-                            "filename": fname,
-                            "path": full_path.replace("\\", "/"),
-                            "caption": caption,
-                        })
+                        entries.append(
+                            {
+                                "filename": fname,
+                                "path": full_path.replace("\\", "/"),
+                                "caption": caption,
+                            }
+                        )
         else:
             for entry in sorted(os.scandir(path), key=lambda e: e.name):
                 if entry.is_file() and _is_valid_image(entry.name):
@@ -138,16 +136,18 @@ def list_images(
                                 caption = fh.read().strip()
                         except Exception:
                             caption = None
-                    entries.append({
-                        "filename": entry.name,
-                        "path": entry.path.replace("\\", "/"),
-                        "caption": caption,
-                    })
+                    entries.append(
+                        {
+                            "filename": entry.name,
+                            "path": entry.path.replace("\\", "/"),
+                            "caption": caption,
+                        }
+                    )
     except PermissionError as err:
         raise HTTPException(status_code=403, detail="Permission denied") from err
 
     total = len(entries)
-    page = entries[offset:offset + limit]
+    page = entries[offset : offset + limit]
 
     return JSONResponse({"total": total, "offset": offset, "images": page})
 
@@ -216,14 +216,26 @@ def create_concept_config(req: CreateConfigRequest) -> dict:
     return {"name": safe_name, "path": rel_path}
 
 
-@router.get("")
-def get_concepts() -> list[dict]:
+def _resolve_concept_path(path: str | None) -> str:
+    if path:
+        # Concept files live under the project; restrict to JSON files via the
+        # standard path validator to keep the override flow sandboxed.
+        return validate_path(path, allow_file=True)
     service = ConfigService.get_instance()
     concept_path = service.config.concept_file_name
-
     if not concept_path:
         raise HTTPException(status_code=422, detail="No concept_file_name configured")
+    return concept_path
 
+
+@router.get("")
+def get_concepts(
+    path: str | None = Query(
+        None,
+        description="Override the concept file path; defaults to the global config value.",
+    ),
+) -> list[dict]:
+    concept_path = _resolve_concept_path(path)
     concept_service = ConceptService()
     try:
         return concept_service.load_concepts(concept_path)
@@ -237,13 +249,14 @@ def get_concepts() -> list[dict]:
 
 
 @router.put("")
-def save_concepts(concepts: list[dict]) -> dict:
-    service = ConfigService.get_instance()
-    concept_path = service.config.concept_file_name
-
-    if not concept_path:
-        raise HTTPException(status_code=422, detail="No concept_file_name configured")
-
+def save_concepts(
+    concepts: list[dict],
+    path: str | None = Query(
+        None,
+        description="Override the concept file path; defaults to the global config value.",
+    ),
+) -> dict:
+    concept_path = _resolve_concept_path(path)
     concept_service = ConceptService()
     try:
         concept_service.save_concepts(concept_path, concepts)
@@ -301,14 +314,17 @@ def scan_concept_stats(req: StatsRequest):
                 stats_dict["force_cancelled"] = True
                 break
             stats_dict = concept_stats.folder_scan(
-                folder, stats_dict, req.advanced, concept_config,
-                start_time, max_scan_seconds, cancel_flag,
+                folder,
+                stats_dict,
+                req.advanced,
+                concept_config,
+                start_time,
+                max_scan_seconds,
+                cancel_flag,
             )
             if req.include_subdirectories and not cancel_flag.is_set():
                 with contextlib.suppress(PermissionError):
-                    subfolders.extend(
-                        entry.path for entry in os.scandir(folder) if entry.is_dir()
-                    )
+                    subfolders.extend(entry.path for entry in os.scandir(folder) if entry.is_dir())
 
         stats_dict["processing_time"] = round(time.perf_counter() - start_time, 3)
         stats_dict["scan_id"] = scan_id
@@ -337,6 +353,7 @@ def cancel_concept_stats(scan_id: str = Query("", description="Scan ID to cancel
 
 # ---- Caption save ----
 
+
 class SaveCaptionRequest(BaseModel):
     image_path: str
     caption: str
@@ -357,6 +374,7 @@ def save_caption(req: SaveCaptionRequest):
 
 
 # ---- Augmentation preview ----
+
 
 class AugPreviewRequest(BaseModel):
     image_path: str
@@ -391,26 +409,32 @@ def _apply_image_augmentations(img, image_cfg: dict, rng: random.Random):
             img = img.rotate(angle, resample=2, expand=False)  # 2 = BILINEAR
 
     # Brightness (1.0 = unchanged)
-    s = _strength("enable_random_brightness", "enable_fixed_brightness",
-                  float(image_cfg.get("random_brightness_max_strength", 0) or 0))
+    s = _strength(
+        "enable_random_brightness",
+        "enable_fixed_brightness",
+        float(image_cfg.get("random_brightness_max_strength", 0) or 0),
+    )
     if s != 0.0:
         img = ImageEnhance.Brightness(img.convert("RGB")).enhance(1.0 + s)
 
     # Contrast
-    s = _strength("enable_random_contrast", "enable_fixed_contrast",
-                  float(image_cfg.get("random_contrast_max_strength", 0) or 0))
+    s = _strength(
+        "enable_random_contrast", "enable_fixed_contrast", float(image_cfg.get("random_contrast_max_strength", 0) or 0)
+    )
     if s != 0.0:
         img = ImageEnhance.Contrast(img.convert("RGB")).enhance(1.0 + s)
 
     # Saturation
-    s = _strength("enable_random_saturation", "enable_fixed_saturation",
-                  float(image_cfg.get("random_saturation_max_strength", 0) or 0))
+    s = _strength(
+        "enable_random_saturation",
+        "enable_fixed_saturation",
+        float(image_cfg.get("random_saturation_max_strength", 0) or 0),
+    )
     if s != 0.0:
         img = ImageEnhance.Color(img.convert("RGB")).enhance(1.0 + s)
 
     # Hue (PIL has no direct hue control; rotate via HSV)
-    s = _strength("enable_random_hue", "enable_fixed_hue",
-                  float(image_cfg.get("random_hue_max_strength", 0) or 0))
+    s = _strength("enable_random_hue", "enable_fixed_hue", float(image_cfg.get("random_hue_max_strength", 0) or 0))
     if s != 0.0:
         hsv = img.convert("HSV")
         h, sat, v = hsv.split()

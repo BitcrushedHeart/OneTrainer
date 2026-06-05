@@ -109,13 +109,10 @@ class QueueExecutor:
 
     def should_skip_oom(self, entry: QueueEntry) -> bool:
         settings = self.queue_manager.settings
-        oom_failures = [
-            f for f in entry.failure_history
-            if "out of memory" in f.get("error", "").lower()
-        ]
+        oom_failures = [f for f in entry.failure_history if "out of memory" in f.get("error", "").lower()]
         if len(oom_failures) < settings.oom_skip_threshold:
             return False
-        recent = oom_failures[-settings.oom_skip_threshold:]
+        recent = oom_failures[-settings.oom_skip_threshold :]
         steps = [f.get("step", -1) for f in recent if f.get("step", -1) >= 0]
         if len(steps) < settings.oom_skip_threshold:
             return False
@@ -139,11 +136,13 @@ class QueueExecutor:
             return QueueEntryStatus.COMPLETED
         except Exception as e:
             step = self._get_current_step()
-            entry.failure_history.append({
-                "step": step,
-                "error": str(e),
-                "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-            })
+            entry.failure_history.append(
+                {
+                    "step": step,
+                    "error": str(e),
+                    "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+                }
+            )
             self.queue_manager.save()
             traceback.print_exc()
             if self._stop_current_run:
@@ -160,6 +159,8 @@ class QueueExecutor:
             return None
 
     def _execute_entry(self, entry: QueueEntry, resume_from_backup: bool):
+        import gc
+
         from modules.util import create
         from modules.util.callbacks.TrainCallbacks import TrainCallbacks
         from modules.util.commands.TrainCommands import TrainCommands
@@ -172,6 +173,7 @@ class QueueExecutor:
             merged_config.continue_last_backup = True
         commands = TrainCommands()
         self._current_commands = commands
+
         def _track_progress(p, s, ep):
             self._last_global_step = getattr(p, "global_step", -1)
             self._on_progress(p, s, ep)
@@ -184,14 +186,31 @@ class QueueExecutor:
         trainer = create.create_trainer(merged_config, callbacks, commands)
         error = None
         try:
-            trainer.start()
-            trainer.train()
-        except Exception as e:
-            error = e
-        trainer.end()
-        del trainer
-        torch.clear_autocast_cache()
-        torch_gc()
+            try:
+                trainer.start()
+                trainer.train()
+            except Exception as e:
+                error = e
+            try:
+                trainer.end()
+            except Exception as end_err:
+                # Don't let a teardown failure mask the original error or skip cleanup below.
+                if error is None:
+                    error = end_err
+                else:
+                    traceback.print_exc()
+        finally:
+            del trainer
+            merged_config = None
+            callbacks = None
+            commands = None
+            self._current_commands = None
+            torch.clear_autocast_cache()
+            # Two collect passes break cyclic refs (callbacks ↔ trainer, hooks ↔ params)
+            # that a single pass leaves behind, then torch_gc empties the CUDA caches.
+            gc.collect()
+            gc.collect()
+            torch_gc()
         if error is not None:
             raise error
         if self._stop_current_run:

@@ -52,21 +52,28 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
         return sanitized
 
     def _create_mgds(
-            self,
-            config: TrainConfig,
-            definition: list,
-            train_progress: TrainProgress,
-            is_validation: bool = False,
+        self,
+        config: TrainConfig,
+        definition: list,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
     ):
         concepts = config.concepts
         if concepts is None:
-            with open(config.concept_file_name, 'r') as f:
+            with open(config.concept_file_name, "r") as f:
                 concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
 
+        # The SFT-anchor parallel loader for DPO runs reaches this method with
+        # config.rlhf_enabled forced to False by BaseDataLoader, so it falls
+        # into the standard branch and picks up STANDARD/PRIOR_PREDICTION only.
         if is_validation:
             valid_types = {ConceptType.VALIDATION, ConceptType.DPO_CHOSEN_VAL, ConceptType.DPO_REJECTED_VAL}
+        elif config.rlhf_enabled:
+            # Pure-DPO pipeline. STANDARD/PRIOR_PREDICTION concepts go to the
+            # SFT-anchor loader instead of being silently dropped here.
+            valid_types = {ConceptType.DPO_CHOSEN, ConceptType.DPO_REJECTED}
         else:
-            valid_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION, ConceptType.DPO_CHOSEN, ConceptType.DPO_REJECTED}
+            valid_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         concepts = [
             self.__sanitize_dpo_concept(concept) if is_dpo_concept_type(ConceptType(concept.type)) else concept
             for concept in concepts

@@ -1,5 +1,6 @@
 import { type ChangeEvent, useEffect, useState } from "react";
 
+import { useBoundField } from "@/hooks/fieldBinding";
 import { useConfigField } from "@/hooks/useConfigField";
 import { EMPTY_PRESETS, LAYER_PRESETS_BY_MODEL, type LayerPresetMap } from "@/types/generated/layerPresets";
 import { INPUT_FULL, PLACEHOLDER, SELECT_BASE } from "@/utils/inputStyles";
@@ -17,9 +18,10 @@ export interface LayerFilterEntryProps {
 const CUSTOM_KEY = "custom";
 
 export function LayerFilterEntry({ filterPath, presetPath, regexPath, tooltip }: LayerFilterEntryProps) {
-  const [filterValue, setFilterValue] = useConfigField<string>(filterPath);
-  const [presetValue, setPresetValue] = useConfigField<string>(presetPath);
-  const [, setRegexValue] = useConfigField<boolean>(regexPath);
+  const [filterValue, setFilterValue] = useBoundField<string>(filterPath);
+  const [presetValue, setPresetValue] = useBoundField<string>(presetPath);
+  const [, setRegexValue] = useBoundField<boolean>(regexPath);
+  // model_type is always read from the global config (it gates which presets exist).
   const [modelType] = useConfigField<string>("model_type");
 
   const resolvedMap = modelType ? LAYER_PRESETS_BY_MODEL[modelType as keyof typeof LAYER_PRESETS_BY_MODEL] : undefined;

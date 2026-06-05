@@ -17,7 +17,6 @@ TrainingStatus = Literal["idle", "starting", "running", "stopping", "error"]
 
 
 class TrainerService(SingletonMixin):
-
     def __init__(self) -> None:
         self._status: TrainingStatus = "idle"
         self._error_message: str | None = None
@@ -95,6 +94,7 @@ class TrainerService(SingletonMixin):
 
         with suppress(Exception):
             from modules.util.torch_util import torch_gc
+
             torch_gc()
 
         self._training_commands = commands
@@ -123,6 +123,7 @@ class TrainerService(SingletonMixin):
             if config.cloud.enabled:
                 with suppress(Exception):
                     from web.backend.services.config_service import ConfigService as _CS
+
                     _CS.get_instance().update_cloud_secrets(config.secrets.cloud.to_dict())
 
             with self._status_lock:
@@ -132,6 +133,7 @@ class TrainerService(SingletonMixin):
             if config.cloud.enabled:
                 with suppress(Exception):
                     from web.backend.services.config_service import ConfigService as _CS
+
                     _CS.get_instance().update_cloud_secrets(config.secrets.cloud.to_dict())
 
             error_caught = True
@@ -149,9 +151,11 @@ class TrainerService(SingletonMixin):
 
         with suppress(Exception):
             import torch
+
             torch.clear_autocast_cache()
         with suppress(Exception):
             from modules.util.torch_util import torch_gc
+
             torch_gc()
 
         if error_caught:
@@ -224,17 +228,19 @@ class TrainerService(SingletonMixin):
         return {"ok": True}
 
     def _on_update_train_progress(self, train_progress: Any, max_step: int, max_epoch: int) -> None:
-        self._broadcast({
-            "type": "progress",
-            "data": {
-                "epoch": train_progress.epoch,
-                "epoch_step": train_progress.epoch_step,
-                "epoch_sample": train_progress.epoch_sample,
-                "global_step": train_progress.global_step,
-                "max_step": max_step,
-                "max_epoch": max_epoch,
-            },
-        })
+        self._broadcast(
+            {
+                "type": "progress",
+                "data": {
+                    "epoch": train_progress.epoch,
+                    "epoch_step": train_progress.epoch_step,
+                    "epoch_sample": train_progress.epoch_sample,
+                    "global_step": train_progress.global_step,
+                    "max_step": max_step,
+                    "max_epoch": max_epoch,
+                },
+            }
+        )
 
     def _on_update_status(self, status_text: str) -> None:
         self._broadcast({"type": "status", "data": {"text": status_text}})
@@ -245,10 +251,12 @@ class TrainerService(SingletonMixin):
             self._broadcast({"type": "sample", "data": payload})
 
     def _on_update_sample_default_progress(self, step: int, max_step: int) -> None:
-        self._broadcast({
-            "type": "sample_progress",
-            "data": {"step": step, "max_step": max_step},
-        })
+        self._broadcast(
+            {
+                "type": "sample_progress",
+                "data": {"step": step, "max_step": max_step},
+            }
+        )
 
     def _on_sample_custom(self, sampler_output: Any) -> None:
         with suppress(Exception):
@@ -256,10 +264,12 @@ class TrainerService(SingletonMixin):
             self._broadcast({"type": "sample", "data": payload})
 
     def _on_update_sample_custom_progress(self, step: int, max_step: int) -> None:
-        self._broadcast({
-            "type": "sample_progress",
-            "data": {"step": step, "max_step": max_step},
-        })
+        self._broadcast(
+            {
+                "type": "sample_progress",
+                "data": {"step": step, "max_step": max_step},
+            }
+        )
 
     _always_on_tensorboard_subprocess: Any = None
 
@@ -278,8 +288,10 @@ class TrainerService(SingletonMixin):
 
         args = [
             tensorboard_executable,
-            "--logdir", tensorboard_log_dir,
-            "--port", str(config.tensorboard_port),
+            "--logdir",
+            tensorboard_log_dir,
+            "--port",
+            str(config.tensorboard_port),
             "--samples_per_plugin=images=100,scalars=10000",
         ]
 

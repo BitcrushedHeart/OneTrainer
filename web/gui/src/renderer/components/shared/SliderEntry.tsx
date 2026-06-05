@@ -1,6 +1,6 @@
 import { type ChangeEvent, useCallback, useEffect, useState } from "react";
 
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import { INPUT_BASE, PLACEHOLDER } from "@/utils/inputStyles";
 
 import { FormFieldWrapper } from "./FormFieldWrapper";
@@ -28,7 +28,7 @@ export function SliderEntry({
   tooltip,
   disabled,
 }: SliderEntryProps) {
-  const [configValue, setConfigValue] = useConfigField<number>(configPath);
+  const [configValue, setConfigValue] = useBoundField<number>(configPath);
 
   const externalValue = configPath ? configValue : controlledValue;
   const [localValue, setLocalValue] = useState<number>(externalValue ?? min);

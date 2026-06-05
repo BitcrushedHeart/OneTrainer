@@ -65,7 +65,7 @@ def _extract_png_metadata(path: str) -> dict:
     }
 
 
-_PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def _read_png_text_chunks(path: str) -> dict[str, str]:
@@ -99,18 +99,18 @@ def _parse_png_text_chunk(chunk_type: bytes, data: bytes, info: dict[str, str]):
     try:
         sep = data.index(b"\x00")
         if chunk_type == b"tEXt":
-            info[data[:sep].decode("latin-1")] = data[sep + 1:].decode("latin-1")
+            info[data[:sep].decode("latin-1")] = data[sep + 1 :].decode("latin-1")
         elif chunk_type == b"zTXt":
             # format: keyword \x00 compression_method compressed_text
-            info[data[:sep].decode("latin-1")] = zlib.decompress(data[sep + 2:]).decode("latin-1")
+            info[data[:sep].decode("latin-1")] = zlib.decompress(data[sep + 2 :]).decode("latin-1")
         elif chunk_type == b"iTXt":
             key = data[:sep].decode("utf-8")
             compression_flag = data[sep + 1]
-            rest = data[sep + 3:]  # skip compression_flag + compression_method
+            rest = data[sep + 3 :]  # skip compression_flag + compression_method
             sep2 = rest.index(b"\x00")  # end of language tag
-            rest = rest[sep2 + 1:]
+            rest = rest[sep2 + 1 :]
             sep3 = rest.index(b"\x00")  # end of translated keyword
-            text_data = rest[sep3 + 1:]
+            text_data = rest[sep3 + 1 :]
             if compression_flag:
                 info[key] = zlib.decompress(text_data).decode("utf-8")
             else:
@@ -185,30 +185,45 @@ def _extract_comfyui_prompt(data: dict) -> str:
     return max(text_nodes.values(), key=len)
 
 
+def _has_metadata_marker(raw: bytes) -> bool:
+    """Byte-level (C-speed) check for a prompt/params marker in UTF-8,
+    UTF-16-LE, or UTF-16-BE encoding."""
+    return (
+        b'"sui_image_params"' in raw
+        or b'"prompt"' in raw
+        or b'"\x00p\x00r\x00o\x00m\x00p\x00t\x00"' in raw  # UTF-16-LE
+        or b'\x00"\x00p\x00r\x00o\x00m\x00p\x00t\x00"' in raw  # UTF-16-BE
+    )
+
+
 def _extract_raw_metadata(path: str) -> dict:
-    """Scan raw file bytes for plaintext metadata (JPEG, WebP, etc.)."""
+    """Scan raw file bytes for plaintext metadata (JPEG, WebP, etc.).
+
+    Cost discipline matters here — this runs once per file over entire
+    datasets. Files without any prompt marker return after pure byte-level
+    ``in`` checks (no decode, no scanning). Files with a marker take a
+    C-speed regex first; the character-by-character balanced-JSON scan is a
+    last resort for layouts the regex can't see."""
     CHUNK = 256 * 1024  # 256 KB covers metadata in most formats
     with open(path, "rb") as f:
         raw = f.read(CHUNK)
-        # Check for metadata markers in UTF-8 or UTF-16LE encoding
-        has_marker = (
-            b'"sui_image_params"' in raw or b'"prompt"' in raw or b'"\x00p\x00r\x00o\x00m\x00p\x00t\x00"' in raw
-        )
-        if not has_marker:
-            raw = raw + f.read()  # fall back to full read
+        if not _has_metadata_marker(raw):
+            raw += f.read()  # metadata may sit past the first chunk
+            if not _has_metadata_marker(raw):
+                return {"prompt": "", "aspectratio": ""}
 
     # Try UTF-8 first, then UTF-16 variants for generators that embed
     # metadata in wide-character encoding (e.g. SwarmUI WebP EXIF).
     for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
         text = raw.decode(encoding, errors="surrogateescape" if encoding == "utf-8" else "ignore")
 
-        prompt, aspectratio = _try_json_block(text)
-        if prompt is not None:
-            return {"prompt": prompt, "aspectratio": aspectratio or ""}
-
         prompt = _find_json_string(text, "prompt")
         if prompt:
             aspectratio = _find_json_string(text, "aspectratio")
+            return {"prompt": prompt, "aspectratio": aspectratio or ""}
+
+        prompt, aspectratio = _try_json_block(text)
+        if prompt is not None:
             return {"prompt": prompt, "aspectratio": aspectratio or ""}
 
     return {"prompt": "", "aspectratio": ""}

@@ -1,7 +1,7 @@
 import { MoreHorizontal } from "lucide-react";
 import { type ChangeEvent, forwardRef } from "react";
 
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import { enumLabel } from "@/utils/enumLabels";
 import { SELECT_FLEX, SELECT_FULL, SIDE_BUTTON } from "@/utils/inputStyles";
 
@@ -40,7 +40,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
     },
     ref,
   ) => {
-    const [configValue, setConfigValue] = useConfigField<string>(configPath);
+    const [configValue, setConfigValue] = useBoundField<string>(configPath);
 
     const currentValue = configPath ? (configValue ?? "") : (controlledValue ?? "");
 

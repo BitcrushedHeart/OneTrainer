@@ -30,7 +30,7 @@ class PeftBase(nn.Module):
 
     def __init__(self, prefix: str, orig_module: nn.Module | None):
         super().__init__()
-        self.prefix = prefix + '.'
+        self.prefix = prefix + "."
         self._orig_module = [orig_module] if orig_module else None
         self.is_applied = False
         self.layer_kwargs = {}
@@ -109,8 +109,7 @@ class PeftBase(nn.Module):
         assert self._orig_module is not None
         return self._orig_module[0]
 
-    def load_state_dict(self, state_dict: Mapping[str, Any],
-                        strict: bool = True, assign: bool = False):
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
         state_dict = {k.removeprefix(self.prefix): v for (k, v) in state_dict.items() if k.startswith(self.prefix)}
         return super().load_state_dict(state_dict, strict, assign)
 
@@ -151,7 +150,9 @@ class PeftBase(nn.Module):
                 padding = self.orig_module.padding
                 dilation = self.orig_module.dilation
                 groups = self.orig_module.groups
-                lora_down = Conv2d(in_channels, self.rank, kernel_size, stride, padding, dilation=dilation, bias=False, device=device)
+                lora_down = Conv2d(
+                    in_channels, self.rank, kernel_size, stride, padding, dilation=dilation, bias=False, device=device
+                )
                 # Note: small departure here from part of the community.
                 # The original Mcrosoft repo does it this way. The cloneofsimo
                 # repo handles the groups in lora_down. We follow the Microsoft
@@ -171,6 +172,7 @@ class PeftBase(nn.Module):
         actually train or hook to the module at all. Generally used to hold
         extra keys that aren't specified in the training configuration.
         """
+
         class Dummy(cls):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
@@ -180,8 +182,7 @@ class PeftBase(nn.Module):
                 assert self.orig_module is not None
                 return PeftBase.forward(self, *args, **kwargs)
 
-            def load_state_dict(self, state_dict: Mapping[str, Any],
-                                strict: bool = True, assign: bool = False):
+            def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
                 self._initialized = True
                 self._state_dict = copy.deepcopy(state_dict)
                 # noinspection PyProtectedMember
@@ -268,10 +269,8 @@ class LoHaModule(PeftBase):
 
         # Yeah, yeah, it's different from the A/B parameters in make_weight.
         # Lycoris defines them in the opposite order. Yeah, it's confusing.
-        W1 = self.make_weight(self.dropout(self.hada_w1_b),
-                              self.dropout(self.hada_w1_a))
-        W2 = self.make_weight(self.dropout(self.hada_w2_b),
-                              self.dropout(self.hada_w2_a))
+        W1 = self.make_weight(self.dropout(self.hada_w1_b), self.dropout(self.hada_w1_a))
+        W2 = self.make_weight(self.dropout(self.hada_w2_b), self.dropout(self.hada_w2_a))
         W = (W1 * W2) * (self.alpha / self.rank)
         return self.orig_forward(x) + self.op(x, W, bias=None, **self.layer_kwargs)
 
@@ -347,10 +346,22 @@ class OFTModule(PeftBase):
     coft_eps: float
     block_share: bool
     scaled_oft: bool
+    oft_clipped_norm: bool
     dropout_probability: float
-    adjustment_info: tuple[int, int] | None # for reporting
+    adjustment_info: tuple[int, int] | None  # for reporting
 
-    def __init__(self, prefix: str, orig_module: nn.Module | None, oft_block_size: int, coft: bool, coft_eps: float, block_share: bool, scaled_oft: bool, **kwargs):
+    def __init__(
+        self,
+        prefix: str,
+        orig_module: nn.Module | None,
+        oft_block_size: int,
+        coft: bool,
+        coft_eps: float,
+        block_share: bool,
+        scaled_oft: bool,
+        oft_clipped_norm: bool = False,
+        **kwargs,
+    ):
         super().__init__(prefix, orig_module)
         self.oft_block_size = oft_block_size
         self.rank = 0
@@ -358,10 +369,10 @@ class OFTModule(PeftBase):
         self.coft_eps = coft_eps
         self.block_share = block_share
         self.use_scaled_oft = scaled_oft
-        self.dropout_probability = kwargs.pop('dropout_probability', 0.0)
+        self.oft_clipped_norm = oft_clipped_norm
+        self.dropout_probability = kwargs.pop("dropout_probability", 0.0)
         self.oft_R = None
         self.adjustment_info = None
-
 
         if orig_module is not None:
             self.initialize_weights()
@@ -394,7 +405,9 @@ class OFTModule(PeftBase):
         elif isinstance(self.orig_module, nn.Conv2d):
             if self.orig_module.dilation[0] > 1 or self.orig_module.dilation[1] > 1:
                 raise ValueError("Conv2d with dilation > 1 is not supported by OFT.")
-            in_features = self.orig_module.in_channels * self.orig_module.kernel_size[0] * self.orig_module.kernel_size[1]
+            in_features = (
+                self.orig_module.in_channels * self.orig_module.kernel_size[0] * self.orig_module.kernel_size[1]
+            )
         else:
             raise NotImplementedError("Unsupported layer type for OFT")
 
@@ -429,6 +442,7 @@ class OFTModule(PeftBase):
             use_cayley_neumann=True,
             num_cayley_neumann_terms=5,
             dropout_probability=self.dropout_probability,
+            oft_clipped_norm=self.oft_clipped_norm,
         )
 
         nn.init.zeros_(self.oft_R.weight)
@@ -463,8 +477,51 @@ class OFTModule(PeftBase):
         return self.op(x, rotated_weight, self.orig_module.bias, **self.layer_kwargs)
 
     def apply_to_module(self):
-        # TODO
-        pass
+        """Bake the OFT rotation into orig_module.weight in place.
+
+        Math mirrors forward() exactly: same scaling_factor, same _cayley_batch.
+        Linear (training rotates input) is equivalent to right-multiplying each
+        per-block weight slice by R^T. Conv2d rotates weights directly with R
+        to match forward's einsum.
+        """
+        if not self._initialized:
+            raise RuntimeError(f"Module {self.prefix} is not initialized.")
+
+        target_dtype = self.orig_module.weight.dtype
+        target_device = self.orig_module.weight.device
+
+        if isinstance(self.orig_module, nn.Linear):
+            orig_weight = get_unquantized_weight(self.orig_module, torch.float32, target_device)
+        else:  # nn.Conv2d -- get_unquantized_weight asserts Linear
+            orig_weight = self.orig_module.weight.detach().to(device=target_device, dtype=torch.float32)
+
+        scaling_factor = 2 * math.sqrt(self.oft_R.block_size - 1) if self.use_scaled_oft else 1
+        effective_weight = self.oft_R.weight.to(device=target_device, dtype=torch.float32) / scaling_factor
+
+        orth_rotate = self.oft_R._cayley_batch(
+            effective_weight,
+            self.oft_R.block_size,
+            self.oft_R.use_cayley_neumann,
+            self.oft_R.num_cayley_neumann_terms,
+        )
+
+        if self.block_share:
+            orth_rotate = orth_rotate.repeat(self.rank, 1, 1)
+
+        if isinstance(self.orig_module, nn.Linear):
+            # forward rotates input as x[..., r, k] -> sum_k x*R[r, k, c].
+            # Equivalent weight transform per block: W_block @ R[r]^T.
+            # In einsum: W_merged[o, r, k] = sum_c W_orig[o, r, c] * R[r, k, c].
+            weight_reshaped = orig_weight.reshape(orig_weight.shape[0], self.rank, self.oft_block_size)
+            merged_reshaped = torch.einsum("orc,rkc->ork", weight_reshaped, orth_rotate)
+            merged = merged_reshaped.reshape(orig_weight.shape)
+        else:  # nn.Conv2d, same einsum as forward at line 469
+            flat = orig_weight.reshape(orig_weight.shape[0], -1)
+            weight_reshaped = flat.reshape(flat.shape[0], self.rank, self.oft_block_size)
+            merged_reshaped = torch.einsum("ork,rkc->orc", weight_reshaped, orth_rotate)
+            merged = merged_reshaped.reshape(orig_weight.shape)
+
+        self.orig_module.weight.data.copy_(merged.to(target_dtype))
 
     def extract_from_module(self, base_module: nn.Module):
         # TODO
@@ -478,89 +535,104 @@ class OFTModule(PeftBase):
     def dropout(self):
         return self.oft_R.dropout
 
+
 class DoRAOFTModule(OFTModule):
     """
-    DoRA applied to OFT.
-    Since OFT (Orthogonal Finetuning) applies a rotation R such that W_new = W_orig @ R^T,
-    and R is orthogonal, the norm of the weight rows (output features) is preserved.
-    ||W_new|| = ||W_orig||.
+    DoRA applied to OFT (relative-multiplier form, ported from Koratahiu PR #1335).
 
-    Standard DoRA: W_new = m * (V / ||V||).
-    In OFT-DoRA: V = W_orig @ R^T.
-    Since ||V|| = ||W_orig|| is constant under rotation, we can simplify:
-    W_final = m * ( (W_orig @ R^T) / ||W_orig|| )
-            = (m / ||W_orig||) * OFT(x)
+    OFT applies an orthogonal rotation R (W_new = W_orig @ R^T). Because R is
+    norm-preserving (||W_new|| == ||W_orig||), DoRA's magnitude reduces to a single
+    learnable per-output-row multiplier initialized to 1.0 -- no division by the
+    base-weight norm is required.
 
-    We learn 'm' (dora_scale) and the rotation parameters.
+    This replaces the earlier absolute-norm parametrization (dora_scale initialized
+    to ||W_row|| and applied as dora_scale / initial_norm). That form gave every row
+    a per-row effective LR proportional to 1/||W_row||, so under a uniform optimizer
+    step the large-norm rows barely moved while small-norm rows overshot to zero or
+    blew up. The relative multiplier starts at 1.0 for every row, so all rows train
+    on equal footing.
+
+    NOTE: the constructor keeps OUR OFTModule signature (coft/coft_eps/scaled_oft)
+    because this branch's OFT still carries COFT, which upstream removed. The
+    apply_to_module() bake override is intentionally omitted for now -- the
+    oft_merge/oft_verify path will be re-added against the dora_multiplier invariant
+    (||merged_row|| == dora_multiplier * ||base_row||) separately.
     """
-    dora_scale: nn.Parameter | None
-    initial_norm: Tensor | None
 
-    def __init__(self, prefix: str, orig_module: nn.Module | None, oft_block_size: int, coft: bool, coft_eps: float, block_share: bool, scaled_oft: bool, **kwargs):
-        self.dora_scale = None
+    dora_multiplier: nn.Parameter | None
 
-        super().__init__(prefix, orig_module, oft_block_size, coft, coft_eps, block_share, scaled_oft, **kwargs)
+    def __init__(
+        self,
+        prefix: str,
+        orig_module: nn.Module | None,
+        oft_block_size: int,
+        coft: bool,
+        coft_eps: float,
+        block_share: bool,
+        scaled_oft: bool,
+        oft_clipped_norm: bool = False,
+        **kwargs,
+    ):
+        self.dora_multiplier = None
 
-        if not hasattr(self, "initial_norm"):
-            self.register_buffer("initial_norm", None)
+        super().__init__(
+            prefix, orig_module, oft_block_size, coft, coft_eps, block_share, scaled_oft, oft_clipped_norm, **kwargs
+        )
 
     def initialize_weights(self):
         super().initialize_weights()
 
-        # Calculate initial norms (magnitude) of the weights
+        # Per-output-row magnitude multiplier shape
         if isinstance(self.orig_module, nn.Linear):
-            weight = get_unquantized_weight(self.orig_module, torch.float32, self.orig_module.weight.device)
-            norm = torch.norm(weight, dim=1, keepdim=True)
+            multiplier_shape = (self.orig_module.weight.shape[0],)
         elif isinstance(self.orig_module, nn.Conv2d):
-            weight = self.orig_module.weight.detach().float()
-            norm = torch.norm(weight.reshape(weight.shape[0], -1), dim=1).reshape(weight.shape[0], 1, 1, 1)
+            multiplier_shape = (self.orig_module.weight.shape[0], 1, 1, 1)
         else:
             raise NotImplementedError("DoRA-OFT only supports Linear and Conv2d")
 
-        if hasattr(self, "initial_norm"):
-             self.initial_norm = norm.to(self.orig_module.weight.device).detach()
-        else:
-             self.register_buffer("initial_norm", norm.to(self.orig_module.weight.device).detach())
-
-        # Initialize learnable magnitude vector to the initial norm
-        self.dora_scale = nn.Parameter(self.initial_norm.clone())
+        # Relative scale: initialize to 1.0 (identity magnitude)
+        self.dora_multiplier = nn.Parameter(torch.ones(multiplier_shape, device=self.orig_module.weight.device))
 
     def check_initialized(self):
         super().check_initialized()
-        assert self.dora_scale is not None
-        assert self.initial_norm is not None
+        assert self.dora_multiplier is not None
 
     def forward(self, x, *args, **kwargs):
-        # Get the standard OFT output
-        # result = W_orig @ R^T @ x + bias
+        # Standard OFT output: W_orig @ R^T @ x + bias
         result = super().forward(x, *args, **kwargs)
 
-        # Remove the original bias temporarily
+        # Strip bias, apply the relative per-output-row multiplier, re-add bias.
+        # dora_multiplier broadcasts on the output-feature axis: (out,) over (..., out)
+        # for Linear, (out, 1, 1, 1) over (B, out, H, W) for Conv2d.
         bias = self.orig_module.bias
         if bias is not None:
             bias_view = bias.view(1, -1, 1, 1) if isinstance(self.orig_module, nn.Conv2d) else bias
             result = result - bias_view
 
-        # Apply DoRA Scaling
-        # Clamp the denominator so rows with zero-norm base weights (which can
-        # arise from pruning, quantization, or fp16-underflow during a prior
-        # merge) don't produce 0/0 = NaN. dora_scale is init-cloned from
-        # initial_norm, so clamping here keeps scale=0 for those rows, which
-        # is safe: the row's contribution to the output is zero anyway.
-        scale = self.dora_scale / self.initial_norm.clamp(min=1e-8)
+        result = result * self.dora_multiplier.to(result.dtype)
 
-        if isinstance(self.orig_module, nn.Linear):
-            scale = scale.view(1, -1)
-        elif isinstance(self.orig_module, nn.Conv2d):
-            scale = scale.view(1, -1, 1, 1)
-
-        result = result * scale
-
-        # Re-add bias
         if bias is not None:
-             result = result + bias_view
+            result = result + bias_view
 
         return result
+
+    def apply_to_module(self):
+        """Bake OFT rotation + DoRA multiplier into orig_module.weight.
+
+        super().apply_to_module() bakes the rotation (W <- W @ R^T); each output
+        row is then scaled by dora_multiplier. Because the rotation is
+        norm-preserving, the baked invariant is
+        ||merged_row|| == |dora_multiplier| * ||base_row|| (base_row = pre-merge).
+        """
+        super().apply_to_module()
+
+        target_dtype = self.orig_module.weight.dtype
+        mult = self.dora_multiplier.to(device=self.orig_module.weight.device, dtype=torch.float32)
+        mult_view = mult.view(-1, 1) if isinstance(self.orig_module, nn.Linear) else mult.view(-1, 1, 1, 1)
+
+        scaled = self.orig_module.weight.data.to(torch.float32) * mult_view
+        self.orig_module.weight.data.copy_(scaled.to(target_dtype))
+
 
 class DoRAModule(LoRAModule):
     """Weight-decomposed low rank adaptation.
@@ -568,6 +640,7 @@ class DoRAModule(LoRAModule):
     Not unlike LoRA in theory but the forward pass is significantly more
     complicated, as it involves taking the norm of the directional result.
     """
+
     dora_num_dims: int
     dora_scale: Tensor | None
     norm_epsilon: bool
@@ -575,9 +648,9 @@ class DoRAModule(LoRAModule):
 
     def __init__(self, *args, **kwargs):
         self.dora_scale = None
-        self.norm_epsilon = kwargs.pop('norm_epsilon', False)
-        self.decompose_output_axis = kwargs.pop('decompose_output_axis', False)
-        self.train_device = kwargs.pop('train_device')
+        self.norm_epsilon = kwargs.pop("norm_epsilon", False)
+        self.decompose_output_axis = kwargs.pop("decompose_output_axis", False)
+        self.train_device = kwargs.pop("train_device")
         super().__init__(*args, **kwargs)
 
     def initialize_weights(self):
@@ -595,17 +668,13 @@ class DoRAModule(LoRAModule):
         self.dora_num_dims = orig_weight.dim() - 1
         if self.decompose_output_axis:
             self.dora_scale = nn.Parameter(
-                torch.norm(
-                    orig_weight.reshape(orig_weight.shape[0], -1),
-                    dim=1, keepdim=True)
+                torch.norm(orig_weight.reshape(orig_weight.shape[0], -1), dim=1, keepdim=True)
                 .reshape(orig_weight.shape[0], *[1] * self.dora_num_dims)
                 .to(device=self.orig_module.weight.device)
             )
         else:
             self.dora_scale = nn.Parameter(
-                torch.norm(
-                    orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1),
-                    dim=1, keepdim=True)
+                torch.norm(orig_weight.transpose(1, 0).reshape(orig_weight.shape[1], -1), dim=1, keepdim=True)
                 .reshape(orig_weight.shape[1], *[1] * self.dora_num_dims)
                 .transpose(1, 0)
                 .to(device=self.orig_module.weight.device)
@@ -638,26 +707,24 @@ class DoRAModule(LoRAModule):
         # the gradient graph).
         eps = torch.finfo(WP.dtype).eps if self.norm_epsilon else 0.0
         if self.decompose_output_axis:
-            norm = WP.detach() \
-                    .reshape(WP.shape[0], -1) \
-                    .norm(dim=1) \
-                    .reshape(WP.shape[0], *[1] * self.dora_num_dims) \
-                    + eps
+            norm = (
+                WP.detach().reshape(WP.shape[0], -1).norm(dim=1).reshape(WP.shape[0], *[1] * self.dora_num_dims) + eps
+            )
         else:
-            norm = WP.detach() \
-                    .transpose(0, 1) \
-                    .reshape(WP.shape[1], -1) \
-                    .norm(dim=1, keepdim=True) \
-                    .reshape(WP.shape[1], *[1] * self.dora_num_dims) \
-                    .transpose(0, 1) + eps
+            norm = (
+                WP.detach()
+                .transpose(0, 1)
+                .reshape(WP.shape[1], -1)
+                .norm(dim=1, keepdim=True)
+                .reshape(WP.shape[1], *[1] * self.dora_num_dims)
+                .transpose(0, 1)
+                + eps
+            )
         WP = self.dora_scale * (WP / norm)
         # In the DoRA codebase (and thus the paper results), they perform
         # dropout on the *input*, rather than between layers, so we duplicate
         # that here.
-        return self.op(self.dropout(x),
-                       WP,
-                       self.orig_module.bias,
-                       **self.layer_kwargs)
+        return self.op(self.dropout(x), WP, self.orig_module.bias, **self.layer_kwargs)
 
 
 DummyLoRAModule = LoRAModule.make_dummy()
@@ -676,11 +743,11 @@ class LoRAModuleWrapper:
     lora_modules: dict[str, PeftBase]
 
     def __init__(
-            self,
-            orig_module: nn.Module | None,
-            prefix: str,
-            config: TrainConfig,
-            module_filter: list[str] = None,
+        self,
+        orig_module: nn.Module | None,
+        prefix: str,
+        config: TrainConfig,
+        module_filter: list[str] = None,
     ):
         self.orig_module = orig_module
         self.prefix = prefix
@@ -690,8 +757,7 @@ class LoRAModuleWrapper:
         dora_oft = config.dora_oft
 
         self.module_filters = [
-            ModuleFilter(pattern, use_regex=config.layer_filter_regex)
-            for pattern in (module_filter or [])
+            ModuleFilter(pattern, use_regex=config.layer_filter_regex) for pattern in (module_filter or [])
         ]
 
         weight_decompose = config.lora_decompose
@@ -701,9 +767,9 @@ class LoRAModuleWrapper:
                 self.dummy_klass = DummyDoRAModule
                 self.additional_args = [self.rank, self.alpha]
                 self.additional_kwargs = {
-                    'norm_epsilon': config.lora_decompose_norm_epsilon,
-                    'decompose_output_axis': config.lora_decompose_output_axis,
-                    'train_device': torch.device(config.train_device),
+                    "norm_epsilon": config.lora_decompose_norm_epsilon,
+                    "decompose_output_axis": config.lora_decompose_output_axis,
+                    "train_device": torch.device(config.train_device),
                 }
             else:
                 self.klass = LoRAModule
@@ -717,11 +783,11 @@ class LoRAModuleWrapper:
             self.additional_kwargs = {}
         elif self.peft_type == PeftType.OFT_2:
             if dora_oft:
-                 self.klass = DoRAOFTModule
-                 self.dummy_klass = DummyDoRAOFTModule
+                self.klass = DoRAOFTModule
+                self.dummy_klass = DummyDoRAOFTModule
             else:
-                 self.klass = OFTModule
-                 self.dummy_klass = DummyOFTModule
+                self.klass = OFTModule
+                self.dummy_klass = DummyOFTModule
 
             self.additional_args = [
                 config.oft_block_size,
@@ -729,9 +795,10 @@ class LoRAModuleWrapper:
                 config.coft_eps,
                 config.oft_block_share,
                 config.scaled_oft,
+                config.oft_clipped_norm,
             ]
             self.additional_kwargs = {
-                'dropout_probability': config.dropout_probability,
+                "dropout_probability": config.dropout_probability,
             }
 
         self.lora_modules = self.__create_modules(orig_module, config)
@@ -757,7 +824,7 @@ class LoRAModuleWrapper:
                 lora_modules[name] = lora_module
                 if self.peft_type == PeftType.OFT_2 and lora_module.adjustment_info:
                     old, new = lora_module.adjustment_info
-                    oft_adjustments.append({'old': old, 'new': new})
+                    oft_adjustments.append({"old": old, "new": new})
                 selected.append(name)
             else:
                 deselected.append(name)
@@ -765,7 +832,7 @@ class LoRAModuleWrapper:
         if oft_adjustments:
             summary = defaultdict(int)
             for adj in oft_adjustments:
-                summary[(adj['old'], adj['new'])] += 1
+                summary[(adj["old"], adj["new"])] += 1
 
             sorted_summary = sorted(summary.items(), key=lambda item: (item[0][0], item[0][1]))
 
@@ -788,7 +855,7 @@ class LoRAModuleWrapper:
 
         unused_filters = [mf for mf in self.module_filters if not mf.was_used()]
         if len(unused_filters) > 0:
-            raise ValueError('Custom layer filters: no modules were matched by the custom filter(s)')
+            raise ValueError("Custom layer filters: no modules were matched by the custom filter(s)")
 
         return lora_modules
 
@@ -802,7 +869,7 @@ class LoRAModuleWrapper:
             parameters += module.parameters()
         return parameters
 
-    def to(self, device: torch.device = None, dtype: torch.dtype = None) -> 'LoRAModuleWrapper':
+    def to(self, device: torch.device = None, dtype: torch.dtype = None) -> "LoRAModuleWrapper":
         for module in self.lora_modules.values():
             module.to(device, dtype)
         return self
@@ -817,7 +884,9 @@ class LoRAModuleWrapper:
 
         if rank_key := next((k for k in state_dict if k.endswith((".lora_down.weight", ".hada_w1_a"))), None):
             if (checkpoint_rank := state_dict[rank_key].shape[0]) != self.rank:
-                raise ValueError(f"Rank mismatch: checkpoint={checkpoint_rank}, config={self.rank}, please correct in the UI.")
+                raise ValueError(
+                    f"Rank mismatch: checkpoint={checkpoint_rank}, config={self.rank}, please correct in the UI."
+                )
 
     def load_state_dict(self, state_dict: dict[str, Tensor], strict: bool = True):
         """
@@ -836,7 +905,7 @@ class LoRAModuleWrapper:
             for module in self.lora_modules.values():
                 module.load_state_dict(state_dict, strict=strict)
         except RuntimeError as e:
-            raise RuntimeError(f"Error during loading of module key \"{module.prefix}\"") from e
+            raise RuntimeError(f'Error during loading of module key "{module.prefix}"') from e
 
         # Temporarily re-create the state dict, so we can see what keys were left.
         remaining_names = set(state_dict) - set(self.state_dict())

@@ -190,12 +190,7 @@ export function EloStep({
                 style={{ borderColor: "var(--color-success-500)", ...arStyle }}
               >
                 {bestPath && (
-                  <img
-                    src={imageUrl(bestPath)}
-                    alt="Best"
-                    className="object-contain w-full h-full"
-                    draggable={false}
-                  />
+                  <img src={imageUrl(bestPath)} alt="Best" className="object-contain w-full h-full" draggable={false} />
                 )}
               </div>
               <div

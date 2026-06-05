@@ -49,11 +49,13 @@ def list_images(folder: str, include_subdirectories: bool = False):
     result = []
     for img_path in images:
         mask_path = img_path.parent / f"{img_path.stem}-masklabel.png"
-        result.append(ImageListItem(
-            path=str(img_path),
-            filename=img_path.name,
-            has_mask=mask_path.exists(),
-        ))
+        result.append(
+            ImageListItem(
+                path=str(img_path),
+                filename=img_path.name,
+                has_mask=mask_path.exists(),
+            )
+        )
     return result
 
 
@@ -62,9 +64,13 @@ def get_image(path: str):
     canonical = validate_path(path, must_exist=True, allow_dir=False)
     ext = os.path.splitext(canonical)[1].lower()
     media_types = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".webp": "image/webp",
-        ".bmp": "image/bmp", ".tiff": "image/tiff", ".tif": "image/tiff",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".tiff": "image/tiff",
+        ".tif": "image/tiff",
     }
     media_type = media_types.get(ext, "application/octet-stream")
 
@@ -147,12 +153,14 @@ def yolo_predict(req: YoloPredictRequest):
                 if result.masks is not None and i < len(result.masks.xyn):
                     polygon = result.masks.xyn[i].tolist()
 
-                detections.append(YoloDetection(
-                    class_name=names.get(cls_id, str(cls_id)),
-                    confidence=round(conf, 3),
-                    polygon=polygon,
-                    bbox=bbox,
-                ))
+                detections.append(
+                    YoloDetection(
+                        class_name=names.get(cls_id, str(cls_id)),
+                        confidence=round(conf, 3),
+                        polygon=polygon,
+                        bbox=bbox,
+                    )
+                )
 
         return YoloPredictResponse(ok=True, detections=detections)
 

@@ -18,7 +18,6 @@ QueueStatus = Literal["idle", "running", "stopping"]
 
 
 class QueueService(SingletonMixin):
-
     def __init__(self) -> None:
         self._manager = QueueManager("queue.json")
         self._executor: QueueExecutor | None = None
@@ -200,10 +199,7 @@ class QueueService(SingletonMixin):
         config_service = ConfigService.get_instance()
         global_config = config_service.get_config_for_training()
         results = QueueValidator.validate_queue(self._manager, global_config)
-        return {
-            entry_id: {"errors": errors, "warnings": warnings}
-            for entry_id, (errors, warnings) in results.items()
-        }
+        return {entry_id: {"errors": errors, "warnings": warnings} for entry_id, (errors, warnings) in results.items()}
 
     # --- Execution ---
 
@@ -250,38 +246,46 @@ class QueueService(SingletonMixin):
                 continue
             res = self.auto_batch_calculate(entry.id)
             if not res.get("ok"):
-                events.append({
-                    "type": "queue:auto_batch_failed",
-                    "entry_id": entry.id,
-                    "error": res.get("error", "Auto-Batch calculation failed"),
-                })
+                events.append(
+                    {
+                        "type": "queue:auto_batch_failed",
+                        "entry_id": entry.id,
+                        "error": res.get("error", "Auto-Batch calculation failed"),
+                    }
+                )
                 continue
             result = res.get("result") or {}
             bs = result.get("batch_size")
             accum = result.get("accum")
             warning = result.get("warning")
             if not isinstance(bs, int) or not isinstance(accum, int):
-                events.append({
-                    "type": "queue:auto_batch_failed",
-                    "entry_id": entry.id,
-                    "error": "Auto-Batch returned no batch size",
-                })
+                events.append(
+                    {
+                        "type": "queue:auto_batch_failed",
+                        "entry_id": entry.id,
+                        "error": "Auto-Batch returned no batch size",
+                    }
+                )
                 continue
             entry.overrides["batch_size"] = bs
             entry.overrides["gradient_accumulation_steps"] = accum
             logger.info(
                 "Auto-Batch resolved entry %s: batch_size=%d accum=%d (effective=%s, drops=%s)%s",
-                entry.id, bs, accum,
+                entry.id,
+                bs,
+                accum,
                 result.get("effective_sample_count"),
                 result.get("dropped"),
                 f" — warning: {warning}" if warning else "",
             )
             if warning:
-                events.append({
-                    "type": "queue:auto_batch_warning",
-                    "entry_id": entry.id,
-                    "warning": warning,
-                })
+                events.append(
+                    {
+                        "type": "queue:auto_batch_warning",
+                        "entry_id": entry.id,
+                        "warning": warning,
+                    }
+                )
         self._manager.save()
         return events
 
@@ -312,6 +316,7 @@ class QueueService(SingletonMixin):
         import json
         import os
         import tempfile
+
         fd, tmp_path = tempfile.mkstemp(suffix=".json")
         try:
             with os.fdopen(fd, "w") as f:
@@ -339,47 +344,59 @@ class QueueService(SingletonMixin):
         self._current_entry_id = entry.id
         self._run_index = run_idx
         self._total_entries = total
-        self._broadcast({
-            "type": "queue:entry_started",
-            "entry_id": entry.id,
-            "name": entry.name,
-            "run_index": run_idx,
-            "total": total,
-        })
+        self._broadcast(
+            {
+                "type": "queue:entry_started",
+                "entry_id": entry.id,
+                "name": entry.name,
+                "run_index": run_idx,
+                "total": total,
+            }
+        )
 
     def _on_entry_complete(self, entry: QueueEntry) -> None:
-        self._broadcast({
-            "type": "queue:entry_completed",
-            "entry_id": entry.id,
-        })
+        self._broadcast(
+            {
+                "type": "queue:entry_completed",
+                "entry_id": entry.id,
+            }
+        )
 
     def _on_entry_failed(self, entry: QueueEntry, message: str) -> None:
-        self._broadcast({
-            "type": "queue:entry_failed",
-            "entry_id": entry.id,
-            "error": message,
-        })
+        self._broadcast(
+            {
+                "type": "queue:entry_failed",
+                "entry_id": entry.id,
+                "error": message,
+            }
+        )
 
     def _on_entry_skipped(self, entry: QueueEntry) -> None:
-        self._broadcast({
-            "type": "queue:entry_skipped",
-            "entry_id": entry.id,
-        })
+        self._broadcast(
+            {
+                "type": "queue:entry_skipped",
+                "entry_id": entry.id,
+            }
+        )
 
     def _on_progress(self, progress: Any, step: int, epoch: int) -> None:
-        self._broadcast({
-            "type": "queue:progress",
-            "entry_id": self._current_entry_id,
-            "step": step,
-            "epoch": epoch,
-            "global_step": getattr(progress, "global_step", -1),
-        })
+        self._broadcast(
+            {
+                "type": "queue:progress",
+                "entry_id": self._current_entry_id,
+                "step": step,
+                "epoch": epoch,
+                "global_step": getattr(progress, "global_step", -1),
+            }
+        )
 
     def _on_status_msg(self, msg: str) -> None:
-        self._broadcast({
-            "type": "queue:status",
-            "message": msg,
-        })
+        self._broadcast(
+            {
+                "type": "queue:status",
+                "message": msg,
+            }
+        )
 
     def _on_queue_complete(self) -> None:
         self._broadcast({"type": "queue:complete"})

@@ -277,8 +277,8 @@ export function SelectionStep({
                 Best: {basename(pendingBest)} / Worst: {basename(pendingWorst)}
               </div>
               <div className="text-[11px] text-[var(--color-on-surface-secondary)] text-center mb-2">
-                Confirm = accept and move to next group · Pick More = accept and keep scoring this
-                group · Cancel = discard this pair (nothing written)
+                Confirm = accept and move to next group · Pick More = accept and keep scoring this group · Cancel =
+                discard this pair (nothing written)
               </div>
               <div className="flex items-center justify-center gap-2 flex-wrap">
                 <Button variant="primary" size="sm" onClick={() => onAcceptPair(false)}>

@@ -1,12 +1,13 @@
-import { Activity, Database, Grid3x3, Heart, Image, ListOrdered, RefreshCw, Video, Wand2 } from "lucide-react";
+import { Activity, Database, Grid3x3, Heart, Image, Layers, ListOrdered, RefreshCw, Video, Wand2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 
+import { BucketAnalysisModal } from "@/components/modals/BucketAnalysisModal";
 import { CaptionToolModal } from "@/components/modals/CaptionToolModal";
 import { ConvertModelModal } from "@/components/modals/ConvertModelModal";
-import { BucketAnalysisModal } from "@/components/modals/BucketAnalysisModal";
 import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
+import { MergeOFTModal } from "@/components/modals/MergeOFTModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
 import { StandaloneSamplingModal } from "@/components/modals/StandaloneSamplingModal";
 import { VideoToolModal } from "@/components/modals/VideoToolModal";
@@ -44,6 +45,7 @@ export default function ToolsPage() {
   const [samplingOpen, setSamplingOpen] = useState(false);
   const [dpoOpen, setDpoOpen] = useState(false);
   const [bucketOpen, setBucketOpen] = useState(false);
+  const [mergeOftOpen, setMergeOftOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   return (
@@ -103,6 +105,12 @@ export default function ToolsPage() {
           description="Analyze aspect-bucket counts and clean-up targets for your batch size"
           onLaunch={() => setBucketOpen(true)}
         />
+        <ToolCard
+          icon={<Layers className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Merge OFT"
+          description="Bake an OFT / DoRA-OFT adapter into a base checkpoint using OneTrainer's training math"
+          onLaunch={() => setMergeOftOpen(true)}
+        />
       </div>
 
       <ProfilingPanel open={profilingOpen} onClose={() => setProfilingOpen(false)} />
@@ -113,6 +121,7 @@ export default function ToolsPage() {
       <StandaloneSamplingModal open={samplingOpen} onClose={() => setSamplingOpen(false)} />
       <DPOToolModal open={dpoOpen} onClose={() => setDpoOpen(false)} />
       <BucketAnalysisModal open={bucketOpen} onClose={() => setBucketOpen(false)} />
+      <MergeOFTModal open={mergeOftOpen} onClose={() => setMergeOftOpen(false)} />
     </>
   );
 }

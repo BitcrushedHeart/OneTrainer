@@ -43,6 +43,9 @@ export interface SetupStepProps {
 
 export interface ScanningStepProps {
   scanCount: number;
+  scanTotal: number;
+  hashCount: number;
+  cacheHits: number;
   onCancel: () => void;
 }
 

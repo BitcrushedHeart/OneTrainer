@@ -275,7 +275,7 @@ class TrainModelPartConfig(BaseConfig):
     stop_training_after_unit: TimeUnit
     learning_rate: float
     weight_dtype: DataType
-    dropout_probability: float #this is text encoder caption dropout!
+    dropout_probability: float  # this is text encoder caption dropout!
     train_embedding: bool
     attention_mask: bool
     guidance_scale: float
@@ -334,6 +334,7 @@ class TrainEmbeddingConfig(BaseConfig):
 
         return TrainEmbeddingConfig(data)
 
+
 class QuantizationConfig(BaseConfig):
     layer_filter: str
     layer_filter_preset: str
@@ -354,6 +355,7 @@ class QuantizationConfig(BaseConfig):
         data.append(("svd_rank", 16, int, False))
         data.append(("cache_dir", None, str, True))
         return QuantizationConfig(data)
+
 
 class TrainConfig(BaseConfig):
     training_method: TrainingMethod
@@ -436,12 +438,12 @@ class TrainConfig(BaseConfig):
     vb_loss_strength: float
     loss_weight_fn: LossWeight
     loss_weight_strength: float
-    dropout_probability: float #this is LoRA dropout!
+    dropout_probability: float  # this is LoRA dropout!
     loss_scaler: LossScaler
     learning_rate_scaler: LearningRateScaler
     clip_grad_norm: float
 
-    #layer filter
+    # layer filter
     layer_filter: str  # comma-separated
     layer_filter_preset: str
     layer_filter_regex: bool
@@ -548,6 +550,11 @@ class TrainConfig(BaseConfig):
     oft_block_share: bool
     dora_oft: bool
     scaled_oft: bool
+    oft_clipped_norm: bool
+
+    # distillation
+    distillation_teacher_lora_model_name: str
+    distillation_base_anchor_weight: float
 
     # dpo
     rlhf_mode: RLHFMode
@@ -557,6 +564,7 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_ref_mode: DPORefMode
     rlhf_dpo_execution_mode: DPOExecutionMode
     rlhf_supervised_mix: float
+    rlhf_sft_anchor_weight: float
     rlhf_dpo_shared_noise: bool
     rlhf_dpo_validation: bool
     rlhf_dpo_validation_percentage: float
@@ -601,7 +609,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=16,
+            config_version=17,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -620,7 +628,8 @@ class TrainConfig(BaseConfig):
                 14: self.__migration_14,
                 15: self.__migration_15,
                 16: self.__migration_16,
-            }
+                17: self.__migration_17,
+            },
         )
 
     def __migration_0(self, data: dict) -> dict:
@@ -628,18 +637,16 @@ class TrainConfig(BaseConfig):
         migrated_data = {}
         for key, value in data.items():
             # move optimizer settings to sub object
-            if key == 'optimizer':
-                optimizer_settings['optimizer'] = value
-            elif key.startswith('optimizer'):
-                optimizer_settings[key.removeprefix('optimizer_')] = value
+            if key == "optimizer":
+                optimizer_settings["optimizer"] = value
+            elif key.startswith("optimizer"):
+                optimizer_settings[key.removeprefix("optimizer_")] = value
             else:
                 migrated_data[key] = value
 
-        if 'optimizer' in optimizer_settings:
-            migrated_data['optimizer'] = optimizer_settings
-            migrated_data['optimizer_defaults'] = {
-                optimizer_settings['optimizer']: deepcopy(optimizer_settings)
-            }
+        if "optimizer" in optimizer_settings:
+            migrated_data["optimizer"] = optimizer_settings
+            migrated_data["optimizer_defaults"] = {optimizer_settings["optimizer"]: deepcopy(optimizer_settings)}
 
         return migrated_data
 
@@ -789,10 +796,7 @@ class TrainConfig(BaseConfig):
         migrated_data = data.copy()
 
         # None is not a valid value, but there was a bug that allowed it, so old config files can have it set to None:
-        if (
-            "lora_layer_preset" in migrated_data
-            and migrated_data["lora_layer_preset"] is None
-        ):
+        if "lora_layer_preset" in migrated_data and migrated_data["lora_layer_preset"] is None:
             migrated_data["lora_layer_preset"] = "full"
 
         return migrated_data
@@ -823,6 +827,7 @@ class TrainConfig(BaseConfig):
         def replace_dtype(part: str):
             if part in migrated_data and migrated_data[part]["weight_dtype"] == "NONE":
                 migrated_data[part]["weight_dtype"] = migrated_data["weight_dtype"]
+
         replace_dtype("unet")
         replace_dtype("prior")
         replace_dtype("transformer")
@@ -888,9 +893,17 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("sourceless_training", False)
         return migrated_data
 
+    def __migration_17(self, data: dict) -> dict:
+        # Existing configs that mix DPO with STANDARD concepts silently dropped
+        # the STANDARD data. Set the anchor weight to 0.0 on migration so a
+        # resumed run produces identical loss to before; new configs default
+        # to 0.5 (see defaults list) and anchor automatically.
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_sft_anchor_weight", 0.0)
+        return migrated_data
+
     def effective_dpo_ref_mode(self) -> DPORefMode:
         return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
-
 
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
@@ -922,10 +935,13 @@ class TrainConfig(BaseConfig):
             text_encoder_4=self.text_encoder_4.model_name,
             vae_model=self.vae.model_name,
             lora=self.lora_model_name,
-            embedding=EmbeddingName(self.embedding.uuid, self.embedding.model_name) \
-                if self.training_method == TrainingMethod.EMBEDDING else None,
-            additional_embeddings=[EmbeddingName(embedding.uuid, embedding.model_name) for embedding in
-                                   self.additional_embeddings],
+            teacher_lora=self.distillation_teacher_lora_model_name,
+            embedding=EmbeddingName(self.embedding.uuid, self.embedding.model_name)
+            if self.training_method == TrainingMethod.EMBEDDING
+            else None,
+            additional_embeddings=[
+                EmbeddingName(embedding.uuid, embedding.model_name) for embedding in self.additional_embeddings
+            ],
             include_text_encoder=self.text_encoder.include,
             include_text_encoder_2=self.text_encoder_2.include,
             include_text_encoder_3=self.text_encoder_3.include,
@@ -933,36 +949,54 @@ class TrainConfig(BaseConfig):
         )
 
     def train_any_embedding(self) -> bool:
-        return ((self.training_method == TrainingMethod.EMBEDDING) and not self.embedding.is_output_embedding) \
-            or any((embedding.train and not embedding.is_output_embedding) for embedding in self.additional_embeddings)
+        return ((self.training_method == TrainingMethod.EMBEDDING) and not self.embedding.is_output_embedding) or any(
+            (embedding.train and not embedding.is_output_embedding) for embedding in self.additional_embeddings
+        )
 
     def train_any_output_embedding(self) -> bool:
-        return ((self.training_method == TrainingMethod.EMBEDDING) and self.embedding.is_output_embedding) \
-            or any((embedding.train and embedding.is_output_embedding) for embedding in self.additional_embeddings)
+        return ((self.training_method == TrainingMethod.EMBEDDING) and self.embedding.is_output_embedding) or any(
+            (embedding.train and embedding.is_output_embedding) for embedding in self.additional_embeddings
+        )
 
     def train_text_encoder_or_embedding(self) -> bool:
-        return (self.text_encoder.train and self.training_method != TrainingMethod.EMBEDDING
-                and not self.embedding.is_output_embedding) \
-            or ((self.text_encoder.train_embedding or not self.model_type.has_multiple_text_encoders())
-                and self.train_any_embedding())
+        return (
+            self.text_encoder.train
+            and self.training_method != TrainingMethod.EMBEDDING
+            and not self.embedding.is_output_embedding
+        ) or (
+            (self.text_encoder.train_embedding or not self.model_type.has_multiple_text_encoders())
+            and self.train_any_embedding()
+        )
 
     def train_text_encoder_2_or_embedding(self) -> bool:
-        return (self.text_encoder_2.train and self.training_method != TrainingMethod.EMBEDDING
-                and not self.embedding.is_output_embedding) \
-            or ((self.text_encoder_2.train_embedding or not self.model_type.has_multiple_text_encoders())
-                and self.train_any_embedding())
+        return (
+            self.text_encoder_2.train
+            and self.training_method != TrainingMethod.EMBEDDING
+            and not self.embedding.is_output_embedding
+        ) or (
+            (self.text_encoder_2.train_embedding or not self.model_type.has_multiple_text_encoders())
+            and self.train_any_embedding()
+        )
 
     def train_text_encoder_3_or_embedding(self) -> bool:
-        return (self.text_encoder_3.train and self.training_method != TrainingMethod.EMBEDDING
-                and not self.embedding.is_output_embedding) \
-            or ((self.text_encoder_3.train_embedding or not self.model_type.has_multiple_text_encoders())
-                and self.train_any_embedding())
+        return (
+            self.text_encoder_3.train
+            and self.training_method != TrainingMethod.EMBEDDING
+            and not self.embedding.is_output_embedding
+        ) or (
+            (self.text_encoder_3.train_embedding or not self.model_type.has_multiple_text_encoders())
+            and self.train_any_embedding()
+        )
 
     def train_text_encoder_4_or_embedding(self) -> bool:
-        return (self.text_encoder_4.train and self.training_method != TrainingMethod.EMBEDDING
-                and not self.embedding.is_output_embedding) \
-            or ((self.text_encoder_4.train_embedding or not self.model_type.has_multiple_text_encoders())
-                and self.train_any_embedding())
+        return (
+            self.text_encoder_4.train
+            and self.training_method != TrainingMethod.EMBEDDING
+            and not self.embedding.is_output_embedding
+        ) or (
+            (self.text_encoder_4.train_embedding or not self.model_type.has_multiple_text_encoders())
+            and self.train_any_embedding()
+        )
 
     def all_embedding_configs(self):
         if self.training_method == TrainingMethod.EMBEDDING:
@@ -974,8 +1008,7 @@ class TrainConfig(BaseConfig):
         backups_path = os.path.join(self.workspace_dir, "backup")
         if os.path.exists(backups_path):
             backup_paths = sorted(
-                [path for path in os.listdir(backups_path) if
-                 os.path.isdir(os.path.join(backups_path, path))],
+                [path for path in os.listdir(backups_path) if os.path.isdir(os.path.join(backups_path, path))],
                 reverse=True,
             )
 
@@ -993,21 +1026,21 @@ class TrainConfig(BaseConfig):
 
         config_dict = config.to_dict()
         if not secrets:
-            config_dict.pop('secrets',None)
+            config_dict.pop("secrets", None)
         return config_dict
 
     def to_pack_dict(self, secrets: bool) -> dict:
         config = TrainConfig.default_values().from_dict(self.to_dict())
 
         if config.concepts is None:
-            with open(config.concept_file_name, 'r') as f:
+            with open(config.concept_file_name, "r") as f:
                 concepts = json.load(f)
                 for i in range(len(concepts)):
                     concepts[i] = ConceptConfig.default_values().from_dict(concepts[i])
                 config.concepts = concepts
 
         if config.samples is None:
-            with open(config.sample_definition_file_name, 'r') as f:
+            with open(config.sample_definition_file_name, "r") as f:
                 samples = json.load(f)
                 for i in range(len(samples)):
                     samples[i] = SampleConfig.default_values(config.model_type).from_dict(samples[i])
@@ -1015,17 +1048,17 @@ class TrainConfig(BaseConfig):
 
         config_dict = config.to_dict()
         if not secrets:
-            config_dict.pop('secrets',None)
+            config_dict.pop("secrets", None)
         return config_dict
 
-    def to_unpacked_config(self) -> 'TrainConfig':
+    def to_unpacked_config(self) -> "TrainConfig":
         config = TrainConfig.default_values().from_dict(self.to_dict())
         config.concepts = None
         config.samples = None
         return config
 
     @staticmethod
-    def default_values() -> 'TrainConfig':
+    def default_values() -> "TrainConfig":
         data = []
 
         # name, default value, data type, nullable
@@ -1050,10 +1083,12 @@ class TrainConfig(BaseConfig):
         data.append(("prevent_overwrites", False, bool, False))
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
 
-        #multi-GPU
+        # multi-GPU
         data.append(("multi_gpu", False, bool, False))
         data.append(("device_indexes", "", str, False))
-        data.append(("gradient_reduce_precision", GradientReducePrecision.FLOAT_32_STOCHASTIC, GradientReducePrecision, False))
+        data.append(
+            ("gradient_reduce_precision", GradientReducePrecision.FLOAT_32_STOCHASTIC, GradientReducePrecision, False)
+        )
         data.append(("fused_gradient_reduce", True, bool, False))
         data.append(("async_gradient_reduce", True, bool, False))
         data.append(("async_gradient_reduce_buffer", 100, int, False))
@@ -1131,7 +1166,6 @@ class TrainConfig(BaseConfig):
         data.append(("timestep_shift", 1.0, float, False))
         data.append(("dynamic_timestep_shifting", False, bool, False))
 
-
         # unet
         unet = TrainModelPartConfig.default_values()
         unet.train = True
@@ -1155,7 +1189,7 @@ class TrainConfig(BaseConfig):
         transformer.learning_rate = None
         data.append(("transformer", transformer, TrainModelPartConfig, False))
 
-        #quantization layer filter
+        # quantization layer filter
         quantization = QuantizationConfig.default_values()
         data.append(("quantization", quantization, QuantizationConfig, False))
 
@@ -1228,7 +1262,7 @@ class TrainConfig(BaseConfig):
         data.append(("masked_prior_preservation_weight", 0.0, float, False))
         data.append(("custom_conditioning_image", False, bool, False))
 
-        #layer filter
+        # layer filter
         data.append(("layer_filter", "", str, False))
         data.append(("layer_filter_preset", "full", str, False))
         data.append(("layer_filter_regex", False, bool, False))
@@ -1267,6 +1301,11 @@ class TrainConfig(BaseConfig):
         data.append(("oft_block_share", False, bool, False))
         data.append(("dora_oft", False, bool, False))
         data.append(("scaled_oft", False, bool, False))
+        data.append(("oft_clipped_norm", True, bool, False))
+
+        # distillation
+        data.append(("distillation_teacher_lora_model_name", "", str, False))
+        data.append(("distillation_base_anchor_weight", 0.0, float, False))
 
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
@@ -1276,6 +1315,7 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
         data.append(("rlhf_dpo_execution_mode", DPOExecutionMode.FULL_CONCURRENT, DPOExecutionMode, False))
         data.append(("rlhf_supervised_mix", 0.0, float, False))
+        data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
         data.append(("rlhf_dpo_shared_noise", True, bool, False))
         data.append(("rlhf_dpo_validation", False, bool, False))
         data.append(("rlhf_dpo_validation_percentage", 10.0, float, False))

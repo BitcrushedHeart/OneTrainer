@@ -93,14 +93,29 @@ def extract_dtype_subsets() -> dict[str, list[dict[str, str]]]:
     return result
 
 
+def _sanitize_default(value):
+    # Browsers' JSON.parse rejects raw Infinity / -Infinity / NaN tokens,
+    # so encode them as strings the same way the backend JSON does.
+    if isinstance(value, float):
+        if value == float("inf"):
+            return "Infinity"
+        if value == float("-inf"):
+            return "-Infinity"
+        if value != value:  # NaN
+            return "NaN"
+        return value
+    if hasattr(value, "name"):
+        return value.name
+    return value
+
+
 def extract_optimizer_defaults() -> dict[str, dict]:
     try:
         from web.scripts.generate_types import _extract_optimizer_defaults
+
         raw = _extract_optimizer_defaults()
         return {
-            (k.name if hasattr(k, "name") else str(k)): {
-                pk: (pv.name if hasattr(pv, "name") else pv) for pk, pv in v.items()
-            }
+            (k.name if hasattr(k, "name") else str(k)): {pk: _sanitize_default(pv) for pk, pv in v.items()}
             for k, v in raw.items()
         }
     except Exception:
@@ -115,6 +130,7 @@ def extract_optimizer_defaults() -> dict[str, dict]:
 def extract_optimizer_key_details() -> dict[str, dict]:
     try:
         from web.scripts.generate_types import _extract_key_detail_map
+
         return _extract_key_detail_map()
     except Exception:
         json_path = PROJECT_ROOT / "web" / "backend" / "generated" / "optimizer_key_details.json"
@@ -139,9 +155,13 @@ def parse_all_tabs() -> dict[str, ParsedTab]:
             result = parser.parse_file(filepath)
             if result and result.tab_id not in custom_tab_ids:
                 tabs[result.tab_id] = result
-                logger.info("Parsed %s -> tab '%s' (%d sections, %d variants)",
-                           filepath.name, result.tab_id,
-                           len(result.sections), len(result.variants))
+                logger.info(
+                    "Parsed %s -> tab '%s' (%d sections, %d variants)",
+                    filepath.name,
+                    result.tab_id,
+                    len(result.sections),
+                    len(result.variants),
+                )
 
     train_ui_path = ui_dir / "TrainUI.py"
     if train_ui_path.exists():
@@ -173,12 +193,12 @@ def parse_all_tabs() -> dict[str, ParsedTab]:
                     else:
                         existing.sections[sec_id] = sec
                         merged_fields += len(sec.fields)
-                logger.info("Merged TrainUI.%s() into tab '%s' (+%d fields)",
-                           method_name, tab_id, merged_fields)
+                logger.info("Merged TrainUI.%s() into tab '%s' (+%d fields)", method_name, tab_id, merged_fields)
             else:
                 tabs[result.tab_id] = result
-                logger.info("Parsed TrainUI.%s() -> tab '%s' (%d sections)",
-                           method_name, result.tab_id, len(result.sections))
+                logger.info(
+                    "Parsed TrainUI.%s() -> tab '%s' (%d sections)", method_name, result.tab_id, len(result.sections)
+                )
 
     return tabs
 
@@ -222,20 +242,20 @@ def _derive_sec_ref(method_name: str) -> str:
     sec_ref = method_name
     for prefix in ("__create_", "_create_"):
         if sec_ref.startswith(prefix):
-            sec_ref = sec_ref[len(prefix):]
+            sec_ref = sec_ref[len(prefix) :]
     for suffix in ("_frame", "_components"):
         if sec_ref.endswith(suffix):
-            sec_ref = sec_ref[:-len(suffix)]
+            sec_ref = sec_ref[: -len(suffix)]
             break
     mangled_prefix_match = re.match(r"_\w+(__create_)", sec_ref)
     if mangled_prefix_match:
-        sec_ref = sec_ref[mangled_prefix_match.end(1) - len("__create_"):]
+        sec_ref = sec_ref[mangled_prefix_match.end(1) - len("__create_") :]
         for prefix in ("__create_", "_create_"):
             if sec_ref.startswith(prefix):
-                sec_ref = sec_ref[len(prefix):]
+                sec_ref = sec_ref[len(prefix) :]
         for suffix in ("_frame", "_components"):
             if sec_ref.endswith(suffix):
-                sec_ref = sec_ref[:-len(suffix)]
+                sec_ref = sec_ref[: -len(suffix)]
                 break
     return sec_ref
 
@@ -319,9 +339,7 @@ def _expand_templated_sections(
                 base_name = core_ref[:-2] if core_ref.endswith("_n") else core_ref
                 expanded_id = f"{base_name}_{i_val}{qualifier}"
                 if expanded_id not in section_defs:
-                    _, expanded_dict = _expand_section_template(
-                        section_defs[sec_ref], i_val, sec_ref
-                    )
+                    _, expanded_dict = _expand_section_template(section_defs[sec_ref], i_val, sec_ref)
                     expanded_dict["id"] = expanded_id
                     section_defs[expanded_id] = expanded_dict
                 col_map[col_var].append(expanded_id)
@@ -375,10 +393,12 @@ def tab_to_dict(tab: ParsedTab) -> dict:
             sorted_cols = sorted(columns.keys())
             col_defs = [{"sections": columns[c]} for c in sorted_cols]
 
-            variants.append({
-                "when": {"predicate": variant.predicate},
-                "columns": col_defs,
-            })
+            variants.append(
+                {
+                    "when": {"predicate": variant.predicate},
+                    "columns": col_defs,
+                }
+            )
 
         _expand_templated_sections(section_defs, variants, tab.variants)
 
@@ -450,6 +470,7 @@ def enrich_field_visibility(schema: dict):
 def enrich_field_types(schema: dict):
     try:
         from modules.util.config.TrainConfig import TrainConfig
+
         config = TrainConfig.default_values()
         type_map = {}
         _collect_types(config, "", type_map)
@@ -503,10 +524,22 @@ CUSTOM_TABS = [
 # Queue is intentionally excluded from the top-level bar — it's reached via
 # the Tools tab instead (matches Ctk, which has QueueWindow as a tool popup).
 TAB_ORDER = [
-    "general", "model", "data", "concepts", "training", "sampling",
-    "backup", "tools", "additionalembeddings", "cloud",
-    "lora", "embedding", "rlhf",
-    "performance", "run", "help",
+    "general",
+    "model",
+    "data",
+    "concepts",
+    "training",
+    "sampling",
+    "backup",
+    "tools",
+    "additionalembeddings",
+    "cloud",
+    "lora",
+    "embedding",
+    "rlhf",
+    "performance",
+    "run",
+    "help",
 ]
 
 
@@ -616,10 +649,7 @@ def main():
     if validate:
         tab_count = len(schema["tabs"])
         field_count = sum(
-            len(f.get("fields", []))
-            for tab in schema["tabs"]
-            for section in _iter_all_sections(tab)
-            for f in [section]
+            len(f.get("fields", [])) for tab in schema["tabs"] for section in _iter_all_sections(tab) for f in [section]
         )
         print(f"Schema: {tab_count} tabs, {field_count} fields")
         print(f"Predicates: {len(schema['predicates'])}")

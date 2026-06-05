@@ -50,6 +50,7 @@ class OFTRotationModule(nn.Module):
         use_cayley_neumann=True,
         num_cayley_neumann_terms=5,
         dropout_probability=0.0,
+        oft_clipped_norm=False,
     ):
         super().__init__()
         self.r = r
@@ -70,14 +71,25 @@ class OFTRotationModule(nn.Module):
         self.register_buffer("rows", rows, persistent=False)
         self.register_buffer("cols", cols, persistent=False)
         self.dropout = MultiplicativeDropoutLayer(p=dropout_probability)
-
+        self.oft_clipped_norm = oft_clipped_norm
+        if oft_clipped_norm:
+            # Non-persistent marker: behavior is driven by self.oft_clipped_norm /
+            # the ot_config field, so this never affects state_dict compatibility.
+            self.register_buffer("clipped_oft", torch.tensor(True), persistent=False)
+            # Power-iteration state for spectral-norm estimation; one state per block.
+            u = torch.randn(r, block_size)
+            u = u / u.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            self.register_buffer("u_state", u, persistent=False)
+            v = torch.randn(r, block_size)
+            v = v / v.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            self.register_buffer("v_state", v, persistent=False)
 
     def _pytorch_skew_symmetric(self, vec, block_size):
         batch_size = vec.shape[0]
         matrix = torch.zeros(batch_size, block_size, block_size, device=vec.device, dtype=vec.dtype)
 
-        #the following two lines are equivalent to "matrix[:, self.rows, self.cols] = vec",
-        #but they work around a pytorch issue: https://github.com/pytorch/pytorch/issues/169179
+        # the following two lines are equivalent to "matrix[:, self.rows, self.cols] = vec",
+        # but they work around a pytorch issue: https://github.com/pytorch/pytorch/issues/169179
         batch_idx = torch.arange(batch_size, device=vec.device)[:, None]
         matrix = matrix.index_put((batch_idx, self.rows, self.cols), vec)
 
@@ -89,6 +101,26 @@ class OFTRotationModule(nn.Module):
         vec = matrix[:, self.rows, self.cols]
         return vec
 
+    @torch.no_grad()
+    def _spectral_norm(self, Q_skew):
+        """One power-iteration step; returns the (right, left) singular vectors per block."""
+        u = self.u_state.unsqueeze(-1).to(Q_skew.dtype)
+        v = self.v_state.unsqueeze(-1).to(Q_skew.dtype)
+        # Update v (right singular vector)
+        v_raw = torch.bmm(Q_skew.mT, u)
+        v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
+        candidate_v = v_raw / v_norm.clamp_min(1e-8)
+        next_v = torch.where(v_norm >= 1e-6, candidate_v, v)
+        # Update u (left singular vector)
+        u_raw = torch.bmm(Q_skew, next_v)
+        u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
+        candidate_u = u_raw / u_norm.clamp_min(1e-8)
+        next_u = torch.where(u_norm >= 1e-6, candidate_u, u)
+        if self.training:
+            self.v_state.copy_(next_v.squeeze(-1))
+            self.u_state.copy_(next_u.squeeze(-1))
+        return next_v, next_u
+
     def _cayley_batch(
         self, Q: torch.Tensor, block_size: int, use_cayley_neumann: bool = True, num_neumann_terms: int = 5
     ) -> torch.Tensor:
@@ -99,6 +131,16 @@ class OFTRotationModule(nn.Module):
         previous_dtype = Q.dtype
 
         Q_skew = self._pytorch_skew_symmetric(Q, block_size)
+
+        if use_cayley_neumann and getattr(self, "oft_clipped_norm", False):
+            # The Neumann series converges only if the spectral norm ||Q||_2 < 1.
+            # Estimate it with one power-iteration step and clip Q to 0.999 so the
+            # series can't diverge on long / high-block-size runs (PR #1492).
+            v_vec, u_vec = self._spectral_norm(Q_skew)
+            u_raw = torch.bmm(Q_skew, v_vec)
+            sigma = torch.sum(u_vec * u_raw, dim=1, keepdim=True)
+            max_norm = 0.999
+            Q_skew = Q_skew * (max_norm / torch.clamp(sigma, min=max_norm))
 
         if use_cayley_neumann:
             R = torch.eye(block_size, device=Q.device, dtype=Q.dtype).repeat(b, 1, 1)

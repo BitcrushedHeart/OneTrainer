@@ -42,6 +42,9 @@ export function DPOToolModal({ open, onClose }: Props) {
     outputDir,
     pairsPerGroup,
     scanCount,
+    scanTotal,
+    hashCount,
+    cacheHits,
     group,
     phase,
     bestImage,
@@ -62,13 +65,15 @@ export function DPOToolModal({ open, onClose }: Props) {
     actions,
   } = session;
 
+  const sessionActive = step === "scanning" || step === "selecting" || step === "elo";
+
   const handleClose = useCallback(() => {
-    if (step === "scanning" || step === "selecting" || step === "elo") {
+    if (sessionActive) {
       void actions.cancelSession().finally(onClose);
     } else {
       onClose();
     }
-  }, [step, actions, onClose]);
+  }, [sessionActive, actions, onClose]);
 
   const suggestedForGroup = Math.max(
     15,
@@ -76,7 +81,17 @@ export function DPOToolModal({ open, onClose }: Props) {
   );
 
   return (
-    <ModalBase open={open} onClose={handleClose} title={titleByStep[step]} size={sizeByStep[step]}>
+    <ModalBase
+      open={open}
+      onClose={handleClose}
+      title={titleByStep[step]}
+      size={sizeByStep[step]}
+      // A stray click outside the dialog (or an accidental Escape) must not
+      // kill an in-flight curation session — that throws away the whole scan.
+      // Closing mid-session stays possible via the X button or Cancel.
+      closeOnBackdrop={!sessionActive}
+      closeOnEscape={!sessionActive}
+    >
       {step === "setup" && (
         <SetupStep
           sourceFolder={sourceFolder}
@@ -94,7 +109,15 @@ export function DPOToolModal({ open, onClose }: Props) {
         />
       )}
 
-      {step === "scanning" && <ScanningStep scanCount={scanCount} onCancel={() => void actions.cancelSession()} />}
+      {step === "scanning" && (
+        <ScanningStep
+          scanCount={scanCount}
+          scanTotal={scanTotal}
+          hashCount={hashCount}
+          cacheHits={cacheHits}
+          onCancel={() => void actions.cancelSession()}
+        />
+      )}
 
       {step === "selecting" && group && (
         <SelectionStep

@@ -49,6 +49,7 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
   const schema = useUiSchemaStore((s) => s.schema);
   const config = useConfigStore((s) => s.config);
   const [activeModal, setActiveModal] = useState<string | null>(null);
+  const [cleanCacheBusy, setCleanCacheBusy] = useState(false);
 
   const predicates = useMemo(() => schema?.predicates ?? {}, [schema]);
   const configRecord = useMemo(() => (config ?? {}) as Record<string, unknown>, [config]);
@@ -174,28 +175,45 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
               <Button
                 variant="secondary"
                 size="sm"
+                loading={cleanCacheBusy}
+                disabled={cleanCacheBusy}
                 onClick={async () => {
-                  const preview = await request<{
-                    ok: boolean;
-                    total_files: number;
-                    total_mb: number;
-                    error?: string;
-                  }>("/system/cache/gc-preview", { method: "POST" });
-                  if (!preview.ok) {
-                    alert(preview.error ?? "Failed to preview cache");
-                    return;
-                  }
-                  if (preview.total_files === 0) {
-                    alert("No orphaned cache files found.");
-                    return;
-                  }
-                  if (confirm(`Remove ${preview.total_files} orphaned cache files (${preview.total_mb} MB)?`)) {
-                    await request("/system/cache/gc-clean", { method: "POST" });
+                  if (cleanCacheBusy) return;
+                  setCleanCacheBusy(true);
+                  try {
+                    const preview = await request<{
+                      ok: boolean;
+                      total_files: number;
+                      total_mb: number;
+                      error?: string;
+                    }>("/system/cache/gc-preview", { method: "POST" });
+                    if (!preview.ok) {
+                      alert(preview.error ?? "Failed to preview cache");
+                      return;
+                    }
+                    if (preview.total_files === 0) {
+                      alert("No orphaned cache files found.");
+                      return;
+                    }
+                    if (confirm(`Remove ${preview.total_files} orphaned cache files (${preview.total_mb} MB)?`)) {
+                      const result = await request<{ ok: boolean; error?: string }>("/system/cache/gc-clean", {
+                        method: "POST",
+                      });
+                      if (!result.ok) {
+                        alert(result.error ?? "Failed to clean cache");
+                      } else {
+                        alert(`Removed ${preview.total_files} orphaned cache files (${preview.total_mb} MB).`);
+                      }
+                    }
+                  } catch (err) {
+                    alert(`Clean cache failed: ${err instanceof Error ? err.message : String(err)}`);
+                  } finally {
+                    setCleanCacheBusy(false);
                   }
                 }}
               >
                 <Trash2 className="w-4 h-4 mr-1" />
-                Clean Cache
+                {cleanCacheBusy ? "Scanning…" : "Clean Cache"}
               </Button>
             </div>
           )}

@@ -20,9 +20,10 @@ class LoRALoaderMixin(metaclass=ABCMeta):
         pass
 
     def __load_safetensors(
-            self,
-            model: BaseModel,
-            lora_name: str,
+        self,
+        model: BaseModel,
+        lora_name: str,
+        target_attr: str,
     ):
         state_dict = load_file(lora_name)
 
@@ -30,12 +31,13 @@ class LoRALoaderMixin(metaclass=ABCMeta):
         if key_sets is not None:
             state_dict = convert_to_diffusers(state_dict, key_sets)
 
-        model.lora_state_dict = state_dict
+        setattr(model, target_attr, state_dict)
 
     def __load_ckpt(
-            self,
-            model: BaseModel,
-            lora_name: str,
+        self,
+        model: BaseModel,
+        lora_name: str,
+        target_attr: str,
     ):
         state_dict = torch.load(lora_name, weights_only=True)
 
@@ -43,49 +45,67 @@ class LoRALoaderMixin(metaclass=ABCMeta):
         if key_sets is not None:
             state_dict = convert_to_diffusers(state_dict, key_sets)
 
-        model.lora_state_dict = state_dict
+        setattr(model, target_attr, state_dict)
 
     def __load_internal(
-            self,
-            model: BaseModel,
-            lora_name: str,
+        self,
+        model: BaseModel,
+        lora_name: str,
+        target_attr: str,
     ):
         if os.path.exists(os.path.join(lora_name, "meta.json")):
             safetensors_lora_name = os.path.join(lora_name, "lora", "lora.safetensors")
             if os.path.exists(safetensors_lora_name):
-                self.__load_safetensors(model, safetensors_lora_name)
+                self.__load_safetensors(model, safetensors_lora_name, target_attr)
         else:
             raise Exception("not an internal model")
 
-    def _load(
-            self,
-            model: BaseModel,
-            model_names: ModelNames,
+    def __load_to_attr(
+        self,
+        model: BaseModel,
+        lora_name: str,
+        target_attr: str,
     ):
         stacktraces = []
 
-        if model_names.lora == "":
-            return
-
         try:
-            self.__load_internal(model, model_names.lora)
+            self.__load_internal(model, lora_name, target_attr)
             return
         except Exception:
             stacktraces.append(traceback.format_exc())
 
-        if model_names.lora.endswith(".ckpt"):
+        if lora_name.endswith(".ckpt"):
             try:
-                self.__load_ckpt(model, model_names.lora)
+                self.__load_ckpt(model, lora_name, target_attr)
                 return
             except Exception:
                 stacktraces.append(traceback.format_exc())
 
         try:
-            self.__load_safetensors(model, model_names.lora)
+            self.__load_safetensors(model, lora_name, target_attr)
             return
         except Exception:
             stacktraces.append(traceback.format_exc())
 
         for stacktrace in stacktraces:
             print(stacktrace)
-        raise Exception("could not load LoRA: " + model_names.lora)
+        raise Exception("could not load LoRA: " + lora_name)
+
+    def _load(
+        self,
+        model: BaseModel,
+        model_names: ModelNames,
+    ):
+        if model_names.lora == "":
+            return
+        self.__load_to_attr(model, model_names.lora, "lora_state_dict")
+
+    def _load_teacher(
+        self,
+        model: BaseModel,
+        model_names: ModelNames,
+    ):
+        teacher_path = getattr(model_names, "teacher_lora", "")
+        if not teacher_path:
+            return
+        self.__load_to_attr(model, teacher_path, "teacher_lora_state_dict")

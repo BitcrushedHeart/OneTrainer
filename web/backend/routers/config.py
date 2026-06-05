@@ -7,9 +7,7 @@ from web.backend.services.config_service import ConfigService
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-_OPTIMIZER_DEFAULTS_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "generated", "optimizer_defaults.json"
-)
+_OPTIMIZER_DEFAULTS_PATH = os.path.join(os.path.dirname(__file__), "..", "generated", "optimizer_defaults.json")
 _optimizer_defaults_cache: dict | None = None
 
 
@@ -21,9 +19,7 @@ def _load_optimizer_defaults() -> dict:
     return _optimizer_defaults_cache
 
 
-_OPTIMIZER_KEY_DETAILS_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "generated", "optimizer_key_details.json"
-)
+_OPTIMIZER_KEY_DETAILS_PATH = os.path.join(os.path.dirname(__file__), "..", "generated", "optimizer_key_details.json")
 _optimizer_key_details_cache: dict | None = None
 
 
@@ -115,7 +111,7 @@ def get_optimizer_params() -> dict:
     for opt_name, defaults in all_defaults.items():
         clean_defaults = {}
         for k, v in defaults.items():
-            if isinstance(v, float) and v == float('inf'):
+            if isinstance(v, float) and v == float("inf"):
                 clean_defaults[k] = "Infinity"
             else:
                 clean_defaults[k] = v

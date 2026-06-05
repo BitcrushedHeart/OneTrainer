@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { Button, FormEntry, Toggle } from "@/components/shared";
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import { useConfigStore } from "@/store/configStore";
 import type { Optimizer } from "@/types/generated/enums";
 
@@ -14,7 +14,7 @@ export interface OptimizerParamsModalProps {
 }
 
 export function OptimizerParamsModal({ open, onClose }: OptimizerParamsModalProps) {
-  const [optimizer] = useConfigField<Optimizer>("optimizer.optimizer");
+  const [optimizer] = useBoundField<Optimizer>("optimizer.optimizer");
   const [muonAdamOpen, setMuonAdamOpen] = useState(false);
   const changeOptimizer = useConfigStore((s) => s.changeOptimizer);
   const paramsData = useConfigStore((s) => s.optimizerParams);

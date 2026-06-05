@@ -2,7 +2,7 @@ import { RefreshCw } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 
 import { Button, FormEntry, Select, Toggle } from "@/components/shared";
-import { useConfigField } from "@/hooks/useConfigField";
+import { useBoundField } from "@/hooks/fieldBinding";
 import type { TimestepDistribution } from "@/types/generated/enums";
 import { TimestepDistributionValues } from "@/types/generated/enums";
 import { formatValue, generateTicks } from "@/utils/chartUtils";
@@ -160,12 +160,12 @@ export interface TimestepDistModalProps {
 }
 
 export function TimestepDistModal({ open, onClose }: TimestepDistModalProps) {
-  const [distribution] = useConfigField<TimestepDistribution>("timestep_distribution");
-  const [minNoisingStrength] = useConfigField<number>("min_noising_strength");
-  const [maxNoisingStrength] = useConfigField<number>("max_noising_strength");
-  const [noisingWeight] = useConfigField<number>("noising_weight");
-  const [noisingBias] = useConfigField<number>("noising_bias");
-  const [timestepShift] = useConfigField<number>("timestep_shift");
+  const [distribution] = useBoundField<TimestepDistribution>("timestep_distribution");
+  const [minNoisingStrength] = useBoundField<number>("min_noising_strength");
+  const [maxNoisingStrength] = useBoundField<number>("max_noising_strength");
+  const [noisingWeight] = useBoundField<number>("noising_weight");
+  const [noisingBias] = useBoundField<number>("noising_bias");
+  const [timestepShift] = useBoundField<number>("timestep_shift");
 
   // Increment to force re-sampling (continuous distributions use Math.random)
   const [seed, setSeed] = useState(0);

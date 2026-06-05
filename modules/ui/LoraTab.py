@@ -1,4 +1,3 @@
-
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import PeftType
@@ -32,14 +31,21 @@ class LoraTab:
         self.scroll_frame.grid_columnconfigure(1, weight=1)
         self.scroll_frame.grid_columnconfigure(2, weight=2)
 
-        components.label(self.scroll_frame, 0, 0, "Type",
-                         tooltip="The type of low-parameter finetuning method.")
+        components.label(self.scroll_frame, 0, 0, "Type", tooltip="The type of low-parameter finetuning method.")
         # This will instantly call self.setup_lora.
-        components.options_kv(self.scroll_frame, 0, 1, [
-            ("LoRA", PeftType.LORA),
-            ("LoHa", PeftType.LOHA),
-            ("OFT v2", PeftType.OFT_2),
-        ], self.ui_state, "peft_type", command=self.setup_lora)
+        components.options_kv(
+            self.scroll_frame,
+            0,
+            1,
+            [
+                ("LoRA", PeftType.LORA),
+                ("LoHa", PeftType.LOHA),
+                ("OFT v2", PeftType.OFT_2),
+            ],
+            self.ui_state,
+            "peft_type",
+            command=self.setup_lora,
+        )
 
     def setup_lora(self, peft_type: PeftType):
         if peft_type == PeftType.LOHA:
@@ -62,103 +68,242 @@ class LoraTab:
         master.grid_columnconfigure(4, weight=1, uniform="a")
 
         # lora model name
-        components.label(master, 0, 0, f"{name} base model",
-                         tooltip=f"The base {name} to train on. Leave empty to create a new {name}")
+        components.label(
+            master,
+            0,
+            0,
+            f"{name} base model",
+            tooltip=f"The base {name} to train on. Leave empty to create a new {name}",
+        )
         entry = components.path_entry(
-            master, 0, 1, self.ui_state, "lora_model_name",
-            mode="file", path_modifier=components.json_path_modifier
+            master, 0, 1, self.ui_state, "lora_model_name", mode="file", path_modifier=components.json_path_modifier
         )
         entry.grid(row=0, column=1, columnspan=4)
 
-
         # LoRA decomposition
         if peft_type == PeftType.LORA:
-            components.label(master, 1, 3, "Decompose Weights (DoRA)",
-                             tooltip="Decompose LoRA Weights (aka, DoRA).")
+            components.label(master, 1, 3, "Decompose Weights (DoRA)", tooltip="Decompose LoRA Weights (aka, DoRA).")
             components.switch(master, 1, 4, self.ui_state, "lora_decompose")
 
-            components.label(master, 2, 3, "Use Norm Epsilon (DoRA Only)",
-                             tooltip="Add an epsilon to the norm divison calculation in DoRA. Can aid in training stability, and also acts as regularization.")
+            components.label(
+                master,
+                2,
+                3,
+                "Use Norm Epsilon (DoRA Only)",
+                tooltip="Add an epsilon to the norm divison calculation in DoRA. Can aid in training stability, and also acts as regularization.",
+            )
             components.switch(master, 2, 4, self.ui_state, "lora_decompose_norm_epsilon")
-            components.label(master, 3, 3, "Apply on output axis (DoRA Only)",
-                             tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
+            components.label(
+                master,
+                3,
+                3,
+                "Apply on output axis (DoRA Only)",
+                tooltip="Apply the weight decomposition on the output axis instead of the input axis.",
+            )
             components.switch(master, 3, 4, self.ui_state, "lora_decompose_output_axis")
 
         # LoRA and LoHA shared settings
         if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:
             # rank
-            components.label(master, 1, 0, f"{name} rank",
-                            tooltip=f"The rank parameter used when creating a new {name}")
-            components.entry(master, 1, 1, self.ui_state, "lora_rank", required=True, extra_validate=check_range(lower=1, message="Rank must be at least 1"))
+            components.label(
+                master, 1, 0, f"{name} rank", tooltip=f"The rank parameter used when creating a new {name}"
+            )
+            components.entry(
+                master,
+                1,
+                1,
+                self.ui_state,
+                "lora_rank",
+                required=True,
+                extra_validate=check_range(lower=1, message="Rank must be at least 1"),
+            )
 
             # alpha
-            components.label(master, 2, 0, f"{name} alpha",
-                            tooltip=f"The alpha parameter used when creating a new {name}")
+            components.label(
+                master, 2, 0, f"{name} alpha", tooltip=f"The alpha parameter used when creating a new {name}"
+            )
             components.entry(master, 2, 1, self.ui_state, "lora_alpha", required=True)
 
             # Dropout Percentage
-            components.label(master, 3, 0, "Dropout Probability",
-                            tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.")
+            components.label(
+                master,
+                3,
+                0,
+                "Dropout Probability",
+                tooltip="Dropout probability. This percentage of model nodes will be randomly ignored at each training step. Helps with overfitting. 0 disables, 1 maximum.",
+            )
             components.entry(master, 3, 1, self.ui_state, "dropout_probability")
 
             # weight dtype
-            components.label(master, 4, 0, f"{name} Weight Data Type",
-                            tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision")
-            components.options_kv(master, 4, 1, [
-                ("float32", DataType.FLOAT_32),
-                ("bfloat16", DataType.BFLOAT_16),
-            ], self.ui_state, "lora_weight_dtype")
+            components.label(
+                master,
+                4,
+                0,
+                f"{name} Weight Data Type",
+                tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision",
+            )
+            components.options_kv(
+                master,
+                4,
+                1,
+                [
+                    ("float32", DataType.FLOAT_32),
+                    ("bfloat16", DataType.BFLOAT_16),
+                ],
+                self.ui_state,
+                "lora_weight_dtype",
+            )
 
             # For use with additional embeddings.
-            components.label(master, 5, 0, "Bundle Embeddings",
-                            tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
+            components.label(
+                master,
+                5,
+                0,
+                "Bundle Embeddings",
+                tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files",
+            )
             components.switch(master, 5, 1, self.ui_state, "bundle_additional_embeddings")
 
         # OFTv2
         elif peft_type == PeftType.OFT_2:
             # Block Size
-            components.label(master, 1, 0, f"{name} Block Size",
-                            tooltip=f"The block size parameter used when creating a new {name}")
+            components.label(
+                master, 1, 0, f"{name} Block Size", tooltip=f"The block size parameter used when creating a new {name}"
+            )
             components.entry(master, 1, 1, self.ui_state, "oft_block_size", required=True)
 
             # COFT
-            components.label(master, 1, 3, "Constrained OFT (COFT)",
-                             tooltip="Use the constrained variant of OFT. This constrains the learned rotation to stay very close to the identity matrix, limiting adaptation to only small changes. This improves training stability, helps prevent overfitting on small datasets, and better preserves the base models original knowledge but it may lack expressiveness for tasks requiring substantial adaptation and introduces an additional hyperparameter (COFT Epsilon) that needs tuning.")
+            components.label(
+                master,
+                1,
+                3,
+                "Constrained OFT (COFT)",
+                tooltip="Use the constrained variant of OFT. This constrains the learned rotation to stay very close to the identity matrix, limiting adaptation to only small changes. This improves training stability, helps prevent overfitting on small datasets, and better preserves the base models original knowledge but it may lack expressiveness for tasks requiring substantial adaptation and introduces an additional hyperparameter (COFT Epsilon) that needs tuning.",
+            )
             components.switch(master, 1, 4, self.ui_state, "oft_coft")
 
-            components.label(master, 2, 3, "COFT Epsilon",
-                             tooltip="The control strength of COFT. Only has an effect if COFT is enabled.")
+            components.label(
+                master,
+                2,
+                3,
+                "COFT Epsilon",
+                tooltip="The control strength of COFT. Only has an effect if COFT is enabled.",
+            )
             components.entry(master, 2, 4, self.ui_state, "coft_eps")
 
             # Block Share
-            components.label(master, 3, 3, "Block Share",
-                             tooltip="Share the OFT parameters between blocks. A single rotation matrix is shared across all blocks within a layer, drastically cutting the number of trainable parameters and yielding very compact adapter files, potentially improving generalization but at the cost of significant expressiveness, which can lead to underfitting on more complex or diverse tasks.")
+            components.label(
+                master,
+                3,
+                3,
+                "Block Share",
+                tooltip="Share the OFT parameters between blocks. A single rotation matrix is shared across all blocks within a layer, drastically cutting the number of trainable parameters and yielding very compact adapter files, potentially improving generalization but at the cost of significant expressiveness, which can lead to underfitting on more complex or diverse tasks.",
+            )
             components.switch(master, 3, 4, self.ui_state, "oft_block_share")
 
             # DoRA-OFT
-            components.label(master, 4, 3, "DoRA OFT (DOFT)",
-                             tooltip="Combines Weight-Decomposed Low-Rank Adaptation (DoRA) with OFT. By decoupling the weight into magnitude and direction components, it achieves the superior training dynamics of DoRA but with the stability and performance of OFT. Because OFT is norm-preserving, it avoids the heavy re-calculations typically found in standard DoRA, resulting in faster training (same speed as standard OFT) and better convergence.")
+            components.label(
+                master,
+                4,
+                3,
+                "DoRA OFT (DOFT)",
+                tooltip="Combines Weight-Decomposed Low-Rank Adaptation (DoRA) with OFT. By decoupling the weight into magnitude and direction components, it achieves the superior training dynamics of DoRA but with the stability and performance of OFT. Because OFT is norm-preserving, it avoids the heavy re-calculations typically found in standard DoRA, resulting in faster training (same speed as standard OFT) and better convergence.",
+            )
             components.switch(master, 4, 4, self.ui_state, "dora_oft")
 
             # Scaled OFT
-            components.label(master, 5, 3, "Scaled OFT",
-                             tooltip="Applies a scaling factor to the learned weights. This ensures that the effective learning rate remains consistent across different block sizes. Without this, different block sizes require significantly different learning rates.")
+            components.label(
+                master,
+                5,
+                3,
+                "Scaled OFT",
+                tooltip="Applies a scaling factor to the learned weights. This ensures that the effective learning rate remains consistent across different block sizes. Without this, different block sizes require significantly different learning rates.",
+            )
             components.switch(master, 5, 4, self.ui_state, "scaled_oft")
 
+            # Spectral Norm Clipping (OFT long-term stability)
+            components.label(
+                master,
+                7,
+                3,
+                "Spectral Norm Clipping",
+                tooltip="Clips the spectral norm of the OFT rotation generator to <= 1, guaranteeing the Cayley-Neumann series converges. Prevents the divergence/garbage-update failure that corrupts backgrounds on long or high-block-size runs. Negligible cost; recommended on.",
+            )
+            components.switch(master, 7, 4, self.ui_state, "oft_clipped_norm")
+
             # Dropout Percentage
-            components.label(master, 2, 0, "Dropout Probability",
-                            tooltip="Dropout probability. This percentage of the rotated adapter nodes that will be randomly restored to the base model initial statue. Helps with overfitting. 0 disables, 1 maximum.")
+            components.label(
+                master,
+                2,
+                0,
+                "Dropout Probability",
+                tooltip="Dropout probability. This percentage of the rotated adapter nodes that will be randomly restored to the base model initial statue. Helps with overfitting. 0 disables, 1 maximum.",
+            )
             components.entry(master, 2, 1, self.ui_state, "dropout_probability")
 
             # OFT weight dtype
-            components.label(master, 3, 0, f"{name} Weight Data Type",
-                            tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision")
-            components.options_kv(master, 3, 1, [
-                ("float32", DataType.FLOAT_32),
-                ("bfloat16", DataType.BFLOAT_16),
-            ], self.ui_state, "lora_weight_dtype")
+            components.label(
+                master,
+                3,
+                0,
+                f"{name} Weight Data Type",
+                tooltip=f"The {name} weight data type used for training. This can reduce memory consumption, but reduces precision",
+            )
+            components.options_kv(
+                master,
+                3,
+                1,
+                [
+                    ("float32", DataType.FLOAT_32),
+                    ("bfloat16", DataType.BFLOAT_16),
+                ],
+                self.ui_state,
+                "lora_weight_dtype",
+            )
 
             # For use with additional embeddings.
-            components.label(master, 4, 0, "Bundle Embeddings",
-                            tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files")
+            components.label(
+                master,
+                4,
+                0,
+                "Bundle Embeddings",
+                tooltip=f"Bundles any additional embeddings into the {name} output file, rather than as separate files",
+            )
             components.switch(master, 4, 1, self.ui_state, "bundle_additional_embeddings")
+
+            # Distillation teacher LoRA (only valid with DoRA-OFT)
+            components.label(
+                master,
+                6,
+                0,
+                "Distill from DoRA",
+                tooltip=(
+                    "Path to a trained DoRA safetensors file to distill into this DoRA-OFT student. "
+                    "The teacher provides dense noise-prediction supervision so the student can learn the "
+                    "teacher's concepts while OFT's orthogonal-rotation prior prevents catastrophic "
+                    "forgetting. Requires DoRA-OFT (set DoRA OFT above to enabled). Leave empty to disable."
+                ),
+            )
+            distill_entry = components.path_entry(
+                master,
+                6,
+                1,
+                self.ui_state,
+                "distillation_teacher_lora_model_name",
+                mode="file",
+                path_modifier=components.json_path_modifier,
+            )
+            distill_entry.grid(row=6, column=1, columnspan=1)
+
+            components.label(
+                master,
+                6,
+                3,
+                "Base Anchor Weight",
+                tooltip=(
+                    "Optional regularization toward the bare base model. 0 disables (recommended default — "
+                    "the OFT orthogonality prior is usually enough). Try 0.05 only if forgetting still leaks "
+                    "through visual inspection. Each non-zero value adds a third forward pass per training step."
+                ),
+            )
+            components.entry(master, 6, 4, self.ui_state, "distillation_base_anchor_weight")

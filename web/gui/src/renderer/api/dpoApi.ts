@@ -22,9 +22,23 @@ export interface ReviewPair {
   prompt_key: string;
 }
 
+export interface CaptionMismatch {
+  concept_pair_index: number;
+  key: string;
+  chosen_image: string;
+  rejected_image: string;
+  chosen_caption_path: string | null;
+  rejected_caption_path: string | null;
+  chosen_caption: string;
+  rejected_caption: string;
+}
+
 export interface SessionStatus {
   active: boolean;
   scan_count: number;
+  scan_total: number;
+  hash_count: number;
+  cache_hits: number;
   groups_queued: number;
   groups_shown: number;
   worker_finished: boolean;
@@ -145,6 +159,26 @@ export const dpoApi = {
   fixCaptions: () =>
     request<{ ok: boolean; fixed?: number }>("/dpo/fix-captions", {
       method: "POST",
+    }),
+
+  checkCaptionMismatches: () =>
+    request<{ ok: boolean; mismatches?: CaptionMismatch[]; error?: string }>("/dpo/check-caption-mismatches", {
+      method: "POST",
+    }),
+
+  correctAllToChosen: () =>
+    request<{ ok: boolean; corrected?: number; error?: string }>("/dpo/correct-all-to-chosen", {
+      method: "POST",
+    }),
+
+  applyCaption: (chosenImage: string, rejectedImage: string, caption: string) =>
+    request<{ ok: boolean; error?: string }>("/dpo/apply-caption", {
+      method: "POST",
+      body: JSON.stringify({
+        chosen_image: chosenImage,
+        rejected_image: rejectedImage,
+        caption,
+      }),
     }),
 
   // Curation session

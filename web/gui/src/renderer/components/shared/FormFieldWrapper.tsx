@@ -3,6 +3,7 @@ import { type CSSProperties, type ReactNode } from "react";
 
 import { getTooltip } from "@/utils/tooltips";
 
+import { FieldStatusAdorner } from "./FieldStatusAdorner";
 import { Tooltip } from "./Tooltip";
 
 export interface FormFieldWrapperProps {
@@ -12,10 +13,21 @@ export interface FormFieldWrapperProps {
   className?: string;
   style?: CSSProperties;
   children: ReactNode;
+  /** Override the path used by the override-status adorner. Defaults to configPath. */
+  statusPath?: string;
 }
 
-export function FormFieldWrapper({ label, tooltip, configPath, className, style, children }: FormFieldWrapperProps) {
+export function FormFieldWrapper({
+  label,
+  tooltip,
+  configPath,
+  className,
+  style,
+  children,
+  statusPath,
+}: FormFieldWrapperProps) {
   const resolvedTooltip = tooltip ?? (configPath ? getTooltip(configPath) : undefined);
+  const adornerPath = statusPath ?? configPath;
 
   const wrapperClass =
     className ??
@@ -40,6 +52,7 @@ export function FormFieldWrapper({ label, tooltip, configPath, className, style,
   return (
     <div className={wrapperClass} style={style}>
       <div className="flex items-center gap-1">
+        <FieldStatusAdorner path={adornerPath} />
         <span className="text-sm font-medium text-[var(--color-on-surface)]">{label}</span>
         {resolvedTooltip && (
           <Tooltip content={resolvedTooltip}>
