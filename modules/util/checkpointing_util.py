@@ -540,3 +540,17 @@ def enable_checkpointing_for_hi_dream_transformer(
             (HiDreamImageSingleTransformerBlock, ["hidden_states"]),
         ],
     )
+
+
+def enable_checkpointing_for_ernie_transformer(
+    model: nn.Module,
+    config: TrainConfig,
+) -> LayerOffloadConductor:
+    return enable_checkpointing(
+        model,
+        config,
+        config.compile,
+        [
+            (model.layers, ["x"]),
+        ],
+    )

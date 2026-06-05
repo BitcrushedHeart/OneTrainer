@@ -545,12 +545,20 @@ class TrainConfig(BaseConfig):
 
     # oft
     oft_block_size: int
-    oft_coft: bool
-    coft_eps: float
     oft_block_share: bool
     dora_oft: bool
-    scaled_oft: bool
+    oft_scaled: bool
     oft_clipped_norm: bool
+
+    # lokr
+    lokr_dim: int
+    lokr_decompose_both: bool
+    lokr_decompose_factor: int
+    lokr_use_tucker: bool
+    lokr_weight_decompose: bool
+    lokr_dora_on_output: bool
+    lokr_full_matrix: bool
+    lokr_vec_trick: bool
 
     # distillation
     distillation_teacher_lora_model_name: str
@@ -609,7 +617,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=17,
+            config_version=18,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -629,6 +637,7 @@ class TrainConfig(BaseConfig):
                 15: self.__migration_15,
                 16: self.__migration_16,
                 17: self.__migration_17,
+                18: self.__migration_18,
             },
         )
 
@@ -900,6 +909,18 @@ class TrainConfig(BaseConfig):
         # to 0.5 (see defaults list) and anchor automatically.
         migrated_data = data.copy()
         migrated_data.setdefault("rlhf_sft_anchor_weight", 0.0)
+        return migrated_data
+
+    def __migration_18(self, data: dict) -> dict:
+        # Upstream merged its own Scaled OFT under the name "oft_scaled"
+        # (this branch's port used "scaled_oft"); rename so old presets keep
+        # the flag. Upstream also removed COFT entirely; drop its keys.
+        migrated_data = data.copy()
+        if "scaled_oft" in migrated_data:
+            migrated_data.setdefault("oft_scaled", migrated_data["scaled_oft"])
+            del migrated_data["scaled_oft"]
+        migrated_data.pop("oft_coft", None)
+        migrated_data.pop("coft_eps", None)
         return migrated_data
 
     def effective_dpo_ref_mode(self) -> DPORefMode:
@@ -1296,12 +1317,20 @@ class TrainConfig(BaseConfig):
 
         # oft
         data.append(("oft_block_size", 32, int, False))
-        data.append(("oft_coft", False, bool, False))
-        data.append(("coft_eps", 1e-4, float, False))
         data.append(("oft_block_share", False, bool, False))
         data.append(("dora_oft", False, bool, False))
-        data.append(("scaled_oft", False, bool, False))
+        data.append(("oft_scaled", False, bool, False))
         data.append(("oft_clipped_norm", True, bool, False))
+
+        # lokr
+        data.append(("lokr_dim", 16, int, False))
+        data.append(("lokr_decompose_both", False, bool, False))
+        data.append(("lokr_decompose_factor", -1, int, False))
+        data.append(("lokr_use_tucker", False, bool, False))
+        data.append(("lokr_weight_decompose", False, bool, False))
+        data.append(("lokr_dora_on_output", True, bool, False))
+        data.append(("lokr_full_matrix", False, bool, False))
+        data.append(("lokr_vec_trick", True, bool, False))
 
         # distillation
         data.append(("distillation_teacher_lora_model_name", "", str, False))

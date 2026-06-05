@@ -28,6 +28,7 @@ class BaseFileSync(metaclass=ABCMeta):
         local: Path,
         remote: Path,
         recursive: bool,
+        sync_info=None,
         skip_hidden: bool = False,
         allowed_extensions: set[str] | None = None,
     ):
