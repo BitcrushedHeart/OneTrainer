@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 class ValidationService(SingletonMixin):
-
     def __init__(self) -> None:
         self._scan_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -58,9 +57,7 @@ class ValidationService(SingletonMixin):
             self._status = "scanning"
             self._stop_event.clear()
 
-        self._scan_thread = threading.Thread(
-            target=self._run_deep_scan, args=(threshold,), daemon=True
-        )
+        self._scan_thread = threading.Thread(target=self._run_deep_scan, args=(threshold,), daemon=True)
         self._scan_thread.start()
         return {"ok": True}
 
@@ -106,12 +103,14 @@ class ValidationService(SingletonMixin):
 
     def _progress_callback(self, label: str, current: int, total: int) -> None:
         self._progress = {"label": label, "current": current, "total": total}
-        self._broadcast({
-            "type": "validation:progress",
-            "label": label,
-            "current": current,
-            "total": total,
-        })
+        self._broadcast(
+            {
+                "type": "validation:progress",
+                "label": label,
+                "current": current,
+                "total": total,
+            }
+        )
 
     def _run_basic_scan(self) -> None:
         try:
@@ -131,11 +130,13 @@ class ValidationService(SingletonMixin):
                 matches.append(self._serialize_match(match))
 
             def on_caption(caption_match: CaptionMatch) -> None:
-                captions.append({
-                    "caption": caption_match.caption,
-                    "train_images": [img.display_name for img in caption_match.train_images],
-                    "val_images": [img.display_name for img in caption_match.val_images],
-                })
+                captions.append(
+                    {
+                        "caption": caption_match.caption,
+                        "train_images": [img.display_name for img in caption_match.train_images],
+                        "val_images": [img.display_name for img in caption_match.val_images],
+                    }
+                )
 
             result = scan_basic_validation_matches(
                 concepts,
@@ -157,12 +158,10 @@ class ValidationService(SingletonMixin):
                     "val_images": result.val_image_count,
                 },
                 "train_images": [
-                    {"path": img.path, "display_name": img.display_name}
-                    for img in (result.train_images or [])
+                    {"path": img.path, "display_name": img.display_name} for img in (result.train_images or [])
                 ],
                 "val_images": [
-                    {"path": img.path, "display_name": img.display_name}
-                    for img in (result.val_images or [])
+                    {"path": img.path, "display_name": img.display_name} for img in (result.val_images or [])
                 ],
             }
 

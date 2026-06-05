@@ -20,8 +20,7 @@ try:
 except ImportError:
     _HAS_TENSORBOARD = False
     logger.warning(
-        "tensorboard package not found. TensorBoard tab will return empty data. "
-        "Install with: pip install tensorboard"
+        "tensorboard package not found. TensorBoard tab will return empty data. Install with: pip install tensorboard"
     )
 
 
@@ -29,7 +28,6 @@ MAX_CACHED_ACCUMULATORS = 10
 
 
 class TensorboardService(SingletonMixin):
-
     def __init__(self) -> None:
         self._accumulators: dict[str, EventAccumulator] = {}
         self._access_times: dict[str, float] = {}
@@ -202,9 +200,12 @@ class TensorboardService(SingletonMixin):
             host = "0.0.0.0" if expose else "localhost"
             args = [
                 tb_exe,
-                "--logdir", log_dir,
-                "--port", str(port),
-                "--host", host,
+                "--logdir",
+                log_dir,
+                "--port",
+                str(port),
+                "--host",
+                host,
             ]
             try:
                 self._tb_process = subprocess.Popen(

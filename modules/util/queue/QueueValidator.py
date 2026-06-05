@@ -74,8 +74,4 @@ def _path_or_hf_exists(path: str) -> bool:
     parts = path.split("/")
     if len(parts) != 2:
         return False
-    return all(
-        p and not p.startswith(".")
-        and not p.endswith((".safetensors", ".ckpt", ".bin", ".pt"))
-        for p in parts
-    )
+    return all(p and not p.startswith(".") and not p.endswith((".safetensors", ".ckpt", ".bin", ".pt")) for p in parts)

@@ -14,6 +14,7 @@ Bit-identicalness is the load-bearing claim of Fix B. Anything less
 than exact equality at every logged step would mean the fix is
 incomplete.
 """
+
 from __future__ import annotations
 
 import os
@@ -21,20 +22,18 @@ import sys
 import tempfile
 
 import pytest
-import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from _shadow_trainer import (   # noqa: E402
+from _shadow_trainer import (  # noqa: E402
     ShadowTrainer,
     fresh_optimizer,
     make_batches,
     make_seeded_model,
     set_global_seeds,
 )
-
 
 # Parametrise across the user's typical-usage range.  acc=150 is the
 # expensive end and dominates wall-time; pick batches/steps so all three
@@ -48,11 +47,11 @@ def _build_trainer(seed: int, acc: int, enable_fix: bool) -> ShadowTrainer:
     model = make_seeded_model(seed)
     opt = fresh_optimizer(model)
     return ShadowTrainer(
-        model, opt,
+        model,
+        opt,
         accumulation_steps=acc,
         enable_fix=enable_fix,
-        concepts=[{"name": "c1", "path": "/tmp/x", "seed": 7,
-                   "type": "image", "include_subdirectories": False}],
+        concepts=[{"name": "c1", "path": "/tmp/x", "seed": 7, "type": "image", "include_subdirectories": False}],
     )
 
 
@@ -80,11 +79,12 @@ def _run_restart(acc: int, total_steps: int, stop_after_step: int, enable_fix: b
         t1.save_to(td)
 
         # Second leg: fresh trainer, restore.
-        set_global_seeds(SEED + 9999)   # irrelevant -- restored RNG should win
-        model2 = make_seeded_model(SEED)   # same init weights
+        set_global_seeds(SEED + 9999)  # irrelevant -- restored RNG should win
+        model2 = make_seeded_model(SEED)  # same init weights
         opt2 = fresh_optimizer(model2)
         t2 = ShadowTrainer(
-            model2, opt2,
+            model2,
+            opt2,
             accumulation_steps=acc,
             enable_fix=enable_fix,
             concepts=t1.concepts,
@@ -93,7 +93,7 @@ def _run_restart(acc: int, total_steps: int, stop_after_step: int, enable_fix: b
         t2.load_from(td, warn_callback=warnings.append)
         assert warnings == [], f"unexpected warnings on matched-load: {warnings}"
 
-        remaining = batches[t2.global_step:]
+        remaining = batches[t2.global_step :]
         result2 = t2.run_epoch(remaining)
 
     return result1.logs + result2.logs
@@ -125,9 +125,7 @@ def test_unfixed_save_diverges_from_baseline(acc: int):
     stop_step = _pick_stop_step(acc, total_steps)
 
     baseline = _logs_to_dict(_run_baseline(acc, total_steps))
-    restart = _logs_to_dict(_run_restart(
-        acc, total_steps, stop_step, enable_fix=False
-    ))
+    restart = _logs_to_dict(_run_restart(acc, total_steps, stop_step, enable_fix=False))
 
     # The first update-step boundary >= stop_step must show a *different*
     # logged loss.  (Subsequent boundaries may also drift, but at least the
@@ -152,25 +150,19 @@ def test_fixed_save_matches_baseline_bit_identical(acc: int):
     stop_step = _pick_stop_step(acc, total_steps)
 
     baseline = _logs_to_dict(_run_baseline(acc, total_steps))
-    restart = _logs_to_dict(_run_restart(
-        acc, total_steps, stop_step, enable_fix=True
-    ))
+    restart = _logs_to_dict(_run_restart(acc, total_steps, stop_step, enable_fix=True))
 
     assert sorted(baseline.keys()) == sorted(restart.keys()), (
-        f"acc={acc}: different update-step sets -- "
-        f"baseline={sorted(baseline)} restart={sorted(restart)}"
+        f"acc={acc}: different update-step sets -- baseline={sorted(baseline)} restart={sorted(restart)}"
     )
 
     diffs = []
     for step in sorted(baseline.keys()):
         b, r = baseline[step], restart[step]
-        if b != r:    # bit-identical required
+        if b != r:  # bit-identical required
             diffs.append((step, b, r, abs(b - r)))
 
-    assert not diffs, (
-        f"acc={acc}: Fix B is not bit-identical to baseline. "
-        f"First divergences: {diffs[:3]}"
-    )
+    assert not diffs, f"acc={acc}: Fix B is not bit-identical to baseline. First divergences: {diffs[:3]}"
 
 
 if __name__ == "__main__":

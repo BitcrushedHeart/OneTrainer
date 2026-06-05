@@ -45,7 +45,9 @@ class ValidationCheckerImage:
 
     @property
     def display_name(self) -> str:
-        concept_name = self.concept.name or os.path.basename(self.concept.configured_path) or f"concept {self.concept.index + 1}"
+        concept_name = (
+            self.concept.name or os.path.basename(self.concept.configured_path) or f"concept {self.concept.index + 1}"
+        )
         return f"{concept_name}/{self.relative_path}".replace("\\", "/")
 
 
@@ -102,7 +104,9 @@ def resolve_concept_path(path: str) -> str | None:
         return None
 
 
-def collect_validation_checker_concepts(concepts: list[ConceptConfig]) -> tuple[list[ValidationCheckerConcept], list[ValidationCheckerConcept]]:
+def collect_validation_checker_concepts(
+    concepts: list[ConceptConfig],
+) -> tuple[list[ValidationCheckerConcept], list[ValidationCheckerConcept]]:
     train_concepts = []
     val_concepts = []
 
@@ -159,7 +163,9 @@ def collect_validation_checker_images(concepts: list[ValidationCheckerConcept]) 
     return images
 
 
-def _build_validation_image(path: Path, root_path: Path, concept: ValidationCheckerConcept) -> ValidationCheckerImage | None:
+def _build_validation_image(
+    path: Path, root_path: Path, concept: ValidationCheckerConcept
+) -> ValidationCheckerImage | None:
     if not path.is_file():
         return None
     if path.name.startswith("."):
@@ -250,7 +256,9 @@ def scan_basic_validation_matches(
                 if current is None or distance < current[0]:
                     best_matches[key] = (distance, train_variant_name, val_variant_name)
 
-        for key, (distance, train_variant_name, val_variant_name) in sorted(best_matches.items(), key=lambda item: item[1][0]):
+        for key, (distance, train_variant_name, val_variant_name) in sorted(
+            best_matches.items(), key=lambda item: item[1][0]
+        ):
             if key in exact_keys or key in perceptual_keys:
                 continue
             perceptual_keys.add(key)
@@ -346,7 +354,12 @@ def scan_clip_similarity_matches(
             )
 
         _raise_if_cancelled(stop_event)
-        _report_progress(progress_callback, "Computing similarity scores", len(train_images) + len(val_images), len(train_images) + len(val_images))
+        _report_progress(
+            progress_callback,
+            "Computing similarity scores",
+            len(train_images) + len(val_images),
+            len(train_images) + len(val_images),
+        )
 
         similarities = train_embeddings @ val_embeddings.T
         matches = []
@@ -368,6 +381,7 @@ def scan_clip_similarity_matches(
         return matches
     finally:
         import contextlib
+
         with contextlib.suppress(UnboundLocalError):
             del model
         with contextlib.suppress(UnboundLocalError):
@@ -483,7 +497,9 @@ def move_validation_image_to_train(image: ValidationCheckerImage, target_concept
     if not os.path.isdir(target_concept.configured_path):
         raise RuntimeError("Target training concept path is not available locally.")
 
-    destination_path = _next_available_destination(os.path.join(target_concept.configured_path, os.path.basename(image.path)))
+    destination_path = _next_available_destination(
+        os.path.join(target_concept.configured_path, os.path.basename(image.path))
+    )
     os.makedirs(os.path.dirname(destination_path), exist_ok=True)
     shutil.move(image.path, destination_path)
 
@@ -492,7 +508,11 @@ def move_validation_image_to_train(image: ValidationCheckerImage, target_concept
         shutil.move(image.caption_path, caption_destination)
 
     image.path = canonical_join(destination_path)
-    image.caption_path = canonical_join(os.path.splitext(destination_path)[0] + ".txt") if os.path.isfile(os.path.splitext(destination_path)[0] + ".txt") else None
+    image.caption_path = (
+        canonical_join(os.path.splitext(destination_path)[0] + ".txt")
+        if os.path.isfile(os.path.splitext(destination_path)[0] + ".txt")
+        else None
+    )
     return image.path
 
 
@@ -531,7 +551,7 @@ def _encode_clip_embeddings(
 
     for start_index in range(0, len(images), batch_size):
         _raise_if_cancelled(stop_event)
-        batch = images[start_index:start_index + batch_size]
+        batch = images[start_index : start_index + batch_size]
         pil_images = []
         try:
             for image in batch:

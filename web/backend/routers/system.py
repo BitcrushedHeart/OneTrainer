@@ -66,6 +66,7 @@ def get_cache_status():
     import os
 
     from web.backend.services.config_service import ConfigService
+
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
     cache_dir = getattr(config, "cache_dir", "") or "workspace-cache/run"
@@ -95,6 +96,7 @@ def clear_cache():
     import shutil
 
     from web.backend.services.config_service import ConfigService
+
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
     cache_dir = getattr(config, "cache_dir", "") or "workspace-cache/run"
@@ -126,6 +128,7 @@ def cache_gc_preview():
     import os
 
     from web.backend.services.config_service import ConfigService
+
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
     cache_dir = getattr(config, "cache_dir", "") or "workspace-cache/run"
@@ -135,6 +138,7 @@ def cache_gc_preview():
 
     try:
         from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
+
         text_stats = SmartDiskCache.gc_preview(os.path.join(cache_dir, "text"))
         image_stats = SmartDiskCache.gc_preview(os.path.join(cache_dir, "image"))
         total_files = text_stats["orphan_count"] + image_stats["orphan_count"]
@@ -157,6 +161,7 @@ def cache_gc_clean():
     import os
 
     from web.backend.services.config_service import ConfigService
+
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
     cache_dir = getattr(config, "cache_dir", "") or "workspace-cache/run"
@@ -166,6 +171,7 @@ def cache_gc_clean():
 
     try:
         from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
+
         SmartDiskCache.gc_clean(os.path.join(cache_dir, "text"))
         SmartDiskCache.gc_clean(os.path.join(cache_dir, "image"))
         return CacheActionResponse(ok=True)
@@ -174,6 +180,7 @@ def cache_gc_clean():
 
 
 # ---- Profiling ----
+
 
 class ProfilingDumpResponse(BaseModel):
     ok: bool

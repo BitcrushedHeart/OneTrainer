@@ -16,7 +16,6 @@ _log_reentrant = threading.local()
 
 
 class _TeeWriter(io.TextIOBase):
-
     def __init__(self, original: io.TextIOBase, log_service: "LogService") -> None:
         self._original = original
         self._log_service = log_service
@@ -56,7 +55,6 @@ class _TeeWriter(io.TextIOBase):
 
 
 class _WebSocketLogHandler(logging.Handler):
-
     def __init__(self, log_service: "LogService") -> None:
         super().__init__()
         self._log_service = log_service
@@ -71,7 +69,6 @@ class _WebSocketLogHandler(logging.Handler):
 
 
 class LogService(SingletonMixin):
-
     def __init__(self) -> None:
         self._buffer: deque[dict[str, Any]] = deque(maxlen=1000)
         self._lock = threading.Lock()

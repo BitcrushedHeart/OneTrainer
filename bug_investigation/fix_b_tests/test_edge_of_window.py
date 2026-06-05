@@ -7,6 +7,7 @@ conditions:
     and .grad is None -- the trivial "save at clean boundary" case
     that the production code's automatic-backup path always satisfies).
 """
+
 from __future__ import annotations
 
 import os
@@ -19,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from _shadow_trainer import (   # noqa: E402
+from _shadow_trainer import (  # noqa: E402
     ShadowTrainer,
     fresh_optimizer,
     make_batches,
@@ -35,10 +36,11 @@ def _build():
     set_global_seeds(SEED)
     model = make_seeded_model(SEED)
     return ShadowTrainer(
-        model, fresh_optimizer(model),
-        accumulation_steps=ACC, enable_fix=True,
-        concepts=[{"name": "c", "path": "/x", "seed": 1, "type": "image",
-                   "include_subdirectories": False}],
+        model,
+        fresh_optimizer(model),
+        accumulation_steps=ACC,
+        enable_fix=True,
+        concepts=[{"name": "c", "path": "/x", "seed": 1, "type": "image", "include_subdirectories": False}],
     )
 
 
@@ -57,21 +59,23 @@ def _restart(total_steps, stop_step):
         set_global_seeds(SEED + 7777)
         t2 = _build()
         t2.load_from(td)
-        remaining = batches[t2.global_step:]
+        remaining = batches[t2.global_step :]
         r2 = t2.run_epoch(remaining)
     return dict(r1.logs + r2.logs)
 
 
-@pytest.mark.parametrize("stop_step,description", [
-    (3, "one micro-batch BEFORE boundary at step 4 (k_lost=acc-1, worst case)"),
-    (4, "EXACTLY AT boundary (k_lost=0, accumulator is 0, .grad is None)"),
-])
+@pytest.mark.parametrize(
+    "stop_step,description",
+    [
+        (3, "one micro-batch BEFORE boundary at step 4 (k_lost=acc-1, worst case)"),
+        (4, "EXACTLY AT boundary (k_lost=0, accumulator is 0, .grad is None)"),
+    ],
+)
 def test_edge_of_window_bit_identical(stop_step, description):
     total_steps = ACC * 3
     base = _baseline(total_steps)
     restart = _restart(total_steps, stop_step)
     for step in sorted(base):
         assert base[step] == restart[step], (
-            f"[{description}] step {step}: baseline={base[step]} "
-            f"restart={restart[step]}"
+            f"[{description}] step {step}: baseline={base[step]} restart={restart[step]}"
         )

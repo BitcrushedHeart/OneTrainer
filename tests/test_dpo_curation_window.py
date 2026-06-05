@@ -3,6 +3,7 @@ E2E test for DPOCurationWindow: image scaling (_fit_image) and prompt expander.
 
 Runs headless via Tk withdraw() — no visible window appears.
 """
+
 import json
 import os
 import tempfile
@@ -19,9 +20,11 @@ def _get_win():
     global _root, _win
     if _root is None:
         import customtkinter as ctk
+
         _root = ctk.CTk()
         _root.withdraw()
         from modules.ui.DPOCurationWindow import DPOCurationWindow
+
         _win = DPOCurationWindow(_root)
         _win.withdraw()
         _win.geometry("1400x900")
@@ -33,10 +36,15 @@ def _create_test_png(path: str, width: int, height: int, prompt: str, aspectrati
     """Create a PNG with SwarmUI-style metadata embedded."""
     img = Image.new("RGB", (width, height), color=(128, 64, 32))
     info = PngImagePlugin.PngInfo()
-    info.add_text("sui_image_params", json.dumps({
-        "prompt": prompt,
-        "aspectratio": aspectratio,
-    }))
+    info.add_text(
+        "sui_image_params",
+        json.dumps(
+            {
+                "prompt": prompt,
+                "aspectratio": aspectratio,
+            }
+        ),
+    )
     img.save(path, pnginfo=info)
 
 
@@ -166,9 +174,9 @@ class TestScanAndGroup(unittest.TestCase):
             _create_test_png(os.path.join(tmpdir, "img3.png"), 768, 512, "different prompt", "3:2")
 
             self.win._scan_and_group(tmpdir)
-            matching = [g for g in self.win.groups if g['prompt'] == prompt]
+            matching = [g for g in self.win.groups if g["prompt"] == prompt]
             self.assertEqual(len(matching), 1)
-            self.assertEqual(len(matching[0]['images']), 2)
+            self.assertEqual(len(matching[0]["images"]), 2)
 
     def test_single_image_group_excluded(self):
         """Groups with only 1 image should be excluded (need >=2 for pairing)."""
@@ -176,7 +184,7 @@ class TestScanAndGroup(unittest.TestCase):
             _create_test_png(os.path.join(tmpdir, "lonely.png"), 512, 512, "unique prompt alone")
 
             self.win._scan_and_group(tmpdir)
-            matching = [g for g in self.win.groups if g['prompt'] == "unique prompt alone"]
+            matching = [g for g in self.win.groups if g["prompt"] == "unique prompt alone"]
             self.assertEqual(len(matching), 0)
 
 
@@ -200,7 +208,7 @@ class TestDisplayImageScalesUp(unittest.TestCase):
             self.win._display_image(frame, path, 0, 0)
 
             for child in frame.winfo_children():
-                if hasattr(child, 'image') and child.image is not None:
+                if hasattr(child, "image") and child.image is not None:
                     size = child.image.cget("size")
                     self.assertGreater(size[0], 64, "Image should have been scaled up")
                     self.assertGreater(size[1], 64, "Image should have been scaled up")
@@ -223,7 +231,7 @@ class TestDisplayImageScalesUp(unittest.TestCase):
             self.win._display_thumbnail(frame, path, 0, 0)
 
             for child in frame.winfo_children():
-                if hasattr(child, 'image') and child.image is not None:
+                if hasattr(child, "image") and child.image is not None:
                     size = child.image.cget("size")
                     self.assertEqual(size[0], 250, "Thumbnail should scale up to 250px")
                     self.assertEqual(size[1], 250, "Thumbnail should scale up to 250px")

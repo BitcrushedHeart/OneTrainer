@@ -4,6 +4,7 @@ gradient_accumulation_steps for a queue entry.
 Reuses the bucketing analyser from `modules.util.dpo_bucket_analysis_util` so that
 drop counts match what the trainer actually sees at run time.
 """
+
 from __future__ import annotations
 
 import logging
@@ -200,8 +201,7 @@ def compute_auto_batch(
                 per_target_drops[tres] = per_target_drops.get(tres, 0) + int(target.get("total_drops", 0))
 
         per_target_drop_pcts = [
-            (per_target_drops[t] / per_target_pairs[t]) if per_target_pairs[t] > 0 else 1.0
-            for t in per_target_pairs
+            (per_target_drops[t] / per_target_pairs[t]) if per_target_pairs[t] > 0 else 1.0 for t in per_target_pairs
         ]
         drop_pct = max(per_target_drop_pcts) if per_target_drop_pcts else 1.0
         # Effective sample count = images per resolution (the same images bucket
@@ -217,13 +217,15 @@ def compute_auto_batch(
         worst_target = list(per_target_pairs.keys())[worst_idx] if per_target_pairs else None
         worst_drops = per_target_drops[worst_target] if worst_target is not None else 0
 
-        candidates.append(AutoBatchCandidate(
-            batch_size=bs,
-            total_pairs=effective_pairs,
-            total_drops=worst_drops,
-            drop_pct=drop_pct,
-            valid=drop_pct <= tolerance,
-        ))
+        candidates.append(
+            AutoBatchCandidate(
+                batch_size=bs,
+                total_pairs=effective_pairs,
+                total_drops=worst_drops,
+                drop_pct=drop_pct,
+                valid=drop_pct <= tolerance,
+            )
+        )
 
     if not candidates:
         warnings.append("No candidates evaluated (all concepts skipped)")

@@ -21,9 +21,9 @@ Each instance has two modes controlled by `enable_fix`:
 This lets one test prove both halves: the bug reproduces with
 enable_fix=False, and is *bit-identical*-fixed with enable_fix=True.
 """
+
 from __future__ import annotations
 
-import copy
 import hashlib
 import io
 import json
@@ -31,12 +31,13 @@ import os
 import random
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+import numpy as np
 
 # ----------------------- model + data ----------------------------
+
 
 def make_seeded_model(seed: int, *, freeze_first_n: int = 0) -> nn.Module:
     """Tiny deterministic MLP.
@@ -79,6 +80,7 @@ def make_batches(n: int, *, seed: int, batch_size: int = 4):
 
 # ----------------------- fingerprint helper ------------------------
 
+
 def compute_concept_fingerprint(concepts: list[dict]) -> tuple[str, int]:
     """Mirrors what the production helper does.
 
@@ -88,21 +90,28 @@ def compute_concept_fingerprint(concepts: list[dict]) -> tuple[str, int]:
     """
     payload = sorted(
         [
-            (c.get('name', ''), c.get('path', ''), int(c.get('seed', 0)),
-             c.get('type', ''), bool(c.get('include_subdirectories', False)))
+            (
+                c.get("name", ""),
+                c.get("path", ""),
+                int(c.get("seed", 0)),
+                c.get("type", ""),
+                bool(c.get("include_subdirectories", False)),
+            )
             for c in concepts
         ],
-        key=lambda t: t[1],   # sort by path
+        key=lambda t: t[1],  # sort by path
     )
-    blob = json.dumps(payload, separators=(',', ':'), sort_keys=False).encode()
+    blob = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode()
     return hashlib.sha256(blob).hexdigest(), len(payload)
 
 
 # ----------------------- shadow trainer ----------------------------
 
+
 @dataclass
 class ShadowState:
     """State the trainer owns across stop/resume."""
+
     accumulated_loss: float = 0.0
     accumulated_dpo_metrics: dict | None = None
     ema_loss: float | None = None
@@ -112,6 +121,7 @@ class ShadowState:
 @dataclass
 class TrainResult:
     """Returned by run_epoch."""
+
     logs: list[tuple[int, float]] = field(default_factory=list)
     final_global_step: int = 0
 
@@ -161,9 +171,7 @@ class ShadowTrainer:
         non-DPO path.  See file-level docstring for line refs.
         """
         logs: list[tuple[int, float]] = []
-        accumulated_loss = torch.tensor(
-            self.state.accumulated_loss, dtype=torch.float32
-        )
+        accumulated_loss = torch.tensor(self.state.accumulated_loss, dtype=torch.float32)
 
         for x, y in batches:
             # Forward + scaled backward
@@ -229,13 +237,11 @@ class ShadowTrainer:
         param_grads: dict[str, torch.Tensor] = {}
         for name, p in self.model.named_parameters():
             if p.requires_grad and p.grad is not None:
-                param_grads[name] = p.grad.detach().to(
-                    device="cpu", copy=True
-                )
+                param_grads[name] = p.grad.detach().to(device="cpu", copy=True)
 
         rng = {
             "torch_cpu": torch.get_rng_state(),
-            "torch_cuda": None,   # CPU tests only
+            "torch_cuda": None,  # CPU tests only
             "python": random.getstate(),
             "numpy": np.random.get_state(legacy=True),
         }
@@ -260,7 +266,7 @@ class ShadowTrainer:
         self,
         src_dir: str,
         *,
-        warn_callback=None,    # invoked as warn_callback(msg) for any mismatch
+        warn_callback=None,  # invoked as warn_callback(msg) for any mismatch
     ) -> None:
         """Restore state.
 
@@ -268,12 +274,8 @@ class ShadowTrainer:
         (legacy or enable_fix=False save), the partial-accumulator state
         stays at defaults (0.0, no grads) -- exactly today's behavior.
         """
-        self.model.load_state_dict(
-            torch.load(os.path.join(src_dir, "model.pt"), weights_only=True)
-        )
-        self.optimizer.load_state_dict(
-            torch.load(os.path.join(src_dir, "optimizer.pt"), weights_only=True)
-        )
+        self.model.load_state_dict(torch.load(os.path.join(src_dir, "model.pt"), weights_only=True))
+        self.optimizer.load_state_dict(torch.load(os.path.join(src_dir, "optimizer.pt"), weights_only=True))
         with open(os.path.join(src_dir, "meta.json"), "r") as f:
             meta = json.load(f)
         self.global_step = meta["global_step"]
@@ -345,6 +347,7 @@ class ShadowTrainer:
 
 
 # ----------------------- helpers -----------------------------------
+
 
 def fresh_optimizer(model: nn.Module, lr: float = 1e-2, momentum: float = 0.9):
     trainable = [p for p in model.parameters() if p.requires_grad]

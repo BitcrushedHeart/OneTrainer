@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 class SamplerService(SingletonMixin):
-
     def __init__(self) -> None:
         self._model: Any | None = None
         self._model_sampler: Any | None = None
@@ -131,9 +130,11 @@ class SamplerService(SingletonMixin):
                 self._train_config = None
             with suppress(Exception):
                 import torch
+
                 torch.clear_autocast_cache()
             with suppress(Exception):
                 from modules.util.torch_util import torch_gc
+
                 torch_gc()
             self._set_status("error", str(exc))
             return {"ok": False, "error": str(exc)}
@@ -234,9 +235,11 @@ class SamplerService(SingletonMixin):
 
         with suppress(Exception):
             import torch
+
             torch.clear_autocast_cache()
         with suppress(Exception):
             from modules.util.torch_util import torch_gc
+
             torch_gc()
 
         logger.info("Standalone sampling model unloaded")

@@ -377,7 +377,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         "Uses torch.compile and Triton to significantly speed up training."
         " Only applies to transformer/unet. Disable in case of compatibility issues."
     ),
-
     "unet.weight_dtype": "The unet weight data type",
     "transformer.model_name": (
         "Can be used to override the transformer in the base model."
@@ -387,27 +386,23 @@ FIELD_TOOLTIPS: dict[str, str] = {
     "transformer.weight_dtype": "The transformer weight data type",
     "prior.model_name": "Filename, directory or Hugging Face repository of the prior model",
     "prior.weight_dtype": "The prior weight data type",
-
     "text_encoder.weight_dtype": "The text encoder weight data type",
     "text_encoder_2.weight_dtype": "The text encoder 2 weight data type",
     "text_encoder_3.weight_dtype": "The text encoder 3 weight data type",
     "text_encoder_4.model_name": "Filename, directory or Hugging Face repository of the text encoder 4 model",
     "text_encoder_4.weight_dtype": "The text encoder 4 weight data type",
-
     "vae.model_name": (
         "Directory or Hugging Face repository of a VAE model in diffusers format."
         " Can be used to override the VAE included in the base model."
         " Using a safetensor VAE file will cause an error that the model cannot be loaded."
     ),
     "vae.weight_dtype": "The vae weight data type",
-
     "effnet_encoder.model_name": "Filename, directory or Hugging Face repository of the effnet encoder model",
     "effnet_encoder.weight_dtype": "The effnet encoder weight data type",
     "decoder.model_name": "Filename, directory or Hugging Face repository of the decoder model",
     "decoder.weight_dtype": "The decoder weight data type",
     "decoder_text_encoder.weight_dtype": "The decoder text encoder weight data type",
     "decoder_vqgan.weight_dtype": "The decoder vqgan weight data type",
-
     "quantization.layer_filter_preset": (
         "Select a preset defining which layers to quantize."
         " Quantization of certain layers can decrease model quality."
@@ -424,7 +419,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "quantization.svd_dtype": "What datatype to use for SVDQuant weights decomposition.",
     "quantization.svd_rank": "Rank for SVDQuant weights decomposition",
-
     "output_model_destination": "Filename or directory where the output model is saved",
     "output_dtype": "Precision to use when saving the output model",
     "output_model_format": "Format to use when saving the output model",
@@ -435,7 +429,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Settings: All training settings are included."
         " All: All settings, including the samples and concepts are included."
     ),
-
     "optimizer.optimizer": "The type of optimizer",
     "learning_rate_scheduler": "Learning rate scheduler that automatically changes the learning rate during training",
     "learning_rate": "The base learning rate",
@@ -450,8 +443,7 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " 10% of the initial LR. If the initial LR is 1e-4, the final LR will be 1e-5."
     ),
     "learning_rate_cycles": (
-        "The number of learning rate cycles."
-        " This is only applicable if the learning rate scheduler supports cycles"
+        "The number of learning rate cycles. This is only applicable if the learning rate scheduler supports cycles"
     ),
     "epochs": "The number of epochs for a full training run",
     "batch_size": (
@@ -459,19 +451,14 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " If you use multiple GPUs, this is the batch size of each GPU (local batch size)."
     ),
     "gradient_accumulation_steps": (
-        "Number of accumulation steps."
-        " Increase this number to trade batch size for training speed"
+        "Number of accumulation steps. Increase this number to trade batch size for training speed"
     ),
     "learning_rate_scaler": (
         "Selects the type of learning rate scaling to use during training."
         " Functionally equated as: LR * SQRT(selection)"
     ),
     "clip_grad_norm": "Clips the gradient norm. Leave empty to disable gradient clipping.",
-
-    "ema": (
-        "EMA averages the training progress over many steps,"
-        " better preserving different concepts in big datasets"
-    ),
+    "ema": ("EMA averages the training progress over many steps, better preserving different concepts in big datasets"),
     "ema_decay": (
         "Decay parameter of the EMA model. Higher numbers will average more steps."
         " For datasets of hundreds or thousands of images, set this to 0.9999."
@@ -479,8 +466,7 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "ema_update_step_interval": "Number of steps between EMA update steps",
     "gradient_checkpointing": (
-        "Enables gradient checkpointing."
-        " This reduces memory usage, but increases training time"
+        "Enables gradient checkpointing. This reduces memory usage, but increases training time"
     ),
     "layer_offload_fraction": (
         "Enables offloading of individual layers during training to reduce VRAM usage."
@@ -497,16 +483,14 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " May slow training slightly due to CPU-GPU transfers"
     ),
     "train_dtype": (
-        "The mixed precision data type used for training."
-        " This can increase training speed, but reduces precision"
+        "The mixed precision data type used for training. This can increase training speed, but reduces precision"
     ),
     "fallback_train_dtype": (
         "The mixed precision data type used for training stages that don't support"
         " float16 data types. This can increase training speed, but reduces precision"
     ),
     "enable_autocast_cache": (
-        "Enables the autocast cache."
-        " Disabling this reduces memory usage, but increases training time"
+        "Enables the autocast cache. Disabling this reduces memory usage, but increases training time"
     ),
     "resolution": (
         "The resolution used for training."
@@ -514,18 +498,13 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " or a single exact resolution in the format <width>x<height>"
     ),
     "frames": "The number of frames used for training.",
-    "force_circular_padding": (
-        "Enables circular padding for all conv layers"
-        " to better train seamless images"
-    ),
-
+    "force_circular_padding": ("Enables circular padding for all conv layers to better train seamless images"),
     "text_encoder.train": "Enables training the text encoder model",
     "text_encoder.dropout_probability": "The Probability for dropping the text encoder conditioning",
     "text_encoder.stop_training_after": "When to stop training the text encoder",
     "text_encoder.learning_rate": "The learning rate of the text encoder. Overrides the base learning rate",
     "text_encoder_layer_skip": "The number of additional clip layers to skip. 0 = the model default",
     "text_encoder_sequence_length": "Number of tokens for captions",
-
     "text_encoder.include": "Includes the text encoder in the training run",
     "text_encoder.train_embedding": "Enables training embeddings for the text encoder model",
     "text_encoder_2.include": "Includes text encoder 2 in the training run",
@@ -554,10 +533,8 @@ FIELD_TOOLTIPS: dict[str, str] = {
     "text_encoder_4.dropout_probability": "The Probability for dropping the text encoder 4 conditioning",
     "text_encoder_4.stop_training_after": "When to stop training the text encoder 4",
     "text_encoder_4.learning_rate": "The learning rate of the text encoder 4. Overrides the base learning rate",
-
     "embedding_learning_rate": "The learning rate of embeddings. Overrides the base learning rate",
     "preserve_embedding_norm": "Rescales each trained embedding to the median embedding norm",
-
     "unet.train": "Enables training the UNet model",
     "unet.stop_training_after": "When to stop training the UNet",
     "unet.learning_rate": "The learning rate of the UNet. Overrides the base learning rate",
@@ -565,11 +542,9 @@ FIELD_TOOLTIPS: dict[str, str] = {
         "Rescales the noise scheduler to a zero terminal signal to noise ratio"
         " and switches the model to a v-prediction target"
     ),
-
     "prior.train": "Enables training the Prior model",
     "prior.stop_training_after": "When to stop training the Prior",
     "prior.learning_rate": "The learning rate of the Prior. Overrides the base learning rate",
-
     "transformer.train": "Enables training the Transformer model",
     "transformer.stop_training_after": "When to stop training the Transformer",
     "transformer.learning_rate": "The learning rate of the Transformer. Overrides the base learning rate",
@@ -578,10 +553,8 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " This can improve training on shorter captions."
     ),
     "transformer.guidance_scale": (
-        "The guidance scale of guidance distilled models"
-        " passed to the transformer during training."
+        "The guidance scale of guidance distilled models passed to the transformer during training."
     ),
-
     "offset_noise_weight": "The weight of offset noise added to each training step",
     "generalized_offset_noise": (
         "Per-timestep 'brightness knob' instead of a fixed offset -"
@@ -590,13 +563,9 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "perturbation_noise_weight": "The weight of perturbation noise added to each training step",
     "ciop_noise_weight": (
-        "Applies Coordinated Input-Output Perturbation (CIOP) to each training step."
-        " Recommended 0.01-0.1."
+        "Applies Coordinated Input-Output Perturbation (CIOP) to each training step. Recommended 0.01-0.1."
     ),
-    "ciop_p": (
-        "The probability of applying I/O perturbation noise per training step."
-        " Recommended 0.5-0.8."
-    ),
+    "ciop_p": ("The probability of applying I/O perturbation noise per training step. Recommended 0.5-0.8."),
     "timestep_distribution": "Selects the function to sample timesteps during training",
     "min_noising_strength": (
         "Specifies the minimum noising strength used during training."
@@ -608,12 +577,10 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " of training samples on the overall image composition"
     ),
     "noising_weight": (
-        "Controls the weight parameter of the timestep distribution function."
-        " Use the preview to see more details."
+        "Controls the weight parameter of the timestep distribution function. Use the preview to see more details."
     ),
     "noising_bias": (
-        "Controls the bias parameter of the timestep distribution function."
-        " Use the preview to see more details."
+        "Controls the bias parameter of the timestep distribution function. Use the preview to see more details."
     ),
     "timestep_shift": "Shift the timestep distribution. Use the preview to see more details.",
     "dynamic_timestep_shifting": (
@@ -623,22 +590,18 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Note: For Z-Image and Flux2, the dynamic shifting parameters are likely"
         " wrong and unknown. Use with care or set your own, fixed shift."
     ),
-
     "masked_training": (
         "Masks the training samples to let the model focus on certain parts"
         " of the image. When enabled, one mask image is loaded for each training sample."
     ),
     "unmasked_probability": (
-        "When masked training is enabled, specifies the number of"
-        " training steps done on unmasked samples"
+        "When masked training is enabled, specifies the number of training steps done on unmasked samples"
     ),
     "unmasked_weight": (
-        "When masked training is enabled, specifies the loss weight"
-        " of areas outside the masked region"
+        "When masked training is enabled, specifies the loss weight of areas outside the masked region"
     ),
     "normalize_masked_area_loss": (
-        "When masked training is enabled, normalizes the loss for each sample"
-        " based on the sizes of the masked region"
+        "When masked training is enabled, normalizes the loss for each sample based on the sizes of the masked region"
     ),
     "masked_prior_preservation_weight": (
         "Preserves regions outside the mask using the original untrained model"
@@ -651,12 +614,10 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " It's suitable for special scenarios, such as object removal,"
         " allowing the model to learn a certain behavior concept"
     ),
-
     "mse_strength": "Mean Squared Error strength for custom loss settings. Strengths should generally sum to 1.",
     "mae_strength": "Mean Absolute Error strength for custom loss settings. Strengths should generally sum to 1.",
     "log_cosh_strength": (
-        "Log - Hyperbolic cosine Error strength for custom loss settings."
-        " Strengths should generally sum to 1."
+        "Log - Hyperbolic cosine Error strength for custom loss settings. Strengths should generally sum to 1."
     ),
     "huber_strength": (
         "Huber loss strength for custom loss settings."
@@ -664,19 +625,13 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "huber_delta": "Delta parameter for huber loss",
     "vb_loss_strength": (
-        "Variational lower-bound strength for custom loss settings."
-        " Should be set to 1 for variational diffusion models"
+        "Variational lower-bound strength for custom loss settings. Should be set to 1 for variational diffusion models"
     ),
     "loss_weight_fn": "Choice of loss weight function. Can help the model learn details more accurately.",
-    "loss_weight_strength": (
-        "Inverse strength of loss weighting."
-        " Range: 1-20, only applies to Min SNR and P2."
-    ),
+    "loss_weight_strength": ("Inverse strength of loss weighting. Range: 1-20, only applies to Min SNR and P2."),
     "loss_scaler": (
-        "Selects the type of loss scaling to use during training."
-        " Functionally equated as: Loss * selection"
+        "Selects the type of loss scaling to use during training. Functionally equated as: Loss * selection"
     ),
-
     "layer_filter_preset": (
         "Select a preset defining which layers to train, or select 'Custom'"
         " to define your own.\nA blank 'custom' field or 'Full' will train all layers."
@@ -690,7 +645,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         "If enabled, layer filter patterns are interpreted as regular expressions."
         " Otherwise, simple substring matching is used."
     ),
-
     "peft_type": "The type of low-parameter finetuning method.",
     "lora_model_name": "The base LoRA to train on. Leave empty to create a new LoRA",
     "lora_rank": "The rank parameter used when creating a new LoRA",
@@ -700,21 +654,17 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " ignored at each training step. Helps with overfitting. 0 disables, 1 maximum."
     ),
     "lora_weight_dtype": (
-        "The LoRA weight data type used for training."
-        " This can reduce memory consumption, but reduces precision"
+        "The LoRA weight data type used for training. This can reduce memory consumption, but reduces precision"
     ),
     "bundle_additional_embeddings": (
-        "Bundles any additional embeddings into the LoRA output file,"
-        " rather than as separate files"
+        "Bundles any additional embeddings into the LoRA output file, rather than as separate files"
     ),
     "lora_decompose": "Decompose LoRA Weights (aka, DoRA).",
     "lora_decompose_norm_epsilon": (
         "Add an epsilon to the norm division calculation in DoRA."
         " Can aid in training stability, and also acts as regularization."
     ),
-    "lora_decompose_output_axis": (
-        "Apply the weight decomposition on the output axis instead of the input axis."
-    ),
+    "lora_decompose_output_axis": ("Apply the weight decomposition on the output axis instead of the input axis."),
     "oft_block_size": "The block size parameter used when creating a new OFT v2",
     "oft_coft": (
         "Use the constrained variant of OFT. This constrains the learned rotation"
@@ -729,7 +679,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " shared across all blocks within a layer, drastically cutting the number"
         " of trainable parameters and yielding very compact adapter files."
     ),
-
     "embedding.model_name": "The base embedding to train on. Leave empty to create a new embedding",
     "embedding.placeholder": "The placeholder used when using the embedding in a prompt",
     "embedding.token_count": (
@@ -738,8 +687,7 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "embedding.initial_embedding_text": "The initial embedding text used when creating a new embedding",
     "embedding_weight_dtype": (
-        "The Embedding weight data type used for training."
-        " This can reduce memory consumption, but reduces precision"
+        "The Embedding weight data type used for training. This can reduce memory consumption, but reduces precision"
     ),
     "embedding.is_output_embedding": (
         "Output embeddings are calculated at the output of the text encoder,"
@@ -748,7 +696,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "embedding.train": "Enable or disable training of the embedding",
     "embedding.stop_training_after": "When to stop training the embedding",
-
     "additional_embedding.model_name": "The base embedding to train on. Leave empty to create a new embedding",
     "additional_embedding.placeholder": "The placeholder used when using the embedding in a prompt",
     "additional_embedding.token_count": (
@@ -762,26 +709,20 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "additional_embedding.stop_training_after": "When to stop training the embedding",
     "additional_embedding.initial_embedding_text": "The initial embedding text used when creating a new embedding",
-
     "workspace_dir": "The directory where all files of this training run are saved",
     "cache_dir": "The directory where cached data is saved",
     "continue_last_backup": "Automatically continues training from the last backup saved in <workspace>/backup",
     "only_cache": "Only populate the cache, without any training",
-
     "debug_mode": "Save debug information during the training into the debug directory",
     "debug_dir": "The directory where debug data is saved",
-
     "tensorboard": "Starts the Tensorboard Web UI during training",
     "tensorboard_always_on": (
-        "Keep Tensorboard accessible even when not training."
-        " Useful for monitoring completed training sessions."
+        "Keep Tensorboard accessible even when not training. Useful for monitoring completed training sessions."
     ),
     "tensorboard_expose": "Exposes Tensorboard Web UI to all network interfaces (makes it accessible from the network)",
     "tensorboard_port": "Port to use for Tensorboard link",
-
     "validation": "Enable validation steps and add new graph in tensorboard",
     "validate_after": "The interval used when validate training",
-
     "dataloader_threads": (
         "Number of threads used for the data loader."
         " Increase if your GPU has room during caching,"
@@ -792,7 +733,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         ' Default:"cuda". Must be "cuda" for multi-GPU training.'
     ),
     "temp_device": 'The device used to temporarily offload models while they are not used. Default:"cpu"',
-
     "multi_gpu": "Enable multi-GPU training",
     "device_indexes": (
         "Multi-GPU: A comma-separated list of device indexes."
@@ -823,13 +763,11 @@ FIELD_TOOLTIPS: dict[str, str] = {
         ' A multiple of this value can be needed if combined with "Fused Back Pass"'
         ' and/or "Layer offload fraction"'
     ),
-
     "sample_after": "The interval used when automatically sampling from the model during training",
     "sample_skip_first": "Start sampling automatically after this interval has elapsed.",
     "sample_image_format": "File Format used when saving samples",
     "non_ema_sampling": "Whether to include non-ema sampling when using ema.",
     "samples_to_tensorboard": "Whether to include sample images in the Tensorboard output.",
-
     "backup_after": "The interval used when automatically creating model backups during training",
     "rolling_backup": "If rolling backups are enabled, older backups are deleted automatically",
     "rolling_backup_count": "Defines the number of backups to keep if rolling backups are enabled",
@@ -837,7 +775,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
     "save_every": "The interval used when automatically saving the model during training",
     "save_skip_first": "Start saving automatically after this interval has elapsed",
     "save_filename_prefix": "The prefix for filenames used when saving the model during training",
-
     "aspect_ratio_bucketing": "Aspect ratio bucketing enables training on images with different aspect ratios",
     "latent_caching": "Caching of intermediate training data that can be re-used between epochs",
     "clear_cache_before_training": (
@@ -845,13 +782,11 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Only disable this if you want to continue using the same cached data."
         " Disabling this can lead to errors, if other settings are changed during a restart"
     ),
-
     "sample.frames": "Number of frames to generate. Only used when generating videos.",
     "sample.length": "Length in seconds of audio output.",
     "sample.sample_inpainting": "Enables inpainting sampling. Only available when sampling from an inpainting model.",
     "sample.base_image_path": "The base image used when inpainting.",
     "sample.mask_image_path": "The mask used when inpainting.",
-
     "cloud.enabled": "Enable cloud training",
     "cloud.type": (
         "Choose LINUX to connect to a linux machine via SSH."
@@ -866,12 +801,10 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " This value is stored separately, not saved to your configuration file."
     ),
     "secrets.cloud.host": (
-        "SSH server hostname or IP."
-        " Leave empty if you have a Cloud ID or want to automatically create a new cloud."
+        "SSH server hostname or IP. Leave empty if you have a Cloud ID or want to automatically create a new cloud."
     ),
     "secrets.cloud.port": (
-        "SSH server port."
-        " Leave empty if you have a Cloud ID or want to automatically create a new cloud."
+        "SSH server port. Leave empty if you have a Cloud ID or want to automatically create a new cloud."
     ),
     "secrets.cloud.user": (
         'SSH username. Use "root" for RUNPOD.'
@@ -949,8 +882,7 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Stop or delete the cloud, or do nothing."
     ),
     "cloud.on_error": (
-        "What to do if training stops due to an error:"
-        " Stop or delete the cloud, or do nothing. Data may be lost."
+        "What to do if training stops due to an error: Stop or delete the cloud, or do nothing. Data may be lost."
     ),
     "cloud.on_detached_finish": (
         "What to do when training finishes, but the client has been detached"
@@ -960,7 +892,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         "What to do if training stops due to an error, but the client has been detached"
         " and cannot download data. Data may be lost."
     ),
-
     "concept.name": "Name of the concept",
     "concept.enabled": "Enable or disable this concept",
     "concept.type": (
@@ -984,7 +915,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Use repeats to multiply the concept, or samples to specify an exact number of samples used in each epoch."
     ),
     "concept.loss_weight": "The loss multiplier for this concept.",
-
     "concept.image.enable_crop_jitter": "Enables random cropping of samples",
     "concept.image.enable_random_flip": "Randomly flip the sample during training",
     "concept.image.enable_fixed_flip": "Apply a fixed horizontal flip to all images in this concept",
@@ -1001,7 +931,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Optionally specify multiple resolutions separated by a comma,"
         " or a single exact resolution in the format <width>x<height>"
     ),
-
     "concept.text.enable_tag_shuffling": "Enables tag shuffling",
     "concept.text.tag_delimiter": "The delimiter between tags",
     "concept.text.keep_tags_count": "The number of tags at the start of the caption that are not shuffled or dropped",
@@ -1036,7 +965,6 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " 'first' for First word only, 'random' for randomized letters."
     ),
     "concept.text.caps_randomize_probability": "Probability to randomize capitalization of each tag, from 0 to 1.",
-
     "tools.dataset": "Open the captioning tool",
     "tools.video": "Open the video tools",
     "tools.convert_model": "Open the model conversion tool",

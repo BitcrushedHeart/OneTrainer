@@ -116,18 +116,34 @@ class QueueManager:
         return None
 
     def get_run_index(self, entry_id: str) -> int | None:
-        runnable = [e for e in self.entries if e.included and e.status in (
-            QueueEntryStatus.PENDING, QueueEntryStatus.RUNNING, QueueEntryStatus.COMPLETED,
-        )]
+        runnable = [
+            e
+            for e in self.entries
+            if e.included
+            and e.status
+            in (
+                QueueEntryStatus.PENDING,
+                QueueEntryStatus.RUNNING,
+                QueueEntryStatus.COMPLETED,
+            )
+        ]
         for i, e in enumerate(runnable):
             if e.id == entry_id:
                 return i
         return None
 
     def total_runnable(self) -> int:
-        return sum(1 for e in self.entries if e.included and e.status in (
-            QueueEntryStatus.PENDING, QueueEntryStatus.RUNNING, QueueEntryStatus.COMPLETED,
-        ))
+        return sum(
+            1
+            for e in self.entries
+            if e.included
+            and e.status
+            in (
+                QueueEntryStatus.PENDING,
+                QueueEntryStatus.RUNNING,
+                QueueEntryStatus.COMPLETED,
+            )
+        )
 
     def export_to_file(self, file_path: str):
         data = {

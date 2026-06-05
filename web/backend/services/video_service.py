@@ -43,7 +43,6 @@ ALLOWED_YTDLP_FLAGS = {
 
 
 class VideoService(SingletonMixin):
-
     def __init__(self) -> None:
         self._status: VideoStatus = "idle"
         self._message: str | None = None
@@ -69,17 +68,18 @@ class VideoService(SingletonMixin):
     def _import_cv2():
         try:
             import cv2
+
             return cv2
         except ImportError as exc:
             raise RuntimeError(
-                "opencv-python (cv2) is required for video tools. "
-                "Install it with:  pip install opencv-python"
+                "opencv-python (cv2) is required for video tools. Install it with:  pip install opencv-python"
             ) from exc
 
     @staticmethod
     def _import_scenedetect():
         try:
             import scenedetect
+
             return scenedetect
         except ImportError as exc:
             raise RuntimeError(
@@ -131,11 +131,25 @@ class VideoService(SingletonMixin):
         old_aspect = height / width
         variation_scaled = old_aspect * variation
         if old_aspect > 1.2:
-            new_aspect = min(4.0, max(1.0, random.triangular(
-                old_aspect - (variation_scaled * 1.5), old_aspect + (variation_scaled / 2), old_aspect)))
+            new_aspect = min(
+                4.0,
+                max(
+                    1.0,
+                    random.triangular(
+                        old_aspect - (variation_scaled * 1.5), old_aspect + (variation_scaled / 2), old_aspect
+                    ),
+                ),
+            )
         elif old_aspect < 0.85:
-            new_aspect = max(0.25, min(1.0, random.triangular(
-                old_aspect - (variation_scaled / 2), old_aspect + (variation_scaled * 1.5), old_aspect)))
+            new_aspect = max(
+                0.25,
+                min(
+                    1.0,
+                    random.triangular(
+                        old_aspect - (variation_scaled / 2), old_aspect + (variation_scaled * 1.5), old_aspect
+                    ),
+                ),
+            )
         else:
             new_aspect = random.triangular(old_aspect - variation_scaled, old_aspect + variation_scaled)
 
@@ -175,7 +189,7 @@ class VideoService(SingletonMixin):
     @staticmethod
     def _parse_timestamp_to_frames(timestamp: str, fps: float) -> int:
         parts = timestamp.split(":")
-        seconds = sum(int(x) * 60 ** i for i, x in enumerate(reversed(parts)))
+        seconds = sum(int(x) * 60**i for i, x in enumerate(reversed(parts)))
         return int(seconds * fps)
 
     def extract_clips(
@@ -229,8 +243,15 @@ class VideoService(SingletonMixin):
                         ts_end = "99:99:99" if batch_mode else time_end
                         executor.submit(
                             self._extract_clips_single,
-                            str(vpath), ts_start, ts_end, max_length,
-                            split_at_cuts, remove_borders, crop_variation, fps, out,
+                            str(vpath),
+                            ts_start,
+                            ts_end,
+                            max_length,
+                            split_at_cuts,
+                            remove_borders,
+                            crop_variation,
+                            fps,
+                            out,
                         )
 
                 msg = (
@@ -308,14 +329,21 @@ class VideoService(SingletonMixin):
 
         logger.info(
             "Video '%s' being split into %d clips in %s...",
-            os.path.basename(video_path), len(scene_list_split), output_dir,
+            os.path.basename(video_path),
+            len(scene_list_split),
+            output_dir,
         )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             for scene in scene_list_split:
                 executor.submit(
-                    self._save_clip, scene, video_path, target_fps,
-                    remove_borders, crop_variation, output_dir,
+                    self._save_clip,
+                    scene,
+                    video_path,
+                    target_fps,
+                    remove_borders,
+                    crop_variation,
+                    output_dir,
                 )
 
         video.release()
@@ -374,8 +402,8 @@ class VideoService(SingletonMixin):
         success, frame = video.read()
 
         while success and (frame_number < scene[1]):
-            frame_trimmed = frame[y1:y1 + h1, x1:x1 + w1]
-            writer.write(frame_trimmed[y2:y2 + h2, x2:x2 + w2])
+            frame_trimmed = frame[y1 : y1 + h1, x1 : x1 + w1]
+            writer.write(frame_trimmed[y2 : y2 + h2, x2 : x2 + w2])
             success, frame = video.read()
             frame_number += 1
         writer.release()
@@ -385,9 +413,12 @@ class VideoService(SingletonMixin):
             if int(round(fps)) == target_fps:
                 return
             cmd = [
-                "ffmpeg", "-y",
-                "-i", f"{output_name}{output_ext}",
-                "-filter:v", f"fps={target_fps}",
+                "ffmpeg",
+                "-y",
+                "-i",
+                f"{output_name}{output_ext}",
+                "-filter:v",
+                f"fps={target_fps}",
                 "-an",
                 f"{output_name}_{target_fps}fps{output_ext}",
             ]
@@ -448,8 +479,14 @@ class VideoService(SingletonMixin):
                         ts_end = "99:99:99" if batch_mode else time_end
                         executor.submit(
                             self._save_frames,
-                            str(vpath), ts_start, ts_end, images_per_second,
-                            blur_removal, remove_borders, crop_variation, out,
+                            str(vpath),
+                            ts_start,
+                            ts_end,
+                            images_per_second,
+                            blur_removal,
+                            remove_borders,
+                            crop_variation,
+                            out,
                         )
 
                 msg = (
@@ -505,7 +542,9 @@ class VideoService(SingletonMixin):
 
         logger.info(
             "Video '%s' will be split into %d images in %s...",
-            os.path.basename(video_path), len(frame_list), output_dir,
+            os.path.basename(video_path),
+            len(frame_list),
+            output_dir,
         )
 
         output_list: list[tuple[int, float]] = []
@@ -537,7 +576,7 @@ class VideoService(SingletonMixin):
 
             if remove_borders and success and frame is not None:
                 x1, y1, w1, h1 = self._find_main_contour(frame)
-                frame_cropped = frame[y1:y1 + h1, x1:x1 + w1]
+                frame_cropped = frame[y1 : y1 + h1, x1 : x1 + w1]
             else:
                 frame_cropped = frame if success and frame is not None else None
                 if frame_cropped is not None:
@@ -547,7 +586,7 @@ class VideoService(SingletonMixin):
 
             if frame_cropped is not None:
                 y2, h2, x2, w2 = self._get_random_aspect(h1, w1, crop_variation)
-                cv2.imwrite(filename, frame_cropped[y2:y2 + h2, x2:x2 + w2])
+                cv2.imwrite(filename, frame_cropped[y2 : y2 + h2, x2 : x2 + w2])
         video.release()
 
     def download_videos(

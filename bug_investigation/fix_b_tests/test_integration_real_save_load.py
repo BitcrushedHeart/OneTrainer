@@ -9,6 +9,7 @@ This is the missing piece between the shadow-trainer regression test
 (which proves the *algorithm*) and end-to-end manual training (which
 proves the integration in a real workload).
 """
+
 from __future__ import annotations
 
 import os
@@ -17,9 +18,10 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
-import numpy as np
 import torch
 import torch.nn as nn
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -31,7 +33,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from modules.modelLoader.mixin.InternalModelLoaderMixin import InternalModelLoaderMixin  # noqa: E402
-from modules.modelSaver.mixin.InternalModelSaverMixin import InternalModelSaverMixin     # noqa: E402
+from modules.modelSaver.mixin.InternalModelSaverMixin import InternalModelSaverMixin  # noqa: E402
 
 
 class _Saver(InternalModelSaverMixin):
@@ -59,8 +61,11 @@ def _build_mock_model(with_accumulator: bool):
     opt.zero_grad(set_to_none=True)
 
     train_progress = SimpleNamespace(
-        epoch=2, epoch_step=15, epoch_sample=60, global_step=27,
-        last_action_epoch={'sample': 2, 'validate': 2},
+        epoch=2,
+        epoch_step=15,
+        epoch_sample=60,
+        global_step=27,
+        last_action_epoch={"sample": 2, "validate": 2},
     )
     inner_optimizer_cfg = SimpleNamespace(optimizer="SGD")
     train_config = SimpleNamespace(optimizer=inner_optimizer_cfg)
@@ -127,7 +132,7 @@ def test_real_save_and_load_round_trip_full_payload():
 
         # Train progress round-trips.
         assert dst.train_progress.global_step == 27
-        assert dst.train_progress.last_action_epoch == {'sample': 2, 'validate': 2}
+        assert dst.train_progress.last_action_epoch == {"sample": 2, "validate": 2}
         assert dst.resumed_tensorboard_subdir == "run-1"
 
         # Optimizer state round-trips.
@@ -135,12 +140,9 @@ def test_real_save_and_load_round_trip_full_payload():
         assert "param_group_mapping" in dst.optimizer_state_dict
 
         # Accumulator round-trips.
-        assert dst.accumulator_state is not None, (
-            "accumulator_state not populated by load"
-        )
+        assert dst.accumulator_state is not None, "accumulator_state not populated by load"
         assert dst.accumulator_state["accumulated_loss"] == 0.1234
-        assert dst.accumulator_state["accumulated_dpo_metrics"] == \
-            {"loss": 0.42, "_count": 3}
+        assert dst.accumulator_state["accumulated_dpo_metrics"] == {"loss": 0.42, "_count": 3}
         assert set(dst.accumulator_state["param_grads"].keys()) == {"head.0", "head.1"}
         # Exact tensor equality.
         for k in ("head.0", "head.1"):
@@ -162,8 +164,7 @@ def test_real_save_without_accumulator_does_not_write_file():
     with tempfile.TemporaryDirectory() as td:
         saver._save_internal_data(model, td)
         assert not os.path.exists(os.path.join(td, "accumulator")), (
-            "saver wrote an accumulator directory despite "
-            "model.accumulator_state being None"
+            "saver wrote an accumulator directory despite model.accumulator_state being None"
         )
 
 

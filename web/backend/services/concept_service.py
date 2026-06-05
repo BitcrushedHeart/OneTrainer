@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 
 
 class ConceptService:
-
     def _load_list(self, file_path: str, config_class: Any) -> list[dict]:
         with open(file_path, "r", encoding="utf-8") as fh:
             raw_list: list[dict] = json.load(fh)

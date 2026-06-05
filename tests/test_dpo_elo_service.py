@@ -1,4 +1,5 @@
 """Unit tests for ELO ranking math in DPOService."""
+
 import math
 
 from web.backend.services.dpo_service import DPOService

@@ -43,93 +43,156 @@ STATUS_SYMBOLS = {
 }
 
 EXCLUDED_FIELDS = {
-    "concepts", "samples", "secrets", "cloud", "additional_embeddings",
-    "embedding", "optimizer_defaults", "scheduler_params",
+    "concepts",
+    "samples",
+    "secrets",
+    "cloud",
+    "additional_embeddings",
+    "embedding",
+    "optimizer_defaults",
+    "scheduler_params",
 }
 
 DISPLAY_NAMES = {
-    "training_method": "Training Method", "model_type": "Model Type",
-    "workspace_dir": "Workspace Directory", "cache_dir": "Cache Directory",
-    "debug_mode": "Debug Mode", "debug_dir": "Debug Directory",
-    "tensorboard": "Tensorboard", "tensorboard_expose": "Expose Tensorboard",
-    "tensorboard_always_on": "Always-On Tensorboard", "tensorboard_port": "Tensorboard Port",
-    "validation": "Validation", "validate_after": "Validate After",
+    "training_method": "Training Method",
+    "model_type": "Model Type",
+    "workspace_dir": "Workspace Directory",
+    "cache_dir": "Cache Directory",
+    "debug_mode": "Debug Mode",
+    "debug_dir": "Debug Directory",
+    "tensorboard": "Tensorboard",
+    "tensorboard_expose": "Expose Tensorboard",
+    "tensorboard_always_on": "Always-On Tensorboard",
+    "tensorboard_port": "Tensorboard Port",
+    "validation": "Validation",
+    "validate_after": "Validate After",
     "validate_after_unit": "Validate After Unit",
-    "patience": "Patience", "patience_epochs": "Patience Epochs",
-    "continue_last_backup": "Continue From Last Backup", "prevent_overwrites": "Prevent Overwrites",
+    "patience": "Patience",
+    "patience_epochs": "Patience Epochs",
+    "continue_last_backup": "Continue From Last Backup",
+    "prevent_overwrites": "Prevent Overwrites",
     "include_train_config": "Include Config",
-    "multi_gpu": "Multi-GPU", "device_indexes": "Device Indexes",
+    "multi_gpu": "Multi-GPU",
+    "device_indexes": "Device Indexes",
     "gradient_reduce_precision": "Gradient Reduce Precision",
     "fused_gradient_reduce": "Fused Gradient Reduce",
     "async_gradient_reduce": "Async Gradient Reduce",
     "async_gradient_reduce_buffer": "Buffer Size (MB)",
-    "base_model_name": "Base Model", "output_dtype": "Output Data Type",
-    "output_model_format": "Output Format", "output_model_destination": "Output Destination",
+    "base_model_name": "Base Model",
+    "output_dtype": "Output Data Type",
+    "output_model_format": "Output Format",
+    "output_model_destination": "Output Destination",
     "gradient_checkpointing": "Gradient Checkpointing",
     "enable_async_offloading": "Async Offloading",
     "enable_activation_offloading": "Activation Offloading",
     "layer_offload_fraction": "Layer Offload Fraction",
-    "force_circular_padding": "Force Circular Padding", "compile": "Compile",
+    "force_circular_padding": "Force Circular Padding",
+    "compile": "Compile",
     "concept_file_name": "Concept File",
     "aspect_ratio_bucketing": "Aspect Ratio Bucketing",
-    "latent_caching": "Latent Caching", "clear_cache_before_training": "Clear Cache Before Training",
-    "learning_rate_scheduler": "LR Scheduler", "custom_learning_rate_scheduler": "Custom LR Scheduler",
-    "learning_rate": "Learning Rate", "learning_rate_warmup_steps": "LR Warmup Steps",
-    "learning_rate_cycles": "LR Cycles", "learning_rate_min_factor": "LR Min Factor",
-    "epochs": "Epochs", "batch_size": "Local Batch Size",
+    "latent_caching": "Latent Caching",
+    "clear_cache_before_training": "Clear Cache Before Training",
+    "learning_rate_scheduler": "LR Scheduler",
+    "custom_learning_rate_scheduler": "Custom LR Scheduler",
+    "learning_rate": "Learning Rate",
+    "learning_rate_warmup_steps": "LR Warmup Steps",
+    "learning_rate_cycles": "LR Cycles",
+    "learning_rate_min_factor": "LR Min Factor",
+    "epochs": "Epochs",
+    "batch_size": "Local Batch Size",
     "gradient_accumulation_steps": "Accumulation Steps",
-    "ema": "EMA", "ema_decay": "EMA Decay", "ema_update_step_interval": "EMA Update Interval",
-    "dataloader_threads": "Dataloader Threads", "train_device": "Train Device",
-    "temp_device": "Temp Device", "train_dtype": "Train Data Type",
+    "ema": "EMA",
+    "ema_decay": "EMA Decay",
+    "ema_update_step_interval": "EMA Update Interval",
+    "dataloader_threads": "Dataloader Threads",
+    "train_device": "Train Device",
+    "temp_device": "Temp Device",
+    "train_dtype": "Train Data Type",
     "fallback_train_dtype": "Fallback Train Data Type",
-    "enable_autocast_cache": "Autocast Cache", "only_cache": "Only Cache",
-    "resolution": "Resolution", "frames": "Frames",
-    "mse_strength": "MSE Strength", "mae_strength": "MAE Strength",
-    "log_cosh_strength": "Log Cosh Strength", "huber_strength": "Huber Strength",
-    "huber_delta": "Huber Delta", "vb_loss_strength": "VB Loss Strength",
-    "loss_weight_fn": "Loss Weight Function", "loss_weight_strength": "Loss Weight Strength",
+    "enable_autocast_cache": "Autocast Cache",
+    "only_cache": "Only Cache",
+    "resolution": "Resolution",
+    "frames": "Frames",
+    "mse_strength": "MSE Strength",
+    "mae_strength": "MAE Strength",
+    "log_cosh_strength": "Log Cosh Strength",
+    "huber_strength": "Huber Strength",
+    "huber_delta": "Huber Delta",
+    "vb_loss_strength": "VB Loss Strength",
+    "loss_weight_fn": "Loss Weight Function",
+    "loss_weight_strength": "Loss Weight Strength",
     "dropout_probability": "Dropout Probability",
-    "loss_scaler": "Loss Scaler", "learning_rate_scaler": "LR Scaler",
+    "loss_scaler": "Loss Scaler",
+    "learning_rate_scaler": "LR Scaler",
     "clip_grad_norm": "Clip Grad Norm",
-    "layer_filter": "Layer Filter", "layer_filter_preset": "Layer Filter Preset",
+    "layer_filter": "Layer Filter",
+    "layer_filter_preset": "Layer Filter Preset",
     "layer_filter_regex": "Regex Filter",
-    "offset_noise_weight": "Offset Noise Weight", "generalized_offset_noise": "Generalized Offset Noise",
+    "offset_noise_weight": "Offset Noise Weight",
+    "generalized_offset_noise": "Generalized Offset Noise",
     "perturbation_noise_weight": "Perturbation Noise Weight",
     "rescale_noise_scheduler_to_zero_terminal_snr": "Rescale Noise to Zero Terminal SNR",
-    "force_v_prediction": "Force V-Prediction", "force_epsilon_prediction": "Force Epsilon Prediction",
+    "force_v_prediction": "Force V-Prediction",
+    "force_epsilon_prediction": "Force Epsilon Prediction",
     "timestep_distribution": "Timestep Distribution",
-    "min_noising_strength": "Min Noising Strength", "max_noising_strength": "Max Noising Strength",
-    "noising_weight": "Noising Weight", "noising_bias": "Noising Bias",
-    "timestep_shift": "Timestep Shift", "dynamic_timestep_shifting": "Dynamic Timestep Shifting",
-    "masked_training": "Masked Training", "unmasked_probability": "Unmasked Probability",
-    "unmasked_weight": "Unmasked Weight", "normalize_masked_area_loss": "Normalize Masked Area Loss",
+    "min_noising_strength": "Min Noising Strength",
+    "max_noising_strength": "Max Noising Strength",
+    "noising_weight": "Noising Weight",
+    "noising_bias": "Noising Bias",
+    "timestep_shift": "Timestep Shift",
+    "dynamic_timestep_shifting": "Dynamic Timestep Shifting",
+    "masked_training": "Masked Training",
+    "unmasked_probability": "Unmasked Probability",
+    "unmasked_weight": "Unmasked Weight",
+    "normalize_masked_area_loss": "Normalize Masked Area Loss",
     "masked_prior_preservation_weight": "Prior Preservation Weight",
     "custom_conditioning_image": "Custom Conditioning Image",
     "embedding_learning_rate": "Embedding Learning Rate",
     "preserve_embedding_norm": "Preserve Embedding Norm",
     "embedding_weight_dtype": "Embedding Data Type",
-    "peft_type": "PEFT Type", "lora_model_name": "LoRA Model",
-    "lora_rank": "LoRA Rank", "lora_alpha": "LoRA Alpha",
-    "lora_decompose": "LoRA Decompose", "lora_decompose_norm_epsilon": "Decompose Norm Epsilon",
+    "peft_type": "PEFT Type",
+    "lora_model_name": "LoRA Model",
+    "lora_rank": "LoRA Rank",
+    "lora_alpha": "LoRA Alpha",
+    "lora_decompose": "LoRA Decompose",
+    "lora_decompose_norm_epsilon": "Decompose Norm Epsilon",
     "lora_decompose_output_axis": "Decompose Output Axis",
-    "lora_weight_dtype": "LoRA Data Type", "bundle_additional_embeddings": "Bundle Embeddings",
-    "oft_block_size": "OFT Block Size", "oft_coft": "OFT CoFT",
-    "coft_eps": "CoFT Epsilon", "oft_block_share": "OFT Block Share",
+    "lora_weight_dtype": "LoRA Data Type",
+    "bundle_additional_embeddings": "Bundle Embeddings",
+    "oft_block_size": "OFT Block Size",
+    "oft_coft": "OFT CoFT",
+    "coft_eps": "CoFT Epsilon",
+    "oft_block_share": "OFT Block Share",
     "sample_definition_file_name": "Sample Definition File",
-    "sample_after": "Sample After", "sample_after_unit": "Sample After Unit",
-    "sample_skip_first": "Skip First Samples", "sample_image_format": "Image Format",
-    "sample_video_format": "Video Format", "sample_audio_format": "Audio Format",
-    "samples_to_tensorboard": "Samples to Tensorboard", "non_ema_sampling": "Non-EMA Sampling",
-    "backup_after": "Backup After", "backup_after_unit": "Backup After Unit",
-    "rolling_backup": "Rolling Backup", "rolling_backup_count": "Rolling Backup Count",
+    "sample_after": "Sample After",
+    "sample_after_unit": "Sample After Unit",
+    "sample_skip_first": "Skip First Samples",
+    "sample_image_format": "Image Format",
+    "sample_video_format": "Video Format",
+    "sample_audio_format": "Audio Format",
+    "samples_to_tensorboard": "Samples to Tensorboard",
+    "non_ema_sampling": "Non-EMA Sampling",
+    "backup_after": "Backup After",
+    "backup_after_unit": "Backup After Unit",
+    "rolling_backup": "Rolling Backup",
+    "rolling_backup_count": "Rolling Backup Count",
     "backup_before_save": "Backup Before Save",
-    "save_every": "Save Every", "save_every_unit": "Save Every Unit",
-    "save_skip_first": "Skip First Saves", "save_filename_prefix": "Save Filename Prefix",
-    "model_name": "Model Name", "include": "Include", "train": "Train",
-    "stop_training_after": "Stop Training After", "stop_training_after_unit": "Stop After Unit",
-    "weight_dtype": "Data Type", "train_embedding": "Train Embedding",
-    "attention_mask": "Attention Mask", "guidance_scale": "Guidance Scale",
-    "optimizer": "Optimizer", "weight_decay": "Weight Decay", "eps": "Epsilon",
+    "save_every": "Save Every",
+    "save_every_unit": "Save Every Unit",
+    "save_skip_first": "Skip First Saves",
+    "save_filename_prefix": "Save Filename Prefix",
+    "model_name": "Model Name",
+    "include": "Include",
+    "train": "Train",
+    "stop_training_after": "Stop Training After",
+    "stop_training_after_unit": "Stop After Unit",
+    "weight_dtype": "Data Type",
+    "train_embedding": "Train Embedding",
+    "attention_mask": "Attention Mask",
+    "guidance_scale": "Guidance Scale",
+    "optimizer": "Optimizer",
+    "weight_decay": "Weight Decay",
+    "eps": "Epsilon",
     "text_encoder_layer_skip": "TE1 Layer Skip",
     "text_encoder_sequence_length": "TE1 Sequence Length",
     "text_encoder_2_layer_skip": "TE2 Layer Skip",
@@ -139,95 +202,224 @@ DISPLAY_NAMES = {
 }
 
 PATH_FIELDS = {
-    "workspace_dir": "dir", "cache_dir": "dir", "debug_dir": "dir",
-    "base_model_name": "file", "output_model_destination": "file",
-    "concept_file_name": "file", "lora_model_name": "file",
-    "sample_definition_file_name": "file", "model_name": "file",
+    "workspace_dir": "dir",
+    "cache_dir": "dir",
+    "debug_dir": "dir",
+    "base_model_name": "file",
+    "output_model_destination": "file",
+    "concept_file_name": "file",
+    "lora_model_name": "file",
+    "sample_definition_file_name": "file",
+    "model_name": "file",
 }
 
 # fork authors: prefix custom fields (e.g. myfork_*) for auto-grouped sections
-SECTION_MAP = OrderedDict([
-    ("General", [
-        "training_method", "model_type", "workspace_dir", "cache_dir",
-        "continue_last_backup", "prevent_overwrites",
-        "tensorboard", "tensorboard_expose", "tensorboard_always_on", "tensorboard_port",
-        "validation", "validate_after", "validate_after_unit",
-        "patience", "patience_epochs",
-        "debug_mode", "debug_dir", "only_cache", "include_train_config",
-    ]),
-    ("Multi-GPU", [
-        "multi_gpu", "device_indexes",
-        "gradient_reduce_precision", "fused_gradient_reduce",
-        "async_gradient_reduce", "async_gradient_reduce_buffer",
-    ]),
-    ("Model", [
-        "base_model_name", "output_model_destination", "output_dtype", "output_model_format",
-        "gradient_checkpointing", "enable_async_offloading", "enable_activation_offloading",
-        "layer_offload_fraction", "force_circular_padding", "compile",
-    ]),
-    ("Concepts", ["concept_file_name"]),
-    ("Data", [
-        "aspect_ratio_bucketing", "latent_caching", "clear_cache_before_training",
-    ]),
-    ("Training", [
-        "learning_rate", "epochs", "batch_size", "gradient_accumulation_steps",
-        "learning_rate_scheduler", "custom_learning_rate_scheduler",
-        "learning_rate_warmup_steps", "learning_rate_cycles", "learning_rate_min_factor",
-        "ema", "ema_decay", "ema_update_step_interval",
-        "dataloader_threads", "train_device", "temp_device",
-        "train_dtype", "fallback_train_dtype", "enable_autocast_cache",
-        "resolution", "frames",
-        "mse_strength", "mae_strength", "log_cosh_strength",
-        "huber_strength", "huber_delta", "vb_loss_strength",
-        "loss_weight_fn", "loss_weight_strength",
-        "dropout_probability", "loss_scaler", "learning_rate_scaler", "clip_grad_norm",
-    ]),
-    ("Layer Filter", ["layer_filter", "layer_filter_preset", "layer_filter_regex"]),
-    ("Noise", [
-        "offset_noise_weight", "generalized_offset_noise", "perturbation_noise_weight",
-        "rescale_noise_scheduler_to_zero_terminal_snr",
-        "force_v_prediction", "force_epsilon_prediction",
-        "timestep_distribution", "min_noising_strength", "max_noising_strength",
-        "noising_weight", "noising_bias", "timestep_shift", "dynamic_timestep_shifting",
-    ]),
-    ("Model Parts", [
-        "unet", "prior", "transformer", "quantization",
-        "text_encoder", "text_encoder_layer_skip", "text_encoder_sequence_length",
-        "text_encoder_2", "text_encoder_2_layer_skip", "text_encoder_2_sequence_length",
-        "text_encoder_3", "text_encoder_3_layer_skip",
-        "text_encoder_4", "text_encoder_4_layer_skip",
-        "vae", "effnet_encoder", "decoder",
-        "decoder_text_encoder", "decoder_vqgan",
-    ]),
-    ("Masked Training", [
-        "masked_training", "unmasked_probability", "unmasked_weight",
-        "normalize_masked_area_loss", "masked_prior_preservation_weight",
-        "custom_conditioning_image",
-    ]),
-    ("Embedding", ["embedding_learning_rate", "preserve_embedding_norm", "embedding_weight_dtype"]),
-    ("LoRA / OFT", [
-        "peft_type", "lora_model_name", "lora_rank", "lora_alpha",
-        "lora_decompose", "lora_decompose_norm_epsilon", "lora_decompose_output_axis",
-        "lora_weight_dtype", "bundle_additional_embeddings",
-        "oft_block_size", "oft_coft", "coft_eps", "oft_block_share",
-    ]),
-    ("Optimizer", ["optimizer"]),
-    ("Sampling", [
-        "sample_definition_file_name", "sample_after", "sample_after_unit",
-        "sample_skip_first", "sample_image_format", "sample_video_format",
-        "sample_audio_format", "samples_to_tensorboard", "non_ema_sampling",
-    ]),
-    ("Backup", [
-        "backup_after", "backup_after_unit", "rolling_backup", "rolling_backup_count",
-        "backup_before_save", "save_every", "save_every_unit",
-        "save_skip_first", "save_filename_prefix",
-    ]),
-])
+SECTION_MAP = OrderedDict(
+    [
+        (
+            "General",
+            [
+                "training_method",
+                "model_type",
+                "workspace_dir",
+                "cache_dir",
+                "continue_last_backup",
+                "prevent_overwrites",
+                "tensorboard",
+                "tensorboard_expose",
+                "tensorboard_always_on",
+                "tensorboard_port",
+                "validation",
+                "validate_after",
+                "validate_after_unit",
+                "patience",
+                "patience_epochs",
+                "debug_mode",
+                "debug_dir",
+                "only_cache",
+                "include_train_config",
+            ],
+        ),
+        (
+            "Multi-GPU",
+            [
+                "multi_gpu",
+                "device_indexes",
+                "gradient_reduce_precision",
+                "fused_gradient_reduce",
+                "async_gradient_reduce",
+                "async_gradient_reduce_buffer",
+            ],
+        ),
+        (
+            "Model",
+            [
+                "base_model_name",
+                "output_model_destination",
+                "output_dtype",
+                "output_model_format",
+                "gradient_checkpointing",
+                "enable_async_offloading",
+                "enable_activation_offloading",
+                "layer_offload_fraction",
+                "force_circular_padding",
+                "compile",
+            ],
+        ),
+        ("Concepts", ["concept_file_name"]),
+        (
+            "Data",
+            [
+                "aspect_ratio_bucketing",
+                "latent_caching",
+                "clear_cache_before_training",
+            ],
+        ),
+        (
+            "Training",
+            [
+                "learning_rate",
+                "epochs",
+                "batch_size",
+                "gradient_accumulation_steps",
+                "learning_rate_scheduler",
+                "custom_learning_rate_scheduler",
+                "learning_rate_warmup_steps",
+                "learning_rate_cycles",
+                "learning_rate_min_factor",
+                "ema",
+                "ema_decay",
+                "ema_update_step_interval",
+                "dataloader_threads",
+                "train_device",
+                "temp_device",
+                "train_dtype",
+                "fallback_train_dtype",
+                "enable_autocast_cache",
+                "resolution",
+                "frames",
+                "mse_strength",
+                "mae_strength",
+                "log_cosh_strength",
+                "huber_strength",
+                "huber_delta",
+                "vb_loss_strength",
+                "loss_weight_fn",
+                "loss_weight_strength",
+                "dropout_probability",
+                "loss_scaler",
+                "learning_rate_scaler",
+                "clip_grad_norm",
+            ],
+        ),
+        ("Layer Filter", ["layer_filter", "layer_filter_preset", "layer_filter_regex"]),
+        (
+            "Noise",
+            [
+                "offset_noise_weight",
+                "generalized_offset_noise",
+                "perturbation_noise_weight",
+                "rescale_noise_scheduler_to_zero_terminal_snr",
+                "force_v_prediction",
+                "force_epsilon_prediction",
+                "timestep_distribution",
+                "min_noising_strength",
+                "max_noising_strength",
+                "noising_weight",
+                "noising_bias",
+                "timestep_shift",
+                "dynamic_timestep_shifting",
+            ],
+        ),
+        (
+            "Model Parts",
+            [
+                "unet",
+                "prior",
+                "transformer",
+                "quantization",
+                "text_encoder",
+                "text_encoder_layer_skip",
+                "text_encoder_sequence_length",
+                "text_encoder_2",
+                "text_encoder_2_layer_skip",
+                "text_encoder_2_sequence_length",
+                "text_encoder_3",
+                "text_encoder_3_layer_skip",
+                "text_encoder_4",
+                "text_encoder_4_layer_skip",
+                "vae",
+                "effnet_encoder",
+                "decoder",
+                "decoder_text_encoder",
+                "decoder_vqgan",
+            ],
+        ),
+        (
+            "Masked Training",
+            [
+                "masked_training",
+                "unmasked_probability",
+                "unmasked_weight",
+                "normalize_masked_area_loss",
+                "masked_prior_preservation_weight",
+                "custom_conditioning_image",
+            ],
+        ),
+        ("Embedding", ["embedding_learning_rate", "preserve_embedding_norm", "embedding_weight_dtype"]),
+        (
+            "LoRA / OFT",
+            [
+                "peft_type",
+                "lora_model_name",
+                "lora_rank",
+                "lora_alpha",
+                "lora_decompose",
+                "lora_decompose_norm_epsilon",
+                "lora_decompose_output_axis",
+                "lora_weight_dtype",
+                "bundle_additional_embeddings",
+                "oft_block_size",
+                "oft_coft",
+                "coft_eps",
+                "oft_block_share",
+            ],
+        ),
+        ("Optimizer", ["optimizer"]),
+        (
+            "Sampling",
+            [
+                "sample_definition_file_name",
+                "sample_after",
+                "sample_after_unit",
+                "sample_skip_first",
+                "sample_image_format",
+                "sample_video_format",
+                "sample_audio_format",
+                "samples_to_tensorboard",
+                "non_ema_sampling",
+            ],
+        ),
+        (
+            "Backup",
+            [
+                "backup_after",
+                "backup_after_unit",
+                "rolling_backup",
+                "rolling_backup_count",
+                "backup_before_save",
+                "save_every",
+                "save_every_unit",
+                "save_skip_first",
+                "save_filename_prefix",
+            ],
+        ),
+    ]
+)
 
 
 class _FieldInfo:
-    __slots__ = ("value_var", "widget", "field_type", "nullable", "path",
-                 "indicator", "reset_btn", "is_overridden")
+    __slots__ = ("value_var", "widget", "field_type", "nullable", "path", "indicator", "reset_btn", "is_overridden")
 
     def __init__(self, value_var, widget, field_type, nullable, path, indicator, reset_btn):
         self.value_var = value_var
@@ -252,13 +444,15 @@ def _get_concept_preview(concept_dict: dict) -> Image.Image:
     preview_path = None
     if concept_path and os.path.isdir(concept_path):
         for p in pathlib.Path(concept_path).glob(glob_pattern):
-            if any(part.startswith('.') for part in p.relative_to(concept_path).parent.parts):
+            if any(part.startswith(".") for part in p.relative_to(concept_path).parent.parts):
                 continue
             ext = os.path.splitext(p)[1]
-            if (p.is_file()
-                    and path_util.is_supported_image_extension(ext)
-                    and not p.name.endswith("-masklabel.png")
-                    and not p.name.endswith("-condlabel.png")):
+            if (
+                p.is_file()
+                and path_util.is_supported_image_extension(ext)
+                and not p.name.endswith("-masklabel.png")
+                and not p.name.endswith("-condlabel.png")
+            ):
                 preview_path = str(p)
                 break
 
@@ -271,19 +465,20 @@ def _get_concept_preview(concept_dict: dict) -> Image.Image:
         image = Image.new("RGBA", (CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE), (200, 200, 200, 255))
 
     size = min(image.width, image.height)
-    image = image.crop((
-        (image.width - size) // 2,
-        (image.height - size) // 2,
-        (image.width - size) // 2 + size,
-        (image.height - size) // 2 + size,
-    ))
+    image = image.crop(
+        (
+            (image.width - size) // 2,
+            (image.height - size) // 2,
+            (image.width - size) // 2 + size,
+            (image.height - size) // 2 + size,
+        )
+    )
     return image.resize((CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE), Image.Resampling.BILINEAR)
 
 
 class _QueueConceptCard(ctk.CTkFrame):
     def __init__(self, master, concept_dict: dict, index: int, on_toggle):
-        super().__init__(master, width=CONCEPT_THUMB_SIZE + 20, height=CONCEPT_THUMB_SIZE + 50,
-                         corner_radius=8)
+        super().__init__(master, width=CONCEPT_THUMB_SIZE + 20, height=CONCEPT_THUMB_SIZE + 50, corner_radius=8)
         self.concept_dict = concept_dict
         self.index = index
         self.grid_propagate(False)
@@ -293,16 +488,17 @@ class _QueueConceptCard(ctk.CTkFrame):
             light_image=_get_concept_preview(concept_dict),
             size=(CONCEPT_THUMB_SIZE, CONCEPT_THUMB_SIZE),
         )
-        ctk.CTkLabel(self, text="", image=self._ctk_image,
-                     height=CONCEPT_THUMB_SIZE, width=CONCEPT_THUMB_SIZE).grid(row=0, column=0)
+        ctk.CTkLabel(self, text="", image=self._ctk_image, height=CONCEPT_THUMB_SIZE, width=CONCEPT_THUMB_SIZE).grid(
+            row=0, column=0
+        )
 
         name = concept_dict.get("name") or os.path.basename(concept_dict.get("path", "")) or f"Concept {index}"
-        ctk.CTkLabel(self, text=name, wraplength=CONCEPT_THUMB_SIZE + 10,
-                     font=ctk.CTkFont(size=11)).grid(row=1, column=0, pady=(2, 0))
+        ctk.CTkLabel(self, text=name, wraplength=CONCEPT_THUMB_SIZE + 10, font=ctk.CTkFont(size=11)).grid(
+            row=1, column=0, pady=(2, 0)
+        )
 
         self.enabled_var = tk.BooleanVar(value=concept_dict.get("enabled", True))
-        self._switch = ctk.CTkSwitch(self, variable=self.enabled_var, text="", width=40,
-                                      command=on_toggle)
+        self._switch = ctk.CTkSwitch(self, variable=self.enabled_var, text="", width=40, command=on_toggle)
         self._switch.grid(row=2, column=0, pady=(2, 4))
 
     def place_in_grid(self, visible_index: int):
@@ -387,13 +583,16 @@ class QueueWindow(ctk.CTkToplevel):
 
         r = 0
         ctk.CTkLabel(sf, text="Queue Settings", font=ctk.CTkFont(weight="bold")).grid(
-            row=r, column=0, columnspan=2, sticky="w", pady=(0, PAD))
+            row=r, column=0, columnspan=2, sticky="w", pady=(0, PAD)
+        )
         r += 1
-        ctk.CTkCheckBox(sf, text="Retry on error", variable=self._retry_var,
-                         command=self._save_settings).grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
+        ctk.CTkCheckBox(sf, text="Retry on error", variable=self._retry_var, command=self._save_settings).grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=2
+        )
         r += 1
-        ctk.CTkCheckBox(sf, text="Retry from backup", variable=self._retry_backup_var,
-                         command=self._save_settings).grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
+        ctk.CTkCheckBox(
+            sf, text="Retry from backup", variable=self._retry_backup_var, command=self._save_settings
+        ).grid(row=r, column=0, columnspan=2, sticky="w", pady=2)
         r += 1
         ctk.CTkLabel(sf, text="Max retries").grid(row=r, column=0, sticky="w", pady=2)
         ctk.CTkEntry(sf, textvariable=self._max_retries_var, width=50).grid(row=r, column=1, sticky="w", padx=PAD)
@@ -431,8 +630,7 @@ class QueueWindow(ctk.CTkToplevel):
             frame.grid_columnconfigure(1, weight=1)
             color = STATUS_COLORS.get(entry.status, "gray60")
             symbol = STATUS_SYMBOLS.get(entry.status, "?")
-            status_lbl = ctk.CTkLabel(frame, text=symbol, text_color=color, width=22,
-                                       font=ctk.CTkFont(size=14))
+            status_lbl = ctk.CTkLabel(frame, text=symbol, text_color=color, width=22, font=ctk.CTkFont(size=14))
             status_lbl.grid(row=0, column=0, padx=(PAD, 4))
             name_lbl = ctk.CTkLabel(frame, text=entry.name or "(unnamed)", anchor="w")
             name_lbl.grid(row=0, column=1, sticky="ew", pady=3)
@@ -491,7 +689,8 @@ class QueueWindow(ctk.CTkToplevel):
         self._name_var = tk.StringVar()
         self._name_var.trace_add("write", lambda *_: self._on_name_change())
         ctk.CTkEntry(name_frame, textvariable=self._name_var, font=ctk.CTkFont(size=13)).grid(
-            row=0, column=1, sticky="ew")
+            row=0, column=1, sticky="ew"
+        )
 
         self._editor_scroll = ctk.CTkScrollableFrame(main, fg_color="transparent")
         self._editor_scroll.grid(row=1, column=0, sticky="nsew", padx=PAD, pady=(0, PAD))
@@ -502,6 +701,7 @@ class QueueWindow(ctk.CTkToplevel):
     def _build_override_sections(self):
         ref_config = TrainConfig.default_values()
         from modules.util.config.BaseConfig import BaseConfig
+
         assigned = set()
         section_row = 0
         for section_name, field_names in SECTION_MAP.items():
@@ -515,12 +715,14 @@ class QueueWindow(ctk.CTkToplevel):
                     sub_config = getattr(ref_config, field_name)
                     display = field_name.replace("_", " ").title()
                     ctk.CTkLabel(content, text=display, font=ctk.CTkFont(size=12, weight="bold")).grid(
-                        row=field_row, column=0, columnspan=5, sticky="w", padx=PAD, pady=(PAD, 2))
+                        row=field_row, column=0, columnspan=5, sticky="w", padx=PAD, pady=(PAD, 2)
+                    )
                     field_row += 1
                     for sub_name in sub_config.types:
                         path = f"{field_name}.{sub_name}"
-                        self._create_field_row(content, path, sub_config.types[sub_name],
-                                               sub_config.nullables[sub_name], field_row)
+                        self._create_field_row(
+                            content, path, sub_config.types[sub_name], sub_config.nullables[sub_name], field_row
+                        )
                         field_row += 1
                     assigned.add(field_name)
                 else:
@@ -554,8 +756,9 @@ class QueueWindow(ctk.CTkToplevel):
         header.grid_columnconfigure(1, weight=1)
         arrow_lbl = ctk.CTkLabel(header, text="\u25b6", width=20, font=ctk.CTkFont(size=11))
         arrow_lbl.grid(row=0, column=0, padx=(PAD, 0), pady=4)
-        ctk.CTkLabel(header, text=section_name, font=ctk.CTkFont(size=13, weight="bold"),
-                     anchor="w").grid(row=0, column=1, sticky="w", padx=PAD, pady=4)
+        ctk.CTkLabel(header, text=section_name, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(
+            row=0, column=1, sticky="w", padx=PAD, pady=4
+        )
 
         content = ctk.CTkFrame(container, fg_color="transparent")
         content.grid_columnconfigure(0, weight=0, minsize=18)
@@ -577,6 +780,7 @@ class QueueWindow(ctk.CTkToplevel):
                 else:
                     cont.grid_remove()
                     arrow.configure(text="\u25b6")
+
             return toggle
 
         toggle_fn = make_toggle(content, arrow_lbl)
@@ -593,8 +797,7 @@ class QueueWindow(ctk.CTkToplevel):
         indicator = ctk.CTkLabel(parent, text="  ", width=16, font=ctk.CTkFont(size=10))
         indicator.grid(row=row, column=0, padx=(2, 0), pady=3, sticky="w")
 
-        ctk.CTkLabel(parent, text=label_text, anchor="w").grid(
-            row=row, column=1, padx=(0, PAD), pady=3, sticky="w")
+        ctk.CTkLabel(parent, text=label_text, anchor="w").grid(row=row, column=1, padx=(0, PAD), pady=3, sticky="w")
 
         if field_type is bool:
             value_var = tk.BooleanVar(value=False)
@@ -613,23 +816,37 @@ class QueueWindow(ctk.CTkToplevel):
         browse_col = 3
         if leaf in PATH_FIELDS:
             mode = PATH_FIELDS[leaf]
+
             def _browse(m=mode, v=value_var):
                 if m == "dir":
                     chosen = filedialog.askdirectory()
                 else:
-                    chosen = filedialog.askopenfilename(filetypes=[
-                        ("All Files", "*.*"), ("Safetensors", "*.safetensors"),
-                        ("Checkpoint", "*.ckpt *.pt *.bin"), ("JSON", "*.json"),
-                    ])
+                    chosen = filedialog.askopenfilename(
+                        filetypes=[
+                            ("All Files", "*.*"),
+                            ("Safetensors", "*.safetensors"),
+                            ("Checkpoint", "*.ckpt *.pt *.bin"),
+                            ("JSON", "*.json"),
+                        ]
+                    )
                 if chosen:
                     v.set(str(chosen))
+
             ctk.CTkButton(parent, text="...", width=30, height=26, command=_browse).grid(
-                row=row, column=browse_col, padx=(0, 2), pady=3)
+                row=row, column=browse_col, padx=(0, 2), pady=3
+            )
             browse_col = 4
 
-        reset_btn = ctk.CTkButton(parent, text="\u21ba", width=30, height=26, fg_color="transparent",
-                                   text_color=("gray40", "gray60"), hover_color=("gray80", "gray30"),
-                                   command=lambda: self._reset_field(path))
+        reset_btn = ctk.CTkButton(
+            parent,
+            text="\u21ba",
+            width=30,
+            height=26,
+            fg_color="transparent",
+            text_color=("gray40", "gray60"),
+            hover_color=("gray80", "gray30"),
+            command=lambda: self._reset_field(path),
+        )
         reset_btn.grid(row=row, column=browse_col if leaf not in PATH_FIELDS else 4, padx=(0, PAD), pady=3)
 
         self._fields[path] = _FieldInfo(value_var, widget, field_type, nullable, path, indicator, reset_btn)
@@ -639,43 +856,51 @@ class QueueWindow(ctk.CTkToplevel):
 
     def _build_concept_grid(self, content, start_row: int) -> int:
         ctk.CTkFrame(content, height=1, fg_color="gray40").grid(
-            row=start_row, column=0, columnspan=5, sticky="ew", padx=PAD, pady=(PAD, 4))
+            row=start_row, column=0, columnspan=5, sticky="ew", padx=PAD, pady=(PAD, 4)
+        )
         start_row += 1
 
         header_row = ctk.CTkFrame(content, fg_color="transparent")
         header_row.grid(row=start_row, column=0, columnspan=5, sticky="ew")
         header_row.grid_columnconfigure(1, weight=1)
 
-        self._concept_override_indicator = ctk.CTkLabel(
-            header_row, text="", width=16, font=ctk.CTkFont(size=10))
+        self._concept_override_indicator = ctk.CTkLabel(header_row, text="", width=16, font=ctk.CTkFont(size=10))
         self._concept_override_indicator.grid(row=0, column=0, padx=(2, 0))
 
-        ctk.CTkLabel(header_row, text="Concept Selection",
-                     font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(
-            row=0, column=1, sticky="w", padx=PAD)
+        ctk.CTkLabel(header_row, text="Concept Selection", font=ctk.CTkFont(size=12, weight="bold"), anchor="w").grid(
+            row=0, column=1, sticky="w", padx=PAD
+        )
 
         self._concept_reset_btn = ctk.CTkButton(
-            header_row, text="\u21ba", width=30, height=26, fg_color="transparent",
-            text_color=("gray40", "gray60"), hover_color=("gray80", "gray30"),
-            command=self._reset_concept_overrides)
+            header_row,
+            text="\u21ba",
+            width=30,
+            height=26,
+            fg_color="transparent",
+            text_color=("gray40", "gray60"),
+            hover_color=("gray80", "gray30"),
+            command=self._reset_concept_overrides,
+        )
         self._concept_reset_btn.grid(row=0, column=2, padx=(0, PAD))
         start_row += 1
 
         self._concept_grid = ctk.CTkFrame(content, fg_color="transparent")
-        self._concept_grid.grid(row=start_row, column=0, columnspan=5, sticky="ew",
-                                padx=(PAD, 0), pady=(4, PAD))
+        self._concept_grid.grid(row=start_row, column=0, columnspan=5, sticky="ew", padx=(PAD, 0), pady=(4, PAD))
         start_row += 1
 
         self._concept_empty_label = ctk.CTkLabel(
-            self._concept_grid, text="Select a queue entry to see concepts",
-            text_color="gray50", font=ctk.CTkFont(size=12))
+            self._concept_grid,
+            text="Select a queue entry to see concepts",
+            text_color="gray50",
+            font=ctk.CTkFont(size=12),
+        )
         self._concept_empty_label.grid(row=0, column=0, pady=PAD)
 
         return start_row
 
     def _load_concepts_from_file(self, path: str) -> list[dict]:
         try:
-            with open(path, 'r') as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return []
@@ -702,8 +927,7 @@ class QueueWindow(ctk.CTkToplevel):
         file_concepts = self._load_concepts_from_file(concept_path)
 
         if not file_concepts:
-            self._concept_empty_label.configure(
-                text=f"No concepts found in: {os.path.basename(concept_path)}")
+            self._concept_empty_label.configure(text=f"No concepts found in: {os.path.basename(concept_path)}")
             self._concept_empty_label.grid(row=0, column=0, pady=PAD)
             return
 
@@ -735,9 +959,7 @@ class QueueWindow(ctk.CTkToplevel):
             if i < len(self._loaded_concepts):
                 self._loaded_concepts[i]["enabled"] = card.enabled_var.get()
 
-        entry.overrides["concepts"] = [
-            {**c} for c in self._loaded_concepts
-        ]
+        entry.overrides["concepts"] = [{**c} for c in self._loaded_concepts]
         self.queue_manager.save()
 
         self._concepts_overridden = True
@@ -974,15 +1196,18 @@ class QueueWindow(ctk.CTkToplevel):
         btn_frame = ctk.CTkFrame(footer, fg_color="transparent")
         btn_frame.grid(row=0, column=1, padx=PAD, pady=PAD)
 
-        self._start_btn = ctk.CTkButton(btn_frame, text="Start Queue", fg_color="#198754",
-                                         hover_color="#146c43", command=self._start_queue)
+        self._start_btn = ctk.CTkButton(
+            btn_frame, text="Start Queue", fg_color="#198754", hover_color="#146c43", command=self._start_queue
+        )
         self._start_btn.grid(row=0, column=0, padx=3)
-        self._stop_run_btn = ctk.CTkButton(btn_frame, text="Stop Run", fg_color="#fd7e14",
-                                            hover_color="#e06c0a", command=self._stop_run)
+        self._stop_run_btn = ctk.CTkButton(
+            btn_frame, text="Stop Run", fg_color="#fd7e14", hover_color="#e06c0a", command=self._stop_run
+        )
         self._stop_run_btn.grid(row=0, column=1, padx=3)
         self._stop_run_btn.grid_remove()
-        self._stop_queue_btn = ctk.CTkButton(btn_frame, text="Stop Queue", fg_color="#dc3545",
-                                              hover_color="#bb2d3b", command=self._stop_queue)
+        self._stop_queue_btn = ctk.CTkButton(
+            btn_frame, text="Stop Queue", fg_color="#dc3545", hover_color="#bb2d3b", command=self._stop_queue
+        )
         self._stop_queue_btn.grid(row=0, column=2, padx=3)
         self._stop_queue_btn.grid_remove()
         self._reset_btn = ctk.CTkButton(btn_frame, text="Reset All", command=self._reset_all)
@@ -1006,8 +1231,9 @@ class QueueWindow(ctk.CTkToplevel):
                 name = entry.name if entry else eid
                 if errors:
                     msg_parts.append(f"{name}:\n" + "\n".join(f"  \u2022 {e}" for e in errors))
-            if not messagebox.askyesno("Validation Errors",
-                                        "Critical errors found:\n\n" + "\n\n".join(msg_parts) + "\n\nStart anyway?"):
+            if not messagebox.askyesno(
+                "Validation Errors", "Critical errors found:\n\n" + "\n\n".join(msg_parts) + "\n\nStart anyway?"
+            ):
                 return
         elif results:
             msg_parts = []
@@ -1020,7 +1246,8 @@ class QueueWindow(ctk.CTkToplevel):
                 messagebox.showinfo("Validation Warnings", "\n\n".join(msg_parts))
 
         self._executor = QueueExecutor(
-            queue_manager=self.queue_manager, global_config=self.train_config,
+            queue_manager=self.queue_manager,
+            global_config=self.train_config,
             on_entry_start=lambda e, i, t: self.after(0, lambda: self._on_entry_start(e, i, t)),
             on_entry_complete=lambda e: self.after(0, lambda: self._on_entry_done(e)),
             on_entry_failed=lambda e, m: self.after(0, lambda: self._on_entry_done(e)),
@@ -1096,7 +1323,8 @@ class QueueWindow(ctk.CTkToplevel):
     def _export_queue(self):
         path = filedialog.asksaveasfilename(
             filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
-            initialfile="queue.json", defaultextension=".json",
+            initialfile="queue.json",
+            defaultextension=".json",
         )
         if path:
             self.queue_manager.export_to_file(path)
@@ -1112,8 +1340,9 @@ class QueueWindow(ctk.CTkToplevel):
             return
         self._refresh_entry_list()
         if warnings:
-            messagebox.showwarning("Import Warnings",
-                                   f"{len(warnings)} path warning(s):\n\n" + "\n".join(warnings[:10]))
+            messagebox.showwarning(
+                "Import Warnings", f"{len(warnings)} path warning(s):\n\n" + "\n".join(warnings[:10])
+            )
 
     def _on_close(self):
         if self._executor_thread is not None:

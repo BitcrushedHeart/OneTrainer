@@ -8,6 +8,7 @@ steps proceed normally under the new acc value.
 This matches the explicit user preference: losing hours of in-flight
 gradient state is worse than one off-spec optimizer step.
 """
+
 from __future__ import annotations
 
 import math
@@ -19,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from _shadow_trainer import (   # noqa: E402
+from _shadow_trainer import (  # noqa: E402
     ShadowTrainer,
     fresh_optimizer,
     make_batches,
@@ -35,11 +36,11 @@ def _build(enable_fix: bool, acc: int):
     model = make_seeded_model(SEED)
     opt = fresh_optimizer(model)
     return ShadowTrainer(
-        model, opt,
+        model,
+        opt,
         accumulation_steps=acc,
         enable_fix=enable_fix,
-        concepts=[{"name": "c", "path": "/x", "seed": 1, "type": "image",
-                   "include_subdirectories": False}],
+        concepts=[{"name": "c", "path": "/x", "seed": 1, "type": "image", "include_subdirectories": False}],
     )
 
 
@@ -49,7 +50,7 @@ def test_acc_mismatch_warns_then_restores():
 
     t1 = _build(enable_fix=True, acc=SAVED_ACC)
     batches = make_batches(40, seed=33, batch_size=2)
-    t1.run_epoch(batches, stop_after_step=15)   # mid-window 10..19
+    t1.run_epoch(batches, stop_after_step=15)  # mid-window 10..19
 
     with tempfile.TemporaryDirectory() as td:
         t1.save_to(td)
@@ -61,19 +62,13 @@ def test_acc_mismatch_warns_then_restores():
         t2.load_from(td, warn_callback=warnings.append)
 
         acc_warnings = [w for w in warnings if "accumulation_steps mismatch" in w]
-        assert acc_warnings, (
-            f"expected an acc-steps warning, got: {warnings}"
-        )
+        assert acc_warnings, f"expected an acc-steps warning, got: {warnings}"
 
         # Partial state must have been restored.
-        assert t2.state.accumulated_loss > 0.0, (
-            "partial accumulator was discarded under acc mismatch"
-        )
+        assert t2.state.accumulated_loss > 0.0, "partial accumulator was discarded under acc mismatch"
         assert t2.has_gradient, "saved grads were not applied under acc mismatch"
 
-        remaining = batches[t2.global_step:]
+        remaining = batches[t2.global_step :]
         result = t2.run_epoch(remaining)
         for step, loss in result.logs:
-            assert not math.isnan(loss) and math.isfinite(loss), (
-                f"step {step}: NaN/Inf after acc mismatch: {loss}"
-            )
+            assert not math.isnan(loss) and math.isfinite(loss), f"step {step}: NaN/Inf after acc mismatch: {loss}"

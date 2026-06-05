@@ -5,6 +5,7 @@ stays aligned with `Base*Setup.LAYER_PRESETS`. If these break, the web UI dropdo
 will desync from the CTk dropdown and training can fail with
 `ValueError('Custom layer filters: no modules were matched')`.
 """
+
 from __future__ import annotations
 
 import pytest

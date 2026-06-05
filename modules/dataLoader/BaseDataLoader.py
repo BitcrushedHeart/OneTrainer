@@ -12,7 +12,7 @@ from mgds.MGDS import MGDS, TrainDataLoader
 import torch
 from torch.utils.data._utils.collate import default_collate
 
-_IDENTITY_KEYS = ('image_path', 'sample_prompt_path', 'concept')
+_IDENTITY_KEYS = ("image_path", "sample_prompt_path", "concept")
 
 
 def _shape_summary(value):
@@ -28,9 +28,9 @@ def _identity(item: dict) -> str:
         v = item.get(k)
         if isinstance(v, str) and v:
             return v
-        if isinstance(v, dict) and v.get('path'):
-            return v['path']
-    return '<unknown>'
+        if isinstance(v, dict) and v.get("path"):
+            return v["path"]
+    return "<unknown>"
 
 
 def _aspect_disagrees(spatial_shape, crop_resolution) -> bool:
@@ -73,7 +73,7 @@ def _shape_safe_collate(batch):
     try:
         return default_collate(batch)
     except RuntimeError as e:
-        if 'stack expects each tensor to be equal size' not in str(e):
+        if "stack expects each tensor to be equal size" not in str(e):
             raise
         if not batch or not isinstance(batch[0], dict):
             raise
@@ -93,20 +93,11 @@ def _shape_safe_collate(batch):
             "Per-entry tensor shapes vs cached crop_resolution:",
         ]
         for i, item in enumerate(batch):
-            cr = item.get('crop_resolution')
-            tensor_shapes = {
-                k: tuple(v.shape)
-                for k, v in item.items()
-                if isinstance(v, torch.Tensor) and v.dim() >= 2
-            }
-            disagreeing = [
-                k for k, s in tensor_shapes.items()
-                if _aspect_disagrees(s, cr)
-            ]
+            cr = item.get("crop_resolution")
+            tensor_shapes = {k: tuple(v.shape) for k, v in item.items() if isinstance(v, torch.Tensor) and v.dim() >= 2}
+            disagreeing = [k for k, s in tensor_shapes.items() if _aspect_disagrees(s, cr)]
             mark = " <-- AGGREGATE/TENSOR ORIENTATION MISMATCH" if disagreeing else ""
-            lines.append(
-                f"  [{i}] crop_resolution={cr} source={_identity(item)}{mark}"
-            )
+            lines.append(f"  [{i}] crop_resolution={cr} source={_identity(item)}{mark}")
             for k in sorted(tensor_shapes):
                 marker = "  *" if k in disagreeing else "   "
                 lines.append(f"    {marker} {k}={tensor_shapes[k]}")
@@ -119,17 +110,16 @@ class BaseDataLoader(
     DataLoaderMgdsMixin,
     metaclass=ABCMeta,
 ):
-
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            config: TrainConfig,
-            model: BaseModel,
-            model_setup: BaseModelSetup,
-            train_progress: TrainProgress,
-            is_validation: bool = False,
-            is_sft_anchor: bool = False,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        config: TrainConfig,
+        model: BaseModel,
+        model_setup: BaseModelSetup,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+        is_sft_anchor: bool = False,
     ):
         super().__init__()
 
@@ -169,11 +159,11 @@ class BaseDataLoader(
 
     @abstractmethod
     def _create_dataset(
-            self,
-            config: TrainConfig,
-            model: BaseModel,
-            model_setup: BaseModelSetup,
-            train_progress: TrainProgress,
-            is_validation,
+        self,
+        config: TrainConfig,
+        model: BaseModel,
+        model_setup: BaseModelSetup,
+        train_progress: TrainProgress,
+        is_validation,
     ):
         pass

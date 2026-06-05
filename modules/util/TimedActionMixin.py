@@ -8,15 +8,15 @@ class TimedActionMixin:
     def __init__(self):
         super().__init__()
         self.__previous_action = {}
-        self.__start_time = time.monotonic() # resist system clock changes
+        self.__start_time = time.monotonic()  # resist system clock changes
 
     def repeating_action_needed(
-            self,
-            name: str,
-            interval: float,
-            unit: TimeUnit,
-            train_progress: TrainProgress,
-            start_at_zero: bool = True,
+        self,
+        name: str,
+        interval: float,
+        unit: TimeUnit,
+        train_progress: TrainProgress,
+        start_at_zero: bool = True,
     ):
         if name not in self.__previous_action:
             self.__previous_action[name] = -1
@@ -27,15 +27,17 @@ class TimedActionMixin:
                     return False
                 if start_at_zero:
                     last = train_progress.last_action_epoch.get(name, -1)
-                    fire = train_progress.epoch > last \
-                        and train_progress.epoch % int(interval) == 0
+                    fire = train_progress.epoch > last and train_progress.epoch % int(interval) == 0
                     if fire:
                         train_progress.last_action_epoch[name] = train_progress.epoch
                     return fire
                 else:
                     # should actually be the last step of each epoch, but we don't know how many steps an epoch has
-                    return train_progress.epoch % int(interval) == 0 and train_progress.epoch_step == 0 \
+                    return (
+                        train_progress.epoch % int(interval) == 0
+                        and train_progress.epoch_step == 0
                         and train_progress.epoch > 0
+                    )
             case TimeUnit.STEP:
                 if int(interval) == 0:
                     return False
@@ -81,11 +83,11 @@ class TimedActionMixin:
                 return False
 
     def single_action_elapsed(
-            self,
-            name: str,
-            delay: float,
-            unit: TimeUnit,
-            train_progress: TrainProgress,
+        self,
+        name: str,
+        delay: float,
+        unit: TimeUnit,
+        train_progress: TrainProgress,
     ):
         if name not in self.__previous_action:
             self.__previous_action[name] = time.monotonic()

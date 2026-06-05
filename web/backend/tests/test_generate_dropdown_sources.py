@@ -5,6 +5,7 @@ reflects the CTk `options_kv` calls in `modules/ui/{ConvertModelUI,ConceptWindow
 and the `TOOL_DROPDOWN_OPTIONS` table in `web/scripts/ui_metadata.py`. A regression
 here would re-introduce drift between the web UI dropdowns and their Python source.
 """
+
 from __future__ import annotations
 
 import pytest

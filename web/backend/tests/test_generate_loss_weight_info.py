@@ -6,6 +6,7 @@ Ensures the TS artifact emitted by
 filters on this map; if it desyncs, flow-matching users can silently pick
 values that train incorrectly.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -33,9 +34,7 @@ def test_output_includes_standard_ts_header(generated_ts: str) -> None:
 
 def test_every_loss_weight_value_is_emitted(generated_ts: str) -> None:
     for member in LossWeight:
-        assert f'"{member.value}":' in generated_ts, (
-            f"LossWeight member {member.value} missing from generator output"
-        )
+        assert f'"{member.value}":' in generated_ts, f"LossWeight member {member.value} missing from generator output"
 
 
 def test_constant_is_present(generated_ts: str) -> None:
@@ -43,12 +42,8 @@ def test_constant_is_present(generated_ts: str) -> None:
 
 
 def test_has_both_true_and_false_members(generated_ts: str) -> None:
-    true_count = sum(
-        1 for m in LossWeight if m.supports_flow_matching()
-    )
-    false_count = sum(
-        1 for m in LossWeight if not m.supports_flow_matching()
-    )
+    true_count = sum(1 for m in LossWeight if m.supports_flow_matching())
+    false_count = sum(1 for m in LossWeight if not m.supports_flow_matching())
     assert true_count >= 1, "expected at least one LossWeight with supports_flow_matching() True"
     assert false_count >= 1, "expected at least one LossWeight with supports_flow_matching() False"
     # Output should contain both literal boolean values.

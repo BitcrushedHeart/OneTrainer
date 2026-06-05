@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
-
     def __init__(self, name: str = "WebSocket") -> None:
         self._connections: list[WebSocket] = []
         self._lock: asyncio.Lock | None = None

@@ -226,7 +226,6 @@ def _extract_adv_command_name(call: ast.Call) -> str | None:
 
 
 class CtkTabParser:
-
     def __init__(self):
         self._tree: ast.Module | None = None
         self._source: str = ""
@@ -323,7 +322,7 @@ class CtkTabParser:
         name = class_name
         for suffix in ("Tab", "Window", "UI"):
             if name.endswith(suffix):
-                name = name[:-len(suffix)]
+                name = name[: -len(suffix)]
                 break
         return name.lower()
 
@@ -365,10 +364,12 @@ class CtkTabParser:
         if predicate:
             setup_method = self._extract_setup_call(if_node.body)
             if setup_method:
-                variants.append(ParsedVariant(
-                    predicate=predicate,
-                    setup_method=setup_method,
-                ))
+                variants.append(
+                    ParsedVariant(
+                        predicate=predicate,
+                        setup_method=setup_method,
+                    )
+                )
 
         for elif_node in if_node.orelse:
             if isinstance(elif_node, ast.If):
@@ -401,7 +402,12 @@ class CtkTabParser:
         frame_calls: list[ParsedFrameCall] = []
         for stmt in method.body:
             call: ast.Call | None = None
-            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) or isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            if (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                or isinstance(stmt, ast.Assign)
+                and isinstance(stmt.value, ast.Call)
+            ):
                 call = stmt.value
 
             if call is None:
@@ -436,11 +442,13 @@ class CtkTabParser:
                         if val is not None:
                             kwargs["i"] = val
 
-            frame_calls.append(ParsedFrameCall(
-                method_name=clean_name,
-                column_var=col_var,
-                kwargs=kwargs,
-            ))
+            frame_calls.append(
+                ParsedFrameCall(
+                    method_name=clean_name,
+                    column_var=col_var,
+                    kwargs=kwargs,
+                )
+            )
 
         return frame_calls
 
@@ -498,7 +506,7 @@ class CtkTabParser:
         sections: dict[str, ParsedSection] = {}
         combo_to_section_id: dict[tuple[str, frozenset], str] = {}
 
-        for (mn, sig) in combo_to_fcs:
+        for mn, sig in combo_to_fcs:
             merged_kwargs = dict(sig)
             section = self._parse_frame_method(mn, call_kwargs=merged_kwargs)
             if not section:
@@ -577,15 +585,14 @@ class CtkTabParser:
             if isinstance(node, ast.ClassDef) and node is not self._class_node:
                 for method in node.body:
                     if isinstance(method, ast.FunctionDef) and method.name == "__init__":
-                        section = self._extract_section_from_body(
-                            method.body, tab_id, method
-                        )
+                        section = self._extract_section_from_body(method.body, tab_id, method)
                         if section and section.fields:
                             section.label = _label_from_key(tab_id)
                             sections[section.id] = section
                             logger.info(
                                 "Parsed nested widget class %s.__init__() -> %d fields",
-                                node.name, len(section.fields),
+                                node.name,
+                                len(section.fields),
                             )
 
         return sections
@@ -640,9 +647,7 @@ class CtkTabParser:
                 unconditional_stmts.append(stmt)
 
         if unconditional_stmts:
-            shared = self._extract_section_from_body(
-                unconditional_stmts, f"{tab_id}_shared", method
-            )
+            shared = self._extract_section_from_body(unconditional_stmts, f"{tab_id}_shared", method)
             if shared and shared.fields:
                 self._expand_peft_templates(shared, self._peft_display_name("shared"))
                 sections[shared.id] = shared
@@ -787,10 +792,10 @@ class CtkTabParser:
         section_id = method_name
         for prefix in ("__create_", "_create_"):
             if section_id.startswith(prefix):
-                section_id = section_id[len(prefix):]
+                section_id = section_id[len(prefix) :]
         for suffix in ("_frame", "_components"):
             if section_id.endswith(suffix):
-                section_id = section_id[:-len(suffix)]
+                section_id = section_id[: -len(suffix)]
                 break
 
         labels: list[ParsedLabel] = []
@@ -847,13 +852,19 @@ class CtkTabParser:
                 if cond_name and call_kwargs is not None:
                     cond_val = call_kwargs.get(cond_name)
                     if cond_val is True or cond_val is None:
-                        self._walk_for_components(stmt.body, labels, fields, frame_var, method, call_kwargs, subframe_map)
+                        self._walk_for_components(
+                            stmt.body, labels, fields, frame_var, method, call_kwargs, subframe_map
+                        )
                     if stmt.orelse:
-                        self._walk_for_components(stmt.orelse, labels, fields, frame_var, method, call_kwargs, subframe_map)
+                        self._walk_for_components(
+                            stmt.orelse, labels, fields, frame_var, method, call_kwargs, subframe_map
+                        )
                 else:
                     self._walk_for_components(stmt.body, labels, fields, frame_var, method, call_kwargs, subframe_map)
                     if stmt.orelse:
-                        self._walk_for_components(stmt.orelse, labels, fields, frame_var, method, call_kwargs, subframe_map)
+                        self._walk_for_components(
+                            stmt.orelse, labels, fields, frame_var, method, call_kwargs, subframe_map
+                        )
                 continue
 
             if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):

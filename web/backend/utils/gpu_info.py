@@ -77,11 +77,13 @@ def _static_info_nvml() -> list[GpuStaticInfo]:
         if isinstance(name, bytes):
             name = name.decode("utf-8")
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        gpus.append(GpuStaticInfo(
-            index=i,
-            name=name,
-            vram_total_mb=round(mem_info.total / (1024 ** 2), 1),
-        ))
+        gpus.append(
+            GpuStaticInfo(
+                index=i,
+                name=name,
+                vram_total_mb=round(mem_info.total / (1024**2), 1),
+            )
+        )
     return gpus
 
 
@@ -94,11 +96,13 @@ def _static_info_torch() -> list[GpuStaticInfo]:
     gpus: list[GpuStaticInfo] = []
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
-        gpus.append(GpuStaticInfo(
-            index=i,
-            name=props.name,
-            vram_total_mb=round(props.total_memory / (1024 ** 2), 1),
-        ))
+        gpus.append(
+            GpuStaticInfo(
+                index=i,
+                name=props.name,
+                vram_total_mb=round(props.total_memory / (1024**2), 1),
+            )
+        )
     return gpus
 
 
@@ -131,8 +135,8 @@ def _metrics_nvml() -> list[GpuMetrics]:
                 name = name.decode("utf-8")
 
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            vram_used_mb = round(mem_info.used / (1024 ** 2), 1)
-            vram_total_mb = round(mem_info.total / (1024 ** 2), 1)
+            vram_used_mb = round(mem_info.used / (1024**2), 1)
+            vram_total_mb = round(mem_info.total / (1024**2), 1)
             vram_percent = round((mem_info.used / mem_info.total) * 100, 1) if mem_info.total > 0 else 0.0
 
             temperature: float | None = None
@@ -144,15 +148,17 @@ def _metrics_nvml() -> list[GpuMetrics]:
                 util_rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 utilization = float(util_rates.gpu)
 
-            gpus.append(GpuMetrics(
-                index=i,
-                name=name,
-                vram_used_mb=vram_used_mb,
-                vram_total_mb=vram_total_mb,
-                vram_percent=vram_percent,
-                temperature=temperature,
-                utilization=utilization,
-            ))
+            gpus.append(
+                GpuMetrics(
+                    index=i,
+                    name=name,
+                    vram_used_mb=vram_used_mb,
+                    vram_total_mb=vram_total_mb,
+                    vram_percent=vram_percent,
+                    temperature=temperature,
+                    utilization=utilization,
+                )
+            )
         except Exception:  # noqa: BLE001, PERF203
             logger.debug("Failed to read GPU %d via pynvml", i)
 
@@ -173,19 +179,21 @@ def _metrics_torch() -> list[GpuMetrics]:
             name = torch.cuda.get_device_name(i)
             mem_allocated = torch.cuda.memory_allocated(i)
             mem_total = torch.cuda.get_device_properties(i).total_memory
-            vram_used_mb = round(mem_allocated / (1024 ** 2), 1)
-            vram_total_mb = round(mem_total / (1024 ** 2), 1)
+            vram_used_mb = round(mem_allocated / (1024**2), 1)
+            vram_total_mb = round(mem_total / (1024**2), 1)
             vram_percent = round((mem_allocated / mem_total) * 100, 1) if mem_total > 0 else 0.0
 
-            gpus.append(GpuMetrics(
-                index=i,
-                name=name,
-                vram_used_mb=vram_used_mb,
-                vram_total_mb=vram_total_mb,
-                vram_percent=vram_percent,
-                temperature=None,
-                utilization=None,
-            ))
+            gpus.append(
+                GpuMetrics(
+                    index=i,
+                    name=name,
+                    vram_used_mb=vram_used_mb,
+                    vram_total_mb=vram_total_mb,
+                    vram_percent=vram_percent,
+                    temperature=None,
+                    utilization=None,
+                )
+            )
         except Exception:  # noqa: BLE001, PERF203
             logger.debug("Failed to read GPU %d via torch.cuda", i)
 

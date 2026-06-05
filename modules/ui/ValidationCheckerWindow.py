@@ -74,7 +74,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
 
         title_frame = ctk.CTkFrame(header, fg_color="transparent")
         title_frame.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(title_frame, text="Validation Checker Results", font=("", 26, "bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(title_frame, text="Validation Checker Results", font=("", 26, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
         self.summary_label = ctk.CTkLabel(title_frame, text="Scanning validation concepts...", anchor="w")
         self.summary_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
@@ -101,10 +103,18 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
         else:
             start_row = 0
 
-        self.exact_card, self.exact_body, self.exact_heading = self._create_section(self.content, start_row, "Exact Duplicates")
-        self.perceptual_card, self.perceptual_body, self.perceptual_heading = self._create_section(self.content, start_row + 1, "Perceptual Matches")
-        self.deep_card, self.deep_body, self.deep_heading = self._create_section(self.content, start_row + 2, "Deep Scan (CLIP)")
-        self.caption_card, self.caption_body, self.caption_heading = self._create_section(self.content, start_row + 3, "Caption Matches")
+        self.exact_card, self.exact_body, self.exact_heading = self._create_section(
+            self.content, start_row, "Exact Duplicates"
+        )
+        self.perceptual_card, self.perceptual_body, self.perceptual_heading = self._create_section(
+            self.content, start_row + 1, "Perceptual Matches"
+        )
+        self.deep_card, self.deep_body, self.deep_heading = self._create_section(
+            self.content, start_row + 2, "Deep Scan (CLIP)"
+        )
+        self.caption_card, self.caption_body, self.caption_heading = self._create_section(
+            self.content, start_row + 3, "Caption Matches"
+        )
 
         self._build_deep_scan_controls()
 
@@ -150,7 +160,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
         self.threshold_value_label = ctk.CTkLabel(controls, text="Threshold: 0.93")
         self.threshold_value_label.grid(row=0, column=1, sticky="e")
 
-        self.threshold_slider = ctk.CTkSlider(controls, from_=0.80, to=0.99, number_of_steps=190, command=self._update_threshold_label)
+        self.threshold_slider = ctk.CTkSlider(
+            controls, from_=0.80, to=0.99, number_of_steps=190, command=self._update_threshold_label
+        )
         self.threshold_slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 4))
         self.threshold_slider.set(0.93)
 
@@ -255,7 +267,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
                 self._render_match_section(self.exact_body, self.exact_heading, "Exact Duplicates", self._exact_matches)
             elif match.kind == "perceptual":
                 self._perceptual_matches.append(match)
-                self._render_match_section(self.perceptual_body, self.perceptual_heading, "Perceptual Matches", self._perceptual_matches)
+                self._render_match_section(
+                    self.perceptual_body, self.perceptual_heading, "Perceptual Matches", self._perceptual_matches
+                )
             self._update_summary_labels()
         elif event_type == "basic_done":
             self._scan_result = event[1]
@@ -287,7 +301,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
 
     def _render_all_sections(self):
         self._render_match_section(self.exact_body, self.exact_heading, "Exact Duplicates", self._exact_matches)
-        self._render_match_section(self.perceptual_body, self.perceptual_heading, "Perceptual Matches", self._perceptual_matches)
+        self._render_match_section(
+            self.perceptual_body, self.perceptual_heading, "Perceptual Matches", self._perceptual_matches
+        )
         self._render_clip_section()
         self._render_caption_section()
         self._update_summary_labels()
@@ -295,9 +311,22 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
     def _render_clip_section(self):
         for child in self.deep_scan_results.winfo_children():
             child.destroy()
-        self._render_match_section(self.deep_scan_results, self.deep_heading, "Deep Scan Matches", self._clip_matches, no_results_text="No CLIP matches yet.")
+        self._render_match_section(
+            self.deep_scan_results,
+            self.deep_heading,
+            "Deep Scan Matches",
+            self._clip_matches,
+            no_results_text="No CLIP matches yet.",
+        )
 
-    def _render_match_section(self, body, heading, title: str, matches: list[ValidationCheckerMatch], no_results_text: str = "No matches found."):
+    def _render_match_section(
+        self,
+        body,
+        heading,
+        title: str,
+        matches: list[ValidationCheckerMatch],
+        no_results_text: str = "No matches found.",
+    ):
         for child in body.winfo_children():
             if child is self.deep_scan_results and body is self.deep_body:
                 continue
@@ -371,16 +400,20 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
             child.destroy()
 
         visible_matches = [match for match in self._caption_matches if match.val_images]
-        self.caption_heading.configure(text=f"Caption Matches: {len(visible_matches)} prompts appear in both train and val")
+        self.caption_heading.configure(
+            text=f"Caption Matches: {len(visible_matches)} prompts appear in both train and val"
+        )
 
         if not visible_matches:
-            ctk.CTkLabel(self.caption_body, text="No exact caption matches found.", anchor="w").grid(row=0, column=0, sticky="ew")
+            ctk.CTkLabel(self.caption_body, text="No exact caption matches found.", anchor="w").grid(
+                row=0, column=0, sticky="ew"
+            )
             return
 
         matches_to_show = visible_matches if self._show_all_captions else visible_matches[:5]
         for row_index, match in enumerate(matches_to_show):
             preview = match.caption if len(match.caption) <= 110 else match.caption[:107] + "..."
-            count_text = f"\"{preview}\" — {len(match.train_images)} train, {len(match.val_images)} val"
+            count_text = f'"{preview}" — {len(match.train_images)} train, {len(match.val_images)} val'
             ctk.CTkLabel(self.caption_body, text=count_text, anchor="w", justify="left", wraplength=1180).grid(
                 row=row_index,
                 column=0,
@@ -436,7 +469,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
         return match.train_image.path, match.val_image.path
 
     def _remove_match(self, match: ValidationCheckerMatch):
-        if not messagebox.askyesno("Remove from Validation", f"Remove {os.path.basename(match.val_image.path)} from validation?"):
+        if not messagebox.askyesno(
+            "Remove from Validation", f"Remove {os.path.basename(match.val_image.path)} from validation?"
+        ):
             return
         try:
             remove_validation_image(match.val_image)
@@ -478,7 +513,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
         if not unique_paths:
             messagebox.showinfo("Nothing to Remove", "There are no local flagged validation images left to remove.")
             return
-        if not messagebox.askyesno("Remove All Flagged", f"Remove {len(unique_paths)} flagged validation image(s) and their .txt sidecars?"):
+        if not messagebox.askyesno(
+            "Remove All Flagged", f"Remove {len(unique_paths)} flagged validation image(s) and their .txt sidecars?"
+        ):
             return
 
         failures = []
@@ -506,7 +543,9 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
 
     def _choose_train_concept(self, validation_concept: ValidationCheckerConcept) -> ValidationCheckerConcept | None:
         if not self._local_train_concepts:
-            messagebox.showwarning("No Local Training Concepts", "Move to Train requires at least one local training concept.")
+            messagebox.showwarning(
+                "No Local Training Concepts", "Move to Train requires at least one local training concept."
+            )
             return None
         if len(self._local_train_concepts) == 1:
             return self._local_train_concepts[0]
@@ -522,8 +561,12 @@ class ValidationCheckerWindow(ctk.CTkToplevel):
         visible_captions = len([match for match in self._caption_matches if match.val_images])
         leak_count = visible_exact + visible_perceptual + visible_clip
 
-        self.summary_label.configure(text=f"Summary: {leak_count} potential leaks found. {visible_captions} caption-match warnings.")
-        self.footer_status.configure(text=f"Exact: {visible_exact}  Perceptual: {visible_perceptual}  Deep Scan: {visible_clip}  Captions: {visible_captions}")
+        self.summary_label.configure(
+            text=f"Summary: {leak_count} potential leaks found. {visible_captions} caption-match warnings."
+        )
+        self.footer_status.configure(
+            text=f"Exact: {visible_exact}  Perceptual: {visible_perceptual}  Deep Scan: {visible_clip}  Captions: {visible_captions}"
+        )
         self.remove_all_button.configure(state="normal" if leak_count else "disabled")
 
     def _on_close(self):
@@ -564,7 +607,9 @@ class _TrainConceptChooser(ctk.CTkToplevel):
 
         button_row = ctk.CTkFrame(self, fg_color="transparent")
         button_row.grid(row=2, column=0, sticky="e", padx=20, pady=20)
-        ctk.CTkButton(button_row, text="Cancel", fg_color="gray40", command=self._cancel).grid(row=0, column=0, padx=(0, 8))
+        ctk.CTkButton(button_row, text="Cancel", fg_color="gray40", command=self._cancel).grid(
+            row=0, column=0, padx=(0, 8)
+        )
         ctk.CTkButton(button_row, text="Move", command=self._confirm).grid(row=0, column=1)
 
         self.wait_visibility()
