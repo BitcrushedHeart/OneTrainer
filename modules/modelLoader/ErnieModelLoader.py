@@ -33,32 +33,37 @@ class ErnieModelLoader(
         super().__init__()
 
     def __load_internal(
-            self,
-            model: ErnieModel,
-            model_type: ModelType,
-            weight_dtypes: ModelWeightDtypes,
-            base_model_name: str,
-            transformer_model_name: str,
-            vae_model_name: str,
-            quantization: QuantizationConfig,
+        self,
+        model: ErnieModel,
+        model_type: ModelType,
+        weight_dtypes: ModelWeightDtypes,
+        base_model_name: str,
+        transformer_model_name: str,
+        vae_model_name: str,
+        quantization: QuantizationConfig,
     ):
         if os.path.isfile(os.path.join(base_model_name, "meta.json")):
             self.__load_diffusers(
-                model, model_type, weight_dtypes, base_model_name, transformer_model_name, vae_model_name,
+                model,
+                model_type,
+                weight_dtypes,
+                base_model_name,
+                transformer_model_name,
+                vae_model_name,
                 quantization,
             )
         else:
             raise Exception("not an internal model")
 
     def __load_diffusers(
-            self,
-            model: ErnieModel,
-            model_type: ModelType,
-            weight_dtypes: ModelWeightDtypes,
-            base_model_name: str,
-            transformer_model_name: str,
-            vae_model_name: str,
-            quantization: QuantizationConfig,
+        self,
+        model: ErnieModel,
+        model_type: ModelType,
+        weight_dtypes: ModelWeightDtypes,
+        base_model_name: str,
+        transformer_model_name: str,
+        vae_model_name: str,
+        quantization: QuantizationConfig,
     ):
         # transformers < 5.x doesn't register "ministral3"; patch it so Mistral3Config can parse its text_config
         if "ministral3" not in CONFIG_MAPPING:
@@ -82,11 +87,18 @@ class ErnieModelLoader(
                 transformer_model_name,
                 config=base_model_name,
                 subfolder="transformer",
-                torch_dtype=torch.bfloat16 if weight_dtypes.transformer.torch_dtype() is None else weight_dtypes.transformer.torch_dtype(),
-                quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16) if weight_dtypes.transformer.is_gguf() else None,
+                torch_dtype=torch.bfloat16
+                if weight_dtypes.transformer.torch_dtype() is None
+                else weight_dtypes.transformer.torch_dtype(),
+                quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16)
+                if weight_dtypes.transformer.is_gguf()
+                else None,
             )
             transformer = self._convert_diffusers_sub_module_to_dtype(
-                transformer, weight_dtypes.transformer, weight_dtypes.train_dtype, quantization,
+                transformer,
+                weight_dtypes.transformer,
+                weight_dtypes.train_dtype,
+                quantization,
             )
         else:
             transformer = self._load_diffusers_sub_module(
@@ -145,14 +157,14 @@ class ErnieModelLoader(
         model.transformer = transformer
 
     def __load_safetensors(
-            self,
-            model: ErnieModel,
-            model_type: ModelType,
-            weight_dtypes: ModelWeightDtypes,
-            base_model_name: str,
-            transformer_model_name: str,
-            vae_model_name: str,
-            quantization: QuantizationConfig,
+        self,
+        model: ErnieModel,
+        model_type: ModelType,
+        weight_dtypes: ModelWeightDtypes,
+        base_model_name: str,
+        transformer_model_name: str,
+        vae_model_name: str,
+        quantization: QuantizationConfig,
     ):
         raise NotImplementedError(
             "Loading single-file safetensors for Ernie is not supported. Use the diffusers model instead. "
@@ -160,19 +172,24 @@ class ErnieModelLoader(
         )
 
     def load(
-            self,
-            model: ErnieModel,
-            model_type: ModelType,
-            model_names: ModelNames,
-            weight_dtypes: ModelWeightDtypes,
-            quantization: QuantizationConfig,
+        self,
+        model: ErnieModel,
+        model_type: ModelType,
+        model_names: ModelNames,
+        weight_dtypes: ModelWeightDtypes,
+        quantization: QuantizationConfig,
     ):
         stacktraces = []
 
         try:
             self.__load_internal(
-                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model,
-                model_names.vae_model, quantization,
+                model,
+                model_type,
+                weight_dtypes,
+                model_names.base_model,
+                model_names.transformer_model,
+                model_names.vae_model,
+                quantization,
             )
             return
         except Exception:
@@ -180,8 +197,13 @@ class ErnieModelLoader(
 
         try:
             self.__load_diffusers(
-                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model,
-                model_names.vae_model, quantization,
+                model,
+                model_type,
+                weight_dtypes,
+                model_names.base_model,
+                model_names.transformer_model,
+                model_names.vae_model,
+                quantization,
             )
             return
         except Exception:
@@ -189,8 +211,13 @@ class ErnieModelLoader(
 
         try:
             self.__load_safetensors(
-                model, model_type, weight_dtypes, model_names.base_model, model_names.transformer_model,
-                model_names.vae_model, quantization,
+                model,
+                model_type,
+                weight_dtypes,
+                model_names.base_model,
+                model_names.transformer_model,
+                model_names.vae_model,
+                quantization,
             )
             return
         except Exception:
@@ -201,9 +228,7 @@ class ErnieModelLoader(
         raise Exception("could not load model: " + model_names.base_model)
 
 
-class ErnieLoRALoader(
-    LoRALoaderMixin
-):
+class ErnieLoRALoader(LoRALoaderMixin):
     def __init__(self):
         super().__init__()
 
@@ -211,9 +236,9 @@ class ErnieLoRALoader(
         return None
 
     def load(
-            self,
-            model: ErnieModel,
-            model_names: ModelNames,
+        self,
+        model: ErnieModel,
+        model_names: ModelNames,
     ):
         return self._load(model, model_names)
 

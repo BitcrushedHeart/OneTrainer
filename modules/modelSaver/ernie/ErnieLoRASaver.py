@@ -17,8 +17,8 @@ class ErnieLoRASaver(
         return None
 
     def _get_state_dict(
-            self,
-            model: ErnieModel,
+        self,
+        model: ErnieModel,
     ) -> dict[str, Tensor]:
         state_dict = {}
         if model.transformer_lora is not None:
@@ -28,10 +28,10 @@ class ErnieLoRASaver(
         return state_dict
 
     def save(
-            self,
-            model: ErnieModel,
-            output_model_format: ModelFormat,
-            output_model_destination: str,
-            dtype: torch.dtype | None,
+        self,
+        model: ErnieModel,
+        output_model_format: ModelFormat,
+        output_model_destination: str,
+        dtype: torch.dtype | None,
     ):
         self._save(model, output_model_format, output_model_destination, dtype)

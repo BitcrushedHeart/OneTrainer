@@ -384,8 +384,8 @@ class GenericTrainer(BaseTrainer):
                 def on_sample_default(sampler_output: ModelSamplerOutput):
                     if self.config.samples_to_tensorboard and sampler_output.file_type == FileType.IMAGE:
                         self.tensorboard.add_image(
-                            f"sample{str(i)} - {safe_prompt}",
-                            pil_to_tensor(sampler_output.data),  # noqa: B023
+                            f"sample{str(i)} - {safe_prompt}",  # noqa: B023
+                            pil_to_tensor(sampler_output.data),
                             train_progress.global_step,
                         )
                     self.callbacks.on_sample_default(sampler_output)

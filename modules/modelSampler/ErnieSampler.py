@@ -22,11 +22,11 @@ from tqdm import tqdm
 
 class ErnieSampler(BaseModelSampler):
     def __init__(
-            self,
-            train_device: torch.device,
-            temp_device: torch.device,
-            model: ErnieModel,
-            model_type: ModelType,
+        self,
+        train_device: torch.device,
+        temp_device: torch.device,
+        model: ErnieModel,
+        model_type: ModelType,
     ):
         super().__init__(train_device, temp_device)
 
@@ -36,17 +36,17 @@ class ErnieSampler(BaseModelSampler):
 
     @torch.no_grad()
     def __sample_base(
-            self,
-            prompt: str,
-            negative_prompt: str,
-            height: int,
-            width: int,
-            seed: int,
-            random_seed: bool,
-            diffusion_steps: int,
-            cfg_scale: float,
-            noise_scheduler: NoiseScheduler,
-            on_update_progress: Callable[[int, int], None] = lambda _, __: None,
+        self,
+        prompt: str,
+        negative_prompt: str,
+        height: int,
+        width: int,
+        seed: int,
+        random_seed: bool,
+        diffusion_steps: int,
+        cfg_scale: float,
+        noise_scheduler: NoiseScheduler,
+        on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ) -> ModelSamplerOutput:
         with self.model.autocast_context:
             generator = torch.Generator(device=self.train_device)
@@ -106,8 +106,7 @@ class ErnieSampler(BaseModelSampler):
                     noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
                     noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
 
-                latent_image = noise_scheduler.step(noise_pred, timestep, latent_image,
-                                                    return_dict=False)[0]
+                latent_image = noise_scheduler.step(noise_pred, timestep, latent_image, return_dict=False)[0]
 
                 on_update_progress(i + 1, len(timesteps))
 
@@ -134,14 +133,14 @@ class ErnieSampler(BaseModelSampler):
             )
 
     def sample(
-            self,
-            sample_config: SampleConfig,
-            destination: str,
-            image_format: ImageFormat | None = None,
-            video_format: VideoFormat | None = None,
-            audio_format: AudioFormat | None = None,
-            on_sample: Callable[[ModelSamplerOutput], None] = lambda _: None,
-            on_update_progress: Callable[[int, int], None] = lambda _, __: None,
+        self,
+        sample_config: SampleConfig,
+        destination: str,
+        image_format: ImageFormat | None = None,
+        video_format: VideoFormat | None = None,
+        audio_format: AudioFormat | None = None,
+        on_sample: Callable[[ModelSamplerOutput], None] = lambda _: None,
+        on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ):
         sampler_output = self.__sample_base(
             prompt=sample_config.prompt,
@@ -157,8 +156,11 @@ class ErnieSampler(BaseModelSampler):
         )
 
         self.save_sampler_output(
-            sampler_output, destination,
-            image_format, video_format, audio_format,
+            sampler_output,
+            destination,
+            image_format,
+            video_format,
+            audio_format,
         )
 
         on_sample(sampler_output)

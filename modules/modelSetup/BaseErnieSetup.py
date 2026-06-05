@@ -28,7 +28,7 @@ class BaseErnieSetup(
     ModelSetupNoiseMixin,
     ModelSetupFlowMatchingMixin,
     ModelSetupEmbeddingMixin,
-    metaclass=ABCMeta
+    metaclass=ABCMeta,
 ):
     LAYER_PRESETS = {
         "attn-mlp": ["self_attention", "mlp"],
@@ -38,45 +38,48 @@ class BaseErnieSetup(
     }
 
     def setup_optimizations(
-            self,
-            model: ErnieModel,
-            config: TrainConfig,
+        self,
+        model: ErnieModel,
+        config: TrainConfig,
     ):
         if config.gradient_checkpointing.enabled():
-            model.transformer_offload_conductor = \
-                enable_checkpointing_for_ernie_transformer(model.transformer, config)
+            model.transformer_offload_conductor = enable_checkpointing_for_ernie_transformer(model.transformer, config)
 
-        model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
-            config.weight_dtypes().transformer,
-            config.weight_dtypes().text_encoder,
-            config.weight_dtypes().vae,
-            config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
-        ], config.enable_autocast_cache)
+        model.autocast_context, model.train_dtype = create_autocast_context(
+            self.train_device,
+            config.train_dtype,
+            [
+                config.weight_dtypes().transformer,
+                config.weight_dtypes().text_encoder,
+                config.weight_dtypes().vae,
+                config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
+            ],
+            config.enable_autocast_cache,
+        )
 
-        model.text_encoder_autocast_context, model.text_encoder_train_dtype = \
-            disable_fp16_autocast_context(
-                self.train_device,
-                config.train_dtype,
-                config.fallback_train_dtype,
-                [
-                    config.weight_dtypes().text_encoder,
-                    config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
-                ],
-                config.enable_autocast_cache,
-            )
+        model.text_encoder_autocast_context, model.text_encoder_train_dtype = disable_fp16_autocast_context(
+            self.train_device,
+            config.train_dtype,
+            config.fallback_train_dtype,
+            [
+                config.weight_dtypes().text_encoder,
+                config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
+            ],
+            config.enable_autocast_cache,
+        )
 
         quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
 
     def predict(
-            self,
-            model: ErnieModel,
-            batch: dict,
-            config: TrainConfig,
-            train_progress: TrainProgress,
-            *,
-            deterministic: bool = False,
+        self,
+        model: ErnieModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
     ) -> dict:
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
@@ -86,16 +89,16 @@ class BaseErnieSetup(
 
             text_encoder_output, text_lens = model.encode_text(
                 train_device=self.train_device,
-                batch_size=batch['latent_image'].shape[0],
+                batch_size=batch["latent_image"].shape[0],
                 rand=rand,
-                tokens=batch.get('tokens'),
-                tokens_mask=batch.get('tokens_mask'),
-                text_encoder_output=batch.get('text_encoder_hidden_state'),
+                tokens=batch.get("tokens"),
+                tokens_mask=batch.get("tokens_mask"),
+                text_encoder_output=batch.get("text_encoder_hidden_state"),
                 text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
             )
 
             # Patchify: [B, 32, H, W] -> [B, 128, H/2, W/2]
-            latent_image = model.patchify_latents(batch['latent_image'].float())
+            latent_image = model.patchify_latents(batch["latent_image"].float())
             latent_height = latent_image.shape[-2]
             latent_width = latent_image.shape[-1]
             scaled_latent_image = model.scale_latents(latent_image)
@@ -104,7 +107,7 @@ class BaseErnieSetup(
 
             shift = model.calculate_timestep_shift(latent_height, latent_width)
             timestep = self._get_timestep_discrete(
-                model.noise_scheduler.config['num_train_timesteps'],
+                model.noise_scheduler.config["num_train_timesteps"],
                 deterministic,
                 generator,
                 scaled_latent_image.shape[0],
@@ -129,32 +132,32 @@ class BaseErnieSetup(
 
             flow = latent_noise - scaled_latent_image
             model_output_data = {
-                'loss_type': 'target',
-                'timestep': timestep,
+                "loss_type": "target",
+                "timestep": timestep,
                 # unpatchify to match mask shape for masked training
-                'predicted': model.unpatchify_latents(predicted_flow),
-                'target': model.unpatchify_latents(flow),
+                "predicted": model.unpatchify_latents(predicted_flow),
+                "target": model.unpatchify_latents(flow),
             }
 
             if config.debug_mode:
                 with torch.no_grad():
                     predicted_scaled_latent_image = scaled_noisy_latent_image - predicted_flow * sigma
-                    self._save_tokens('7-prompt', batch['tokens'], model.tokenizer, config, train_progress)
-                    self._save_latent('1-noise', latent_noise, config, train_progress)
-                    self._save_latent('2-noisy_image', scaled_noisy_latent_image, config, train_progress)
-                    self._save_latent('3-predicted_flow', predicted_flow, config, train_progress)
-                    self._save_latent('4-flow', flow, config, train_progress)
-                    self._save_latent('5-predicted_image', predicted_scaled_latent_image, config, train_progress)
-                    self._save_latent('6-image', scaled_latent_image, config, train_progress)
+                    self._save_tokens("7-prompt", batch["tokens"], model.tokenizer, config, train_progress)
+                    self._save_latent("1-noise", latent_noise, config, train_progress)
+                    self._save_latent("2-noisy_image", scaled_noisy_latent_image, config, train_progress)
+                    self._save_latent("3-predicted_flow", predicted_flow, config, train_progress)
+                    self._save_latent("4-flow", flow, config, train_progress)
+                    self._save_latent("5-predicted_image", predicted_scaled_latent_image, config, train_progress)
+                    self._save_latent("6-image", scaled_latent_image, config, train_progress)
 
         return model_output_data
 
     def calculate_loss(
-            self,
-            model: ErnieModel,
-            batch: dict,
-            data: dict,
-            config: TrainConfig,
+        self,
+        model: ErnieModel,
+        batch: dict,
+        data: dict,
+        config: TrainConfig,
     ) -> Tensor:
         return self._flow_matching_losses(
             batch=batch,

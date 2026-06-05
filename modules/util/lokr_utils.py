@@ -31,7 +31,7 @@ def make_kron(w1, w2, scale=1.0):
     """
     Kronecker product of two tensors.
     """
-    if len(w2.shape) == 4: # For Conv2d
+    if len(w2.shape) == 4:  # For Conv2d
         w1 = w1.unsqueeze(2).unsqueeze(2)
     w2 = w2.contiguous()
     rebuild = torch.kron(w1, w2)
@@ -46,5 +46,5 @@ def rebuild_tucker(t, wa, wb):
     wb: [r, d]
     rebuild: [b, d, k1, k2]
     """
-    rebuild = torch.einsum('i j k l, i p, j r -> p r k l', t, wa, wb) # [c, d, k1, k2]
+    rebuild = torch.einsum("i j k l, i p, j r -> p r k l", t, wa, wb)  # [c, d, k1, k2]
     return rebuild
