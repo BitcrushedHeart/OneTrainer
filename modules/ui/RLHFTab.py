@@ -11,6 +11,7 @@ from modules.util.dpo_curation_util import (
     remove_finalized_pair,
 )
 from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
@@ -95,10 +96,59 @@ class RLHFTab:
             0,
             "Supervised Mix",
             tooltip="Blends an NLL term on the CHOSEN images of each DPO pair into the loss. "
-            "Anchors the policy to its own chosen samples. Distinct from SFT Anchor, "
-            "which uses a separate set of standard concepts.",
+            "Anchors the policy to its own chosen samples.",
         )
         components.entry(self.scroll_frame, 3, 1, self.ui_state, "rlhf_supervised_mix")
+
+        objective_options = [
+            ("DPO (sigmoid)", DPOObjective.SIGMOID),
+            ("IPO", DPOObjective.IPO),
+        ]
+        components.label(
+            self.scroll_frame,
+            4,
+            0,
+            "Objective",
+            tooltip="DPO (sigmoid): the standard preference loss, scaled by Beta — pushes the preference margin "
+            "ever higher, which can reward-hack on long runs. "
+            "IPO: regresses the margin toward the fixed target 1/(2*Tau) instead — bounded by construction, "
+            "more resistant to reward hacking. Beta and Label Smoothing do not apply to IPO.",
+        )
+        components.options_kv(self.scroll_frame, 4, 1, objective_options, self.ui_state, "rlhf_dpo_objective")
+
+        components.label(
+            self.scroll_frame,
+            5,
+            0,
+            "IPO Tau",
+            tooltip="IPO regularization strength; the target preference margin is 1/(2*Tau). Diffusion DPO margins "
+            "are tiny (around 1e-3), so Tau in the hundreds to thousands gives realistic targets. "
+            "Larger Tau = smaller target = gentler training.",
+        )
+        components.entry(self.scroll_frame, 5, 1, self.ui_state, "rlhf_dpo_ipo_tau")
+
+        components.label(
+            self.scroll_frame,
+            6,
+            0,
+            "Adaptive Beta",
+            tooltip="Adjusts Beta per optimizer step from the smoothed reward margin (beta-DPO): informative "
+            "batches with above-average margins raise Beta, uninformative ones lower it, bounded to "
+            "[Beta/4, Beta*4]. Beta is the starting point. Only applies to the DPO (sigmoid) objective. "
+            "Note that Beta and learning rate are coupled - if you double Beta, halve the learning rate.",
+        )
+        components.switch(self.scroll_frame, 6, 1, self.ui_state, "rlhf_dpo_adaptive_beta")
+
+        components.label(
+            self.scroll_frame,
+            7,
+            0,
+            "SFT Anchor Weight",
+            tooltip="Weight on a supervised loss computed from your STANDARD concepts during a DPO run. "
+            "When >0 and standard concepts are present, the loader runs them in parallel and adds "
+            "weight * sft_loss to the DPO loss. Set to 0 to silently drop standard concepts (legacy behavior).",
+        )
+        components.entry(self.scroll_frame, 7, 1, self.ui_state, "rlhf_sft_anchor_weight")
 
         components.label(
             self.scroll_frame,
@@ -140,13 +190,12 @@ class RLHFTab:
         components.label(
             self.scroll_frame,
             7,
-            0,
-            "SFT Anchor Weight",
-            tooltip="Weight on a supervised loss computed from your STANDARD concepts during a DPO run. "
-            "When >0 and standard concepts are present, the loader runs them in parallel and adds "
-            "weight * sft_loss to the DPO loss. Set to 0 to silently drop standard concepts (legacy behavior).",
+            3,
+            "Timestep Margins",
+            tooltip="Logs the reward margin bucketed by timestep quartile (dpo/margin_by_t/q1..q4) to TensorBoard. "
+            "Useful to verify pairs are compared evenly across noise levels.",
         )
-        components.entry(self.scroll_frame, 7, 1, self.ui_state, "rlhf_sft_anchor_weight")
+        components.switch(self.scroll_frame, 7, 4, self.ui_state, "rlhf_dpo_timestep_margin_logging")
 
         components.button(
             self.scroll_frame,
@@ -166,7 +215,7 @@ class RLHFTab:
         )
         components.button(
             self.scroll_frame,
-            7,
+            8,
             3,
             "DPO Bucket Analysis",
             command=self._bucket_analysis,
@@ -178,7 +227,8 @@ class RLHFTab:
             9,
             0,
             "Training Type:",
-            tooltip="Shows whether DPO is starting from a fresh adapter or refining a loaded adapter. The output is always an adapter file.",
+            tooltip="Shows whether DPO is starting from a fresh adapter or refining a loaded adapter. The output is "
+            "always an adapter file. DPO requires LoRA training; full finetuning is not supported.",
         )
         components.label(
             self.scroll_frame,

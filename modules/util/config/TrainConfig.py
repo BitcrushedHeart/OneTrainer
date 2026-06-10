@@ -12,6 +12,7 @@ from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
@@ -569,6 +570,10 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_beta: float
     rlhf_dpo_label_smoothing: float
     rlhf_dpo_ref_mode: DPORefMode
+    rlhf_dpo_objective: DPOObjective
+    rlhf_dpo_ipo_tau: float
+    rlhf_dpo_adaptive_beta: bool
+    rlhf_dpo_timestep_margin_logging: bool
     rlhf_supervised_mix: float
     rlhf_sft_anchor_weight: float
     rlhf_dpo_validation: bool
@@ -613,7 +618,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=18,
+            config_version=19,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -634,6 +639,7 @@ class TrainConfig(BaseConfig):
                 16: self.__migration_16,
                 17: self.__migration_17,
                 18: self.__migration_18,
+                19: self.__migration_19,
             },
         )
 
@@ -917,6 +923,14 @@ class TrainConfig(BaseConfig):
             del migrated_data["scaled_oft"]
         migrated_data.pop("oft_coft", None)
         migrated_data.pop("coft_eps", None)
+        return migrated_data
+
+    def __migration_19(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_dpo_objective", "SIGMOID")
+        migrated_data.setdefault("rlhf_dpo_ipo_tau", 1000.0)
+        migrated_data.setdefault("rlhf_dpo_adaptive_beta", False)
+        migrated_data.setdefault("rlhf_dpo_timestep_margin_logging", False)
         return migrated_data
 
     def effective_dpo_ref_mode(self) -> DPORefMode:
@@ -1339,6 +1353,10 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_beta", 300.0, float, False))
         data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
+        data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
+        data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
+        data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
+        data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
         data.append(("rlhf_supervised_mix", 0.0, float, False))
         data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
         data.append(("rlhf_dpo_validation", False, bool, False))

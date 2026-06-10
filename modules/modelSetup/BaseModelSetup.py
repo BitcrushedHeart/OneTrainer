@@ -3,6 +3,7 @@ from contextlib import contextmanager
 
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
@@ -36,6 +37,7 @@ class BaseModelSetup(
         self._dpo_ref_params = None
         self._last_dpo_metrics = None
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
+        self._dpo_runtime_beta = None
 
     @abstractmethod
     def create_parameters(
@@ -187,6 +189,12 @@ class BaseModelSetup(
     def get_last_dpo_metrics(self) -> dict[str, float]:
         return self._last_dpo_metrics or {}
 
+    def set_dpo_runtime_beta(self, beta: float | None):
+        # Adaptive-beta override from the trainer. The logged reward metrics
+        # are computed before beta is applied, so adapting beta from them does
+        # not create a feedback loop.
+        self._dpo_runtime_beta = beta
+
     def calculate_dpo_loss(
         self,
         model: BaseModel,
@@ -200,9 +208,11 @@ class BaseModelSetup(
             )
 
         def mse_per_sample(pred, target):
-            return ((pred - target) ** 2).mean(dim=list(range(1, pred.ndim)))
+            # fp32 accumulation in the reduction instead of upcasting the full
+            # [2B,C,H,W] tensors - avoids four fp32 copies per step.
+            return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
 
-        beta = config.rlhf_dpo_beta
+        beta = config.rlhf_dpo_beta if self._dpo_runtime_beta is None else self._dpo_runtime_beta
         supervised_loss = None
 
         # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
@@ -217,8 +227,8 @@ class BaseModelSetup(
         try:
             with torch.no_grad(), self.reference_model(model, config):
                 ref_output = self.predict(model, batched_input, config, train_progress)
-                ref_predicted = ref_output["predicted"].float()
-                ref_target = ref_output["target"].float()
+                ref_predicted = ref_output["predicted"]
+                ref_target = ref_output["target"]
                 ref_chosen_logp = -mse_per_sample(ref_predicted[:chosen_b], ref_target[:chosen_b])
                 ref_rejected_logp = -mse_per_sample(ref_predicted[chosen_b:], ref_target[chosen_b:])
                 del ref_output, ref_predicted, ref_target
@@ -226,8 +236,9 @@ class BaseModelSetup(
             policy_output = self.predict(model, batched_input, config, train_progress)
         finally:
             self._dpo_paired_half = None
-        policy_predicted = policy_output["predicted"].float()
-        policy_target = policy_output["target"].float()
+        policy_timestep = policy_output.get("timestep")
+        policy_predicted = policy_output["predicted"]
+        policy_target = policy_output["target"]
         policy_chosen_logp = -mse_per_sample(policy_predicted[:chosen_b], policy_target[:chosen_b])
         policy_rejected_logp = -mse_per_sample(policy_predicted[chosen_b:], policy_target[chosen_b:])
         if config.rlhf_supervised_mix > 0:
@@ -238,13 +249,23 @@ class BaseModelSetup(
 
         chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
         rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()
-        logits = beta * (chosen_ratio - rejected_ratio)
-        dpo_loss = -F.logsigmoid(logits).mean()
-        loss = dpo_loss
+        margin = chosen_ratio - rejected_ratio
 
-        if config.rlhf_dpo_label_smoothing > 0:
-            s = config.rlhf_dpo_label_smoothing
-            loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
+        if config.rlhf_dpo_objective == DPOObjective.IPO:
+            # IPO regresses the raw margin toward the fixed target 1/(2*tau)
+            # instead of pushing it to infinity, which structurally resists
+            # reward hacking. tau plays beta's role; label smoothing and beta
+            # do not apply.
+            dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
+            loss = dpo_loss
+        else:
+            logits = beta * margin
+            dpo_loss = -F.logsigmoid(logits).mean()
+            loss = dpo_loss
+
+            if config.rlhf_dpo_label_smoothing > 0:
+                s = config.rlhf_dpo_label_smoothing
+                loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
 
         if supervised_loss is not None:
             loss = loss + config.rlhf_supervised_mix * supervised_loss
@@ -255,9 +276,23 @@ class BaseModelSetup(
             "dpo_loss": dpo_loss.detach().item(),
             "chosen_reward": chosen_ratio.detach().mean().item(),
             "rejected_reward": rejected_ratio.detach().mean().item(),
-            "reward_margin": (chosen_ratio - rejected_ratio).detach().mean().item(),
+            "reward_margin": margin.detach().mean().item(),
             "accuracy": (chosen_ratio > rejected_ratio).float().mean().item(),
         }
+
+        if config.rlhf_dpo_timestep_margin_logging and policy_timestep is not None:
+            # Per-sample raw margins bucketed by the chosen half's timestep
+            # quartile. Sums and counts are emitted for every quartile so the
+            # trainer's accumulation always sees the same key set.
+            t = policy_timestep[:chosen_b].detach().float()
+            if t.numel() > 0 and t.max() > 1.0:
+                t = t / 1000.0  # discrete schedulers train on 1000 timesteps
+            quartile_index = (t * 4).long().clamp(0, 3)
+            per_sample_margin = margin.detach()
+            for quartile in range(4):
+                mask = quartile_index == quartile
+                self._last_dpo_metrics[f"margin_t_q{quartile + 1}_sum"] = per_sample_margin[mask].sum().item()
+                self._last_dpo_metrics[f"margin_t_q{quartile + 1}_count"] = float(mask.sum().item())
 
         return loss
 
