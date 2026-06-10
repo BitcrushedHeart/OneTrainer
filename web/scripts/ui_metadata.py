@@ -76,10 +76,6 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "STANDARD": "Standard",
         "VALIDATION": "Validation",
         "PRIOR_PREDICTION": "Prior Prediction",
-        "DPO_CHOSEN": "DPO Chosen",
-        "DPO_REJECTED": "DPO Rejected",
-        "DPO_CHOSEN_VAL": "DPO Chosen (Validation)",
-        "DPO_REJECTED_VAL": "DPO Rejected (Validation)",
     },
     "RLHFMode": {
         "DPO": "DPO (Direct Preference Optimization)",

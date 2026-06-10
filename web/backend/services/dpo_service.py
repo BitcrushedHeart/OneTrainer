@@ -70,18 +70,15 @@ class DPOService(SingletonMixin):
                 self._ws_broadcast(message)
 
     def check_pairs(self) -> dict:
-        from modules.util.dpo_curation_util import check_dpo_pairs, dpo_concept_pairs
+        from modules.util.dpo_curation_util import check_dpo_pairs
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
 
-        try:
-            concept_pairs = dpo_concept_pairs(concepts, is_validation=False)
-        except RuntimeError:
-            try:
-                concept_pairs = dpo_concept_pairs(concepts, is_validation=True)
-            except RuntimeError as e:
-                return {"ok": False, "error": str(e)}
+        concept_pairs = dpo_concept_pattern_dirs(concepts)
+        if not concept_pairs:
+            return {"ok": False, "error": "No DPO concepts found. Set the chosen/rejected patterns on a concept."}
 
         result = check_dpo_pairs(concept_pairs)
         return {"ok": True, "result": result}
@@ -91,20 +88,19 @@ class DPOService(SingletonMixin):
 
         from modules.util.dpo_curation_util import (
             check_dpo_pairs,
-            dpo_concept_pairs,
             dpo_pair_key,
             remove_finalized_pair,
         )
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
         from modules.util.path_util import supported_image_extensions
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
         exts = supported_image_extensions()
 
-        try:
-            concept_pairs = dpo_concept_pairs(concepts, is_validation=False)
-        except RuntimeError:
-            concept_pairs = dpo_concept_pairs(concepts, is_validation=True)
+        concept_pairs = dpo_concept_pattern_dirs(concepts)
+        if not concept_pairs:
+            return {"ok": False, "error": "No DPO concepts found. Set the chosen/rejected patterns on a concept."}
 
         result = check_dpo_pairs(concept_pairs)
         removed = 0
@@ -144,19 +140,13 @@ class DPOService(SingletonMixin):
         return {"ok": True, "removed": removed}
 
     def review_pairs(self) -> dict:
-        import contextlib
-
-        from modules.util.dpo_curation_util import dpo_concept_pairs, scan_finalized_pairs
+        from modules.util.dpo_curation_util import scan_finalized_pairs
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
 
-        all_pairs: list[tuple[str, str]] = []
-        with contextlib.suppress(RuntimeError):
-            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=False))
-        with contextlib.suppress(RuntimeError):
-            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=True))
-
+        all_pairs = dpo_concept_pattern_dirs(concepts)
         if not all_pairs:
             return {"ok": False, "error": "No DPO concept pairs found"}
 
@@ -170,35 +160,22 @@ class DPOService(SingletonMixin):
         return {"ok": True}
 
     def fix_multiline_captions(self) -> dict:
-        import contextlib
-
-        from modules.util.dpo_curation_util import dpo_concept_pairs, fix_multiline_captions
+        from modules.util.dpo_curation_util import fix_multiline_captions
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
 
-        all_pairs: list[tuple[str, str]] = []
-        with contextlib.suppress(RuntimeError):
-            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=False))
-        with contextlib.suppress(RuntimeError):
-            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=True))
-
+        all_pairs = dpo_concept_pattern_dirs(concepts)
         fixed = fix_multiline_captions(all_pairs)
         return {"ok": True, "fixed": fixed}
 
     def _all_concept_pairs(self) -> list[tuple[str, str]]:
-        import contextlib
-
-        from modules.util.dpo_curation_util import dpo_concept_pairs
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
         config_service = ConfigService.get_instance()
         concepts = config_service.get_config_for_training().concepts or []
-        all_pairs: list[tuple[str, str]] = []
-        with contextlib.suppress(RuntimeError):
-            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=False))
-        with contextlib.suppress(RuntimeError):
-            all_pairs.extend(dpo_concept_pairs(concepts, is_validation=True))
-        return all_pairs
+        return dpo_concept_pattern_dirs(concepts)
 
     def _is_path_in_concept_pairs(self, path: str, concept_pairs: list[tuple[str, str]]) -> bool:
         """Verify `path` is inside one of the configured DPO concept folders.

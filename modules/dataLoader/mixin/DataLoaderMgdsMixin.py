@@ -1,10 +1,9 @@
-import copy
 import json
 from abc import ABCMeta
 
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.dpo_curation_util import is_dpo_concept_type
+from modules.util.dpo_pattern_util import validate_dpo_patterns
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.TrainProgress import TrainProgress
 
@@ -16,40 +15,29 @@ import torch
 
 class DataLoaderMgdsMixin(metaclass=ABCMeta):
     @staticmethod
-    def __sanitize_dpo_concept(concept: ConceptConfig) -> ConceptConfig:
-        sanitized = copy.deepcopy(concept)
-        sanitized.image_variations = 1
-        sanitized.text_variations = 1
+    def __filter_dpo_concepts(concepts: list[ConceptConfig]) -> list[ConceptConfig]:
+        # An RLHF DPO run trains on chosen/rejected pairs only. Concepts without
+        # patterns have no pair data, so they are dropped here; in a DPO run
+        # they feed the SFT-anchor loader instead (when enabled).
+        for concept in concepts:
+            if concept.enabled:
+                validate_dpo_patterns(concept.dpo_chosen_pattern, concept.dpo_rejected_pattern)
 
-        sanitized.image.enable_crop_jitter = False
-        sanitized.image.enable_random_flip = False
-        sanitized.image.enable_fixed_flip = False
-        sanitized.image.enable_random_rotate = False
-        sanitized.image.enable_fixed_rotate = False
-        sanitized.image.random_rotate_max_angle = 0.0
-        sanitized.image.enable_random_brightness = False
-        sanitized.image.enable_fixed_brightness = False
-        sanitized.image.random_brightness_max_strength = 0.0
-        sanitized.image.enable_random_contrast = False
-        sanitized.image.enable_fixed_contrast = False
-        sanitized.image.random_contrast_max_strength = 0.0
-        sanitized.image.enable_random_saturation = False
-        sanitized.image.enable_fixed_saturation = False
-        sanitized.image.random_saturation_max_strength = 0.0
-        sanitized.image.enable_random_hue = False
-        sanitized.image.enable_fixed_hue = False
-        sanitized.image.random_hue_max_strength = 0.0
-        sanitized.image.enable_random_circular_mask_shrink = False
-        sanitized.image.enable_random_mask_rotate_crop = False
+        dpo_concepts = [c for c in concepts if c.is_dpo()]
+        skipped = [c.name or c.path for c in concepts if c.enabled and not c.is_dpo()]
 
-        sanitized.text.enable_tag_shuffling = False
-        sanitized.text.tag_dropout_enable = False
-        sanitized.text.tag_dropout_probability = 0.0
-        sanitized.text.caps_randomize_enable = False
-        sanitized.text.caps_randomize_probability = 0.0
-        sanitized.text.caps_randomize_lowercase = False
+        if not any(c.enabled for c in dpo_concepts):
+            raise RuntimeError(
+                "RLHF DPO requires at least one enabled concept with chosen/rejected patterns "
+                "(set 'DPO Chosen Pattern' and 'DPO Rejected Pattern' in the concept window)."
+            )
+        if skipped:
+            print(
+                f"RLHF DPO: skipping {len(skipped)} concepts without DPO patterns "
+                "(they feed the SFT-anchor loader when enabled): " + ", ".join(skipped)
+            )
 
-        return sanitized
+        return dpo_concepts
 
     def _create_mgds(
         self,
@@ -65,20 +53,16 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
 
         # The SFT-anchor parallel loader for DPO runs reaches this method with
         # config.rlhf_enabled forced to False by BaseDataLoader, so it falls
-        # into the standard branch and picks up STANDARD/PRIOR_PREDICTION only.
-        if is_validation:
-            valid_types = {ConceptType.VALIDATION, ConceptType.DPO_CHOSEN_VAL, ConceptType.DPO_REJECTED_VAL}
-        elif config.rlhf_enabled:
-            # Pure-DPO pipeline. STANDARD/PRIOR_PREDICTION concepts go to the
-            # SFT-anchor loader instead of being silently dropped here.
-            valid_types = {ConceptType.DPO_CHOSEN, ConceptType.DPO_REJECTED}
-        else:
-            valid_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
-        concepts = [
-            self.__sanitize_dpo_concept(concept) if is_dpo_concept_type(ConceptType(concept.type)) else concept
-            for concept in concepts
-            if ConceptType(concept.type) in valid_types
-        ]
+        # into the standard branch; DPO pattern concepts are excluded there so
+        # their chosen images aren't double-trained as anchor data.
+        valid_types = (
+            {ConceptType.VALIDATION} if is_validation else {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
+        )
+        concepts = [concept for concept in concepts if ConceptType(concept.type) in valid_types]
+        if config.rlhf_enabled:
+            concepts = self.__filter_dpo_concepts(concepts)
+        elif getattr(self, "is_sft_anchor", False):
+            concepts = [c for c in concepts if not c.is_dpo()]
         concepts = [c.to_dict() for c in concepts]
 
         settings = {

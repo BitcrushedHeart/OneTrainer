@@ -136,8 +136,9 @@ class BaseDataLoader(
         elif is_sft_anchor:
             # Parallel SFT-anchor loader for DPO runs that include STANDARD
             # concepts: re-use the standard (non-DPO) data pipeline so the
-            # PairByFilename module is skipped and STANDARD samples flow as
-            # ordinary supervised batches.
+            # rejected-image wiring is skipped and STANDARD samples flow as
+            # ordinary supervised batches. DPO pattern concepts are excluded
+            # in DataLoaderMgdsMixin via is_sft_anchor.
             config = copy.copy(config)
             config.rlhf_enabled = False
 

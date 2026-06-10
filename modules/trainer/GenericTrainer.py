@@ -299,8 +299,10 @@ class GenericTrainer(BaseTrainer):
                 return 0
             with open(concept_file, "r") as f:
                 concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+        # DPO pattern concepts are typed STANDARD but feed the DPO pipeline;
+        # exclude them so their chosen images aren't double-trained as anchors.
         anchor_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
-        return sum(1 for c in concepts if c.enabled and ConceptType(c.type) in anchor_types)
+        return sum(1 for c in concepts if c.enabled and ConceptType(c.type) in anchor_types and not c.is_dpo())
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
