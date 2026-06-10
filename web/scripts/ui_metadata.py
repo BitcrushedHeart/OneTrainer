@@ -779,6 +779,12 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Only disable this if you want to continue using the same cached data."
         " Disabling this can lead to errors, if other settings are changed during a restart"
     ),
+    "skip_cache_validation": (
+        "Trust the existing cache even when source files look stale (changed mtime/content)."
+        " Skips per-file mtime/hash/existence checks; files missing from the cache index are still cached."
+        " Speeds up startup on large datasets or slow storage,"
+        " but changed source files will keep using their old cached data"
+    ),
     "sample.frames": "Number of frames to generate. Only used when generating videos.",
     "sample.length": "Length in seconds of audio output.",
     "sample.sample_inpainting": "Enables inpainting sampling. Only available when sampling from an inpainting model.",

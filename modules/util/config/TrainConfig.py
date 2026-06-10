@@ -403,6 +403,7 @@ class TrainConfig(BaseConfig):
     aspect_ratio_bucketing: bool
     latent_caching: bool
     clear_cache_before_training: bool
+    skip_cache_validation: bool
     sourceless_training: bool
 
     # training settings
@@ -1132,6 +1133,7 @@ class TrainConfig(BaseConfig):
         data.append(("aspect_ratio_bucketing", True, bool, False))
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", False, bool, False))
+        data.append(("skip_cache_validation", False, bool, False))
         data.append(("sourceless_training", False, bool, False))
 
         # training settings

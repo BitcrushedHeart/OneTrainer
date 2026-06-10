@@ -52,6 +52,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "aspect_ratio_bucketing": "Aspect Ratio Bucketing",
     "latent_caching": "Latent Caching",
     "clear_cache_before_training": "Clear Cache Before Training",
+    "skip_cache_validation": "Skip Cache Validation",
     "learning_rate_scheduler": "LR Scheduler",
     "custom_learning_rate_scheduler": "Custom LR Scheduler",
     "learning_rate": "Learning Rate",
@@ -215,6 +216,7 @@ SECTION_MAP: "OrderedDict[str, list[str]]" = OrderedDict(
                 "aspect_ratio_bucketing",
                 "latent_caching",
                 "clear_cache_before_training",
+                "skip_cache_validation",
             ],
         ),
         (

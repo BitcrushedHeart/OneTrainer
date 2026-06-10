@@ -609,6 +609,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             rebucket_provider=rebucket_provider,
             aspect_bucketing=aspect_bucketing,
             extra_watched_paths_in_names=image_extra_watched or None,
+            trust_cache=config.skip_cache_validation,
         )
 
         text_disk_cache = SmartDiskCache(
@@ -625,6 +626,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             modeltype=config.model_type.value,
             source_path_in_name="sample_prompt_path",
             sourceless=sourceless,
+            trust_cache=config.skip_cache_validation,
         )
 
         modules = []

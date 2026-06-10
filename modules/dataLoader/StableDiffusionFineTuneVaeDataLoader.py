@@ -297,6 +297,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             rebucket_provider=rebucket_provider,
             aspect_bucketing=aspect_bucketing,
             extra_watched_paths_in_names=extra_watched or None,
+            trust_cache=config.skip_cache_validation,
         )
         variation_sorting = VariationSorting(
             names=sort_names,

@@ -526,6 +526,16 @@ class TrainUI(ctk.CTk):
         )
         components.switch(frame, 2, 1, self.ui_state, "clear_cache_before_training")
 
+        # skip cache validation
+        components.label(
+            frame,
+            2,
+            3,
+            "Skip cache validation",
+            tooltip="Trust the existing cache even when source files look stale (changed mtime/content). Skips per-file mtime/hash/existence checks; files missing from the cache index are still cached. Speeds up startup on large datasets or slow storage, but changed source files will keep using their old cached data",
+        )
+        components.switch(frame, 2, 4, self.ui_state, "skip_cache_validation")
+
         # sourceless training
         components.label(
             frame,
