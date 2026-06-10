@@ -54,7 +54,7 @@ export interface GroupData {
   total_groups: number;
   pairs_done: number;
   pairs_target: number;
-  mode?: "selection" | "elo";
+  mode?: "selection" | "elo" | "triage";
 }
 
 export interface EloPairResponse {
@@ -182,7 +182,12 @@ export const dpoApi = {
     }),
 
   // Curation session
-  startSession: (sourceFolder: string, outputDir: string, pairsPerGroup = 1, mode: "selection" | "elo" = "selection") =>
+  startSession: (
+    sourceFolder: string,
+    outputDir: string,
+    pairsPerGroup = 1,
+    mode: "selection" | "elo" | "triage" = "selection",
+  ) =>
     request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
       method: "POST",
       body: JSON.stringify({
@@ -212,6 +217,14 @@ export const dpoApi = {
   cancelPair: () => request<CancelPairResponse>("/dpo/session/cancel-pair", { method: "POST" }),
 
   skipGroup: () => request<{ ok: boolean }>("/dpo/session/skip-group", { method: "POST" }),
+
+  // Triage mode: all voting/pairing happens client-side; this commits the
+  // whole group's pairs in one batch and releases the group.
+  commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>) =>
+    request<{ ok: boolean; pairs_done?: number; error?: string }>("/dpo/session/commit-pairs", {
+      method: "POST",
+      body: JSON.stringify({ pairs }),
+    }),
 
   finalizeSession: (valPercentage = 0) =>
     request<{ ok: boolean; total_pairs?: number; train_count?: number; val_count?: number }>("/dpo/session/finalize", {

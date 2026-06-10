@@ -6,6 +6,7 @@ import { ReviewStep } from "./dpo/ReviewStep";
 import { ScanningStep } from "./dpo/ScanningStep";
 import { SelectionStep } from "./dpo/SelectionStep";
 import { SetupStep } from "./dpo/SetupStep";
+import { TriageStep } from "./dpo/TriageStep";
 import type { CurationStep } from "./dpo/types";
 import { useDpoSession } from "./dpo/useDpoSession";
 import { ModalBase } from "./ModalBase";
@@ -20,6 +21,7 @@ const titleByStep: Record<CurationStep, string> = {
   scanning: "DPO Pair Tool — Scanning",
   selecting: "DPO Pair Tool — Selection",
   elo: "DPO Pair Tool — ELO Ranking",
+  triage: "DPO Pair Tool — Triage",
   review: "DPO Pair Tool — Review Pairs",
   export: "DPO Pair Tool — Finalize",
 };
@@ -29,6 +31,7 @@ const sizeByStep: Record<CurationStep, "lg" | "full"> = {
   scanning: "lg",
   selecting: "full",
   elo: "full",
+  triage: "full",
   review: "full",
   export: "lg",
 };
@@ -65,7 +68,7 @@ export function DPOToolModal({ open, onClose }: Props) {
     actions,
   } = session;
 
-  const sessionActive = step === "scanning" || step === "selecting" || step === "elo";
+  const sessionActive = step === "scanning" || step === "selecting" || step === "elo" || step === "triage";
 
   const handleClose = useCallback(() => {
     if (sessionActive) {
@@ -150,6 +153,16 @@ export function DPOToolModal({ open, onClose }: Props) {
           onSkipGroup={() => void actions.skipGroup()}
           onCancel={() => void actions.cancelSession()}
           pairsDone={pairsDone}
+        />
+      )}
+
+      {step === "triage" && group && (
+        <TriageStep
+          group={group}
+          pairsDone={pairsDone}
+          onCommitPairs={actions.commitTriagePairs}
+          onSkipGroup={() => void actions.skipGroup()}
+          onCancel={() => void actions.cancelSession()}
         />
       )}
 

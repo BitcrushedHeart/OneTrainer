@@ -2,7 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { dpoApi } from "@/api/dpoApi";
 
-import type { CurationStep, FinalResult, GroupData, ResumeInfo, SelectionPhase, SessionConfig } from "./types";
+import type {
+  CurationMode,
+  CurationStep,
+  FinalResult,
+  GroupData,
+  ResumeInfo,
+  SelectionPhase,
+  SessionConfig,
+} from "./types";
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -28,7 +36,7 @@ export interface UseDpoSessionResult {
   sourceFolder: string;
   outputDir: string;
   pairsPerGroup: number;
-  mode: "selection" | "elo";
+  mode: CurationMode;
   scanCount: number;
   scanTotal: number;
   hashCount: number;
@@ -60,6 +68,7 @@ export interface UseDpoSessionResult {
     confirmPair: (keepScoring: boolean) => Promise<void>;
     cancelPendingPair: () => void;
     skipGroup: () => Promise<void>;
+    commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>) => Promise<void>;
     cancelSession: () => Promise<void>;
     eloVote: (winner: "a" | "b" | "tie") => Promise<void>;
     eloAccept: (continueScoring: boolean) => Promise<void>;
@@ -76,7 +85,7 @@ export function useDpoSession(): UseDpoSessionResult {
   const [sourceFolder, setSourceFolder] = useState("");
   const [outputDir, setOutputDir] = useState("");
   const [pairsPerGroup, setPairsPerGroup] = useState(1);
-  const [mode, setMode] = useState<"selection" | "elo">("selection");
+  const [mode, setMode] = useState<CurationMode>("selection");
   const [scanCount, setScanCount] = useState(0);
   const [scanTotal, setScanTotal] = useState(0);
   const [hashCount, setHashCount] = useState(0);
@@ -105,7 +114,7 @@ export function useDpoSession(): UseDpoSessionResult {
   const [toast, setToast] = useState<string | null>(null);
 
   const scanAbortRef = useRef<AbortController | null>(null);
-  const modeRef = useRef<"selection" | "elo">("selection");
+  const modeRef = useRef<CurationMode>("selection");
   modeRef.current = mode;
 
   const setStep = useCallback((s: CurationStep) => {
@@ -166,6 +175,10 @@ export function useDpoSession(): UseDpoSessionResult {
         if (effectiveMode === "elo") {
           setStepState("elo");
           await refreshEloPair();
+        } else if (effectiveMode === "triage") {
+          // No server prep needed — group.images is already client-side and
+          // all triage voting happens locally until the batch commit.
+          setStepState("triage");
         } else {
           setStepState("selecting");
         }
@@ -319,6 +332,19 @@ export function useDpoSession(): UseDpoSessionResult {
     await fetchNextGroup();
   }, [fetchNextGroup]);
 
+  const commitTriagePairs = useCallback(
+    async (pairs: Array<{ chosen: string; rejected: string }>) => {
+      const res = await dpoApi.commitTriagePairs(pairs);
+      if (!res.ok) {
+        setError(res.error ?? "Failed to commit pairs");
+        return;
+      }
+      if (res.pairs_done !== undefined) setPairsDone(res.pairs_done);
+      await fetchNextGroup();
+    },
+    [fetchNextGroup],
+  );
+
   const cancelSession = useCallback(async () => {
     scanAbortRef.current?.abort();
     scanAbortRef.current = null;
@@ -455,6 +481,7 @@ export function useDpoSession(): UseDpoSessionResult {
       confirmPair,
       cancelPendingPair,
       skipGroup,
+      commitTriagePairs,
       cancelSession,
       eloVote,
       eloAccept,

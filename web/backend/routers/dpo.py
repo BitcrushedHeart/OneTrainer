@@ -23,7 +23,7 @@ class StartSessionRequest(BaseModel):
     source_folder: str
     output_dir: str
     pairs_per_group: int = 1
-    mode: Literal["selection", "elo"] = "selection"
+    mode: Literal["selection", "elo", "triage"] = "selection"
 
 
 class SelectImageRequest(BaseModel):
@@ -46,6 +46,15 @@ class EloAcceptRequest(BaseModel):
 
 class ConfirmPairRequest(BaseModel):
     continue_scoring: bool = False
+
+
+class TriagePair(BaseModel):
+    chosen: str
+    rejected: str
+
+
+class CommitPairsRequest(BaseModel):
+    pairs: list[TriagePair]
 
 
 class BucketAnalysisRequest(BaseModel):
@@ -163,6 +172,12 @@ def confirm_pair(req: ConfirmPairRequest):
 def cancel_pair():
     service = DPOService.get_instance()
     return service.cancel_pending_pair()
+
+
+@router.post("/dpo/session/commit-pairs")
+def commit_pairs(req: CommitPairsRequest):
+    service = DPOService.get_instance()
+    return service.commit_triage_pairs([(p.chosen, p.rejected) for p in req.pairs])
 
 
 @router.post("/dpo/session/skip-group", response_model=ActionResponse)

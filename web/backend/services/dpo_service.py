@@ -294,8 +294,8 @@ class DPOService(SingletonMixin):
     ) -> dict:
         from modules.util.dpo_curation_util import DpoScanCache, load_manifest, prune_orphaned_pairs
 
-        if mode not in ("selection", "elo"):
-            return {"ok": False, "error": "mode must be 'selection' or 'elo'"}
+        if mode not in ("selection", "elo", "triage"):
+            return {"ok": False, "error": "mode must be 'selection', 'elo' or 'triage'"}
 
         with self._lock:
             if self._session_active:
@@ -304,7 +304,10 @@ class DPOService(SingletonMixin):
 
         self._source_folder = source_folder
         self._output_dir = output_dir
-        self._pairs_per_group = max(1, pairs_per_group)
+        # Triage drains a whole stack per pass and creates min(good, bad)
+        # pairs per group, so pairs_per_group must never pre-skip groups —
+        # the sentinel disables the cap in next_group and the scan worker.
+        self._pairs_per_group = 10**9 if mode == "triage" else max(1, pairs_per_group)
         self._mode = mode
         self._manifest = load_manifest(output_dir)
         pruned = prune_orphaned_pairs(output_dir, self._manifest)
@@ -551,6 +554,54 @@ class DPOService(SingletonMixin):
         self._selected_best = None
         self._selection_phase = "best"
         return {"ok": True}
+
+    def commit_triage_pairs(self, pairs: list[tuple[str, str]]) -> dict:
+        """Batch-commit a triage group's pairs, then release the group.
+
+        Triage voting/pairing happens entirely client-side, so this is the
+        only write call for the whole group. Every pair is validated against
+        _remaining_images (the dedup-filtered whitelist served by next_group)
+        before anything is exported — a malformed batch writes nothing. An
+        empty list just releases the group, equivalent to skip_group.
+        """
+        from modules.util.dpo_curation_util import export_single_pair
+
+        with self._lock:
+            if not self._current_group:
+                return {"ok": False, "error": "No active group"}
+            group = self._current_group
+
+            valid = set(self._remaining_images)
+            seen: set[str] = set()
+            for chosen, rejected in pairs:
+                if chosen == rejected:
+                    return {"ok": False, "error": "Chosen and rejected images must differ"}
+                if chosen not in valid or rejected not in valid:
+                    return {"ok": False, "error": "Pair references an image not in the current group"}
+                if chosen in seen or rejected in seen:
+                    return {"ok": False, "error": "An image is used in more than one pair"}
+                seen.add(chosen)
+                seen.add(rejected)
+
+            for chosen, rejected in pairs:
+                export_single_pair(
+                    self._output_dir,
+                    self._manifest,
+                    chosen,
+                    rejected,
+                    group["prompt"],
+                    group["aspectratio"],
+                )
+                self._mark_pair_used(chosen, rejected)
+                self._pairs_created_in_group += 1
+
+            self._remaining_images = [i for i in self._remaining_images if i not in seen]
+            # Release the group like skip_group so fetch_next_group advances.
+            self._current_group = None
+            self._pending_pair = None
+            self._selected_best = None
+            self._selection_phase = "best"
+            return {"ok": True, "pairs_done": self._pairs_created_in_group}
 
     def finalize_session(self, val_percentage: float = 0.0) -> dict:
         from modules.util.dpo_curation_util import finalize_export

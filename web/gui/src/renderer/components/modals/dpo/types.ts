@@ -2,9 +2,9 @@ import type { EloPairResponse, GroupData, ReviewPair, SessionStatus } from "@/ap
 
 export type { EloPairResponse, GroupData, ReviewPair, SessionStatus };
 
-export type CurationStep = "setup" | "scanning" | "selecting" | "elo" | "review" | "export";
+export type CurationStep = "setup" | "scanning" | "selecting" | "elo" | "triage" | "review" | "export";
 
-export type CurationMode = "selection" | "elo";
+export type CurationMode = "selection" | "elo" | "triage";
 
 export type SelectionPhase = "best" | "worst";
 
@@ -77,6 +77,14 @@ export interface EloStepProps {
   onSkipGroup: () => void;
   onCancel: () => void;
   pairsDone: number;
+}
+
+export interface TriageStepProps {
+  group: GroupData;
+  pairsDone: number;
+  onCommitPairs: (pairs: Array<{ chosen: string; rejected: string }>) => Promise<void>;
+  onSkipGroup: () => void;
+  onCancel: () => void;
 }
 
 export interface ReviewStepProps {

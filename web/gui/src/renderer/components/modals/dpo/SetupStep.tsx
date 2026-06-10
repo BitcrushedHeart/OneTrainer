@@ -1,4 +1,14 @@
-import { AlertTriangle, CheckCircle2, Eye, FileWarning, MousePointer2, Scissors, Search, Wrench } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Eye,
+  FileWarning,
+  MousePointer2,
+  Scissors,
+  Search,
+  Wrench,
+  Zap,
+} from "lucide-react";
 import { useCallback, useState } from "react";
 
 import { type CaptionMismatch, dpoApi, type PairCheckResult } from "@/api/dpoApi";
@@ -211,7 +221,8 @@ export function SetupStep({
             />
           </div>
           <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
-            How many pairs to collect before moving on.
+            How many pairs to collect before moving on. Triage mode ignores this — it pairs as many good/bad images as
+            each group allows.
           </p>
         </div>
       </SectionCard>
@@ -239,6 +250,14 @@ export function SetupStep({
         >
           <MousePointer2 className="w-4 h-4" />
           Start (ELO)
+        </Button>
+        <Button
+          variant="primary"
+          disabled={!canStart}
+          onClick={() => void onStart({ sourceFolder, outputDir, pairsPerGroup, mode: "triage" })}
+        >
+          <Zap className="w-4 h-4" />
+          Start (Triage)
         </Button>
         <Button variant="secondary" onClick={onReview}>
           <Eye className="w-4 h-4" />
