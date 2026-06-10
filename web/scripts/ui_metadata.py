@@ -84,11 +84,6 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
     "RLHFMode": {
         "DPO": "DPO (Direct Preference Optimization)",
     },
-    "DPOExecutionMode": {
-        "SEQUENTIAL": "Sequential",
-        "POLICY_CONCURRENT": "Policy Concurrent",
-        "FULL_CONCURRENT": "Full Concurrent",
-    },
     "DPOPatienceMode": {
         "EITHER": "Either (Accuracy or Loss)",
         "BOTH": "Both (Accuracy and Loss)",

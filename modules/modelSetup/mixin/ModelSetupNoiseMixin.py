@@ -76,6 +76,21 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         self._offset_noise_psi_schedule = psi_schedule.to(betas.device)
         return self._offset_noise_psi_schedule
 
+    def _apply_dpo_paired_rng(self, tensor: Tensor) -> Tensor:
+        # During a batched DPO forward the batch is [chosen; rejected] along
+        # dim 0, and each pair must be compared at the same timestep with the
+        # same noise. Sequential RNG draws would give rejected[i] draw B+i
+        # instead of draw i, so the second half is overwritten with the first.
+        # calculate_dpo_loss sets _dpo_paired_half to B around its batched
+        # predict() calls; the batch dict itself is not visible here.
+        # Applied at every per-sample RNG draw site: _create_noise,
+        # _get_timestep_discrete, and _apply_ciop (eps_in/eps_out). Any new
+        # draw site must apply it too, or DPO pairs silently desynchronize.
+        half = getattr(self, "_dpo_paired_half", None)
+        if half is not None and tensor.shape[0] == 2 * half:
+            tensor[half:] = tensor[:half]
+        return tensor
+
     def _create_noise(
         self,
         source_tensor: Tensor,
@@ -112,7 +127,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             )
             noise = noise + (config.perturbation_noise_weight * perturbation_noise)
 
-        return noise
+        return self._apply_dpo_paired_rng(noise)
 
     def _apply_ciop(
         self,
@@ -141,6 +156,8 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 device=noisy_latent.device,
                 dtype=noisy_latent.dtype,
             ) * (ciop_noise_weight * apply_mask)
+            # DPO pairing: see _apply_dpo_paired_rng (prob_threshold is batch-wide, no pairing needed)
+            eps_in = self._apply_dpo_paired_rng(eps_in)
 
             eps_out = torch.randn(
                 target_noise.shape,
@@ -148,6 +165,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 device=target_noise.device,
                 dtype=target_noise.dtype,
             ) * (ciop_noise_weight * apply_mask)
+            eps_out = self._apply_dpo_paired_rng(eps_out)
 
             noisy_latent = noisy_latent + eps_in
             target_noise = target_noise + eps_out
@@ -285,7 +303,7 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 )
                 timestep = samples.to(dtype=torch.long, device=generator.device)
 
-            return timestep.int()
+            return self._apply_dpo_paired_rng(timestep.int())
 
     def _get_timestep_continuous(
         self,
