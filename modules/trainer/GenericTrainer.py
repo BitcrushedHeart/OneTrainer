@@ -73,8 +73,6 @@ class GenericTrainer(BaseTrainer):
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
-        # torch._dynamo.config overrides are thread-local, so init_compile() must be called in the training thread/process.
-        init_compile()
 
         if multi.is_master():
             # TB writer creation is deferred to start() so a backup's tensorboard_subdir
@@ -101,6 +99,12 @@ class GenericTrainer(BaseTrainer):
         self._loop_scaler = None
 
     def start(self):
+        # torch._dynamo.config overrides are thread-local. The web backend constructs the
+        # trainer on the API request thread but runs start()/train() on a dedicated training
+        # thread, so this must happen here (not in __init__) or the recompile limit stays at
+        # the default of 8 and fullgraph=True training hard-fails on the 9th recompile.
+        init_compile()
+
         if multi.is_master():
             self.__save_config_to_workspace()
 

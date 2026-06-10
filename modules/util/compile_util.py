@@ -124,6 +124,8 @@ def _install_compile_progress_callbacks():
 
 def init_compile():
     # cache_size_limit and recompile_limit are aliases for the same dynamo config value.
+    # NOTE: dynamo config overrides are thread-local — this must run on the thread that
+    # executes the forward passes (the training thread), not just any importing thread.
     torch._dynamo.config.cache_size_limit = 8192
     torch.utils._sympy.functions.Mod.eval = Mod_patched_eval
     _install_compile_progress_callbacks()
