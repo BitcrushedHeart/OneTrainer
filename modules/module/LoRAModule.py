@@ -811,9 +811,9 @@ class DoRAOFTModule(OFTModule):
     blew up. The relative multiplier starts at 1.0 for every row, so all rows train
     on equal footing.
 
-    NOTE: the apply_to_module() bake override is intentionally omitted for now --
-    the oft_merge/oft_verify path will be re-added against the dora_multiplier
-    invariant (||merged_row|| == dora_multiplier * ||base_row||) separately.
+    The apply_to_module() bake override below fuses rotation + multiplier for the
+    oft_merge/oft_verify path, which checks the invariant
+    ||merged_row|| == |dora_multiplier| * ||base_row||.
     """
 
     dora_multiplier: nn.Parameter | None
