@@ -186,10 +186,9 @@ class GenericTrainer(BaseTrainer):
         self.parameters = self.model.parameters.parameters()
 
         # SFT-anchored DPO: when a DPO run also contains STANDARD/PRIOR_PREDICTION
-        # concepts, run those samples through a parallel non-DPO loader and add
-        # a weighted supervised term to the DPO loss. Without this, the DPO
-        # pipeline silently drops standard concepts via PairByFilename's
-        # concept_lookup miss.
+        # concepts (without DPO patterns), run those samples through a parallel
+        # non-DPO loader and add a weighted supervised term to the DPO loss.
+        # Without this, the DPO pipeline drops non-pattern concepts.
         self.sft_anchor_data_loader = None
         self.sft_anchor_iter = None
         if self.config.rlhf_enabled and self.config.rlhf_sft_anchor_weight > 0:

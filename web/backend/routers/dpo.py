@@ -23,7 +23,7 @@ class StartSessionRequest(BaseModel):
     source_folder: str
     output_dir: str
     pairs_per_group: int = 1
-    mode: Literal["selection", "elo", "triage"] = "selection"
+    mode: Literal["selection", "swiss", "triage"] = "selection"
 
 
 class SelectImageRequest(BaseModel):
@@ -34,14 +34,18 @@ class FinalizeRequest(BaseModel):
     val_percentage: float = 0.0
 
 
-class EloVoteRequest(BaseModel):
+class SwissVoteRequest(BaseModel):
     a: str
     b: str
     winner: Literal["a", "b", "tie"]
 
 
-class EloAcceptRequest(BaseModel):
-    continue_scoring: bool = False
+class SwissReorderRequest(BaseModel):
+    order: list[str]
+
+
+class SwissExportRequest(BaseModel):
+    pair_count: int
 
 
 class ConfirmPairRequest(BaseModel):
@@ -207,22 +211,40 @@ def serve_image(path: str):
     return FileResponse(abs_path)
 
 
-# ---- ELO mode endpoints ----
+# ---- Swiss tournament endpoints ----
 
 
-@router.get("/dpo/session/elo-pair")
-def elo_pair():
+@router.get("/dpo/session/swiss-state")
+def swiss_state():
     service = DPOService.get_instance()
-    return service.elo_current_pair()
+    return service.swiss_state()
 
 
-@router.post("/dpo/session/elo-vote")
-def elo_vote(req: EloVoteRequest):
+@router.post("/dpo/session/swiss-vote")
+def swiss_vote(req: SwissVoteRequest):
     service = DPOService.get_instance()
-    return service.elo_vote(req.a, req.b, req.winner)
+    return service.swiss_vote(req.a, req.b, req.winner)
 
 
-@router.post("/dpo/session/elo-accept")
-def elo_accept(req: EloAcceptRequest):
+@router.post("/dpo/session/swiss-finish-early")
+def swiss_finish_early():
     service = DPOService.get_instance()
-    return service.elo_accept_pair(req.continue_scoring)
+    return service.swiss_finish_early()
+
+
+@router.get("/dpo/session/swiss-ranking")
+def swiss_ranking():
+    service = DPOService.get_instance()
+    return service.swiss_ranking()
+
+
+@router.post("/dpo/session/swiss-reorder")
+def swiss_reorder(req: SwissReorderRequest):
+    service = DPOService.get_instance()
+    return service.swiss_reorder(req.order)
+
+
+@router.post("/dpo/session/swiss-export")
+def swiss_export(req: SwissExportRequest):
+    service = DPOService.get_instance()
+    return service.swiss_export(req.pair_count)

@@ -1,5 +1,4 @@
 import logging
-import math
 import os
 import random
 import threading
@@ -8,6 +7,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from queue import Empty, Full, Queue
 
+from modules.util.dpo_swiss_service import SwissTournament, outermost_pairs
 from web.backend.services._singleton import SingletonMixin
 from web.backend.services.config_service import ConfigService
 
@@ -15,9 +15,6 @@ logger = logging.getLogger(__name__)
 
 
 class DPOService(SingletonMixin):
-    _ELO_K = 32.0
-    _ELO_BASE = 1500.0
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._ws_broadcast: Callable[[dict], None] | None = None
@@ -46,7 +43,7 @@ class DPOService(SingletonMixin):
         self._groups_shown = 0
         self._current_group: dict | None = None
         self._remaining_images: list[str] = []
-        self._mode: str = "selection"  # "selection" | "elo"
+        self._mode: str = "selection"  # "selection" | "swiss" | "triage"
         self._selection_phase = "best"  # "best" or "worst"
         self._selected_best: str | None = None
         self._pairs_created_in_group = 0
@@ -56,10 +53,12 @@ class DPOService(SingletonMixin):
         # matches the Ctk yes/no/cancel dialog semantics.
         self._pending_pair: dict | None = None
 
-        # ELO mode state (per-group)
-        self._elo_ratings: dict[str, float] = {}
-        self._elo_done: int = 0
-        self._elo_pair: tuple[str, str] | None = None
+        # Swiss tournament state (per-group)
+        self._swiss: SwissTournament | None = None
+        # Server-authoritative best-to-worst ranking for the review step;
+        # populated by swiss_ranking, mutated by swiss_reorder, consumed by
+        # swiss_export so a stale client can't export mismatched pairs.
+        self._ranked_order: list[str] | None = None
 
     def set_ws_broadcast(self, fn: Callable[[dict], None]) -> None:
         self._ws_broadcast = fn
@@ -271,8 +270,8 @@ class DPOService(SingletonMixin):
     ) -> dict:
         from modules.util.dpo_curation_util import DpoScanCache, load_manifest, prune_orphaned_pairs
 
-        if mode not in ("selection", "elo", "triage"):
-            return {"ok": False, "error": "mode must be 'selection', 'elo' or 'triage'"}
+        if mode not in ("selection", "swiss", "triage"):
+            return {"ok": False, "error": "mode must be 'selection', 'swiss' or 'triage'"}
 
         with self._lock:
             if self._session_active:
@@ -369,9 +368,9 @@ class DPOService(SingletonMixin):
             self._selected_best = None
             self._pending_pair = None
 
-            if self._mode == "elo":
-                self._elo_init(self._remaining_images)
-                self._elo_next_pair()
+            if self._mode == "swiss":
+                self._swiss = SwissTournament(list(self._remaining_images))
+                self._ranked_order = None
 
             return {
                 "group": {
@@ -530,6 +529,8 @@ class DPOService(SingletonMixin):
         self._pending_pair = None
         self._selected_best = None
         self._selection_phase = "best"
+        self._swiss = None
+        self._ranked_order = None
         return {"ok": True}
 
     def commit_triage_pairs(self, pairs: list[tuple[str, str]]) -> dict:
@@ -610,6 +611,8 @@ class DPOService(SingletonMixin):
         self._session_active = False
         self._current_group = None
         self._pending_pair = None
+        self._swiss = None
+        self._ranked_order = None
         # Keep the hash work done so far — a restarted session over the same
         # output dir resumes from the cache instead of re-decoding everything.
         if self._hash_cache is not None:
@@ -622,149 +625,122 @@ class DPOService(SingletonMixin):
             return None
         return os.path.abspath(path)
 
-    # ---- ELO mode ----
+    # ---- Swiss tournament mode ----
 
-    def _elo_init(self, images: list[str]) -> None:
-        """Initialize ELO ratings for a group of images."""
-        self._elo_ratings = dict.fromkeys(images, self._ELO_BASE)
-        self._elo_done = 0
-        self._elo_pair = None
+    def _swiss_guard(self) -> dict | None:
+        if not self._current_group or self._mode != "swiss" or self._swiss is None:
+            return {"ok": False, "error": "No active tournament group"}
+        return None
 
-    def _elo_suggested_count(self, n: int | None = None) -> int:
-        """Suggested number of comparisons: max(15, ceil(n * log2(n)))."""
-        if n is None:
-            n = len(self._elo_ratings)
-        return max(15, math.ceil(n * math.log2(max(n, 2))))
-
-    def _elo_next_pair(self) -> tuple[str, str] | None:
-        """Pick two consecutive images from the rating-sorted list."""
-        if len(self._elo_ratings) < 2:
-            self._elo_pair = None
-            return None
-        sorted_imgs = sorted(self._elo_ratings, key=lambda x: self._elo_ratings[x])
-        idx = random.randint(0, len(sorted_imgs) - 2)
-        self._elo_pair = (sorted_imgs[idx], sorted_imgs[idx + 1])
-        return self._elo_pair
-
-    def _elo_vote(self, a: str, b: str, winner: str) -> None:
-        """Apply an ELO update for a single pairwise vote.
-
-        winner: "a" | "b" | "tie"
-        """
-        if a not in self._elo_ratings or b not in self._elo_ratings:
-            raise ValueError("Both images must be initialised in ELO ratings")
-        ra = self._elo_ratings[a]
-        rb = self._elo_ratings[b]
-
-        if winner == "a":
-            sa, sb = 1.0, 0.0
-        elif winner == "b":
-            sa, sb = 0.0, 1.0
-        else:
-            sa, sb = 0.5, 0.5
-
-        ea = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
-        eb = 1.0 - ea
-        self._elo_ratings[a] = ra + self._ELO_K * (sa - ea)
-        self._elo_ratings[b] = rb + self._ELO_K * (sb - eb)
-        self._elo_done += 1
-
-    def _elo_finish_round(self) -> tuple[str, str] | None:
-        """Return (best, worst) by final ratings; None if fewer than 2 images."""
-        if len(self._elo_ratings) < 2:
-            return None
-        sorted_imgs = sorted(self._elo_ratings, key=lambda x: self._elo_ratings[x], reverse=True)
-        return sorted_imgs[0], sorted_imgs[-1]
-
-    def elo_current_pair(self) -> dict:
-        """Return the current ELO pair plus progress, or {finished: True} when done."""
-        if not self._current_group or self._mode != "elo":
-            return {"ok": False, "error": "No active ELO group"}
-
-        # Lazy init if no pair yet
-        if self._elo_pair is None and self._elo_ratings:
-            self._elo_next_pair()
-
-        suggested = self._elo_suggested_count()
-        if self._elo_pair is None:
-            return {
-                "ok": True,
-                "finished": True,
-                "done": self._elo_done,
-                "suggested": suggested,
-                "ratings": dict(self._elo_ratings),
-            }
-        a, b = self._elo_pair
+    def _swiss_scores(self) -> dict[str, dict[str, float]]:
         return {
-            "ok": True,
-            "finished": False,
-            "pair": [a, b],
-            "ratings": {a: self._elo_ratings[a], b: self._elo_ratings[b]},
-            "done": self._elo_done,
-            "suggested": suggested,
+            image: {"score": self._swiss.player(image).score, "elo": round(self._swiss.player(image).elo, 1)}
+            for image in self._swiss.standings()
         }
 
-    def elo_vote(self, a: str, b: str, winner: str) -> dict:
-        """Public ELO vote endpoint. Picks the next pair and returns updated state."""
-        if not self._current_group or self._mode != "elo":
-            return {"ok": False, "error": "No active ELO group"}
+    def swiss_state(self) -> dict:
+        """Current match plus round/progress, or finished=True after the last vote."""
+        if error := self._swiss_guard():
+            return error
+        match = self._swiss.next_match()
+        return {
+            "ok": True,
+            "finished": match is None,
+            "match": list(match) if match else None,
+            "round": self._swiss.current_round,
+            "total_rounds": self._swiss.total_rounds,
+            "matches_played": self._swiss.matches_played(),
+            "matches_total": self._swiss.matches_total(),
+            "scores": self._swiss_scores(),
+        }
+
+    def swiss_vote(self, a: str, b: str, winner: str) -> dict:
+        """Resolve the current match. winner: 'a' | 'b' | 'tie' (relative to a/b as sent)."""
+        if error := self._swiss_guard():
+            return error
         if winner not in ("a", "b", "tie"):
             return {"ok": False, "error": "winner must be 'a', 'b', or 'tie'"}
-        try:
-            self._elo_vote(a, b, winner)
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
-        self._elo_next_pair()
-        return self.elo_current_pair()
+        current = self._swiss.next_match()
+        if current is None:
+            return {"ok": False, "error": "Tournament already finished"}
+        if {a, b} != {current[0], current[1]}:
+            return {"ok": False, "error": "Vote does not match the current match"}
+        # report() expects the exact (a, b) order of next_match; translate the
+        # winner if the client sent the pair flipped.
+        if (a, b) != current and winner in ("a", "b"):
+            winner = "b" if winner == "a" else "a"
+        self._swiss.report(current[0], current[1], winner)
+        return self.swiss_state()
 
-    def elo_accept_pair(self, continue_scoring: bool = False) -> dict:
-        """Finalize the current ELO round into a chosen/rejected pair on disk."""
-        from modules.util.dpo_curation_util import export_single_pair
+    def swiss_finish_early(self) -> dict:
+        """Jump straight to the ranked review with the votes cast so far."""
+        if error := self._swiss_guard():
+            return error
+        return self.swiss_ranking()
 
-        if not self._current_group or self._mode != "elo":
-            return {"ok": False, "error": "No active ELO group"}
-        result = self._elo_finish_round()
-        if result is None:
-            return {"ok": False, "error": "Need at least 2 images to accept pair"}
-        chosen, rejected = result
-        group = self._current_group
-
-        export_single_pair(
-            self._output_dir,
-            self._manifest,
-            chosen,
-            rejected,
-            group["prompt"],
-            group["aspectratio"],
+    def swiss_ranking(self) -> dict:
+        """Best-to-worst standings for the review step (computed once per group)."""
+        if error := self._swiss_guard():
+            return error
+        if self._ranked_order is None:
+            self._ranked_order = self._swiss.standings()
+        max_pairs = len(self._ranked_order) // 2
+        is_unconditional = self._current_group["prompt"] == "UNCONDITIONAL"
+        remaining_target = (
+            max_pairs if is_unconditional else max(1, self._pairs_per_group - self._pairs_created_in_group)
         )
-        self._mark_pair_used(chosen, rejected)
-
-        self._remaining_images = [i for i in self._remaining_images if i not in {chosen, rejected}]
-        self._pairs_created_in_group += 1
-
-        is_unconditional = group["prompt"] == "UNCONDITIONAL"
-        keep_going = continue_scoring or is_unconditional or self._pairs_created_in_group < self._pairs_per_group
-        can_continue = len(self._remaining_images) >= 2
-
-        if keep_going and can_continue:
-            self._elo_init(self._remaining_images)
-            self._elo_next_pair()
-            return {
-                "ok": True,
-                "pair_created": True,
-                "chosen": chosen,
-                "rejected": rejected,
-                "continue_group": True,
-                "pairs_done": self._pairs_created_in_group,
-            }
         return {
             "ok": True,
-            "pair_created": True,
-            "chosen": chosen,
-            "rejected": rejected,
-            "continue_group": False,
-            "pairs_done": self._pairs_created_in_group,
+            "order": list(self._ranked_order),
+            "scores": self._swiss_scores(),
+            "max_pairs": max_pairs,
+            "default_pairs": min(remaining_target, max_pairs),
         }
+
+    def swiss_reorder(self, order: list[str]) -> dict:
+        """Persist a manual re-ranking from the review grid (same image multiset)."""
+        if error := self._swiss_guard():
+            return error
+        if self._ranked_order is None:
+            return {"ok": False, "error": "Ranking not computed yet"}
+        if sorted(order) != sorted(self._ranked_order):
+            return {"ok": False, "error": "Reorder must contain exactly the ranked images"}
+        self._ranked_order = list(order)
+        return {"ok": True}
+
+    def swiss_export(self, pair_count: int) -> dict:
+        """Export the outermost pairs of the (possibly reordered) ranking, then
+        release the group. pair_count=0 just skips the group."""
+        from modules.util.dpo_curation_util import export_single_pair
+
+        if error := self._swiss_guard():
+            return error
+        if self._ranked_order is None:
+            return {"ok": False, "error": "Ranking not computed yet"}
+
+        with self._lock:
+            group = self._current_group
+            pairs = outermost_pairs(self._ranked_order, max(0, int(pair_count)))
+
+            for chosen, rejected in pairs:
+                export_single_pair(
+                    self._output_dir,
+                    self._manifest,
+                    chosen,
+                    rejected,
+                    group["prompt"],
+                    group["aspectratio"],
+                )
+                self._mark_pair_used(chosen, rejected)
+                self._pairs_created_in_group += 1
+
+            exported = {img for pair in pairs for img in pair}
+            self._remaining_images = [i for i in self._remaining_images if i not in exported]
+            # Release the group like skip_group so fetch_next_group advances.
+            self._current_group = None
+            self._swiss = None
+            self._ranked_order = None
+            return {"ok": True, "exported": len(pairs), "pairs_done": self._pairs_created_in_group}
 
     # ---- Background worker ----
 
