@@ -80,6 +80,10 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
     "RLHFMode": {
         "DPO": "DPO (Direct Preference Optimization)",
     },
+    "DPOObjective": {
+        "SIGMOID": "DPO (Sigmoid)",
+        "IPO": "IPO",
+    },
     "DPORefMode": {
         "NEW_ADAPTER": "New Adapter",
         "EXISTING_ADAPTER": "Existing Adapter",

@@ -1,10 +1,10 @@
-import type { EloPairResponse, GroupData, ReviewPair, SessionStatus } from "@/api/dpoApi";
+import type { GroupData, ReviewPair, SessionStatus, SwissScores } from "@/api/dpoApi";
 
-export type { EloPairResponse, GroupData, ReviewPair, SessionStatus };
+export type { GroupData, ReviewPair, SessionStatus, SwissScores };
 
-export type CurationStep = "setup" | "scanning" | "selecting" | "elo" | "triage" | "review" | "export";
+export type CurationStep = "setup" | "scanning" | "selecting" | "swiss" | "ranking" | "triage" | "review" | "export";
 
-export type CurationMode = "selection" | "elo" | "triage";
+export type CurationMode = "selection" | "swiss" | "triage";
 
 export type SelectionPhase = "best" | "worst";
 
@@ -65,15 +65,29 @@ export interface SelectionStepProps {
   pendingWorst: string | null;
 }
 
-export interface EloStepProps {
+export interface TournamentStepProps {
   group: GroupData;
-  pair: [string, string] | null;
-  ratings: Record<string, number>;
-  done: number;
-  suggested: number;
-  finished: boolean;
+  match: [string, string] | null;
+  round: number;
+  totalRounds: number;
+  matchesPlayed: number;
+  matchesTotal: number;
   onVote: (winner: "a" | "b" | "tie") => Promise<void>;
-  onAccept: (continueScoring: boolean) => Promise<void>;
+  onFinishEarly: () => Promise<void>;
+  onSkipGroup: () => void;
+  onCancel: () => void;
+  pairsDone: number;
+}
+
+export interface RankingStepProps {
+  group: GroupData;
+  order: string[];
+  scores: SwissScores;
+  maxPairs: number;
+  pairCount: number;
+  onPairCountChange: (n: number) => void;
+  onSwap: (i: number, j: number) => Promise<void>;
+  onExport: () => Promise<void>;
   onSkipGroup: () => void;
   onCancel: () => void;
   pairsDone: number;

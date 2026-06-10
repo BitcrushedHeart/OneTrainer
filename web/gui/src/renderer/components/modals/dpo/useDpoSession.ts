@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { SwissStateResponse } from "@/api/dpoApi";
 import { dpoApi } from "@/api/dpoApi";
 
 import type {
@@ -10,6 +11,7 @@ import type {
   ResumeInfo,
   SelectionPhase,
   SessionConfig,
+  SwissScores,
 } from "./types";
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -46,11 +48,15 @@ export interface UseDpoSessionResult {
   bestImage: string | null;
   remainingImages: string[];
   pairsDone: number;
-  eloPair: [string, string] | null;
-  eloRatings: Record<string, number>;
-  eloDone: number;
-  eloSuggested: number;
-  eloFinished: boolean;
+  swissMatch: [string, string] | null;
+  swissRound: number;
+  swissTotalRounds: number;
+  swissMatchesPlayed: number;
+  swissMatchesTotal: number;
+  rankedOrder: string[];
+  rankingScores: SwissScores;
+  maxPairs: number;
+  pairCount: number;
   showAcceptDialog: boolean;
   pendingBest: string | null;
   pendingWorst: string | null;
@@ -70,8 +76,11 @@ export interface UseDpoSessionResult {
     skipGroup: () => Promise<void>;
     commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>) => Promise<void>;
     cancelSession: () => Promise<void>;
-    eloVote: (winner: "a" | "b" | "tie") => Promise<void>;
-    eloAccept: (continueScoring: boolean) => Promise<void>;
+    swissVote: (winner: "a" | "b" | "tie") => Promise<void>;
+    swissFinishEarly: () => Promise<void>;
+    swapRanked: (i: number, j: number) => Promise<void>;
+    setPairCount: (n: number) => void;
+    swissExportPairs: () => Promise<void>;
     finalize: (valPct: number) => Promise<void>;
     setError: (msg: string | null) => void;
     setToast: (msg: string | null) => void;
@@ -97,11 +106,15 @@ export function useDpoSession(): UseDpoSessionResult {
   const [remainingImages, setRemainingImages] = useState<string[]>([]);
   const [pairsDone, setPairsDone] = useState(0);
 
-  const [eloPair, setEloPair] = useState<[string, string] | null>(null);
-  const [eloRatings, setEloRatings] = useState<Record<string, number>>({});
-  const [eloDone, setEloDone] = useState(0);
-  const [eloSuggested, setEloSuggested] = useState(0);
-  const [eloFinished, setEloFinished] = useState(false);
+  const [swissMatch, setSwissMatch] = useState<[string, string] | null>(null);
+  const [swissRound, setSwissRound] = useState(0);
+  const [swissTotalRounds, setSwissTotalRounds] = useState(0);
+  const [swissMatchesPlayed, setSwissMatchesPlayed] = useState(0);
+  const [swissMatchesTotal, setSwissMatchesTotal] = useState(0);
+  const [rankedOrder, setRankedOrder] = useState<string[]>([]);
+  const [rankingScores, setRankingScores] = useState<SwissScores>({});
+  const [maxPairs, setMaxPairs] = useState(0);
+  const [pairCount, setPairCount] = useState(1);
 
   const [showAcceptDialog, setShowAcceptDialog] = useState(false);
   const [pendingBest, setPendingBest] = useState<string | null>(null);
@@ -123,23 +136,42 @@ export function useDpoSession(): UseDpoSessionResult {
     setToast(null);
   }, []);
 
-  const refreshEloPair = useCallback(async () => {
-    const res = await dpoApi.eloPair();
+  const fetchSwissRanking = useCallback(async () => {
+    const res = await dpoApi.swissRanking();
     if (!res.ok) {
-      setError(res.error ?? "ELO pair fetch failed");
+      setError(res.error ?? "Ranking fetch failed");
       return;
     }
-    setEloRatings(res.ratings ?? {});
-    setEloDone(res.done ?? 0);
-    setEloSuggested(res.suggested ?? 0);
-    if (res.finished) {
-      setEloFinished(true);
-      setEloPair(null);
-    } else if (res.pair) {
-      setEloFinished(false);
-      setEloPair(res.pair);
-    }
+    setRankedOrder(res.order ?? []);
+    setRankingScores(res.scores ?? {});
+    setMaxPairs(res.max_pairs ?? 0);
+    setPairCount(res.default_pairs ?? 1);
+    setStepState("ranking");
   }, []);
+
+  const applySwissState = useCallback(
+    async (res: SwissStateResponse) => {
+      if (!res.ok) {
+        setError(res.error ?? "Tournament state fetch failed");
+        return;
+      }
+      setSwissRound(res.round ?? 0);
+      setSwissTotalRounds(res.total_rounds ?? 0);
+      setSwissMatchesPlayed(res.matches_played ?? 0);
+      setSwissMatchesTotal(res.matches_total ?? 0);
+      if (res.finished) {
+        setSwissMatch(null);
+        await fetchSwissRanking();
+      } else {
+        setSwissMatch(res.match ?? null);
+      }
+    },
+    [fetchSwissRanking],
+  );
+
+  const refreshSwissState = useCallback(async () => {
+    await applySwissState(await dpoApi.swissState());
+  }, [applySwissState]);
 
   const fetchNextGroup = useCallback(async () => {
     const signal = scanAbortRef.current?.signal;
@@ -172,9 +204,11 @@ export function useDpoSession(): UseDpoSessionResult {
         setShowAcceptDialog(false);
         setPairsDone(res.group.pairs_done);
         const effectiveMode = res.group.mode ?? modeRef.current;
-        if (effectiveMode === "elo") {
-          setStepState("elo");
-          await refreshEloPair();
+        if (effectiveMode === "swiss") {
+          setRankedOrder([]);
+          setRankingScores({});
+          setStepState("swiss");
+          await refreshSwissState();
         } else if (effectiveMode === "triage") {
           // No server prep needed — group.images is already client-side and
           // all triage voting happens locally until the batch commit.
@@ -186,7 +220,7 @@ export function useDpoSession(): UseDpoSessionResult {
       }
       return;
     }
-  }, [refreshEloPair]);
+  }, [refreshSwissState]);
 
   const pollScan = useCallback(
     async (signal: AbortSignal) => {
@@ -355,11 +389,15 @@ export function useDpoSession(): UseDpoSessionResult {
     setBestImage(null);
     setPhase("best");
     setPairsDone(0);
-    setEloPair(null);
-    setEloRatings({});
-    setEloDone(0);
-    setEloSuggested(0);
-    setEloFinished(false);
+    setSwissMatch(null);
+    setSwissRound(0);
+    setSwissTotalRounds(0);
+    setSwissMatchesPlayed(0);
+    setSwissMatchesTotal(0);
+    setRankedOrder([]);
+    setRankingScores({});
+    setMaxPairs(0);
+    setPairCount(1);
     setShowAcceptDialog(false);
     setPendingBest(null);
     setPendingWorst(null);
@@ -374,48 +412,53 @@ export function useDpoSession(): UseDpoSessionResult {
     setToast(null);
   }, []);
 
-  const eloVote = useCallback(
+  const swissVote = useCallback(
     async (winner: "a" | "b" | "tie") => {
-      if (!eloPair) return;
-      const [a, b] = eloPair;
-      const res = await dpoApi.eloVote(a, b, winner);
-      if (!res.ok) {
-        setError(res.error ?? "ELO vote failed");
-        return;
-      }
-      // Backend returns only the current pair's ratings when `finished=false`.
-      // Merge into the existing map so the full group's ratings stay visible
-      // to the accept-pair panel (which sorts all ratings to pick best/worst).
-      setEloRatings((prev) => ({ ...prev, ...(res.ratings ?? {}) }));
-      setEloDone(res.done ?? 0);
-      setEloSuggested(res.suggested ?? 0);
-      if (res.finished) {
-        setEloFinished(true);
-        setEloPair(null);
-      } else if (res.pair) {
-        setEloPair(res.pair);
-      }
+      if (!swissMatch) return;
+      const [a, b] = swissMatch;
+      await applySwissState(await dpoApi.swissVote(a, b, winner));
     },
-    [eloPair],
+    [swissMatch, applySwissState],
   );
 
-  const eloAccept = useCallback(
-    async (continueScoring: boolean) => {
-      const res = await dpoApi.eloAccept(continueScoring);
+  const swissFinishEarly = useCallback(async () => {
+    const res = await dpoApi.swissFinishEarly();
+    if (!res.ok) {
+      setError(res.error ?? "Finish early failed");
+      return;
+    }
+    setRankedOrder(res.order ?? []);
+    setRankingScores(res.scores ?? {});
+    setMaxPairs(res.max_pairs ?? 0);
+    setPairCount(res.default_pairs ?? 1);
+    setStepState("ranking");
+  }, []);
+
+  const swapRanked = useCallback(
+    async (i: number, j: number) => {
+      if (i === j || i < 0 || j < 0 || i >= rankedOrder.length || j >= rankedOrder.length) return;
+      const next = [...rankedOrder];
+      [next[i], next[j]] = [next[j], next[i]];
+      setRankedOrder(next);
+      const res = await dpoApi.swissReorder(next);
       if (!res.ok) {
-        setError(res.error ?? "Accept failed");
-        return;
-      }
-      setPairsDone(res.pairs_done ?? pairsDone + 1);
-      if (res.continue_group) {
-        setEloFinished(false);
-        await refreshEloPair();
-      } else {
-        await fetchNextGroup();
+        // Server is authoritative — roll back the optimistic swap.
+        setRankedOrder(rankedOrder);
+        setError(res.error ?? "Reorder failed");
       }
     },
-    [pairsDone, refreshEloPair, fetchNextGroup],
+    [rankedOrder],
   );
+
+  const swissExportPairs = useCallback(async () => {
+    const res = await dpoApi.swissExport(pairCount);
+    if (!res.ok) {
+      setError(res.error ?? "Export failed");
+      return;
+    }
+    if (res.pairs_done !== undefined) setPairsDone(res.pairs_done);
+    await fetchNextGroup();
+  }, [pairCount, fetchNextGroup]);
 
   const finalize = useCallback(async (valPct: number) => {
     const res = await dpoApi.finalizeSession(valPct);
@@ -459,11 +502,15 @@ export function useDpoSession(): UseDpoSessionResult {
     bestImage,
     remainingImages,
     pairsDone,
-    eloPair,
-    eloRatings,
-    eloDone,
-    eloSuggested,
-    eloFinished,
+    swissMatch,
+    swissRound,
+    swissTotalRounds,
+    swissMatchesPlayed,
+    swissMatchesTotal,
+    rankedOrder,
+    rankingScores,
+    maxPairs,
+    pairCount,
     showAcceptDialog,
     pendingBest,
     pendingWorst,
@@ -483,8 +530,11 @@ export function useDpoSession(): UseDpoSessionResult {
       skipGroup,
       commitTriagePairs,
       cancelSession,
-      eloVote,
-      eloAccept,
+      swissVote,
+      swissFinishEarly,
+      swapRanked,
+      setPairCount,
+      swissExportPairs,
       finalize,
       setError,
       setToast,

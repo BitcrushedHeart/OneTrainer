@@ -1,11 +1,12 @@
 import { useCallback } from "react";
 
-import { EloStep } from "./dpo/EloStep";
 import { ExportStep } from "./dpo/ExportStep";
+import { RankingStep } from "./dpo/RankingStep";
 import { ReviewStep } from "./dpo/ReviewStep";
 import { ScanningStep } from "./dpo/ScanningStep";
 import { SelectionStep } from "./dpo/SelectionStep";
 import { SetupStep } from "./dpo/SetupStep";
+import { TournamentStep } from "./dpo/TournamentStep";
 import { TriageStep } from "./dpo/TriageStep";
 import type { CurationStep } from "./dpo/types";
 import { useDpoSession } from "./dpo/useDpoSession";
@@ -20,7 +21,8 @@ const titleByStep: Record<CurationStep, string> = {
   setup: "DPO Pair Tool",
   scanning: "DPO Pair Tool — Scanning",
   selecting: "DPO Pair Tool — Selection",
-  elo: "DPO Pair Tool — ELO Ranking",
+  swiss: "DPO Pair Tool — Tournament",
+  ranking: "DPO Pair Tool — Ranked Review",
   triage: "DPO Pair Tool — Triage",
   review: "DPO Pair Tool — Review Pairs",
   export: "DPO Pair Tool — Finalize",
@@ -30,7 +32,8 @@ const sizeByStep: Record<CurationStep, "lg" | "full"> = {
   setup: "lg",
   scanning: "lg",
   selecting: "full",
-  elo: "full",
+  swiss: "full",
+  ranking: "full",
   triage: "full",
   review: "full",
   export: "lg",
@@ -53,11 +56,15 @@ export function DPOToolModal({ open, onClose }: Props) {
     bestImage,
     remainingImages,
     pairsDone,
-    eloPair,
-    eloRatings,
-    eloDone,
-    eloSuggested,
-    eloFinished,
+    swissMatch,
+    swissRound,
+    swissTotalRounds,
+    swissMatchesPlayed,
+    swissMatchesTotal,
+    rankedOrder,
+    rankingScores,
+    maxPairs,
+    pairCount,
     showAcceptDialog,
     pendingBest,
     pendingWorst,
@@ -68,7 +75,8 @@ export function DPOToolModal({ open, onClose }: Props) {
     actions,
   } = session;
 
-  const sessionActive = step === "scanning" || step === "selecting" || step === "elo" || step === "triage";
+  const sessionActive =
+    step === "scanning" || step === "selecting" || step === "swiss" || step === "ranking" || step === "triage";
 
   const handleClose = useCallback(() => {
     if (sessionActive) {
@@ -77,11 +85,6 @@ export function DPOToolModal({ open, onClose }: Props) {
       onClose();
     }
   }, [sessionActive, actions, onClose]);
-
-  const suggestedForGroup = Math.max(
-    15,
-    Math.ceil((group?.images.length ?? 0) * Math.log2(Math.max(group?.images.length ?? 2, 2))),
-  );
 
   return (
     <ModalBase
@@ -140,16 +143,32 @@ export function DPOToolModal({ open, onClose }: Props) {
         />
       )}
 
-      {step === "elo" && group && (
-        <EloStep
+      {step === "swiss" && group && (
+        <TournamentStep
           group={group}
-          pair={eloPair}
-          ratings={eloRatings}
-          done={eloDone}
-          suggested={eloSuggested || suggestedForGroup}
-          finished={eloFinished}
-          onVote={actions.eloVote}
-          onAccept={actions.eloAccept}
+          match={swissMatch}
+          round={swissRound}
+          totalRounds={swissTotalRounds}
+          matchesPlayed={swissMatchesPlayed}
+          matchesTotal={swissMatchesTotal}
+          onVote={actions.swissVote}
+          onFinishEarly={actions.swissFinishEarly}
+          onSkipGroup={() => void actions.skipGroup()}
+          onCancel={() => void actions.cancelSession()}
+          pairsDone={pairsDone}
+        />
+      )}
+
+      {step === "ranking" && group && (
+        <RankingStep
+          group={group}
+          order={rankedOrder}
+          scores={rankingScores}
+          maxPairs={maxPairs}
+          pairCount={pairCount}
+          onPairCountChange={actions.setPairCount}
+          onSwap={actions.swapRanked}
+          onExport={actions.swissExportPairs}
           onSkipGroup={() => void actions.skipGroup()}
           onCancel={() => void actions.cancelSession()}
           pairsDone={pairsDone}

@@ -19,6 +19,8 @@ const DEFAULT_CONCEPT: ConceptConfig = {
   balancing: 1,
   balancing_strategy: "REPEATS",
   loss_weight: 1.0,
+  dpo_chosen_pattern: "",
+  dpo_rejected_pattern: "",
   concept_stats: {},
   image: {
     enable_crop_jitter: true,

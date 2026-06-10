@@ -79,6 +79,22 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
 
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Seed</span>
       <FormEntry label="" type="number" value={draft.seed} onChange={(v) => update("seed", v)} />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">DPO Chosen Pattern</span>
+      <FormEntry
+        label=""
+        value={draft.dpo_chosen_pattern}
+        onChange={(v) => update("dpo_chosen_pattern", v)}
+        tooltip="Turns this concept into a DPO pair concept. Filename pattern (relative to Path) selecting the chosen images, e.g. 'chosen/{}'. Leave empty for a normal concept; both patterns must be set together."
+      />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">DPO Rejected Pattern</span>
+      <FormEntry
+        label=""
+        value={draft.dpo_rejected_pattern}
+        onChange={(v) => update("dpo_rejected_pattern", v)}
+        tooltip="Pattern locating the rejected image for each chosen image, e.g. 'rejected/{}'. '{}' is the stem matched by the chosen pattern; the extension may differ."
+      />
     </div>
   );
 }

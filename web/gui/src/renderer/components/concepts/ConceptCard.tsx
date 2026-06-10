@@ -47,39 +47,26 @@ const typeStyles: Record<
     overlay: "var(--color-warning-500-alpha-06)",
     label: "Prior",
   },
-  DPO_CHOSEN: {
-    border: "#22c55e",
-    badgeBg: "rgba(34, 197, 94, 0.15)",
-    badgeText: "#22c55e",
-    overlay: "rgba(34, 197, 94, 0.06)",
-    label: "DPO Chosen",
-  },
-  DPO_REJECTED: {
-    border: "#ef4444",
-    badgeBg: "rgba(239, 68, 68, 0.15)",
-    badgeText: "#ef4444",
-    overlay: "rgba(239, 68, 68, 0.06)",
-    label: "DPO Rejected",
-  },
-  DPO_CHOSEN_VAL: {
-    border: "#4ade80",
-    badgeBg: "rgba(74, 222, 128, 0.15)",
-    badgeText: "#4ade80",
-    overlay: "rgba(74, 222, 128, 0.06)",
-    label: "DPO Chosen (Val)",
-  },
-  DPO_REJECTED_VAL: {
-    border: "#f87171",
-    badgeBg: "rgba(248, 113, 113, 0.15)",
-    badgeText: "#f87171",
-    overlay: "rgba(248, 113, 113, 0.06)",
-    label: "DPO Rejected (Val)",
-  },
 };
+
+// DPO pair concepts are typed STANDARD/VALIDATION but carry chosen/rejected
+// patterns; badge them distinctly so they stand out in the concept list.
+const dpoStyle = {
+  border: "#22c55e",
+  badgeBg: "rgba(34, 197, 94, 0.15)",
+  badgeText: "#22c55e",
+  overlay: "rgba(34, 197, 94, 0.06)",
+  label: "DPO Pairs",
+};
+
+function isDpoConcept(concept: ConceptCardProps["concept"]): boolean {
+  const c = concept as unknown as Record<string, unknown>;
+  return Boolean(c.dpo_chosen_pattern) && Boolean(c.dpo_rejected_pattern);
+}
 
 export function ConceptCard({ concept, index, onOpen, onRemove, onClone, onToggle }: ConceptCardProps) {
   const displayName = concept.name || (concept.path ? concept.path.split(/[/\\]/).pop() : `Concept ${index + 1}`);
-  const style = typeStyles[concept.type] ?? typeStyles.STANDARD;
+  const style = isDpoConcept(concept) ? dpoStyle : (typeStyles[concept.type] ?? typeStyles.STANDARD);
 
   const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
   const [thumbnailError, setThumbnailError] = useState(false);

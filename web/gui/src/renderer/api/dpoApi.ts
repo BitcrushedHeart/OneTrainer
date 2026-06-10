@@ -54,16 +54,29 @@ export interface GroupData {
   total_groups: number;
   pairs_done: number;
   pairs_target: number;
-  mode?: "selection" | "elo" | "triage";
+  mode?: "selection" | "swiss" | "triage";
 }
 
-export interface EloPairResponse {
+export type SwissScores = Record<string, { score: number; elo: number }>;
+
+export interface SwissStateResponse {
   ok: boolean;
   finished?: boolean;
-  pair?: [string, string];
-  ratings?: Record<string, number>;
-  done?: number;
-  suggested?: number;
+  match?: [string, string] | null;
+  round?: number;
+  total_rounds?: number;
+  matches_played?: number;
+  matches_total?: number;
+  scores?: SwissScores;
+  error?: string;
+}
+
+export interface SwissRankingResponse {
+  ok: boolean;
+  order?: string[];
+  scores?: SwissScores;
+  max_pairs?: number;
+  default_pairs?: number;
   error?: string;
 }
 
@@ -186,7 +199,7 @@ export const dpoApi = {
     sourceFolder: string,
     outputDir: string,
     pairsPerGroup = 1,
-    mode: "selection" | "elo" | "triage" = "selection",
+    mode: "selection" | "swiss" | "triage" = "selection",
   ) =>
     request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
       method: "POST",
@@ -234,27 +247,29 @@ export const dpoApi = {
 
   cancelSession: () => request<{ ok: boolean }>("/dpo/session/cancel", { method: "POST" }),
 
-  // ELO mode
-  eloPair: () => request<EloPairResponse>("/dpo/session/elo-pair"),
+  // Swiss tournament mode
+  swissState: () => request<SwissStateResponse>("/dpo/session/swiss-state"),
 
-  eloVote: (a: string, b: string, winner: "a" | "b" | "tie") =>
-    request<EloPairResponse>("/dpo/session/elo-vote", {
+  swissVote: (a: string, b: string, winner: "a" | "b" | "tie") =>
+    request<SwissStateResponse>("/dpo/session/swiss-vote", {
       method: "POST",
       body: JSON.stringify({ a, b, winner }),
     }),
 
-  eloAccept: (continueScoring = false) =>
-    request<{
-      ok: boolean;
-      pair_created?: boolean;
-      chosen?: string;
-      rejected?: string;
-      continue_group?: boolean;
-      pairs_done?: number;
-      error?: string;
-    }>("/dpo/session/elo-accept", {
+  swissFinishEarly: () => request<SwissRankingResponse>("/dpo/session/swiss-finish-early", { method: "POST" }),
+
+  swissRanking: () => request<SwissRankingResponse>("/dpo/session/swiss-ranking"),
+
+  swissReorder: (order: string[]) =>
+    request<{ ok: boolean; error?: string }>("/dpo/session/swiss-reorder", {
       method: "POST",
-      body: JSON.stringify({ continue_scoring: continueScoring }),
+      body: JSON.stringify({ order }),
+    }),
+
+  swissExport: (pairCount: number) =>
+    request<{ ok: boolean; exported?: number; pairs_done?: number; error?: string }>("/dpo/session/swiss-export", {
+      method: "POST",
+      body: JSON.stringify({ pair_count: pairCount }),
     }),
 
   bucketAnalysis: (concept_path: string, batch_size: number, target_resolutions: number[], quantization: number) =>

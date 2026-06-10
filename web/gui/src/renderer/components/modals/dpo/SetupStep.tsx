@@ -246,10 +246,10 @@ export function SetupStep({
         <Button
           variant="primary"
           disabled={!canStart}
-          onClick={() => void onStart({ sourceFolder, outputDir, pairsPerGroup, mode: "elo" })}
+          onClick={() => void onStart({ sourceFolder, outputDir, pairsPerGroup, mode: "swiss" })}
         >
           <MousePointer2 className="w-4 h-4" />
-          Start (ELO)
+          Start (Tournament)
         </Button>
         <Button
           variant="primary"
