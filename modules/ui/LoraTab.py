@@ -205,6 +205,16 @@ class LoraTab:
             )
             components.switch(master, 4, 4, self.ui_state, "dora_oft")
 
+            # CANS OFT
+            components.label(
+                master,
+                5,
+                3,
+                "Accelerated Newton-Schulz",
+                tooltip="Replaces Cayley-Neumann with Chebyshev-Optimized Newton-Schulz (CANS) to improve orthogonalization stability and reduce error without the high computational cost of the exact solver.",
+            )
+            components.switch(master, 5, 4, self.ui_state, "oft_cans")
+
             # Spectral Norm Clipping (OFT long-term stability)
             components.label(
                 master,
