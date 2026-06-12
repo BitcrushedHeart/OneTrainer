@@ -1262,23 +1262,53 @@ def create_optimizer(
         # optimizer values it silently mishandles. Fill missing keys and replace
         # incompatible-typed values from the freshly constructed optimizer so old
         # backups can resume.
-        current_groups = optimizer.state_dict()["param_groups"]
-        saved_groups = state_dict.get("param_groups")
-        if saved_groups is not None and len(saved_groups) == len(current_groups):
-            for saved_group, current_group in zip(saved_groups, current_groups, strict=True):
+        # adv_optm 2.5.2 mode strings; anything else (old bools, None, stale
+        # strings) silently breaks the optimizer (e.g. _orthogonalize_gradient
+        # returns None for unknown modes, nulling gradients mid-step).
+        group_enum_values = {
+            "orthogonal_gradient": {"disabled", "flattened", "iterative"},
+            "state_precision": {"auto", "factored", "fp32", "fp16", "bf16_sr", "int8_sr"},
+            "actual_state_precision": {"auto", "factored", "fp32", "fp16", "bf16_sr", "int8_sr"},
+            "centered_wd_mode": {"full", "float8", "int8", "int4"},
+        }
+
+        def _normalize_groups(groups: list[dict], reference_groups: list[dict], where: str):
+            if len(groups) != len(reference_groups):
+                print(
+                    f"WARN: optimizer group count mismatch {where} "
+                    f"({len(groups)} saved vs {len(reference_groups)} current); "
+                    f"version-compat normalization skipped."
+                )
+                return
+            for saved_group, current_group in zip(groups, reference_groups, strict=True):
                 for key, value in current_group.items():
                     if key == "params":
                         continue
                     if key not in saved_group:
                         saved_group[key] = value
-                    elif isinstance(saved_group[key], bool) and isinstance(value, str):
+                        continue
+                    type_changed = (
+                        isinstance(value, str)
+                        and not isinstance(saved_group[key], str)
+                        or isinstance(value, bool)
+                        and not isinstance(saved_group[key], bool)
+                    )
+                    invalid_enum = key in group_enum_values and saved_group[key] not in group_enum_values[key]
+                    if type_changed or invalid_enum:
                         print(
-                            f"INFO: optimizer param group key '{key}' changed format since this "
-                            f"state was saved ({saved_group[key]!r} -> {value!r}); using the current config value."
+                            f"INFO: optimizer param group key '{key}' changed format since this state "
+                            f"was saved ({saved_group[key]!r} -> {value!r}) [{where}]; using the current config value."
                         )
                         saved_group[key] = value
 
+        current_groups = optimizer.state_dict()["param_groups"]
+        _normalize_groups(state_dict.get("param_groups") or [], current_groups, "before load")
+
         optimizer.load_state_dict(state_dict)
+
+        # Belt and braces: torch may merge rather than replace some group content,
+        # so re-check the live groups after loading.
+        _normalize_groups(optimizer.param_groups, current_groups, "after load")
 
     return optimizer
 
