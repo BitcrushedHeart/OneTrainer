@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { Button, FormEntry, Toggle } from "@/components/shared";
+import { Button, FormEntry, Select, Toggle } from "@/components/shared";
 import { useBoundField } from "@/hooks/fieldBinding";
 import { useConfigStore } from "@/store/configStore";
 import type { Optimizer } from "@/types/generated/enums";
@@ -12,6 +12,14 @@ export interface OptimizerParamsModalProps {
   open: boolean;
   onClose: () => void;
 }
+
+// Option lists for enum-like detail types, mirroring the dropdowns in
+// modules/ui/OptimizerParamsWindow.py create_dynamic_ui().
+const ENUM_TYPE_OPTIONS: Record<string, string[]> = {
+  CenteredWDMode: ["full", "float8", "int8", "int4"],
+  StatePrecision: ["auto", "factored", "fp32", "bf16_sr", "int8_sr"],
+  OrthoGrad: ["disabled", "flattened", "iterative"],
+};
 
 export function OptimizerParamsModal({ open, onClose }: OptimizerParamsModalProps) {
   const [optimizer] = useBoundField<Optimizer>("optimizer.optimizer");
@@ -35,12 +43,20 @@ export function OptimizerParamsModal({ open, onClose }: OptimizerParamsModalProp
   const detailMap = useMemo(() => paramsData?.detail_map ?? {}, [paramsData]);
 
   // Split parameters into columns by type, filtering to only those with metadata
-  const { numericParams, boolParams, strParams } = useMemo(() => {
-    if (!optimizerInfo) return { numericParams: [] as string[], boolParams: [] as string[], strParams: [] as string[] };
+  const { numericParams, boolParams, strParams, enumParams } = useMemo(() => {
+    if (!optimizerInfo) {
+      return {
+        numericParams: [] as string[],
+        boolParams: [] as string[],
+        strParams: [] as string[],
+        enumParams: [] as string[],
+      };
+    }
 
     const numeric: string[] = [];
     const bool: string[] = [];
     const str: string[] = [];
+    const enums: string[] = [];
 
     for (const key of optimizerInfo.keys) {
       // Skip muon_adam_config — has its own modal
@@ -51,13 +67,15 @@ export function OptimizerParamsModal({ open, onClose }: OptimizerParamsModalProp
 
       if (detail.type === "bool") {
         bool.push(key);
+      } else if (detail.type in ENUM_TYPE_OPTIONS) {
+        enums.push(key);
       } else if (detail.type === "str") {
         str.push(key);
       } else {
         numeric.push(key);
       }
     }
-    return { numericParams: numeric, boolParams: bool, strParams: str };
+    return { numericParams: numeric, boolParams: bool, strParams: str, enumParams: enums };
   }, [optimizerInfo, detailMap]);
 
   const isMuonFamily = optimizerName && (optimizerName.includes("MUON") || optimizerName.includes("ADAMUON"));
@@ -112,6 +130,16 @@ export function OptimizerParamsModal({ open, onClose }: OptimizerParamsModalProp
               configPath={`optimizer.${param}`}
               tooltip={detailMap[param]?.tooltip}
               nullable
+            />
+          ))}
+          {enumParams.map((param) => (
+            <Select
+              key={param}
+              label={detailMap[param]?.title ?? param}
+              configPath={`optimizer.${param}`}
+              options={ENUM_TYPE_OPTIONS[detailMap[param]?.type ?? ""] ?? []}
+              tooltip={detailMap[param]?.tooltip}
+              formatLabel={(v) => v}
             />
           ))}
           {boolParams.map((param) => (

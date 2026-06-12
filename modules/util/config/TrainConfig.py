@@ -146,8 +146,25 @@ class TrainOptimizerConfig(BaseConfig):
     snr_cond: False
     geometric_wd: False
 
+    # valid adv_optm 2.5.2 values; PR #1344 briefly shipped a "float8" default
+    # that 2.5.2 rejects, and configs saved in that window persist it.
+    _VALID_STATE_PRECISIONS = {"auto", "factored", "fp32", "fp16", "bf16_sr", "int8_sr"}
+
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(data)
+
+    def from_dict(self, data: dict) -> "TrainOptimizerConfig":
+        sp = data.get("state_precision")
+        if sp is not None and sp not in self._VALID_STATE_PRECISIONS:
+            print(f"WARN: invalid optimizer state_precision '{sp}' in config, falling back to 'auto'.")
+            data = data.copy()
+            data["state_precision"] = "auto"
+        # orthogonal_gradient was a bool before adv_optm 2.5 made it a mode string
+        og = data.get("orthogonal_gradient")
+        if isinstance(og, bool):
+            data = data.copy()
+            data["orthogonal_gradient"] = "flattened" if og else "disabled"
+        return super().from_dict(data)
 
     @staticmethod
     def default_values():
@@ -255,7 +272,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("centered_wd_mode", "full", str, False))
         data.append(("factored_2nd", False, bool, False))
         data.append(("fisher_wd", False, bool, False))
-        data.append(("state_precision", "float8", str, False))
+        data.append(("state_precision", "auto", str, False))
         data.append(("orthogonal_sinkhorn", False, bool, False))
         data.append(("sinkhorn_iterations", None, int, True))
         data.append(("normed_momentum", False, bool, False))
