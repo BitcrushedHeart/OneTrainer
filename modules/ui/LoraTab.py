@@ -215,15 +215,15 @@ class LoraTab:
             )
             components.switch(master, 5, 4, self.ui_state, "oft_cans")
 
-            # Spectral Norm Clipping (OFT long-term stability)
+            # Clip OFT max norm
             components.label(
                 master,
-                7,
-                3,
+                5,
+                0,
                 "Spectral Norm Clipping",
-                tooltip="Clips the spectral norm of the OFT rotation generator to <= 1, guaranteeing the Cayley-Neumann series converges. Prevents the divergence/garbage-update failure that corrupts backgrounds on long or high-block-size runs. Negligible cost; recommended on.",
+                tooltip="Strictly clips the spectral norm of the OFT matrix to guarantee convergence of the Cayley parametrization (requires norm <= 1.0). Smaller values constrain the learned rotation to stay near the identity matrix, limiting adaptation (angle ~= 2*arctan(value)). Leave empty to disable.",
             )
-            components.switch(master, 7, 4, self.ui_state, "oft_clipped_norm")
+            components.entry(master, 5, 1, self.ui_state, "oft_clipped_norm")
 
             # Dropout Percentage
             components.label(

@@ -609,7 +609,7 @@ class OFTModule(PeftBase):
     oft_block_size: int
     block_share: bool
     oft_scaled: bool
-    oft_clipped_norm: bool
+    oft_clipped_norm: float | None
     oft_cans: bool
     dropout_probability: float
     adjustment_info: tuple[int, int] | None  # for reporting
@@ -621,7 +621,7 @@ class OFTModule(PeftBase):
         oft_block_size: int,
         block_share: bool,
         oft_scaled: bool,
-        oft_clipped_norm: bool = False,
+        oft_clipped_norm: float | None = None,
         oft_cans: bool = False,
         **kwargs,
     ):
@@ -831,12 +831,15 @@ class DoRAOFTModule(OFTModule):
         oft_block_size: int,
         block_share: bool,
         oft_scaled: bool,
-        oft_clipped_norm: bool = False,
+        oft_clipped_norm: float | None = None,
+        oft_cans: bool = False,
         **kwargs,
     ):
         self.dora_multiplier = None
 
-        super().__init__(prefix, orig_module, oft_block_size, block_share, oft_scaled, oft_clipped_norm, **kwargs)
+        super().__init__(
+            prefix, orig_module, oft_block_size, block_share, oft_scaled, oft_clipped_norm, oft_cans, **kwargs
+        )
 
     def initialize_weights(self):
         super().initialize_weights()

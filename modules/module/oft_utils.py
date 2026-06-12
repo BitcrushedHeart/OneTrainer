@@ -49,7 +49,7 @@ class OFTRotationModule(nn.Module):
         num_cayley_neumann_terms=5,
         oft_cans=False,
         dropout_probability=0.0,
-        oft_clipped_norm=False,
+        oft_clipped_norm: float | None = 0.95,
     ):
         super().__init__()
         self.r = r
@@ -75,10 +75,10 @@ class OFTRotationModule(nn.Module):
         self.register_buffer("cols", cols, persistent=False)
         self.dropout = MultiplicativeDropoutLayer(p=dropout_probability)
         self.oft_clipped_norm = oft_clipped_norm
-        if oft_clipped_norm:
-            # Non-persistent marker: behavior is driven by self.oft_clipped_norm /
-            # the ot_config field, so this never affects state_dict compatibility.
-            self.register_buffer("clipped_oft", torch.tensor(True), persistent=False)
+        if oft_clipped_norm is not None:
+            # Persistent buffer: embeds the clip value in the state_dict so
+            # inference tools can detect and reproduce the clipped rotation.
+            self.register_buffer("clipped_oft", torch.tensor(self.oft_clipped_norm))
             # Power-iteration state for spectral-norm estimation; one state per block.
             u = torch.randn(r, block_size)
             u = u / u.norm(dim=1, keepdim=True).clamp_min(1e-12)
@@ -193,14 +193,15 @@ class OFTRotationModule(nn.Module):
 
         Q_skew = self._pytorch_skew_symmetric(Q, block_size)
 
-        if use_cayley_neumann and getattr(self, "oft_clipped_norm", False):
-            # The Neumann series converges only if the spectral norm ||Q||_2 < 1.
-            # Estimate it with one power-iteration step and clip Q to 0.999 so the
-            # series can't diverge on long / high-block-size runs (PR #1492).
+        if self.oft_clipped_norm is not None:
+            # The Neumann series only converges if the spectral norm ||Q||_2 < 1.
+            # Estimate it with one power-iteration step and clip Q to the
+            # configured max norm; this also bounds the learned rotation angle
+            # (angle ~= 2*arctan(sigma)) regardless of orthogonalization method.
             v_vec, u_vec = self._spectral_norm(Q_skew)
             u_raw = torch.bmm(Q_skew, v_vec)
             sigma = torch.sum(u_vec * u_raw, dim=1, keepdim=True)
-            max_norm = 0.999
+            max_norm = self.oft_clipped_norm
             Q_skew = Q_skew * (max_norm / torch.clamp(sigma, min=max_norm))
 
         if use_cayley_neumann:

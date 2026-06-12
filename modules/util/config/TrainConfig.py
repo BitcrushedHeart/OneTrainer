@@ -548,7 +548,7 @@ class TrainConfig(BaseConfig):
     oft_block_share: bool
     dora_oft: bool
     oft_scaled: bool
-    oft_clipped_norm: bool
+    oft_clipped_norm: float | None
     oft_cans: bool
 
     # lokr
@@ -933,6 +933,16 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("rlhf_dpo_adaptive_beta", False)
         migrated_data.setdefault("rlhf_dpo_timestep_margin_logging", False)
         return migrated_data
+
+    def from_dict(self, data: dict) -> "TrainConfig":
+        # oft_clipped_norm was briefly a bool on this branch (clip on/off at a
+        # hard-coded 0.999) before upstream PR #1492 settled on float | None
+        # (the max norm itself). Coerce old configs / adapter ot_config blobs;
+        # float(False) would otherwise become 0.0 and clip all rotations away.
+        if isinstance(data.get("oft_clipped_norm"), bool):
+            data = data.copy()
+            data["oft_clipped_norm"] = 0.999 if data["oft_clipped_norm"] else None
+        return super().from_dict(data)
 
     def effective_dpo_ref_mode(self) -> DPORefMode:
         return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
@@ -1332,7 +1342,7 @@ class TrainConfig(BaseConfig):
         data.append(("oft_block_share", False, bool, False))
         data.append(("dora_oft", False, bool, False))
         data.append(("oft_scaled", False, bool, False))
-        data.append(("oft_clipped_norm", True, bool, False))
+        data.append(("oft_clipped_norm", 0.95, float, True))
         data.append(("oft_cans", False, bool, False))
 
         # lokr
