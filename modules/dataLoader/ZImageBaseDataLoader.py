@@ -1,7 +1,7 @@
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin, text_encode_batch_size
 from modules.model.BaseModel import BaseModel
 from modules.model.ZImageModel import PROMPT_MAX_LENGTH, ZImageModel, format_input
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
@@ -57,7 +57,8 @@ class ZImageBaseDataLoader(
             apply_chat_template=lambda caption: format_input(caption),
             apply_chat_template_kwargs={"add_generation_prompt": True, "enable_thinking": True},
         )
-        if config.dataloader_threads > 1:
+        text_encode_batch = text_encode_batch_size()
+        if config.dataloader_threads > 1 or text_encode_batch > 1:
             apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
         encode_prompt = EncodeQwenText(
             tokens_name="tokens",
@@ -68,6 +69,15 @@ class ZImageBaseDataLoader(
             hidden_state_output_index=-2,
             autocast_contexts=[model.autocast_context],
             dtype=model.train_dtype.torch_dtype(),
+            # Both gated on latent_caching: PruneMaskedTokens then discards
+            # every padded hidden-state row before the cache stores it, so
+            # trimming the padding off the forward (and zero-filling those
+            # rows) yields a byte-equivalent cached artifact. Without
+            # caching, padded rows flow to the trainer and must stay the
+            # encoder's own outputs.
+            trim_padding=config.latent_caching,
+            batch_collector=config.latent_caching and text_encode_batch > 1,
+            max_batch_size=text_encode_batch,
         )
         prune_masked_tokens = PruneMaskedTokens(
             tokens_name="tokens", tokens_mask_name="tokens_mask", hidden_state_name="text_encoder_hidden_state"
@@ -112,6 +122,9 @@ class ZImageBaseDataLoader(
             sort_names=sort_names,
             config=config,
             text_caching=True,
+            # Match the encoder's batch collector so a full batch of encode
+            # requests can be in flight during the text cache build.
+            text_cache_build_workers=text_encode_batch_size() if config.latent_caching else None,
         )
 
     def _output_modules(

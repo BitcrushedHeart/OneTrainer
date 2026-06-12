@@ -1,7 +1,7 @@
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin, text_encode_batch_size
 from modules.model.Flux2Model import (
     MISTRAL_HIDDEN_STATES_LAYERS,
     MISTRAL_SYSTEM_MESSAGE,
@@ -52,6 +52,13 @@ class Flux2BaseDataLoader(
         )
         image_sample = SampleVAEDistribution(in_name="latent_image_distribution", out_name="latent_image", mode="mean")
         downscale_mask = ScaleImage(in_name="mask", out_name="latent_mask", factor=0.125)
+        # Collector only — no trim_padding: this pipeline caches the full
+        # padded hidden state, so padded rows must remain the encoder's own
+        # outputs. Batching is the win that matters here anyway: one
+        # weight-stream per batch through the 24B Mistral (dev) instead of
+        # one per caption.
+        text_encode_batch = text_encode_batch_size()
+        use_batch_collector = config.latent_caching and text_encode_batch > 1
         if model.is_dev():
             tokenize_prompt = Tokenize(
                 in_name="prompt",
@@ -62,7 +69,7 @@ class Flux2BaseDataLoader(
                 apply_chat_template=lambda caption: mistral_format_input([caption], MISTRAL_SYSTEM_MESSAGE),
                 apply_chat_template_kwargs={"add_generation_prompt": False},
             )
-            if config.dataloader_threads > 1:
+            if config.dataloader_threads > 1 or use_batch_collector:
                 apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
             encode_prompt = EncodeMistralText(
                 tokens_name="tokens",
@@ -73,6 +80,8 @@ class Flux2BaseDataLoader(
                 autocast_contexts=[model.autocast_context],
                 dtype=model.train_dtype.torch_dtype(),
                 hidden_state_output_index=MISTRAL_HIDDEN_STATES_LAYERS,
+                batch_collector=use_batch_collector,
+                max_batch_size=text_encode_batch,
             )
         else:  # klein
             tokenize_prompt = Tokenize(
@@ -84,7 +93,7 @@ class Flux2BaseDataLoader(
                 apply_chat_template=lambda caption: qwen3_format_input(caption),
                 apply_chat_template_kwargs={"add_generation_prompt": True, "enable_thinking": False},
             )
-            if config.dataloader_threads > 1:
+            if config.dataloader_threads > 1 or use_batch_collector:
                 apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
             encode_prompt = EncodeQwenText(
                 tokens_name="tokens",
@@ -95,6 +104,8 @@ class Flux2BaseDataLoader(
                 hidden_state_output_index=QWEN3_HIDDEN_STATES_LAYERS,
                 autocast_contexts=[model.autocast_context],
                 dtype=model.train_dtype.torch_dtype(),
+                batch_collector=use_batch_collector,
+                max_batch_size=text_encode_batch,
             )
 
         modules = [rescale_image, encode_image, image_sample]
@@ -131,6 +142,9 @@ class Flux2BaseDataLoader(
             sort_names=sort_names,
             config=config,
             text_caching=True,
+            # Match the encoder's batch collector so a full batch of encode
+            # requests can be in flight during the text cache build.
+            text_cache_build_workers=text_encode_batch_size() if config.latent_caching else None,
         )
 
     def _output_modules(

@@ -175,11 +175,22 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
                 "type": "bool",
             },
             "growth_rate": {"title": "Growth Rate", "tooltip": "Limit for D estimate growth rate.", "type": "float"},
+            "initial_accumulator_value": {
+                "title": "Initial Accumulator Value",
+                "tooltip": "Initial value for Adagrad optimizer.",
+                "type": "float",
+            },
+            "initial_accumulator": {
+                "title": "Initial Accumulator",
+                "tooltip": "Sets the starting value for both moment estimates to ensure numerical stability and balanced adaptive updates early in training.",
+                "type": "float",
+            },
             "is_paged": {
                 "title": "Is Paged",
                 "tooltip": "Whether the optimizer's internal state should be paged to CPU.",
                 "type": "bool",
             },
+            "log_every": {"title": "Log Every", "tooltip": "Intervals at which logging should occur.", "type": "int"},
             "lr_decay": {"title": "LR Decay", "tooltip": "Rate at which learning rate decreases.", "type": "float"},
             "max_unorm": {
                 "title": "Max Unorm",
@@ -211,6 +222,7 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
                 "tooltip": "Whether to enable Nesterov optimizer_momentum.",
                 "type": "bool",
             },
+            "no_prox": {"title": "No Prox", "tooltip": "Whether to use proximity updates or not.", "type": "bool"},
             "optim_bits": {"title": "Optim Bits", "tooltip": "Number of bits used for optimization.", "type": "int"},
             "percentile_clipping": {
                 "title": "Percentile Clipping",
@@ -340,23 +352,13 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             },
             "orthogonal_gradient": {
                 "title": "OrthoGrad",
-                "tooltip": "Reduces overfitting by removing the gradient component parallel to the weight, thus improving generalization.",
-                "type": "bool",
+                "tooltip": "Reduces overfitting by removing the gradient component parallel to the weight, thus improving generalization. This has two modes: 1. flattened: Standard vectorized OrthoGrad. Fastest, but loses the structural properties of matrices. 2. iterative: Matrix-wise OrthoGrad, preserves structure by iteratively projecting rows and columns.",
+                "type": "OrthoGrad",
             },
             "use_atan2": {
                 "title": "Atan2 Scaling",
                 "tooltip": "A robust replacement for eps, which also incorporates gradient clipping, bounding and stabilizing the optimizer updates.",
                 "type": "bool",
-            },
-            "use_AdEMAMix": {
-                "title": "AdEMAMix EMA",
-                "tooltip": "Adds a second, slow-moving EMA, which is combined with the primary momentum to stabilize updates, and accelerate the training.",
-                "type": "bool",
-            },
-            "beta3_ema": {
-                "title": "Beta3 EMA",
-                "tooltip": "Coefficient for slow-moving EMA of AdEMAMix.",
-                "type": "float",
             },
             "beta1_warmup": {
                 "title": "Beta1 Warmup Steps",
@@ -368,25 +370,10 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
                 "tooltip": "Starting beta1 value for warmup scheduling. Used only when beta1 warmup is enabled. Lower values allow faster initial adaptation, while higher values provide more smoothing. The final beta1 value is specified in the beta1 parameter.",
                 "type": "float",
             },
-            "Simplified_AdEMAMix": {
-                "title": "Simplified AdEMAMix",
-                "tooltip": "Enables a simplified, single-EMA variant of AdEMAMix. Instead of blending two moving averages (fast and slow momentum), this version combines the raw current gradient (controlled by 'Grad α') directly with a single theory-based momentum. This makes the optimizer highly responsive to recent gradient information, which can accelerate training in all batch size scenarios when tuned correctly.",
-                "type": "bool",
-            },
-            "alpha_grad": {
-                "title": "Grad α",
-                "tooltip": "Controls the mixing coefficient between raw gradients and momentum gradients in Simplified AdEMAMix. Higher values (e.g., 10-100) emphasize recent gradients, suitable for small batch sizes to reduce noise. Lower values (e.g., 0-1) emphasize historical gradients, suitable for large batch sizes for stability. Setting to 0 uses only momentum gradients without raw gradient contribution.",
-                "type": "float",
-            },
             "kourkoutas_beta": {
                 "title": "Kourkoutas Beta",
                 "tooltip": 'Enables a layer-wise dynamic β₂ adaptation. This feature makes the optimizer more responsive to "spiky" gradients by lowering β₂ during periods of high variance, and more stable during calm periods by raising β₂ towards its maximum. It can significantly improve training stability and final loss.',
                 "type": "bool",
-            },
-            "k_warmup_steps": {
-                "title": "Kourkoutas Warmup Steps",
-                "tooltip": "Number of steps over which the layer-wise dynamic β₂ adaptation (Kourkoutas Beta) ramps up from its initial value to the configured β₂. Leave empty to use the optimizer default. Only takes effect when Kourkoutas Beta is enabled.",
-                "type": "int",
             },
             "schedulefree_c": {
                 "title": "Schedule free averaging strength",
@@ -468,11 +455,6 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
                 "tooltip": "Enables Approximated MARS-M, a variance reduction technique. It uses the previous step's gradient to correct the current update, leading to lower losses and improved convergence stability. This requires additional state to store the previous gradient.",
                 "type": "bool",
             },
-            "auto_kappa_p": {
-                "title": "Auto Lion-K",
-                "tooltip": "Automatically determines the optimal P-value based on layer dimensions. Uses p=2.0 (Spherical) for 4D (Conv) tensors for stability and rotational invariance, and p=1.0 (Sign) for 2D (Linear) tensors for sparsity. Overrides the manual P-value. Recommend for unet models.",
-                "type": "bool",
-            },
             "compile": {
                 "title": "Compiled Optimizer",
                 "tooltip": "Enables PyTorch compilation for the optimizer internal step logic. This is intended to improve performance by allowing PyTorch to fuse operations and optimize the computational graph.",
@@ -480,22 +462,12 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             },
             "spectral_normalization": {
                 "title": "Spectral Scaling",
-                "tooltip": "Enables explicit Spectral Normalization to automatically rescale the update magnitude and Weight Decay based on layer dimensions. This allows hyperparameters to transfer seamlessly from small to large models without retuning, while making the optimizer highly robust to a wide range of learning rates. This ensures consistent performance across different model sizes, adapter methods, and ranks. ",
+                "tooltip": "Enables explicit Spectral Normalization to automatically rescale the update magnitude based on layer dimensions and training method. This allows hyperparameters to transfer seamlessly from small to large models without retuning, while making the optimizer highly robust to a wide range of learning rates. This ensures consistent performance across different model sizes, adapter methods, and ranks.",
                 "type": "bool",
             },
-            "scaled_optm": {
-                "title": "Scaled Optimizer",
-                "tooltip": "Automatically rescale the update magnitude and Weight Decay based on layer dimensions and type. This allows hyperparameters to transfer seamlessly from small to large models without retuning. This ensures consistent performance across different model sizes, adapter methods, and ranks. For LoRAs set alpha=rank. Using this, LoRA shares the same LR as full finetuning for all ranks.",
-                "type": "bool",
-            },
-            "freeze_on_flip": {
-                "title": "Freeze-on-Flip",
-                "tooltip": "Projected One-hit freeze. Masks updates for coordinates where the gradient sign flips compared to the previous step. Over the steps, this makes the signed update semi-continuous.",
-                "type": "bool",
-            },
-            "l1_adaptive": {
-                "title": "L1 Adaptive",
-                "tooltip": "Scales the learning rate dynamically by the L1 norm of the gradient to handle gradient heterogeneity. This makes the signed-optimizers semi-adaptive.",
+            "stochastic_sign": {
+                "title": "Adaptive Sign",
+                "tooltip": "Applies Adaptive Sign operation, that respects the geometry and direction of the original gradient, and scales the learning rate dynamically by the L1 norm of the gradient. This makes the signed-optimizers adaptive and more robust.",
                 "type": "bool",
             },
             "centered_wd": {
@@ -516,6 +488,41 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
             "fisher_wd": {
                 "title": "Fisher Weight Decay",
                 "tooltip": 'Applies adaptive, scale-invariant weight-decay regularization based on the Fisher Information Matrix (approximated by Adam\'s second moment). It reduces penalty for "important" high-curvature weights while accelerating decay for "useless" weights in flat regions. Leading to improved convergence and better final performance.',
+                "type": "bool",
+            },
+            "state_precision": {
+                "title": "state_precision",
+                "tooltip": """The quantization format used to store the optimizer states to save VRAM. Options include: 'auto': Stores the states in the original parameter's precision. 'factored': Enables a memory-efficient mode by applying fast low-rank factorization to the optimizers states. It combines factorization for magnitudes with 1-bit compression for signs, drastically reducing VRAM usage and allowing for larger models or batch sizes. 'fp32': Uses full FP32. 'bf16_sr': Uses BF16 with stochastic rounding for a balance of precision and memory. 'int8_sr': Uses 8-bit block-wise quantization with stochastic rounding.""",
+                "type": "StatePrecision",
+            },
+            "orthogonal_sinkhorn": {
+                "title": "Orthogonal Sinkhorn",
+                "tooltip": "Applies iterative row and column orthogonal projection to make the updates orthogonal to the current weight, leading to robust regularization and better generalization.",
+                "type": "bool",
+            },
+            "sinkhorn_iterations": {
+                "title": "Sinkhorn Iterations",
+                "tooltip": "Controls the number of iterations for Multi-Normed Sinkhorn. While 1 iteration is often sufficient for convergence and 3 offers a slight refinement, 5 is the default.",
+                "type": "int",
+            },
+            "normed_momentum": {
+                "title": "Normalization-then-Momentum (NtM)",
+                "tooltip": "Applies the momentum after the optimizer normalization. This makes the momentum scale invariant and tracks the true variance of the normalized gradients.",
+                "type": "bool",
+            },
+            "nesterov_coef": {
+                "title": "Nesterov Coef",
+                "tooltip": "Controls the mixing coefficient between momentum gradients and raw gradients in Nesterov momentum. For a factor of 0.8, the final update will be 80% of the momentum gradients and 20% raw gradient. Leaving it unset toggles the standard Nestrov behavior (where nesterov_coef = beta1 or momentum). Setting it to 0 cancels momentum contribution.",
+                "type": "float",
+            },
+            "snr_cond": {
+                "title": "SNR Preconditioning",
+                "tooltip": "Applies a Signal-to-Noise Ratio (SNR) precondition to reshape the optimization curve. It prioritizes high-confidence signals and dampens noise. On-the-fly math with zero memory overhead. Requires Normalization-then-Momentum (NtM). ",
+                "type": "bool",
+            },
+            "geometric_wd": {
+                "title": "Geometric Weight Decay",
+                "tooltip": "Regularizes weights based on the geometric structure of the optimizer. Compatible with cautious weight decay.",
                 "type": "bool",
             },
         }
@@ -566,6 +573,26 @@ class OptimizerParamsWindow(ctk.CTkToplevel):
                     row,
                     col + 1,
                     ["full", "float8", "int8", "int4"],
+                    self.optimizer_ui_state,
+                    key,
+                    command=self.update_user_pref,
+                )
+            elif type == "StatePrecision":
+                components.options(
+                    master,
+                    row,
+                    col + 1,
+                    ["auto", "factored", "fp32", "bf16_sr", "int8_sr"],
+                    self.optimizer_ui_state,
+                    key,
+                    command=self.update_user_pref,
+                )
+            elif type == "OrthoGrad":
+                components.options(
+                    master,
+                    row,
+                    col + 1,
+                    ["disabled", "flattened", "iterative"],
                     self.optimizer_ui_state,
                     key,
                     command=self.update_user_pref,

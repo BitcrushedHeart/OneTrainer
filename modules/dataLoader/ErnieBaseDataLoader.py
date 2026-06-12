@@ -1,7 +1,7 @@
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin, text_encode_batch_size
 from modules.model.ErnieModel import HIDDEN_STATES_LAYER, PROMPT_MAX_LENGTH, ErnieModel
 from modules.modelSetup.BaseErnieSetup import BaseErnieSetup
 from modules.util import factory
@@ -51,7 +51,12 @@ class ErnieBaseDataLoader(
             tokenizer=model.tokenizer,
             max_token_length=PROMPT_MAX_LENGTH,
         )
-        if config.dataloader_threads > 1:
+        # Collector only — no trim_padding: this pipeline caches the full
+        # padded hidden state, so padded rows must remain the encoder's own
+        # outputs.
+        text_encode_batch = text_encode_batch_size()
+        use_batch_collector = config.latent_caching and text_encode_batch > 1
+        if config.dataloader_threads > 1 or use_batch_collector:
             apply_thread_safe_forward(
                 model.text_encoder
             )  # workaround for transformers#42673, unclear if Mistral is affected
@@ -64,6 +69,8 @@ class ErnieBaseDataLoader(
             hidden_state_output_index=HIDDEN_STATES_LAYER,
             autocast_contexts=[model.autocast_context],
             dtype=model.train_dtype.torch_dtype(),
+            batch_collector=use_batch_collector,
+            max_batch_size=text_encode_batch,
         )
 
         modules = [rescale_image, encode_image, image_sample]
@@ -99,6 +106,9 @@ class ErnieBaseDataLoader(
             sort_names=sort_names,
             config=config,
             text_caching=True,
+            # Match the encoder's batch collector so a full batch of encode
+            # requests can be in flight during the text cache build.
+            text_cache_build_workers=text_encode_batch_size() if config.latent_caching else None,
         )
 
     def _output_modules(self, config: TrainConfig, model: ErnieModel, model_setup: BaseErnieSetup):

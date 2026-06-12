@@ -2,6 +2,7 @@ import threading
 import time
 
 import torch
+import torch.utils._sympy.functions
 
 from sympy import S
 from tqdm.auto import tqdm
@@ -9,7 +10,11 @@ from tqdm.auto import tqdm
 
 # code from https://github.com/pytorch/pytorch/blob/ed82d5fcfd80110565f69130f286c7bfec6db2dc/torch/utils/_sympy/functions.py#L481
 # but accepts negative numbers, to avoid https://github.com/Nerogar/OneTrainer/issues/1126
-# can be removed once https://github.com/pytorch/pytorch/pull/169726 is merged into a torch version we use
+# torch 2.12 merged the fix PR https://github.com/pytorch/pytorch/pull/169726, but according to Claude's analysis this bug
+# still exists. TODO confirm manually by testing https://github.com/Nerogar/OneTrainer/issues/1126:
+# Claude: "Mod.eval itself still raises on negative numbers, and inductor's tiling_utils still calls sympy is_constant() (which
+# substitutes negative test values) on expressions that can contain Mod. can be removed once Mod.eval itself
+# accepts negative numbers in a torch version we use"
 @classmethod
 def Mod_patched_eval(cls, p, q):
     # This was adapted from: sympy/core/mod.py
@@ -124,8 +129,12 @@ def _install_compile_progress_callbacks():
 
 def init_compile():
     # cache_size_limit and recompile_limit are aliases for the same dynamo config value.
-    # NOTE: dynamo config overrides are thread-local — this must run on the thread that
-    # executes the forward passes (the training thread), not just any importing thread.
+    # since torch 2.12, dynamo config overrides are stored in ContextVars (pytorch/pytorch#173568),
+    # which threads don't inherit. init_compile() must therefore be called in every thread that can
+    # trigger a compilation - including the autograd worker threads, which recompute checkpointed
+    # modules during the backward pass.
     torch._dynamo.config.cache_size_limit = 8192
-    torch.utils._sympy.functions.Mod.eval = Mod_patched_eval
     _install_compile_progress_callbacks()
+
+
+torch.utils._sympy.functions.Mod.eval = Mod_patched_eval

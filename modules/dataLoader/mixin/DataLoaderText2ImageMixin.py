@@ -60,6 +60,21 @@ import torch
 from diffusers import AutoencoderKL
 
 
+def text_encode_batch_size() -> int:
+    """Encode batch size and build worker count for text caches.
+
+    Batching several captions per forward amortizes the per-forward fixed
+    cost (weight streaming under layer offload, dequant, kernel launches)
+    that dominates a bs=1 encode through a multi-billion-parameter text
+    encoder. Set OT_TEXT_CACHE_BATCH=1 to restore strictly serial bs=1
+    encoding.
+    """
+    try:
+        return max(1, int(os.environ.get("OT_TEXT_CACHE_BATCH", "8")))
+    except ValueError:
+        return 8
+
+
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     @staticmethod
     def __as_output_mapping(name: str | tuple[str, str]) -> tuple[str, str]:
@@ -534,6 +549,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         config: TrainConfig,
         text_caching: bool,
         before_cache_image_fun: Callable[[], None] | None = None,
+        text_cache_build_workers: int | None = None,
     ):
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
@@ -646,6 +662,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             source_path_in_name="sample_prompt_path",
             sourceless=sourceless,
             trust_cache=config.skip_cache_validation,
+            # Content-addressed reuse: the final post-augmentation prompt
+            # string fully determines the cached text payload, so identical
+            # caption lines are encoded once and reused everywhere — across
+            # variations, files and concepts. Editing one line of a
+            # multi-line caption re-encodes only that line; a bulk edit that
+            # appends the same line to every file encodes it once total.
+            content_key_in_name="prompt",
+            build_max_workers=text_cache_build_workers,
         )
 
         modules = []
