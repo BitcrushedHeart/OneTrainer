@@ -1257,14 +1257,25 @@ def create_optimizer(
         # torch's load_state_dict replaces param groups wholesale, so hyperparameter
         # keys introduced after the state was saved (e.g. state_precision /
         # actual_state_precision from the adv_optm 2.4 -> 2.5.2 update) would be
-        # missing and crash the optimizer's post-load processing. Fill any missing
-        # keys from the freshly constructed optimizer so old backups can resume.
+        # missing and crash the optimizer's post-load processing, and keys whose
+        # format changed (orthogonal_gradient bool -> mode string) would feed the
+        # optimizer values it silently mishandles. Fill missing keys and replace
+        # incompatible-typed values from the freshly constructed optimizer so old
+        # backups can resume.
         current_groups = optimizer.state_dict()["param_groups"]
         saved_groups = state_dict.get("param_groups")
         if saved_groups is not None and len(saved_groups) == len(current_groups):
             for saved_group, current_group in zip(saved_groups, current_groups, strict=True):
                 for key, value in current_group.items():
-                    if key != "params" and key not in saved_group:
+                    if key == "params":
+                        continue
+                    if key not in saved_group:
+                        saved_group[key] = value
+                    elif isinstance(saved_group[key], bool) and isinstance(value, str):
+                        print(
+                            f"INFO: optimizer param group key '{key}' changed format since this "
+                            f"state was saved ({saved_group[key]!r} -> {value!r}); using the current config value."
+                        )
                         saved_group[key] = value
 
         optimizer.load_state_dict(state_dict)
