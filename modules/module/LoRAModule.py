@@ -659,6 +659,31 @@ class OFTModule(PeftBase):
         else:
             return higher_params
 
+    # Config-derived marker buffers embedded in the state_dict for inference
+    # tools. They carry no learned state, so on load they are aligned to the
+    # current training config rather than strictly matched against the file.
+    _OFT_MARKER_KEYS = ("oft_R.scaled_oft", "oft_R.cans_oft", "oft_R.clipped_oft")
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
+        state_dict = dict(state_dict)
+        own = self.state_dict()
+        for marker in self._OFT_MARKER_KEYS:
+            full_key = self.prefix + marker
+            if marker in own:
+                # Adapter saved before the feature existed, or saved with a
+                # different value: the current config drives behavior, so the
+                # buffer mirrors it (keeps re-saved markers consistent).
+                state_dict[full_key] = own[marker]
+            elif full_key in state_dict:
+                # e.g. adapter trained with the feature, now disabled in the
+                # config: the config wins for continued training.
+                print(
+                    f"WARN: {full_key} present in the loaded adapter but the corresponding "
+                    f"option is disabled in the current config; continuing with the config setting."
+                )
+                state_dict.pop(full_key)
+        return super().load_state_dict(state_dict, strict, assign)
+
     def initialize_weights(self):
         self._initialized = True
 
