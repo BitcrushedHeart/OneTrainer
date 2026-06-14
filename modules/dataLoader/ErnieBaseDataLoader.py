@@ -111,7 +111,9 @@ class ErnieBaseDataLoader(
             text_cache_build_workers=text_encode_batch_size() if config.latent_caching else None,
         )
 
-    def _output_modules(self, config: TrainConfig, model: ErnieModel, model_setup: BaseErnieSetup):
+    def _output_modules(
+        self, config: TrainConfig, model: ErnieModel, model_setup: BaseErnieSetup, is_validation: bool = False
+    ):
         output_names = [
             "image_path",
             "latent_image",
@@ -137,6 +139,7 @@ class ErnieBaseDataLoader(
             vae=model.vae,
             autocast_context=[model.autocast_context],
             train_dtype=model.train_dtype,
+            is_validation=is_validation,
         )
 
     def _debug_modules(self, config: TrainConfig, model: ErnieModel):
