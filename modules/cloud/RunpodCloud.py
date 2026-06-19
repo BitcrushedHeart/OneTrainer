@@ -7,6 +7,9 @@ from modules.util.enum.CloudAction import CloudAction
 
 import runpod
 
+RUNPOD_TEMPLATE_ID = "1a33vbssq9"
+EUROPE_COUNTRY_CODES = ["EU", "GB", "NL", "DE", "FR", "SE", "NO", "FI", "PL"]
+
 
 class RunpodCloud(LinuxCloud):
     def __init__(self, config: TrainConfig):
@@ -67,19 +70,30 @@ class RunpodCloud(LinuxCloud):
     def _create(self):
         config = self.config.cloud
         secrets = self.config.secrets.cloud
-        pod = runpod.create_pod(
-            name=config.name,
-            image_name="",
-            template_id="1a33vbssq9",
-            gpu_type_id=config.gpu_type,
-            cloud_type=config.sub_type,
-            support_public_ip=True,
-            volume_in_gb=config.volume_size,
-            container_disk_in_gb=20,
-            volume_mount_path="/workspace",
-            min_download=config.min_download,
-            env={"JUPYTER_PASSWORD": pysecrets.token_urlsafe(16)},
-        )
+        last_error = None
+        pod = None
+        for country_code in EUROPE_COUNTRY_CODES:
+            try:
+                pod = runpod.create_pod(
+                    name=config.name,
+                    image_name="",
+                    template_id=RUNPOD_TEMPLATE_ID,
+                    gpu_type_id=config.gpu_type,
+                    cloud_type=config.sub_type or "SECURE",
+                    support_public_ip=True,
+                    start_ssh=True,
+                    country_code=country_code,
+                    volume_in_gb=config.volume_size,
+                    volume_mount_path="/workspace",
+                    min_download=config.min_download,
+                    env={"JUPYTER_PASSWORD": pysecrets.token_urlsafe(16)},
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+
+        if pod is None:
+            raise last_error or RuntimeError("Could not create RunPod pod")
         secrets.id = pod["id"]
 
     def delete(self):

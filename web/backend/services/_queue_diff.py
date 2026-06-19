@@ -357,9 +357,11 @@ def section_for(field: str) -> str:
     return _FIELD_TO_SECTION.get(field, "Other")
 
 
-def diff_section_grouped(overrides: dict, defaults: dict) -> dict:
-    """Group overrides by section and return {section: [{field, label, current, default}]}.
+def diff_section_grouped(overrides: dict, baseline: dict) -> dict:
+    """Group overrides by section and return {section: [{field, label, current, inherited}]}.
 
+    ``baseline`` is the config the entry inherits (the current active config), so
+    ``inherited`` is the value each override actually replaces at run time.
     Excludes EXCLUDED_FIELDS. Returns empty dict if no overrides.
     """
     grouped: dict[str, list[dict]] = {}
@@ -372,7 +374,7 @@ def diff_section_grouped(overrides: dict, defaults: dict) -> dict:
                 "field": field,
                 "label": label_for(field),
                 "current": value,
-                "default": defaults.get(field),
+                "inherited": baseline.get(field),
             }
         )
 
@@ -386,15 +388,16 @@ def diff_section_grouped(overrides: dict, defaults: dict) -> dict:
     return ordered
 
 
-def diff_full_config(full_config: dict, defaults: dict) -> dict:
-    """Compute overrides as the subset of full_config that differs from defaults.
+def diff_full_config(full_config: dict, baseline: dict) -> dict:
+    """Compute overrides as the subset of full_config that differs from ``baseline``.
 
-    Excludes EXCLUDED_FIELDS.
+    ``baseline`` is the current active config (what the entry inherits), so only
+    genuine deltas become overrides. Excludes EXCLUDED_FIELDS.
     """
     overrides: dict = {}
     for field, value in full_config.items():
         if field in EXCLUDED_FIELDS:
             continue
-        if field not in defaults or defaults.get(field) != value:
+        if field not in baseline or baseline.get(field) != value:
             overrides[field] = value
     return overrides

@@ -599,6 +599,12 @@ class GenericTrainer(BaseTrainer):
 
             total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
             total_count = sum(concept_counts[key] for key in concept_counts)
+            if total_count == 0:
+                # approximate_length() estimated a non-empty validation set, but the
+                # data loader yielded no usable batches (e.g. all samples filtered out
+                # at runtime). Skip rather than crash the training run.
+                print("Warning: validation produced no batches, skipping validation loss")
+                return
             total_average_loss = total_loss / total_count
 
             if len(concept_counts) > 1:
@@ -1617,6 +1623,8 @@ class GenericTrainer(BaseTrainer):
         self.model_sampler = None
         self.data_loader = None
         self.validation_data_loader = None
+        self.sft_anchor_data_loader = None
+        self.sft_anchor_iter = None
         self.parameters = None
         self.tensorboard = None
         self.sample_queue = []

@@ -61,7 +61,7 @@ export function DiffPanel({ entryId }: DiffPanelProps) {
 
   return (
     <div className="space-y-2">
-      <h4 className="text-sm font-semibold text-[var(--color-on-surface)]">Overrides vs defaults</h4>
+      <h4 className="text-sm font-semibold text-[var(--color-on-surface)]">Overrides vs current config</h4>
       {sectionEntries.map(([section, fields]) => (
         <details
           key={section}
@@ -73,7 +73,7 @@ export function DiffPanel({ entryId }: DiffPanelProps) {
           </summary>
           <div className="px-3 py-2 grid grid-cols-[1fr_1fr_1fr] gap-x-3 gap-y-1 text-xs">
             <span className="font-medium text-[var(--color-on-surface-secondary)]">Field</span>
-            <span className="font-medium text-[var(--color-on-surface-secondary)]">Default</span>
+            <span className="font-medium text-[var(--color-on-surface-secondary)]">Inherited</span>
             <span className="font-medium text-[var(--color-on-surface-secondary)]">This entry</span>
             {fields.map((f) => (
               <FieldRow key={f.field} field={f} />
@@ -85,14 +85,17 @@ export function DiffPanel({ entryId }: DiffPanelProps) {
   );
 }
 
-function FieldRow({ field }: { field: { field: string; label: string; current: unknown; default: unknown } }) {
+function FieldRow({ field }: { field: { field: string; label: string; current: unknown; inherited: unknown } }) {
   return (
     <>
       <span className="text-[var(--color-on-surface)] truncate" title={field.field}>
         {field.label}
       </span>
-      <span className="text-[var(--color-on-surface-secondary)] truncate font-mono" title={formatValue(field.default)}>
-        {formatValue(field.default)}
+      <span
+        className="text-[var(--color-on-surface-secondary)] truncate font-mono"
+        title={formatValue(field.inherited)}
+      >
+        {formatValue(field.inherited)}
       </span>
       <span className="text-[var(--color-cobalt-600)] truncate font-mono" title={formatValue(field.current)}>
         {formatValue(field.current)}

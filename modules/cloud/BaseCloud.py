@@ -68,6 +68,10 @@ class BaseCloud(metaclass=ABCMeta):
                     local=Path(add_embedding.local_model_name), remote=Path(add_embedding.model_name)
                 )
 
+        if self.config.sourceless_training and self.config.latent_caching:
+            self.__upload_sourceless_training_state(commands)
+            return
+
         concept_extensions = (
             path_util.supported_image_extensions()
             | path_util.supported_video_extensions()
@@ -97,6 +101,38 @@ class BaseCloud(metaclass=ABCMeta):
                     local=Path(concept.text.local_tag_dropout_special_tags),
                     remote=Path(concept.text.tag_dropout_special_tags),
                 )
+
+    def __upload_sourceless_training_state(self, commands: TrainCommands = None):
+        if hasattr(self.config, "local_cache_dir"):
+            print("uploading sourceless cache...")
+            if commands and commands.get_stop_command():
+                return
+            self.__sync_up_dir(local=Path(self.config.local_cache_dir), remote=Path(self.config.cache_dir))
+
+        if hasattr(self.config, "local_workspace_dir"):
+            latest_backup = self.__latest_backup(Path(self.config.local_workspace_dir))
+            if latest_backup is not None:
+                print(f"uploading latest backup {latest_backup.name}...")
+                if commands and commands.get_stop_command():
+                    return
+                remote_backup_root = Path(self.config.workspace_dir, "backup")
+                self.__sync_up_dir(local=latest_backup, remote=remote_backup_root / latest_backup.name)
+
+    def __sync_up_dir(self, local: Path, remote: Path):
+        fast_sync = getattr(self.file_sync, "sync_up_dir_stream", None)
+        if callable(fast_sync) and fast_sync(local=local, remote=remote):
+            return
+        self.file_sync.sync_up_dir(local=local, remote=remote, recursive=True)
+
+    @staticmethod
+    def __latest_backup(workspace_dir: Path) -> Path | None:
+        backups_path = workspace_dir / "backup"
+        if not backups_path.is_dir():
+            return None
+        backup_dirs = [path for path in backups_path.iterdir() if path.is_dir()]
+        if not backup_dirs:
+            return None
+        return sorted(backup_dirs, key=lambda path: path.name, reverse=True)[0]
 
     @staticmethod
     def _filter_download(config: CloudConfig, path: Path):

@@ -41,6 +41,17 @@ train.bat
 debug_report.log
 config_diff.txt
 
+# local analysis and scratch output
+/.claude/
+/.codex-doc-drafts/
+/.diagnostics/
+/.playwright-mcp/
+/bug_investigation/
+/DOFT Fix/
+/DOFTFix/
+/local/
+/Local/
+
 # Webdev
 web/gui/dist/
 web/gui/release/

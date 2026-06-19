@@ -2,6 +2,7 @@ import {
   BarChart3,
   Bug,
   Camera,
+  Cloud,
   Clock,
   Download,
   HardDrive,
@@ -13,8 +14,10 @@ import {
   Terminal,
   Timer,
 } from "lucide-react";
+import { useState } from "react";
 
 import { configApi } from "@/api/configApi";
+import { RunPodSetupModal } from "@/components/modals/RunPodSetupModal";
 import { DualProgress } from "@/components/shared";
 import { useElapsedTime } from "@/hooks/useElapsedTime";
 import { getByPath, useConfigStore } from "@/store/configStore";
@@ -23,6 +26,7 @@ import { useUiStore } from "@/store/uiStore";
 import { formatDuration } from "@/utils/formatDuration";
 
 export default function BottomBar() {
+  const [runpodSetupOpen, setRunpodSetupOpen] = useState(false);
   const exportConfig = useConfigStore((s) => s.exportConfig);
   const isDirty = useConfigStore((s) => s.isDirty);
   const loadedPresetName = useConfigStore((s) => s.loadedPresetName);
@@ -247,6 +251,18 @@ export default function BottomBar() {
           </button>
         )}
 
+        {!isActive && (
+          <button
+            className="action-button"
+            onClick={() => setRunpodSetupOpen(true)}
+            disabled={!backendConnected}
+            aria-label="Prepare RunPod sourceless training"
+            title="Prepare RunPod sourceless training"
+          >
+            <Cloud className="w-4 h-4 inline mr-1" /> RunPod
+          </button>
+        )}
+
         <button
           className="action-button"
           onClick={handleTrainingButton}
@@ -268,6 +284,7 @@ export default function BottomBar() {
           )}
         </button>
       </div>
+      <RunPodSetupModal open={runpodSetupOpen} onClose={() => setRunpodSetupOpen(false)} />
     </footer>
   );
 }

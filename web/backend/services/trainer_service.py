@@ -48,23 +48,24 @@ class TrainerService(SingletonMixin):
                 "start_time": self._start_time,
             }
 
-    def start_training(self, reattach: bool = False) -> dict:
+    def start_training(self, reattach: bool = False, train_config: Any | None = None) -> dict:
         with self._status_lock:
             if self._status in ("running", "stopping", "starting"):
                 return {"ok": False, "error": f"Training is already {self._status}"}
             self._status = "starting"
 
         config_service = ConfigService.get_instance()
-        train_config = config_service.get_config_for_training()
+        if train_config is None:
+            train_config = config_service.get_config_for_training()
 
-        concept_service = ConceptService()
+            concept_service = ConceptService()
 
-        with suppress(Exception):
-            concepts = concept_service.load_concepts(train_config.concept_file_name)
-            concept_service.save_concepts(train_config.concept_file_name, concepts)
-        with suppress(Exception):
-            samples = concept_service.load_samples(train_config.sample_definition_file_name)
-            concept_service.save_samples(train_config.sample_definition_file_name, samples)
+            with suppress(Exception):
+                concepts = concept_service.load_concepts(train_config.concept_file_name)
+                concept_service.save_concepts(train_config.concept_file_name, concepts)
+            with suppress(Exception):
+                samples = concept_service.load_samples(train_config.sample_definition_file_name)
+                concept_service.save_samples(train_config.sample_definition_file_name, samples)
 
         if train_config.tensorboard and not train_config.tensorboard_always_on:
             self.stop_always_on_tensorboard()

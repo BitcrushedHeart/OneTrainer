@@ -107,4 +107,8 @@ class MultiTrainer(BaseTrainer):
         workers.join()
 
     def end(self):
+        # Nothing to free here: the model/optimizer/dataloaders only ever live
+        # inside the spawned _train_process workers (and the rank-0 in-process
+        # call), all of which return/exit before train() returns. The MultiTrainer
+        # instance itself holds no large state.
         pass

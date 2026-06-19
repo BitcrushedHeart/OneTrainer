@@ -14,6 +14,7 @@ sees the exact same load + wrapper-creation state training would.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 
@@ -273,6 +274,14 @@ def merge_oft_adapter(
     )
 
     # -------- final sanity: re-read and NaN-scan the saved file --------
+    # Free the in-memory model first: the merged weights are already on disk, and
+    # holding the full transformer in RAM while memory-mapping the multi-GB output
+    # for read-back exhausts the Windows commit limit (paging-file OSError 1455).
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     print("[merge_oft] final sanity scan of saved file")
     if output_format is ModelFormat.SAFETENSORS:
         with safe_open(output_path, framework="pt", device="cpu") as f:

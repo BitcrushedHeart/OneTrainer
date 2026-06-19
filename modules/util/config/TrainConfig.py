@@ -149,6 +149,7 @@ class TrainOptimizerConfig(BaseConfig):
     # valid adv_optm 2.5.2 values; PR #1344 briefly shipped a "float8" default
     # that 2.5.2 rejects, and configs saved in that window persist it.
     _VALID_STATE_PRECISIONS = {"auto", "factored", "fp32", "fp16", "bf16_sr", "int8_sr"}
+    _VALID_ORTHOGONAL_GRADIENT_MODES = {"disabled", "flattened", "iterative"}
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(data)
@@ -159,11 +160,32 @@ class TrainOptimizerConfig(BaseConfig):
             print(f"WARN: invalid optimizer state_precision '{sp}' in config, falling back to 'auto'.")
             data = data.copy()
             data["state_precision"] = "auto"
-        # orthogonal_gradient was a bool before adv_optm 2.5 made it a mode string
+        # adv_optm 2.5 renamed the scaled_optm kwarg to spectral_normalization
+        # (same feature: per-role update scaling, incl. OFT max-row-norm bounding
+        # and Riemannian preconditioning). Configs saved before the rename carry
+        # scaled_optm and would otherwise silently lose the feature on load.
+        if "scaled_optm" in data:
+            data = data.copy()
+            legacy = data.pop("scaled_optm")
+            if legacy and not data.get("spectral_normalization", False):
+                print(
+                    "INFO: migrating legacy optimizer flag scaled_optm=True to spectral_normalization=True "
+                    "(renamed in adv_optm 2.5)."
+                )
+                data["spectral_normalization"] = True
+        # orthogonal_gradient was a bool before adv_optm 2.5 made it a mode string;
+        # configs saved before that migration existed coerced the bool through the
+        # declared str type, persisting "False"/"True" strings that adv_optm
+        # silently mishandles (_orthogonalize_gradient returns None -> grad nulled).
         og = data.get("orthogonal_gradient")
         if isinstance(og, bool):
             data = data.copy()
             data["orthogonal_gradient"] = "flattened" if og else "disabled"
+        elif og is not None and og not in self._VALID_ORTHOGONAL_GRADIENT_MODES:
+            normalized = "flattened" if str(og).strip().lower() in ("true", "1") else "disabled"
+            print(f"WARN: invalid optimizer orthogonal_gradient {og!r} in config, normalized to '{normalized}'.")
+            data = data.copy()
+            data["orthogonal_gradient"] = normalized
         return super().from_dict(data)
 
     @staticmethod

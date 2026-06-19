@@ -87,18 +87,26 @@ class QueueService(SingletonMixin):
         if entry is None:
             return {"ok": False, "error": "Entry not found"}
 
+        # Baseline against the *current* active config — that's what each entry
+        # inherits and what merge_config layers overrides onto at run time. Using
+        # hardcoded TrainConfig defaults here showed e.g. workspace_dir as
+        # "workspace/run" instead of the user's actual configured value.
         config_service = ConfigService.get_instance()
-        defaults = config_service.get_defaults()
-        grouped = diff_section_grouped(entry.overrides or {}, defaults)
+        baseline = config_service.get_config_dict()
+        grouped = diff_section_grouped(entry.overrides or {}, baseline)
         return {"ok": True, "sections": grouped, "name": entry.name}
 
     def add_entry_from_full_config(self, full_config: dict, name: str = "") -> dict:
-        """Diff a full training-config dict against defaults and create an entry."""
+        """Diff a full training-config dict against the current config and create an entry."""
         from web.backend.services._queue_diff import diff_full_config
 
+        # Diff against the current active config, not hardcoded defaults: otherwise
+        # every field the user customised globally (workspace_dir, base_model_name,
+        # resolution, ...) gets captured as a spurious "override" that merely mirrors
+        # the global value, so the entry appears to override things it does not.
         config_service = ConfigService.get_instance()
-        defaults = config_service.get_defaults()
-        overrides = diff_full_config(full_config, defaults)
+        baseline = config_service.get_config_dict()
+        overrides = diff_full_config(full_config, baseline)
         entry = self._manager.add_entry(name=name, overrides=overrides)
         return {"ok": True, "entry": entry.to_dict()}
 

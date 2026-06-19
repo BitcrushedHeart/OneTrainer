@@ -74,8 +74,14 @@ class OFTRotationModule(nn.Module):
         self.register_buffer("rows", rows, persistent=False)
         self.register_buffer("cols", cols, persistent=False)
         self.dropout = MultiplicativeDropoutLayer(p=dropout_probability)
-        self.oft_clipped_norm = oft_clipped_norm
-        if oft_clipped_norm is not None:
+        # Spectral clipping is a Cayley-Neumann convergence safeguard only: it
+        # exists because the Neumann series diverges once ||Q||_2 >= 1. CANS
+        # self-normalizes (g_norm) and the exact solver is unconditionally
+        # stable, so neither needs the clip. Gate it to the Neumann path so our
+        # merge of PR #1492 + #1512 reproduces each PR exactly in its own mode
+        # (and so the clipped_oft marker isn't written for non-clipped adapters).
+        self.oft_clipped_norm = oft_clipped_norm if self.use_cayley_neumann else None
+        if self.oft_clipped_norm is not None:
             # Persistent buffer: embeds the clip value in the state_dict so
             # inference tools can detect and reproduce the clipped rotation.
             self.register_buffer("clipped_oft", torch.tensor(self.oft_clipped_norm))
@@ -141,13 +147,15 @@ class OFTRotationModule(nn.Module):
         X = G
 
         # Max row sum is guaranteed to be >= the maximum singular value of X.
-        g_norm = X.abs().sum(dim=-1, keepdim=True).amax(dim=-2, keepdim=True).clamp_min(eps)
+        # detach: the normalization is a preconditioning scale only; letting grads
+        # flow through g_norm (a function of Q) creates a feedback term in the
+        # rotation gradient that spirals as Q grows (Koratahiu PR #1512).
+        g_norm = X.abs().sum(dim=-1, keepdim=True).amax(dim=-2, keepdim=True).clamp_min(eps).detach()
         X = X / g_norm
 
         # Since min_singular_value(I + Q) >= 1, the min_singular_value of normalized X
         # is guaranteed to be >= 1 / ||G||_F.
-        # We clamp it to prevent numerical edge cases (e.g. extremely large norms).
-        lower_bound = (1.0 / g_norm.detach()).clamp(min=1e-5, max=0.9)
+        lower_bound = 1.0 / g_norm
         upper_bound = 1
 
         for _ in range(steps):

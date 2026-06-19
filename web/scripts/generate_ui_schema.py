@@ -473,7 +473,8 @@ def enrich_field_types(schema: dict):
 
         config = TrainConfig.default_values()
         type_map = {}
-        _collect_types(config, "", type_map)
+        nullable_map = {}
+        _collect_types(config, "", type_map, nullable_map)
     except Exception:
         return
 
@@ -484,17 +485,21 @@ def enrich_field_types(schema: dict):
                 if field.get("type") == "entry" and key in type_map:
                     if type_map[key] in (int, float):
                         field["inputType"] = "number"
+                    if nullable_map.get(key):
+                        field["nullable"] = True
 
 
-def _collect_types(config, prefix: str, type_map: dict):
+def _collect_types(config, prefix: str, type_map: dict, nullable_map: dict | None = None):
     if not hasattr(config, "types"):
         return
     for name, typ in config.types.items():
         path = f"{prefix}{name}" if not prefix else f"{prefix}.{name}"
         type_map[path] = typ
+        if nullable_map is not None and hasattr(config, "nullables"):
+            nullable_map[path] = config.nullables.get(name, False)
         val = getattr(config, name, None)
         if val is not None and hasattr(val, "types"):
-            _collect_types(val, f"{path}.", type_map)
+            _collect_types(val, f"{path}.", type_map, nullable_map)
 
 
 def _iter_all_sections(tab: dict):

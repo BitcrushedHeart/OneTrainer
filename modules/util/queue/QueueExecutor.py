@@ -12,7 +12,6 @@ from modules.util.enum.QueueEntryStatus import QueueEntryStatus
 from modules.util.queue.QueueManager import QueueManager
 
 if TYPE_CHECKING:
-    from modules.util.commands.TrainCommands import TrainCommands
     from modules.util.TrainProgress import TrainProgress
 
 
@@ -40,7 +39,7 @@ class QueueExecutor:
         self._on_queue_complete = on_queue_complete
         self._stop_queue = False
         self._stop_current_run = False
-        self._current_commands: TrainCommands | None = None
+        self._current_runner = None  # QueueSubprocessRunner for the active entry
         self._current_entry: QueueEntry | None = None
         self._last_global_step: int = -1
 
@@ -48,7 +47,7 @@ class QueueExecutor:
         try:
             self._run_loop()
         finally:
-            self._current_commands = None
+            self._current_runner = None
             self._current_entry = None
             self._on_queue_complete()
 
@@ -78,16 +77,16 @@ class QueueExecutor:
 
     def stop_current_run(self):
         self._stop_current_run = True
-        if self._current_commands:
-            self._current_commands.stop()
+        if self._current_runner is not None:
+            self._current_runner.stop()
 
     def stop_queue(self):
         self._stop_queue = True
 
     def stop_queue_immediate(self):
         self._stop_queue = True
-        if self._current_commands:
-            self._current_commands.stop()
+        if self._current_runner is not None:
+            self._current_runner.stop()
 
     @staticmethod
     def merge_config(global_config: TrainConfig, overrides: dict) -> TrainConfig:
@@ -159,62 +158,53 @@ class QueueExecutor:
             return None
 
     def _execute_entry(self, entry: QueueEntry, resume_from_backup: bool):
-        import gc
-
-        from modules.util import create
-        from modules.util.callbacks.TrainCallbacks import TrainCallbacks
-        from modules.util.commands.TrainCommands import TrainCommands
-        from modules.util.torch_util import torch_gc
-
-        import torch
+        # Each entry trains in its own subprocess: the OS reclaims all of its
+        # memory on exit (model/optimizer/dataloader caches + native CUDA and
+        # safetensors allocations), so RAM no longer spirals across a chain of
+        # runs and a native crash in one entry can't take down the backend.
+        from modules.util.queue.queue_subprocess import QueueSubprocessRunner
 
         merged_config = self.merge_config(self.global_config, entry.overrides)
         if resume_from_backup:
             merged_config.continue_last_backup = True
-        commands = TrainCommands()
-        self._current_commands = commands
 
         def _track_progress(p, s, ep):
             self._last_global_step = getattr(p, "global_step", -1)
             self._on_progress(p, s, ep)
 
-        callbacks = TrainCallbacks(
-            on_update_train_progress=_track_progress,
-            on_update_status=self._on_status,
-        )
         self._on_status(f"Starting: {entry.name}")
-        trainer = create.create_trainer(merged_config, callbacks, commands)
-        error = None
+        runner = QueueSubprocessRunner(
+            config_dict=merged_config.to_dict(),
+            on_progress=_track_progress,
+            on_status=self._on_status,
+        )
+        self._current_runner = runner
         try:
-            try:
-                trainer.start()
-                trainer.train()
-            except Exception as e:
-                error = e
-            try:
-                trainer.end()
-            except Exception as end_err:
-                # Don't let a teardown failure mask the original error or skip cleanup below.
-                if error is None:
-                    error = end_err
-                else:
-                    traceback.print_exc()
+            result = runner.run()
         finally:
-            del trainer
-            merged_config = None
-            callbacks = None
-            commands = None
-            self._current_commands = None
-            torch.clear_autocast_cache()
-            # Two collect passes break cyclic refs (callbacks ↔ trainer, hooks ↔ params)
-            # that a single pass leaves behind, then torch_gc empties the CUDA caches.
-            gc.collect()
-            gc.collect()
-            torch_gc()
-        if error is not None:
-            raise error
-        if self._stop_current_run:
+            self._current_runner = None
+
+        if result.completed:
+            if result.stopped or self._stop_current_run:
+                self._stop_current_run = False
+            return
+
+        if result.stopped or self._stop_current_run:
+            # Stopped on request; the child still saved/backed up as configured.
             self._stop_current_run = False
+            return
+
+        raise self._reconstruct_error(result.error_category, result.error_message)
+
+    @staticmethod
+    def _reconstruct_error(category: str | None, message: str | None) -> Exception:
+        """Rebuild an exception the retry/skip helpers recognise from the child's report."""
+        message = message or "Training subprocess failed"
+        if category == "file_not_found":
+            return FileNotFoundError(message)
+        # nan / oom / other all surface as RuntimeError; is_nan_error / is_oom_error
+        # re-classify from the (preserved) message, so the existing rules still fire.
+        return RuntimeError(message)
 
     def _get_current_step(self) -> int:
         return self._last_global_step

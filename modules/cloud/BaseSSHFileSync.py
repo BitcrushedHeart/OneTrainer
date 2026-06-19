@@ -1,4 +1,6 @@
 import shlex
+import shutil
+import subprocess
 from abc import abstractmethod
 from pathlib import Path
 
@@ -79,6 +81,67 @@ class BaseSSHFileSync(BaseFileSync):
 
         self.upload_files(local_files=files, remote_dir=remote)
 
+    def sync_up_dir_stream(self, local: Path, remote: Path) -> bool:
+        if not local.is_dir() or shutil.which("tar") is None:
+            return False
+
+        self.sync_connection.open()
+        has_remote_tar = self.sync_connection.run("command -v tar", warn=True, hide=True, in_stream=False)
+        if has_remote_tar.exited != 0:
+            return False
+
+        local_size = self.__local_file_size_sum(local)
+        remote_posix = remote.as_posix()
+        command = (
+            f"mkdir -p {shlex.quote(remote_posix)} "
+            f"&& tar -xf - -C {shlex.quote(remote_posix)} "
+            f"&& find {shlex.quote(remote_posix)} -type f -exec stat --printf '%s\\n' {{}} \\; "
+            "| awk '{s+=$1} END {print s+0}'"
+        )
+
+        transport = self.sync_connection.client.get_transport()
+        channel = transport.open_session()
+        channel.exec_command(command)
+
+        proc = subprocess.Popen(
+            ["tar", "-cf", "-", "-C", str(local), "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        try:
+            for chunk in iter(lambda: proc.stdout.read(1024 * 1024), b""):
+                channel.sendall(chunk)
+            channel.shutdown_write()
+            stderr = proc.stderr.read().decode(errors="replace") if proc.stderr is not None else ""
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(stderr or "local tar failed")
+
+            remote_output = b""
+            remote_error = b""
+            while not channel.exit_status_ready():
+                if channel.recv_ready():
+                    remote_output += channel.recv(65536)
+                if channel.recv_stderr_ready():
+                    remote_error += channel.recv_stderr(65536)
+            while channel.recv_ready():
+                remote_output += channel.recv(65536)
+            while channel.recv_stderr_ready():
+                remote_error += channel.recv_stderr(65536)
+
+            exit_status = channel.recv_exit_status()
+            if exit_status != 0:
+                raise RuntimeError(remote_error.decode(errors="replace") or "remote tar failed")
+            remote_size = int(remote_output.decode(errors="replace").strip().splitlines()[-1])
+            if remote_size != local_size:
+                raise RuntimeError(
+                    f"streamed upload verification failed for {local}: local={local_size} remote={remote_size}"
+                )
+            return True
+        finally:
+            channel.close()
+
     def sync_down_file(self, local: Path, remote: Path):
         sync_info = self.__get_sync_info(remote)
         if not self.__needs_download(local=local, remote=remote, sync_info=sync_info):
@@ -130,3 +193,11 @@ class BaseSSHFileSync(BaseFileSync):
             or local.stat().st_size != sync_info[remote]["size"]
             or local.stat().st_mtime < sync_info[remote]["mtime"]
         )
+
+    @staticmethod
+    def __local_file_size_sum(local: Path) -> int:
+        total = 0
+        for path in local.rglob("*"):
+            if path.is_file():
+                total += path.stat().st_size
+        return total

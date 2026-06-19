@@ -1,14 +1,33 @@
-import { ArrowLeftRight, CheckCircle2, ChevronDown, CornerUpLeft, SkipForward, Undo2, X, ZoomIn } from "lucide-react";
+import {
+  ArrowLeftRight,
+  CheckCircle2,
+  ChevronDown,
+  CornerUpLeft,
+  Eye,
+  SkipForward,
+  ThumbsDown,
+  ThumbsUp,
+  Undo2,
+  X,
+  ZoomIn,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { API_BASE } from "@/api/request";
 import { Button } from "@/components/shared";
 
-import { PreviewOverlay } from "./PreviewOverlay";
 import { PromptExpander } from "./PromptExpander";
+import {
+  BAD_COLOR,
+  basename,
+  GOOD_COLOR,
+  imageUrl,
+  SKIP_COLOR,
+  type Verdict,
+  verdictColor,
+  verdictLabel,
+} from "./triageCommon";
+import { TriageReviewOverlay } from "./TriageReviewOverlay";
 import type { TriageStepProps } from "./types";
-
-type Verdict = "good" | "bad" | "skip";
 
 type CardLoc = { type: "pool" } | { type: "slot"; pairIndex: number };
 
@@ -23,16 +42,9 @@ interface TriagePair {
   rejected: string;
 }
 
-const GOOD_COLOR = "#22c55e";
-const BAD_COLOR = "#ef4444";
-const SKIP_COLOR = "#9ca3af";
-
-function basename(p: string): string {
-  return p.split(/[/\\]/).pop() ?? p;
-}
-
-function imageUrl(path: string): string {
-  return `${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`;
+interface ReviewState {
+  list: string[];
+  pos: number;
 }
 
 function aspectRatioStyle(ar: string): React.CSSProperties | undefined {
@@ -41,39 +53,38 @@ function aspectRatioStyle(ar: string): React.CSSProperties | undefined {
   return { aspectRatio: `${m[1]} / ${m[2]}` };
 }
 
-function verdictColor(v: Verdict | undefined): string {
-  if (v === "good") return GOOD_COLOR;
-  if (v === "bad") return BAD_COLOR;
-  if (v === "skip") return SKIP_COLOR;
-  return "var(--color-border-subtle)";
-}
-
 export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCancel }: TriageStepProps) {
   const [phase, setPhase] = useState<"voting" | "pairing">("voting");
-  // Voting is append-only: verdicts[i] belongs to group.images[i] and the
-  // current image index is simply verdicts.length. Undo pops the last vote.
-  const [verdicts, setVerdicts] = useState<Verdict[]>([]);
+  // Verdicts are keyed by image index and sparse: undefined = not yet scored.
+  // The cursor moves freely (arrow keys, thumbnail clicks), so earlier votes
+  // can be revisited and changed at any time without losing the rest.
+  const [verdicts, setVerdicts] = useState<Array<Verdict | undefined>>([]);
+  const [cursorRaw, setCursor] = useState(0);
   const [pairs, setPairs] = useState<TriagePair[]>([]);
   const [goodPool, setGoodPool] = useState<string[]>([]);
   const [badPool, setBadPool] = useState<string[]>([]);
   const [picked, setPicked] = useState<PickedCard | null>(null);
-  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [review, setReview] = useState<ReviewState | null>(null);
   const [stripOpen, setStripOpen] = useState(false);
   const [committing, setCommitting] = useState(false);
 
   const images = group.images;
-  const index = Math.min(verdicts.length, images.length - 1);
+  // When a new group arrives, the reset effect below fires only after the
+  // first render — a stale cursor from a larger group would index past the
+  // new image list, so clamp at render time.
+  const cursor = Math.min(cursorRaw, Math.max(0, images.length - 1));
   const arStyle = aspectRatioStyle(group.aspectratio);
 
   // A fresh group (auto-advance after commit/skip) starts triage clean.
   useEffect(() => {
     setPhase("voting");
     setVerdicts([]);
+    setCursor(0);
     setPairs([]);
     setGoodPool([]);
     setBadPool([]);
     setPicked(null);
-    setPreviewPath(null);
+    setReview(null);
     setStripOpen(false);
     setCommitting(false);
   }, [group]);
@@ -83,13 +94,13 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
   useEffect(() => {
     if (phase !== "voting") return;
     for (let k = 1; k <= 3; k++) {
-      const next = images[verdicts.length + k];
+      const next = images[cursor + k];
       if (next) {
         const im = new Image();
         im.src = imageUrl(next);
       }
     }
-  }, [phase, verdicts.length, images]);
+  }, [phase, cursor, images]);
 
   const counts = useMemo(() => {
     let good = 0;
@@ -98,15 +109,17 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
     for (const v of verdicts) {
       if (v === "good") good++;
       else if (v === "bad") bad++;
-      else skip++;
+      else if (v === "skip") skip++;
     }
     return { good, bad, skip };
   }, [verdicts]);
 
+  const unscored = images.length - counts.good - counts.bad - counts.skip;
+
   const skipped = useMemo(() => images.filter((_, i) => verdicts[i] === "skip"), [images, verdicts]);
 
   const finishVoting = useCallback(
-    (finalVerdicts: Verdict[]) => {
+    (finalVerdicts: Array<Verdict | undefined>) => {
       const good: string[] = [];
       const bad: string[] = [];
       images.forEach((img, i) => {
@@ -125,22 +138,53 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
 
   const vote = useCallback(
     (v: Verdict) => {
-      if (verdicts.length >= images.length) return;
-      const next = [...verdicts, v];
+      const wasUnscored = verdicts[cursor] === undefined;
+      const next = [...verdicts];
+      next[cursor] = v;
       setVerdicts(next);
-      if (next.length === images.length) finishVoting(next);
+      // Jump to the next unscored image (wrapping) — in a fresh pass this is
+      // simply cursor+1, after revisits it returns to the frontier.
+      for (let k = 1; k < images.length; k++) {
+        const i = (cursor + k) % images.length;
+        if (next[i] === undefined) {
+          setCursor(i);
+          return;
+        }
+      }
+      // Everything is scored. Only auto-advance to pairing when this vote
+      // completed the set — a pure re-vote stays in voting so several images
+      // can be changed before finishing explicitly.
+      if (wasUnscored) finishVoting(next);
+      else setCursor((c) => Math.min(c + 1, images.length - 1));
     },
-    [verdicts, images.length, finishVoting],
+    [verdicts, cursor, images.length, finishVoting],
   );
 
   const undo = useCallback(() => {
-    setVerdicts((prev) => prev.slice(0, -1));
-  }, []);
+    if (cursor === 0) return;
+    const next = [...verdicts];
+    next[cursor - 1] = undefined;
+    setVerdicts(next);
+    setCursor(cursor - 1);
+  }, [cursor, verdicts]);
 
-  // Keyboard: 1/0/Space/Backspace while voting, Escape deselects while pairing.
+  const goPrev = useCallback(() => setCursor((c) => Math.max(0, c - 1)), []);
+  const goNext = useCallback(() => setCursor((c) => Math.min(images.length - 1, c + 1)), [images.length]);
+
+  // Finish on demand: anything still unscored becomes an explicit skip, so it
+  // lands in the skipped pile and stays rescorable from the pairing screen.
+  const finishNow = useCallback(() => {
+    const filled = images.map((_, i) => verdicts[i] ?? ("skip" as Verdict));
+    setVerdicts(filled);
+    finishVoting(filled);
+  }, [images, verdicts, finishVoting]);
+
+  // Keyboard: 1/0/Space/Backspace vote, arrows navigate while voting; Escape
+  // deselects while pairing. The review overlay handles its own keys in the
+  // capture phase, so bail out whenever it is open.
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (previewPath) return;
+      if (review) return;
       if (phase === "voting") {
         if (e.key === "1") {
           e.preventDefault();
@@ -157,6 +201,12 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
         } else if (e.key === "Backspace") {
           e.preventDefault();
           undo();
+        } else if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          goPrev();
+        } else if (e.key === "ArrowRight") {
+          e.preventDefault();
+          goNext();
         }
       } else if (e.key === "Escape") {
         setPicked(null);
@@ -164,9 +214,73 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [phase, previewPath, vote, undo]);
+  }, [phase, review, vote, undo, goPrev, goNext]);
 
   // ---- pairing-phase mutations ----
+
+  // Re-score one image in place, preserving manual arrangements: a pair losing
+  // one half pulls a replacement from the matching pool before dissolving,
+  // then a top-up pass pairs whatever both pools allow.
+  const reassign = useCallback(
+    (path: string, v: Verdict) => {
+      const idx = images.indexOf(path);
+      if (idx < 0 || verdicts[idx] === v) return;
+      const newPairs = [...pairs];
+      let newGood = [...goodPool];
+      let newBad = [...badPool];
+
+      if (verdicts[idx] === "good") {
+        const slot = newPairs.findIndex((p) => p.chosen === path);
+        if (slot >= 0) {
+          const replacement = newGood.shift();
+          if (replacement !== undefined) {
+            newPairs[slot] = { ...newPairs[slot], chosen: replacement };
+          } else {
+            newBad.push(newPairs[slot].rejected);
+            newPairs.splice(slot, 1);
+          }
+        } else {
+          newGood = newGood.filter((x) => x !== path);
+        }
+      } else if (verdicts[idx] === "bad") {
+        const slot = newPairs.findIndex((p) => p.rejected === path);
+        if (slot >= 0) {
+          const replacement = newBad.shift();
+          if (replacement !== undefined) {
+            newPairs[slot] = { ...newPairs[slot], rejected: replacement };
+          } else {
+            newGood.push(newPairs[slot].chosen);
+            newPairs.splice(slot, 1);
+          }
+        } else {
+          newBad = newBad.filter((x) => x !== path);
+        }
+      }
+
+      if (v === "good") newGood.push(path);
+      else if (v === "bad") newBad.push(path);
+
+      while (newGood.length > 0 && newBad.length > 0) {
+        newPairs.push({ chosen: newGood.shift() as string, rejected: newBad.shift() as string });
+      }
+
+      setPairs(newPairs);
+      setGoodPool(newGood);
+      setBadPool(newBad);
+      setPicked(null);
+      setVerdicts((prev) => {
+        const next = [...prev];
+        next[idx] = v;
+        return next;
+      });
+    },
+    [images, verdicts, pairs, goodPool, badPool],
+  );
+
+  const moveToOtherSide = useCallback(
+    (card: PickedCard) => reassign(card.path, card.side === "good" ? "bad" : "good"),
+    [reassign],
+  );
 
   const isSameCard = (a: PickedCard, b: PickedCard) => a.path === b.path;
 
@@ -216,64 +330,9 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
     [picked, pairs, goodPool, badPool],
   );
 
-  // Move a card to the other side (good↔bad), preserving manual changes:
-  // untouched pairs survive verbatim; only the affected pair dissolves or
-  // pulls a replacement, then a top-up pass pairs whatever both pools allow.
-  const moveToOtherSide = useCallback(
-    (card: PickedCard) => {
-      const newPairs = [...pairs];
-      let newGood = [...goodPool];
-      let newBad = [...badPool];
-
-      if (card.side === "good") {
-        if (card.loc.type === "pool") {
-          newGood = newGood.filter((x) => x !== card.path);
-        } else {
-          const pr = newPairs[card.loc.pairIndex];
-          newBad.push(pr.rejected);
-          newPairs.splice(card.loc.pairIndex, 1);
-        }
-        newBad.push(card.path);
-      } else {
-        if (card.loc.type === "pool") {
-          newBad = newBad.filter((x) => x !== card.path);
-        } else {
-          const i = card.loc.pairIndex;
-          const replacement = newBad.shift();
-          if (replacement !== undefined) {
-            newPairs[i] = { ...newPairs[i], rejected: replacement };
-          } else {
-            newGood.push(newPairs[i].chosen);
-            newPairs.splice(i, 1);
-          }
-        }
-        newGood.push(card.path);
-      }
-
-      while (newGood.length > 0 && newBad.length > 0) {
-        newPairs.push({ chosen: newGood.shift() as string, rejected: newBad.shift() as string });
-      }
-
-      setPairs(newPairs);
-      setGoodPool(newGood);
-      setBadPool(newBad);
-      setPicked(null);
-      // Keep verdicts in sync so "Back to voting" reflects the reassignment.
-      setVerdicts((prev) => {
-        const idx = images.indexOf(card.path);
-        if (idx < 0 || idx >= prev.length) return prev;
-        const next = [...prev];
-        next[idx] = card.side === "good" ? "bad" : "good";
-        return next;
-      });
-    },
-    [pairs, goodPool, badPool, images],
-  );
-
   const backToVoting = useCallback(() => {
-    // Drop the last vote so the user lands on a re-votable image and can
-    // Backspace further from there.
-    setVerdicts((prev) => prev.slice(0, -1));
+    // Verdicts survive the round-trip — the user lands back in voting with
+    // everything scored and can navigate freely to change individual votes.
     setPairs([]);
     setGoodPool([]);
     setBadPool([]);
@@ -290,6 +349,11 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
       setCommitting(false);
     }
   }, [pairs, committing, onCommitPairs]);
+
+  const openReview = useCallback((list: string[], path?: string) => {
+    const pos = path ? Math.max(0, list.indexOf(path)) : 0;
+    setReview({ list, pos });
+  }, []);
 
   // ---- voting-phase mouse input on the big image ----
 
@@ -325,7 +389,7 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
         <span className="text-[var(--color-border-subtle)]">·</span>
         {phase === "voting" ? (
           <span className="tabular-nums">
-            Image {Math.min(verdicts.length + 1, images.length)} / {images.length}
+            Image {cursor + 1} / {images.length}
           </span>
         ) : (
           <span className="tabular-nums">{pairs.length} pair(s) ready</span>
@@ -335,6 +399,7 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
           <span style={{ color: GOOD_COLOR }}>Good {counts.good}</span>{" "}
           <span style={{ color: BAD_COLOR }}>Bad {counts.bad}</span>{" "}
           <span style={{ color: SKIP_COLOR }}>Skip {counts.skip}</span>
+          {unscored > 0 && <span className="text-[var(--color-on-surface-secondary)]"> Left {unscored}</span>}
         </span>
         {pairsDone > 0 && (
           <>
@@ -368,7 +433,8 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
   }
 
   if (phase === "voting") {
-    const current = images[index];
+    const current = images[cursor];
+    const currentVerdict = verdicts[cursor];
     return (
       <div className="flex flex-col gap-3 h-full min-h-0">
         {header}
@@ -393,6 +459,20 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
             />
           </div>
 
+          {/* Existing verdict badge — visible when revisiting a scored image */}
+          {currentVerdict && (
+            <div
+              className="absolute top-8 left-3 px-2.5 py-1 rounded text-xs font-bold pointer-events-none"
+              style={{
+                background: "rgba(0, 0, 0, 0.7)",
+                color: verdictColor(currentVerdict),
+                border: `1px solid ${verdictColor(currentVerdict)}`,
+              }}
+            >
+              {verdictLabel(currentVerdict)}
+            </div>
+          )}
+
           {/* Overview strip: hover the top edge to see the whole stack */}
           <div
             className="absolute top-0 left-0 right-0 z-10"
@@ -407,8 +487,8 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
                 {images.map((img, i) => (
                   <div
                     key={img}
-                    className={`relative shrink-0 h-20 rounded border-2 overflow-hidden bg-black/40 ${
-                      i === index ? "ring-2 ring-[var(--color-cobalt-600)]" : ""
+                    className={`relative shrink-0 h-20 rounded border-2 overflow-hidden bg-black/40 cursor-pointer ${
+                      i === cursor ? "ring-2 ring-[var(--color-cobalt-600)]" : ""
                     }`}
                     style={{
                       borderColor: verdictColor(verdicts[i]),
@@ -416,6 +496,7 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
                       ...arStyle,
                     }}
                     title={basename(img)}
+                    onClick={() => setCursor(i)}
                   >
                     <img
                       src={imageUrl(img)}
@@ -434,7 +515,7 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
           <div className="absolute bottom-0 left-0 right-0 px-4 py-2 bg-black/70 text-white text-xs flex items-center justify-between pointer-events-none">
             <span className="font-mono truncate">{basename(current)}</span>
             <span className="text-white/60 tabular-nums">
-              {Math.min(verdicts.length + 1, images.length)} / {images.length}
+              {cursor + 1} / {images.length}
             </span>
           </div>
         </div>
@@ -473,11 +554,23 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
             tabIndex={-1}
             onClick={undo}
             className={`px-3 py-1.5 rounded font-semibold flex items-center gap-1 text-[var(--color-on-surface-secondary)] border border-[var(--color-border-subtle)] ${
-              verdicts.length === 0 ? "opacity-40 cursor-default" : "cursor-pointer"
+              cursor === 0 ? "opacity-40 cursor-default" : "cursor-pointer"
             }`}
           >
             <Undo2 className="w-3.5 h-3.5" />
             Undo — Backspace
+          </div>
+          <div className="px-3 py-1.5 rounded font-semibold text-[var(--color-on-surface-secondary)] border border-[var(--color-border-subtle)]">
+            ← / → — browse
+          </div>
+          <div
+            role="button"
+            tabIndex={-1}
+            onClick={finishNow}
+            className="px-3 py-1.5 rounded cursor-pointer font-semibold"
+            style={{ color: "#fff", background: "var(--color-cobalt-600)" }}
+          >
+            {unscored > 0 ? `Finish — skip ${unscored} unscored` : "Finish → pairs"}
           </div>
         </div>
       </div>
@@ -513,10 +606,10 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
           role="button"
           tabIndex={-1}
           className="p-1 rounded bg-black/70 text-white hover:bg-black/90"
-          title="Preview full size"
+          title="Inspect & rescore full size"
           onClick={(e) => {
             e.stopPropagation();
-            setPreviewPath(card.path);
+            openReview(images, card.path);
           }}
         >
           <ZoomIn className="w-3.5 h-3.5" />
@@ -532,6 +625,52 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
           }}
         >
           <ArrowLeftRight className="w-3.5 h-3.5" />
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderSkippedCard = (path: string) => (
+    <div
+      key={path}
+      className="group/card relative h-28 rounded border-2 border-dashed overflow-hidden bg-black/30 cursor-pointer transition-all hover:shadow-lg"
+      style={{ borderColor: SKIP_COLOR, ...arStyle }}
+      title={basename(path)}
+      onClick={() => openReview(images, path)}
+    >
+      <img
+        src={imageUrl(path)}
+        alt={basename(path)}
+        loading="lazy"
+        className="w-full h-full object-cover opacity-70 group-hover/card:opacity-100 transition-opacity"
+        draggable={false}
+      />
+      <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
+        <div
+          role="button"
+          tabIndex={-1}
+          className="p-1 rounded bg-black/70 hover:bg-black/90"
+          style={{ color: GOOD_COLOR }}
+          title="Mark Good"
+          onClick={(e) => {
+            e.stopPropagation();
+            reassign(path, "good");
+          }}
+        >
+          <ThumbsUp className="w-3.5 h-3.5" />
+        </div>
+        <div
+          role="button"
+          tabIndex={-1}
+          className="p-1 rounded bg-black/70 hover:bg-black/90"
+          style={{ color: BAD_COLOR }}
+          title="Mark Bad"
+          onClick={(e) => {
+            e.stopPropagation();
+            reassign(path, "bad");
+          }}
+        >
+          <ThumbsDown className="w-3.5 h-3.5" />
         </div>
       </div>
     </div>
@@ -603,31 +742,26 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
           </div>
         )}
 
-        {/* Skipped pile (read-only) */}
+        {/* Skipped pile — rescorable in place or via the full-screen pass */}
         {skipped.length > 0 && (
-          <details className="rounded border border-[var(--color-border-subtle)] bg-[var(--color-surface-container)]">
-            <summary className="cursor-pointer select-none px-3 py-1.5 text-xs font-semibold text-[var(--color-on-surface-secondary)]">
-              Skipped ({skipped.length})
-            </summary>
-            <div className="flex flex-wrap gap-2 p-3">
-              {skipped.map((path) => (
-                <div
-                  key={path}
-                  className="relative h-24 rounded border-2 border-dashed overflow-hidden bg-black/30"
-                  style={{ borderColor: SKIP_COLOR, ...arStyle }}
-                  title={basename(path)}
-                >
-                  <img
-                    src={imageUrl(path)}
-                    alt={basename(path)}
-                    loading="lazy"
-                    className="w-full h-full object-cover opacity-70"
-                    draggable={false}
-                  />
-                </div>
-              ))}
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold" style={{ color: SKIP_COLOR }}>
+                Skipped ({skipped.length}) — click to inspect & rescore
+              </span>
+              <div
+                role="button"
+                tabIndex={-1}
+                onClick={() => openReview([...skipped])}
+                className="px-2 py-0.5 rounded text-xs font-semibold cursor-pointer flex items-center gap-1"
+                style={{ color: "#fff", background: "var(--color-cobalt-600)" }}
+              >
+                <Eye className="w-3.5 h-3.5" />
+                Rescore skipped
+              </div>
             </div>
-          </details>
+            <div className="flex flex-wrap gap-2">{skipped.map(renderSkippedCard)}</div>
+          </div>
         )}
       </div>
 
@@ -638,8 +772,12 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
             <CornerUpLeft className="w-4 h-4" />
             Back to voting
           </Button>
+          <Button variant="ghost" size="sm" onClick={() => openReview(images)}>
+            <Eye className="w-4 h-4" />
+            Review all
+          </Button>
           <span className="text-[10px] text-[var(--color-on-surface-secondary)]">
-            Re-voting rebuilds pairs — manual swaps reset.
+            Re-voting rebuilds pairs — manual swaps reset. Rescoring here keeps them.
           </span>
         </div>
         <div className="flex items-center gap-2">
@@ -661,8 +799,15 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
         </div>
       </div>
 
-      {previewPath && (
-        <PreviewOverlay path={previewPath} caption={basename(previewPath)} onClose={() => setPreviewPath(null)} />
+      {review && (
+        <TriageReviewOverlay
+          list={review.list}
+          pos={review.pos}
+          verdictFor={(p) => verdicts[images.indexOf(p)]}
+          onVerdict={reassign}
+          onNavigate={(pos) => setReview((r) => (r ? { ...r, pos } : r))}
+          onClose={() => setReview(null)}
+        />
       )}
     </div>
   );

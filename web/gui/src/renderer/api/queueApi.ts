@@ -4,7 +4,8 @@ export interface QueueDiffField {
   field: string;
   label: string;
   current: unknown;
-  default: unknown;
+  /** Value inherited from the current active config — what this override replaces. */
+  inherited: unknown;
 }
 
 export interface QueueDiffResponse {

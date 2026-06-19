@@ -33,6 +33,7 @@ from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 from modules.util.optimizer.adafactor_extensions import patch_adafactor
 from modules.util.optimizer.adam_extensions import patch_adam
 from modules.util.optimizer.adamw_extensions import patch_adamw
+from modules.util.optimizer.depth_calculator import inject_depth_into_param_groups
 from modules.util.optimizer.muon_util import split_parameters_for_muon
 from modules.util.optimizer.tag_util import tag_peft_parameters
 from modules.util.TrainProgress import TrainProgress
@@ -163,6 +164,11 @@ def create_optimizer(
             )
 
     parameters = parameter_group_collection.parameters_for_optimizer(config)
+
+    if optimizer_config.spectral_normalization:
+        # _adv optimizers O(1) depth scaling; Kourkoutas' scale_tiny_spike
+        # requires group['n_layers'] whenever spectral_normalization is on.
+        inject_depth_into_param_groups(model, parameters)
 
     if config.optimizer.optimizer.is_adv:
         # Tag PEFT parameters based on parameter names.
@@ -1271,6 +1277,22 @@ def create_optimizer(
             "actual_state_precision": {"auto", "factored", "fp32", "fp16", "bf16_sr", "int8_sr"},
             "centered_wd_mode": {"full", "float8", "int8", "int4"},
         }
+        # used when the current config value is itself invalid for an enum key,
+        # so the repair never propagates a broken value into the live groups
+        group_enum_fallbacks = {
+            "orthogonal_gradient": "disabled",
+            "state_precision": "auto",
+            "actual_state_precision": "auto",
+            "centered_wd_mode": "full",
+        }
+        # feature flags the current config must control on resume: torch's
+        # load_state_dict keeps the saved group hyperparameters, so a flag
+        # toggled in the config between save and resume would silently revert
+        # (e.g. spectral_normalization baked as False into backups saved while
+        # the scaled_optm rename left it off). Keep this set tight — group
+        # entries like Prodigy's d-estimates are learned state that must NOT
+        # be reset from the config.
+        config_wins_keys = {"spectral_normalization"}
 
         def _normalize_groups(groups: list[dict], reference_groups: list[dict], where: str):
             if len(groups) != len(reference_groups):
@@ -1284,7 +1306,21 @@ def create_optimizer(
                 for key, value in current_group.items():
                     if key == "params":
                         continue
+                    if key in group_enum_values and value not in group_enum_values[key]:
+                        print(
+                            f"WARN: optimizer param group key '{key}' has invalid current value "
+                            f"{value!r}; falling back to '{group_enum_fallbacks[key]}'."
+                        )
+                        value = group_enum_fallbacks[key]
+                        current_group[key] = value
                     if key not in saved_group:
+                        saved_group[key] = value
+                        continue
+                    if key in config_wins_keys and saved_group[key] != value:
+                        print(
+                            f"INFO: optimizer param group key '{key}' differs from the current config "
+                            f"({saved_group[key]!r} -> {value!r}) [{where}]; using the current config value."
+                        )
                         saved_group[key] = value
                         continue
                     type_changed = (

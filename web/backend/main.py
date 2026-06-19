@@ -11,6 +11,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from web.backend.routers import (
     concepts,
+    cloud,
     config,
     converter,
     dpo,
@@ -71,6 +72,7 @@ app.add_middleware(
 
 _routers = [
     health.router,
+    cloud.router,
     config.router,
     presets.router,
     concepts.router,
