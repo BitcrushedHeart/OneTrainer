@@ -9,11 +9,23 @@ from modules.util.TrainProgress import TrainProgress
 
 from mgds.MGDS import MGDS
 from mgds.PipelineModule import PipelineState
+from mgds.pipelineModules.PlaceholderModule import PlaceholderModule
 
 import torch
 
 
 class DataLoaderMgdsMixin(metaclass=ABCMeta):
+    @staticmethod
+    def _placeholder_modules_for(definition: list | object) -> list[PlaceholderModule]:
+        if definition is None:
+            return []
+        if isinstance(definition, list):
+            placeholders = []
+            for item in definition:
+                placeholders.extend(DataLoaderMgdsMixin._placeholder_modules_for(item))
+            return placeholders
+        return [PlaceholderModule()]
+
     @staticmethod
     def __filter_dpo_concepts(concepts: list[ConceptConfig]) -> list[ConceptConfig]:
         # An RLHF DPO run trains on chosen/rejected pairs only. Concepts without

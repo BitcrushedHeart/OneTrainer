@@ -723,20 +723,6 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         output_modules = self._output_modules(config, model, model_setup, is_validation=is_validation)
 
-        if config.sourceless_training and config.latent_caching:
-            if hasattr(config, "train_text_encoder_or_embedding") and config.train_text_encoder_or_embedding():
-                raise RuntimeError(
-                    "Sourceless training cannot be used with text encoder training. "
-                    "Disable sourceless_training or disable text encoder training."
-                )
-            cache_modules = self._cache_modules(config, model, model_setup)
-            return self._create_mgds(
-                config,
-                [cache_modules, output_modules],
-                train_progress,
-                is_validation,
-            )
-
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
@@ -754,12 +740,28 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         debug_modules = self._debug_modules(config, model)
 
+        pre_cache_modules = [enumerate_input, load_input, mask_augmentation, aspect_bucketing_in, crop_modules, augmentation_modules]
+        if supports_inpainting:
+            pre_cache_modules.append(inpainting_modules)
+        pre_cache_modules.append(preparation_modules)
+
+        if config.sourceless_training and config.latent_caching:
+            if hasattr(config, "train_text_encoder_or_embedding") and config.train_text_encoder_or_embedding():
+                raise RuntimeError(
+                    "Sourceless training cannot be used with text encoder training. "
+                    "Disable sourceless_training or disable text encoder training."
+                )
+            return self._create_mgds(
+                config,
+                [self._placeholder_modules_for(pre_cache_modules), cache_modules, output_modules],
+                train_progress,
+                is_validation,
+            )
+
         return self._create_mgds(
             config,
-            [enumerate_input, load_input, mask_augmentation, aspect_bucketing_in, crop_modules, augmentation_modules]
-            + ([inpainting_modules] if supports_inpainting else [])
+            pre_cache_modules
             + [
-                preparation_modules,
                 cache_modules,
                 output_modules,
                 debug_modules if config.debug_mode else None,

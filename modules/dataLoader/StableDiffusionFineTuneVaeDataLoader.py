@@ -400,15 +400,6 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         output_modules = self.__output_modules(config)
 
-        if config.sourceless_training and config.latent_caching:
-            cache_modules = self.__cache_modules(config, model)
-            return self._create_mgds(
-                config,
-                [cache_modules, output_modules],
-                train_progress,
-                is_validation,
-            )
-
         enumerate_input = self.__enumerate_input_modules(config)
         load_input = self.__load_input_modules(config)
         mask_augmentation = self.__mask_augmentation_modules(config)
@@ -422,16 +413,28 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
 
         debug_modules = self.__debug_modules(config, model)
 
+        pre_cache_modules = [
+            enumerate_input,
+            load_input,
+            mask_augmentation,
+            aspect_bucketing_in,
+            crop_modules,
+            augmentation_modules,
+            preparation_modules,
+        ]
+
+        if config.sourceless_training and config.latent_caching:
+            return self._create_mgds(
+                config,
+                [self._placeholder_modules_for(pre_cache_modules), cache_modules, output_modules],
+                train_progress,
+                is_validation,
+            )
+
         return self._create_mgds(
             config,
-            [
-                enumerate_input,
-                load_input,
-                mask_augmentation,
-                aspect_bucketing_in,
-                crop_modules,
-                augmentation_modules,
-                preparation_modules,
+            pre_cache_modules
+            + [
                 cache_modules,
                 output_modules,
                 debug_modules if config.debug_mode else None,
