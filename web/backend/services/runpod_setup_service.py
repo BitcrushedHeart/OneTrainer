@@ -154,7 +154,7 @@ class RunpodSetupService(SingletonMixin):
     def _mutate_config_for_runpod(self, config: TrainConfig, volume_size: int, body: dict[str, Any]) -> None:
         config.cloud.enabled = True
         config.cloud.type = CloudType.RUNPOD
-        config.cloud.file_sync = CloudFileSync.FABRIC_SFTP
+        config.cloud.file_sync = CloudFileSync.NATIVE_RSYNC
         config.cloud.create = True
         config.cloud.name = str(body.get("pod_name") or config.cloud.name or "OneTrainer").strip() or "OneTrainer"
         config.cloud.sub_type = "SECURE"
@@ -241,8 +241,18 @@ class RunpodSetupService(SingletonMixin):
         if cache_file is None:
             raise RuntimeError(f"Cache entry for {entry_path} has no cache file")
 
-        pt_name = f"{cache_file}_1.pt"
-        shutil.copy2(source_dir / pt_name, target_dir / pt_name)
+        copied = False
+        variation = 1
+        while True:
+            pt_name = f"{cache_file}_{variation}.pt"
+            source_pt = source_dir / pt_name
+            if not source_pt.is_file():
+                break
+            shutil.copy2(source_pt, target_dir / pt_name)
+            copied = True
+            variation += 1
+        if not copied:
+            raise RuntimeError(f"Cache entry for {entry_path} has no cache tensors for {cache_file}")
         subset = {
             key: value
             for key, value in source_index.items()
@@ -333,8 +343,8 @@ class RunpodSetupService(SingletonMixin):
     @staticmethod
     def _warnings(config: TrainConfig) -> list[str]:
         warnings: list[str] = []
-        if config.cloud.file_sync.name != "FABRIC_SFTP":
-            warnings.append("RunPod setup will switch file sync to FABRIC_SFTP for streamed uploads.")
+        if config.cloud.file_sync.name != "NATIVE_RSYNC":
+            warnings.append("RunPod setup will switch file sync to NATIVE_RSYNC for resumable cache uploads.")
         if config.only_cache:
             warnings.append("Only Cache is enabled locally; RunPod setup will disable it before starting training.")
         return warnings

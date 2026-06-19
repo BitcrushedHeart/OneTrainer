@@ -55,13 +55,14 @@ class CloudTab:
             2,
             0,
             "File sync method",
-            tooltip="Choose NATIVE_SCP to use scp.exe to transfer files. FABRIC_SFTP uses the Paramiko/Fabric SFTP implementation for file transfers instead.",
+            tooltip="Choose NATIVE_RSYNC to use rsync over SSH for resumable directory transfers. Choose NATIVE_SCP to use scp.exe to transfer files. FABRIC_SFTP uses the Paramiko/Fabric SFTP implementation for file transfers instead.",
         )
         components.options_kv(
             self.frame,
             2,
             1,
             [
+                ("NATIVE_RSYNC", CloudFileSync.NATIVE_RSYNC),
                 ("NATIVE_SCP", CloudFileSync.NATIVE_SCP),
                 ("FABRIC_SFTP", CloudFileSync.FABRIC_SFTP),
             ],

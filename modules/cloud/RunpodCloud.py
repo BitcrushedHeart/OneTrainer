@@ -1,4 +1,5 @@
 import secrets as pysecrets
+import shlex
 import time
 
 from modules.cloud.LinuxCloud import LinuxCloud
@@ -112,3 +113,37 @@ class RunpodCloud(LinuxCloud):
             return "source /etc/rp_environment && runpodctl remove pod $RUNPOD_POD_ID"
         else:
             return ":"
+
+    def _get_detached_watchdog_cmd(self) -> str:
+        stop_cmd = self._get_action_cmd(CloudAction.STOP)
+        script = f"""
+pid_file={shlex.quote(self.pid_file)}
+missing_gpu_seconds=0
+echo "RunPod watchdog started: stopping pod if trainer exits or nvidia-smi is unavailable for 1800 seconds."
+while true; do
+    sleep 60
+    if [ ! -s "$pid_file" ]; then
+        echo "RunPod watchdog: pid file missing or empty; stopping pod."
+        {stop_cmd}
+        exit 0
+    fi
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "RunPod watchdog: trainer process is no longer running; stopping pod."
+        {stop_cmd}
+        exit 0
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        missing_gpu_seconds=0
+    else
+        missing_gpu_seconds=$((missing_gpu_seconds + 60))
+        echo "RunPod watchdog: nvidia-smi unavailable for $missing_gpu_seconds seconds."
+        if [ "$missing_gpu_seconds" -ge 1800 ]; then
+            echo "RunPod watchdog: GPU status unavailable for 1800 seconds; stopping pod."
+            {stop_cmd}
+            exit 0
+        fi
+    fi
+done
+""".strip()
+        return f"(nohup sh -c {shlex.quote(script)} >> {shlex.quote(self.log_file)} 2>&1 &)"

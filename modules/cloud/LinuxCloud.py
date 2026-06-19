@@ -6,6 +6,7 @@ from pathlib import Path
 
 from modules.cloud.BaseCloud import BaseCloud
 from modules.cloud.FabricFileSync import FabricFileSync
+from modules.cloud.NativeRsyncFileSync import NativeRsyncFileSync
 from modules.cloud.NativeSCPFileSync import NativeSCPFileSync
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
@@ -65,6 +66,8 @@ class LinuxCloud(BaseCloud):
             match config.file_sync:
                 case CloudFileSync.NATIVE_SCP:
                     self.file_sync = NativeSCPFileSync(config, secrets)
+                case CloudFileSync.NATIVE_RSYNC:
+                    self.file_sync = NativeRsyncFileSync(config, secrets)
                 case CloudFileSync.FABRIC_SFTP:
                     self.file_sync = FabricFileSync(config, secrets)
 
@@ -141,6 +144,9 @@ class LinuxCloud(BaseCloud):
             raise NotImplementedError("Action on detached not supported for this cloud type")
         return ":"
 
+    def _get_detached_watchdog_cmd(self) -> str:
+        return ""
+
     def run_trainer(self):
         config = self.config.cloud
         if self.can_reattach():
@@ -170,6 +176,9 @@ class LinuxCloud(BaseCloud):
                     || (sleep 10 && test -f {shlex.quote(self.callback_file)} && {self._get_action_cmd(config.on_detached_error)})"
 
             cmd = f"(nohup true && {cmd}) > {self.log_file} 2>&1 & echo $! > {self.pid_file}"
+            watchdog_cmd = self._get_detached_watchdog_cmd()
+            if watchdog_cmd:
+                cmd = f"{cmd}; {watchdog_cmd}"
             self.connection.run(cmd, disown=True)
             self.__trail_detached_trainer()
         else:

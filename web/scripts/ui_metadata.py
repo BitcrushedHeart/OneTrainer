@@ -108,6 +108,7 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
     "CloudFileSync": {
         "FABRIC_SFTP": "Fabric SFTP",
         "NATIVE_SCP": "Native SCP",
+        "NATIVE_RSYNC": "Native rsync",
     },
     "CloudType": {
         "RUNPOD": "RunPod",
@@ -787,7 +788,8 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Choose RUNPOD for additional functionality such as automatically creating and deleting pods."
     ),
     "cloud.file_sync": (
-        "Choose NATIVE_SCP to use scp.exe to transfer files."
+        "Choose NATIVE_RSYNC to use rsync over SSH for resumable directory transfers."
+        " Choose NATIVE_SCP to use scp.exe to transfer files."
         " FABRIC_SFTP uses the Paramiko/Fabric SFTP implementation for file transfers instead."
     ),
     "secrets.cloud.api_key": (

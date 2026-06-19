@@ -43,7 +43,7 @@ def test_mutate_config_for_runpod_preserves_resume_and_sets_sourceless():
 
     assert cfg.cloud.enabled is True
     assert cfg.cloud.type == CloudType.RUNPOD
-    assert cfg.cloud.file_sync == CloudFileSync.FABRIC_SFTP
+    assert cfg.cloud.file_sync == CloudFileSync.NATIVE_RSYNC
     assert cfg.cloud.gpu_type == "NVIDIA GeForce RTX 5090"
     assert cfg.cloud.volume_size == 300
     assert cfg.cloud.install_cmd == "git clone -b bitcrushed-blend https://github.com/BitcrushedHeart/OneTrainer.git"
@@ -103,6 +103,22 @@ def test_runpod_create_falls_back_between_europe_codes(monkeypatch):
     assert [call["country_code"] for call in calls[:2]] == ["EU", "GB"]
 
 
+def test_runpod_detached_watchdog_stops_on_dead_process_or_missing_gpu():
+    cfg = TrainConfig.default_values()
+    cfg.cloud.remote_dir = "/workspace"
+    cfg.cloud.run_id = "job1"
+    cfg.cloud.detach_trainer = True
+    cloud = RunpodCloud(cfg)
+
+    cmd = cloud._get_detached_watchdog_cmd()
+
+    assert "runpodctl stop pod $RUNPOD_POD_ID" in cmd
+    assert "kill -0" in cmd
+    assert "nvidia-smi -L" in cmd
+    assert "1800" in cmd
+    assert "job1.pid" in cmd
+
+
 def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
     from modules.cloud.BaseCloud import BaseCloud
 
@@ -158,6 +174,44 @@ def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
     assert ("2026-06-19_22-21-20-backup-3928-0-3928", "/workspace/remote/F/workspace/Base/backup/2026-06-19_22-21-20-backup-3928-0-3928") in uploaded_dirs
 
 
+def test_native_rsync_syncs_directories_with_delete(monkeypatch, tmp_path):
+    from modules.cloud.NativeRsyncFileSync import NativeRsyncFileSync
+
+    commands = []
+
+    class DummyResult:
+        def check_returncode(self): ...
+
+    class DummyConnection:
+        def open(self): ...
+        def run(self, *args, **kwargs): ...
+        def close(self): ...
+
+    monkeypatch.setattr("modules.cloud.NativeRsyncFileSync.shutil.which", lambda name: "rsync")
+    monkeypatch.setattr("modules.cloud.BaseSSHFileSync.fabric.Connection", lambda *args, **kwargs: DummyConnection())
+    monkeypatch.setattr("modules.cloud.NativeRsyncFileSync.subprocess.run", lambda args: commands.append(args) or DummyResult())
+
+    local = tmp_path / "cache"
+    local.mkdir()
+    (local / "entry.pt").write_bytes(b"cache")
+
+    cfg = TrainConfig.default_values()
+    secrets = cfg.secrets.cloud
+    secrets.host = "1.2.3.4"
+    secrets.port = 22
+    secrets.user = "root"
+    secrets.key_file = str(tmp_path / "id_ed25519")
+    sync = NativeRsyncFileSync(cfg.cloud, secrets)
+
+    sync.sync_up_dir(local=local, remote=Path("/workspace/cache"), recursive=True)
+
+    assert commands
+    assert commands[0][0] == "rsync"
+    assert "--delete" in commands[0]
+    assert "-e" in commands[0]
+    assert commands[0][-1] == "root@1.2.3.4:/workspace/cache"
+
+
 def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
     cache = tmp_path / "cache"
     image_dir = cache / "image"
@@ -181,7 +235,9 @@ def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
         "variants": {"_": {"cache_file": "text001"}},
     }
     (image_dir / "image001_640x448_1.pt").write_bytes(b"image")
+    (image_dir / "image001_640x448_2.pt").write_bytes(b"image2")
     (text_dir / "text001_1.pt").write_bytes(b"text")
+    (text_dir / "text001_2.pt").write_bytes(b"text2")
     (image_dir / "cache.json").write_text(
         json.dumps({"version": 3, "entries": {image_path: image_entry}, "hash_index": {"imagehash": [image_path]}}),
         encoding="utf-8",
@@ -203,7 +259,9 @@ def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
     assert smoke["image_path"] == image_path
     assert smoke["text_path"] == text_path
     assert (smoke_cache / "image" / "image001_640x448_1.pt").is_file()
+    assert (smoke_cache / "image" / "image001_640x448_2.pt").is_file()
     assert (smoke_cache / "text" / "text001_1.pt").is_file()
+    assert (smoke_cache / "text" / "text001_2.pt").is_file()
     assert list(json.loads((smoke_cache / "image" / "cache.json").read_text(encoding="utf-8"))["entries"]) == [
         image_path
     ]

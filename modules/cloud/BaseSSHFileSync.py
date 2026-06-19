@@ -93,7 +93,8 @@ class BaseSSHFileSync(BaseFileSync):
         local_size = self.__local_file_size_sum(local)
         remote_posix = remote.as_posix()
         command = (
-            f"mkdir -p {shlex.quote(remote_posix)} "
+            f"rm -rf -- {shlex.quote(remote_posix)} "
+            f"&& mkdir -p {shlex.quote(remote_posix)} "
             f"&& tar -xf - -C {shlex.quote(remote_posix)} "
             f"&& find {shlex.quote(remote_posix)} -type f -exec stat --printf '%s\\n' {{}} \\; "
             "| awk '{s+=$1} END {print s+0}'"
