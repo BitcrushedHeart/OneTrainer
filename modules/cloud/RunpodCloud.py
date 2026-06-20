@@ -14,7 +14,15 @@ RUNPOD_TEMPLATE_ID = "1a33vbssq9"
 # image (RunPod rejects create_pod with an empty image_name), so it must be set
 # explicitly. Override here if you build/use a different OneTrainer image.
 RUNPOD_IMAGE = "dxqbyd/runpod-onetrainer-cli:1.2"
-EUROPE_COUNTRY_CODES = ["EU", "GB", "NL", "DE", "FR", "SE", "NO", "FI", "PL"]
+# RunPod selects by *data center id*, not country code. The old country-code
+# list ("EU", "PL", …) never matched a real DC, so create_pod always reported
+# "no instances available" even when the GPU was in stock. These are RunPod's
+# current European data centers; extend/reorder to taste (or add non-EU ids).
+RUNPOD_DATA_CENTERS = ["EU-RO-1", "EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-SE-1", "EUR-IS-1", "EUR-IS-2", "EUR-NO-1"]
+# Ephemeral container disk (wiped on stop). All real storage — cache, outputs,
+# backups, HF cache — lives on the persistent volume mounted at /workspace, so
+# this only needs room for the OS/scratch.
+RUNPOD_CONTAINER_DISK_GB = 30
 
 
 class RunpodCloud(LinuxCloud):
@@ -97,12 +105,12 @@ class RunpodCloud(LinuxCloud):
         pod = None
         print(
             f"Creating RunPod pod: image={RUNPOD_IMAGE}, gpu='{config.gpu_type}', "
-            f"type={config.sub_type or 'SECURE'}, volume={config.volume_size}GB",
+            f"type={config.sub_type or 'SECURE'}, persistent volume={config.volume_size}GB @ /workspace",
             flush=True,
         )
-        for country_code in EUROPE_COUNTRY_CODES:
+        for data_center in RUNPOD_DATA_CENTERS:
             try:
-                print(f"  requesting a pod in region {country_code}...", flush=True)
+                print(f"  requesting a pod in data center {data_center}...", flush=True)
                 pod = runpod.create_pod(
                     name=config.name,
                     image_name=RUNPOD_IMAGE,
@@ -111,26 +119,29 @@ class RunpodCloud(LinuxCloud):
                     cloud_type=config.sub_type or "SECURE",
                     support_public_ip=True,
                     start_ssh=True,
-                    country_code=country_code,
+                    data_center_id=data_center,
+                    # Persistent volume (survives a pod stop) holds all the data;
+                    # the container disk is ephemeral and kept small.
+                    container_disk_in_gb=RUNPOD_CONTAINER_DISK_GB,
                     volume_in_gb=config.volume_size,
                     volume_mount_path="/workspace",
                     min_download=config.min_download or None,
                     env={"JUPYTER_PASSWORD": pysecrets.token_urlsafe(16)},
                 )
-                # runpod returns None (rather than raising) when a region has no capacity for the
-                # requested GPU; keep trying the remaining countries instead of bailing on the
-                # first miss.
+                # runpod returns None (rather than raising) when a data center has no capacity for
+                # the requested GPU; keep trying the remaining ones instead of bailing on the first miss.
                 if pod:
-                    print(f"  pod created in {country_code}: id={pod.get('id')}", flush=True)
+                    print(f"  pod created in {data_center}: id={pod.get('id')}", flush=True)
                     break
-                print(f"  no capacity for '{config.gpu_type}' in {country_code}", flush=True)
+                print(f"  no capacity for '{config.gpu_type}' in {data_center}", flush=True)
             except Exception as exc:
-                print(f"  region {country_code} failed: {exc}", flush=True)
+                print(f"  {data_center} failed: {exc}", flush=True)
                 last_error = exc
 
         if not pod:
             raise last_error or RuntimeError(
-                f"Could not create a '{config.gpu_type}' pod in any European region (no capacity)"
+                f"Could not create a '{config.gpu_type}' pod in any of {RUNPOD_DATA_CENTERS} (no capacity). "
+                f"Check availability/region in the RunPod console, or edit RUNPOD_DATA_CENTERS."
             )
         secrets.id = pod["id"]
 
