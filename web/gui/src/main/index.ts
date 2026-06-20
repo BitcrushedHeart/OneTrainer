@@ -209,9 +209,11 @@ function startBackend(): ChildProcess | null {
         String(BACKEND_PORT),
         "--log-level",
         "info",
-        "--reload",
-        "--reload-dir",
-        backendDir,
+        // Backend auto-reload is OFF by default: a file edit triggering a
+        // uvicorn restart kills any in-flight training subprocess. Opt back in
+        // with OT_BACKEND_RELOAD=1 only when actively developing the backend
+        // and not training.
+        ...(process.env.OT_BACKEND_RELOAD === "1" ? ["--reload", "--reload-dir", backendDir] : []),
       ],
       {
         cwd: projectRoot,
