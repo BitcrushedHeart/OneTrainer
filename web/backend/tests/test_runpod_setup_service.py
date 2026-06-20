@@ -10,8 +10,9 @@ from web.backend.services.runpod_setup_service import RunpodSetupService
 
 
 def test_storage_rounding():
-    assert RunpodSetupService._round_storage_gb(284.61) == 300
-    assert RunpodSetupService._round_storage_gb(300.01) == 350
+    # rounds up to the next ROUND_GB (5)
+    assert RunpodSetupService._round_storage_gb(284.61) == 285
+    assert RunpodSetupService._round_storage_gb(300.01) == 305
 
 
 def test_latest_backup_uses_sorted_backup_name(tmp_path):

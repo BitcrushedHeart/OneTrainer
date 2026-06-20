@@ -20,8 +20,13 @@ from web.backend.paths import PROJECT_ROOT
 from web.backend.services._singleton import SingletonMixin
 from web.backend.services.config_service import ConfigService
 
-BUFFER_GIB = 50
-ROUND_GB = 50
+# Headroom on top of the uploaded total, for things that land on the volume but
+# aren't in the upload size: the HF base-model download, the OneTrainer install,
+# and training outputs/backups/samples. Rounded up to ROUND_GB. Keep some margin
+# — a pod that runs out of disk mid-run wastes the GPU time, which costs more
+# than a few spare GB of volume.
+BUFFER_GIB = 30
+ROUND_GB = 5
 RUNPOD_TEMPLATE_ID = "1a33vbssq9"
 RUNPOD_GPU_TYPE = "NVIDIA GeForce RTX 5090"
 RUNPOD_INSTALL_CMD = "git clone -b bitcrushed-blend https://github.com/BitcrushedHeart/OneTrainer.git"

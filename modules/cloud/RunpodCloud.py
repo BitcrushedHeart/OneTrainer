@@ -10,6 +10,10 @@ from modules.util.enum.CloudFileSync import CloudFileSync
 import runpod
 
 RUNPOD_TEMPLATE_ID = "1a33vbssq9"
+# Container image for the pod. The template above carries ports/env but no
+# image (RunPod rejects create_pod with an empty image_name), so it must be set
+# explicitly. Override here if you build/use a different OneTrainer image.
+RUNPOD_IMAGE = "dxqbyd/runpod-onetrainer-cli:1.2"
 EUROPE_COUNTRY_CODES = ["EU", "GB", "NL", "DE", "FR", "SE", "NO", "FI", "PL"]
 
 
@@ -91,11 +95,17 @@ class RunpodCloud(LinuxCloud):
         secrets = self.config.secrets.cloud
         last_error = None
         pod = None
+        print(
+            f"Creating RunPod pod: image={RUNPOD_IMAGE}, gpu='{config.gpu_type}', "
+            f"type={config.sub_type or 'SECURE'}, volume={config.volume_size}GB",
+            flush=True,
+        )
         for country_code in EUROPE_COUNTRY_CODES:
             try:
+                print(f"  requesting a pod in region {country_code}...", flush=True)
                 pod = runpod.create_pod(
                     name=config.name,
-                    image_name="",
+                    image_name=RUNPOD_IMAGE,
                     template_id=RUNPOD_TEMPLATE_ID,
                     gpu_type_id=config.gpu_type,
                     cloud_type=config.sub_type or "SECURE",
@@ -111,8 +121,11 @@ class RunpodCloud(LinuxCloud):
                 # requested GPU; keep trying the remaining countries instead of bailing on the
                 # first miss.
                 if pod:
+                    print(f"  pod created in {country_code}: id={pod.get('id')}", flush=True)
                     break
+                print(f"  no capacity for '{config.gpu_type}' in {country_code}", flush=True)
             except Exception as exc:
+                print(f"  region {country_code} failed: {exc}", flush=True)
                 last_error = exc
 
         if not pod:
