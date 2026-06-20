@@ -8,6 +8,7 @@ from modules.util import factory, path_util
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.sourceless_cache_util import sourceless_cache_problems
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
@@ -424,6 +425,14 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
         ]
 
         if config.sourceless_training and config.latent_caching:
+            # See DataLoaderText2ImageMixin: the cache index must carry baked
+            # sourceless metadata before the source pipeline is stubbed out.
+            problems = sourceless_cache_problems(config.cache_dir)
+            if problems:
+                raise RuntimeError(
+                    "Sourceless training cannot start — the cache is not metadata-complete:\n  - "
+                    + "\n  - ".join(problems)
+                )
             return self._create_mgds(
                 config,
                 [self._placeholder_modules_for(pre_cache_modules), cache_modules, output_modules],

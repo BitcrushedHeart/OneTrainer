@@ -15,6 +15,7 @@ from modules.util.enum.CloudFileSync import CloudFileSync
 from modules.util.enum.CloudType import CloudType
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.TimeUnit import TimeUnit
+from modules.util.sourceless_cache_util import sourceless_cache_problems
 from web.backend.paths import PROJECT_ROOT
 from web.backend.services._singleton import SingletonMixin
 from web.backend.services.config_service import ConfigService
@@ -394,6 +395,13 @@ class RunpodSetupService(SingletonMixin):
         ]
         if config.train_text_encoder_or_embedding():
             errors.append("Sourceless training cannot be used while text encoder or embedding training is enabled.")
+        # The pod runs sourceless, so the cache must be metadata-complete before
+        # we ship it. Catch an un-baked cache here — fail fast locally rather
+        # than after a multi-hundred-GB upload and a billed pod start. Only
+        # checked when the cache dir exists (its absence is already flagged
+        # above).
+        if any(entry.label == "cache" and entry.exists for entry in entries):
+            errors.extend(sourceless_cache_problems(config.cache_dir))
         return errors
 
     @staticmethod

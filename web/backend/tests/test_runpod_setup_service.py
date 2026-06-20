@@ -525,6 +525,101 @@ def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
     assert cfg.cloud.run_id == "job1-live-test"
 
 
+def _write_cache_json(cache_subdir: Path, entries: dict) -> None:
+    cache_subdir.mkdir(parents=True, exist_ok=True)
+    (cache_subdir / "cache.json").write_text(json.dumps({"version": 3, "entries": entries}), encoding="utf-8")
+
+
+def test_validation_errors_block_sourceless_cache_missing_metadata(tmp_path):
+    cache = tmp_path / "cache"
+    # image entry WITHOUT sourceless metadata; text entry WITH it
+    _write_cache_json(cache / "image", {r"F:\ds\a.jpg": {"variants": {"640x448": {"cache_file": "a"}}}})
+    _write_cache_json(
+        cache / "text",
+        {r"F:\ds\a.txt": {"variants": {"_": {"cache_file": "t"}}, "sourceless_rows": {"0": {"metadata": {"x": 1}}}}},
+    )
+
+    cfg = TrainConfig.default_values()
+    cfg.cache_dir = str(cache)
+    entries = RunpodSetupService()._size_entries(cfg)
+    errors = RunpodSetupService._validation_errors(cfg, entries)
+
+    assert any("missing sourceless metadata" in e for e in errors)
+
+    # Stamp the image entry -> the metadata problem clears.
+    _write_cache_json(
+        cache / "image",
+        {r"F:\ds\a.jpg": {"variants": {"640x448": {"cache_file": "a"}}, "sourceless": {"source_index": 0}}},
+    )
+    errors = RunpodSetupService._validation_errors(cfg, RunpodSetupService()._size_entries(cfg))
+    assert not any("sourceless metadata" in e for e in errors)
+
+
+def test_validation_errors_block_when_cache_has_no_index(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "stray.pt").write_bytes(b"x")  # dir exists but no cache.json anywhere
+
+    cfg = TrainConfig.default_values()
+    cfg.cache_dir = str(cache)
+    errors = RunpodSetupService._validation_errors(cfg, RunpodSetupService()._size_entries(cfg))
+
+    assert any("cache.json" in e for e in errors)
+
+
+def test_sourceless_cache_upload_is_not_extension_filtered(tmp_path):
+    # Invariant lock: the sourceless cache sync must mirror the WHOLE cache dir,
+    # including cache.json (which carries the baked sourceless metadata). A
+    # future *.pt-only filter would strand the metadata on the remote and break
+    # sourceless training after a multi-hundred-GB upload.
+    from modules.cloud.BaseCloud import BaseCloud
+
+    class RecordingSync:
+        def __init__(self):
+            self.dir_calls = []
+
+        def sync_up_file(self, local, remote): ...
+        def sync_up(self, local, remote): ...
+
+        def sync_up_dir(self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None):
+            self.dir_calls.append((Path(remote).as_posix(), allowed_extensions))
+
+    class DummyCloud(BaseCloud):
+        def run_trainer(self): ...
+        def close(self): ...
+        def exec_callback(self, callbacks): ...
+        def send_commands(self, commands): ...
+        def sync_workspace(self): ...
+        def can_reattach(self): ...
+        def _install_onetrainer(self, update=False): ...
+        def _make_tensorboard_tunnel(self): ...
+        def _upload_config_file(self, local): ...
+        def delete_workspace(self): ...
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "entry.pt").write_bytes(b"cache")
+    (cache / "cache.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "workspace").mkdir()  # upload_config writes a remote_config-*.json here
+
+    cfg = TrainConfig.default_values()
+    cfg.sourceless_training = True
+    cfg.latent_caching = True
+    cfg.continue_last_backup = False
+    cfg.local_cache_dir = str(cache)
+    cfg.cache_dir = "/workspace/remote/F/workspace/cache"
+    cfg.local_workspace_dir = str(tmp_path / "workspace")
+    cfg.workspace_dir = "/workspace/remote/F/workspace/Base"
+    cfg.concepts = []
+
+    cloud = DummyCloud(cfg)
+    cloud.file_sync = RecordingSync()
+    cloud.upload_config()
+
+    cache_calls = [ext for remote, ext in cloud.file_sync.dir_calls if remote == "/workspace/remote/F/workspace/cache"]
+    assert cache_calls == [None]  # exactly one cache sync, with NO extension filter
+
+
 def test_wsl_rsync_translates_windows_drive_paths():
     from modules.cloud.WslRsyncFileSync import WslRsyncFileSync
 

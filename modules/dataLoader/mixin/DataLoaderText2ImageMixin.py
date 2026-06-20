@@ -12,6 +12,7 @@ from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2Im
 from modules.util import path_util
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
+from modules.util.sourceless_cache_util import sourceless_cache_problems
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
@@ -662,6 +663,13 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             source_path_in_name="sample_prompt_path",
             sourceless=sourceless,
             trust_cache=config.skip_cache_validation,
+            # A caption .txt is optional: an image with no caption trains with
+            # an empty prompt. Tolerate the missing source file so the text
+            # cache still builds an (empty-caption) entry for it instead of
+            # skipping it — otherwise the image is cached but its text
+            # counterpart is not, leaving the pair misaligned for sourceless
+            # training. Captions that DO exist are still edit-checked normally.
+            tolerate_missing_source=True,
             # Content-addressed reuse: the final post-augmentation prompt
             # string fully determines the cached text payload, so identical
             # caption lines are encoded once and reused everywhere — across
@@ -740,7 +748,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         debug_modules = self._debug_modules(config, model)
 
-        pre_cache_modules = [enumerate_input, load_input, mask_augmentation, aspect_bucketing_in, crop_modules, augmentation_modules]
+        pre_cache_modules = [
+            enumerate_input,
+            load_input,
+            mask_augmentation,
+            aspect_bucketing_in,
+            crop_modules,
+            augmentation_modules,
+        ]
         if supports_inpainting:
             pre_cache_modules.append(inpainting_modules)
         pre_cache_modules.append(preparation_modules)
@@ -750,6 +765,17 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 raise RuntimeError(
                     "Sourceless training cannot be used with text encoder training. "
                     "Disable sourceless_training or disable text encoder training."
+                )
+            # Sourceless mode stubs out the source-reading pipeline, so the
+            # cache index must already carry the per-sample metadata. Fail fast
+            # with a clear, UI-surfaced message rather than letting mgds raise
+            # deep in __init_sourceless (or, worse, silently train on misaligned
+            # data).
+            problems = sourceless_cache_problems(config.cache_dir)
+            if problems:
+                raise RuntimeError(
+                    "Sourceless training cannot start — the cache is not metadata-complete:\n  - "
+                    + "\n  - ".join(problems)
                 )
             return self._create_mgds(
                 config,
