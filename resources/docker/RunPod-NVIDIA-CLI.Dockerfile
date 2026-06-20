@@ -24,6 +24,7 @@ RUN apt-get update --yes \
 	  iputils-ping \
 	  nano \
 	  nethogs \
+	  rsync \
  && apt-get autoremove -y \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*

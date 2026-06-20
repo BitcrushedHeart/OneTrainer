@@ -111,6 +111,10 @@ class RunpodSetupService(SingletonMixin):
         secrets.port = 0
         secrets.id = ""
 
+        ssh_error = self._ssh_auth_error(secrets.key_file)
+        if ssh_error:
+            return {"ok": False, "error": ssh_error, "preview": preview}
+
         self._mutate_config_for_runpod(config, preview["required_gb"], body)
         reconciled = service.update_config(config.to_dict())
         service.update_cloud_secrets(secrets.to_dict())
@@ -122,11 +126,7 @@ class RunpodSetupService(SingletonMixin):
         service = ConfigService.get_instance()
         base_config = service.get_config_for_training()
         preview = self.preview()
-        base_errors = [
-            error
-            for error in preview["errors"]
-            if not error.startswith("Missing required latest_backup")
-        ]
+        base_errors = [error for error in preview["errors"] if not error.startswith("Missing required latest_backup")]
         if base_errors:
             return {"ok": False, "error": "; ".join(base_errors), "preview": preview}
 
@@ -136,12 +136,22 @@ class RunpodSetupService(SingletonMixin):
 
         smoke_config = TrainConfig.default_values().from_dict(base_config.to_dict())
         smoke_config.secrets.cloud.api_key = api_key
-        smoke_config.secrets.cloud.user = str(body.get("ssh_user") or smoke_config.secrets.cloud.user or "root").strip() or "root"
-        smoke_config.secrets.cloud.key_file = str(body.get("ssh_key_file") or smoke_config.secrets.cloud.key_file or "").strip()
-        smoke_config.secrets.cloud.password = str(body.get("ssh_password") or smoke_config.secrets.cloud.password or "").strip()
+        smoke_config.secrets.cloud.user = (
+            str(body.get("ssh_user") or smoke_config.secrets.cloud.user or "root").strip() or "root"
+        )
+        smoke_config.secrets.cloud.key_file = str(
+            body.get("ssh_key_file") or smoke_config.secrets.cloud.key_file or ""
+        ).strip()
+        smoke_config.secrets.cloud.password = str(
+            body.get("ssh_password") or smoke_config.secrets.cloud.password or ""
+        ).strip()
         smoke_config.secrets.cloud.host = ""
         smoke_config.secrets.cloud.port = 0
         smoke_config.secrets.cloud.id = ""
+
+        ssh_error = self._ssh_auth_error(smoke_config.secrets.cloud.key_file)
+        if ssh_error:
+            return {"ok": False, "error": ssh_error, "preview": preview}
 
         self._mutate_config_for_runpod(smoke_config, preview["required_gb"], body)
         smoke = self._build_live_test_cache(smoke_config, epochs=int(body.get("epochs") or 3))
@@ -173,7 +183,10 @@ class RunpodSetupService(SingletonMixin):
         config.latent_caching = True
         config.sourceless_training = True
         config.only_cache = False
-        config.continue_last_backup = True
+        # Only resume from a backup when one actually exists locally to upload; otherwise start a
+        # fresh sourceless run from the base model (continue_last_backup=True with no backup would
+        # make the remote trainer fail looking for a checkpoint that was never uploaded).
+        config.continue_last_backup = bool(self._latest_backup(config))
         config.clear_cache_before_training = False
 
     def _build_live_test_cache(self, config: TrainConfig, epochs: int) -> dict[str, Any]:
@@ -181,7 +194,9 @@ class RunpodSetupService(SingletonMixin):
         image_index_path = source_cache / "image" / "cache.json"
         text_index_path = source_cache / "text" / "cache.json"
         if not image_index_path.is_file() or not text_index_path.is_file():
-            raise RuntimeError("Live test requires image/cache.json and text/cache.json in the current cache directory.")
+            raise RuntimeError(
+                "Live test requires image/cache.json and text/cache.json in the current cache directory."
+            )
 
         image_index = json.loads(image_index_path.read_text(encoding="utf-8"))
         text_index = json.loads(text_index_path.read_text(encoding="utf-8"))
@@ -212,7 +227,9 @@ class RunpodSetupService(SingletonMixin):
 
         config.cache_dir = str(smoke_root)
         config.workspace_dir = str(Path(config.workspace_dir).parent / "runpod-live-test-workspace")
-        config.output_model_destination = str(Path(config.output_model_destination).with_name("runpod-live-test.safetensors"))
+        config.output_model_destination = str(
+            Path(config.output_model_destination).with_name("runpod-live-test.safetensors")
+        )
         config.continue_last_backup = False
         config.epochs = max(1, epochs)
         config.backup_after_unit = TimeUnit.NEVER
@@ -272,15 +289,22 @@ class RunpodSetupService(SingletonMixin):
         return None
 
     def _size_entries(self, config: TrainConfig) -> list[SizeEntry]:
+        # The cache is the only hard requirement for sourceless training. The latest backup is
+        # optional - its absence just means a fresh run instead of a continuation. The transformer
+        # and base-model overrides are only uploaded when they are local files that exist; an empty
+        # value or a Hugging Face repo id is downloaded on the pod instead, so they must not block.
         entries = [
             self._entry("cache", config.cache_dir, required=True),
-            self._entry("latest_backup", self._latest_backup(config), required=True),
-            self._entry("transformer_override", config.transformer.model_name, required=True),
+            self._entry("latest_backup", self._latest_backup(config), required=False),
         ]
 
-        base_model = self._entry("base_model", config.base_model_name, required=False)
-        if base_model.exists:
-            entries.append(base_model)
+        for label, path in (
+            ("transformer_override", config.transformer.model_name),
+            ("base_model", config.base_model_name),
+        ):
+            entry = self._entry(label, path, required=False)
+            if entry.exists:
+                entries.append(entry)
         return entries
 
     def _entry(self, label: str, path: str | None, required: bool) -> SizeEntry:
@@ -292,7 +316,14 @@ class RunpodSetupService(SingletonMixin):
             return SizeEntry(label=label, path=str(path), exists=False, bytes=0, files=0, required=required)
 
         if candidate.is_file():
-            return SizeEntry(label=label, path=str(candidate), exists=True, bytes=candidate.stat().st_size, files=1, required=required)
+            return SizeEntry(
+                label=label,
+                path=str(candidate),
+                exists=True,
+                bytes=candidate.stat().st_size,
+                files=1,
+                required=required,
+            )
 
         total = 0
         count = 0
@@ -301,6 +332,20 @@ class RunpodSetupService(SingletonMixin):
                 total += file.stat().st_size
                 count += 1
         return SizeEntry(label=label, path=str(candidate), exists=True, bytes=total, files=count, required=required)
+
+    @staticmethod
+    def _ssh_auth_error(key_file: str) -> str | None:
+        # RunPod pod SSH is key-based, and NATIVE_RSYNC refuses password-only auth, so a usable
+        # private key file is mandatory. Catch it here, before a billed pod is created.
+        key_file = (key_file or "").strip()
+        if not key_file:
+            return (
+                "RunPod requires SSH key authentication. Add your public key to your RunPod account "
+                "and set 'SSH Key File' to the matching private key."
+            )
+        if not Path(key_file).expanduser().is_file():
+            return f"SSH key file not found: {key_file}"
+        return None
 
     @staticmethod
     def _round_storage_gb(required_gib: float) -> int:
@@ -329,15 +374,28 @@ class RunpodSetupService(SingletonMixin):
                 result[key] = CloudTrainer.adjust_path_to_remote_dir(path, remote_dir)
         latest = RunpodSetupService._latest_backup(config)
         if latest:
-            backup_parent = CloudTrainer.adjust_path_to_remote_dir(str(Path(config.workspace_dir) / "backup"), remote_dir)
+            backup_parent = CloudTrainer.adjust_path_to_remote_dir(
+                str(Path(config.workspace_dir) / "backup"), remote_dir
+            )
             result["latest_backup"] = f"{backup_parent}/{Path(latest).name}"
         return result
 
     @staticmethod
     def _validation_errors(config: TrainConfig, entries: list[SizeEntry]) -> list[str]:
-        errors = [f"Missing required {entry.label}: {entry.path or '(empty)'}" for entry in entries if entry.required and not entry.exists]
+        errors = [
+            f"Missing required {entry.label}: {entry.path or '(empty)'}"
+            for entry in entries
+            if entry.required and not entry.exists
+        ]
         if config.train_text_encoder_or_embedding():
             errors.append("Sourceless training cannot be used while text encoder or embedding training is enabled.")
+        if shutil.which("rsync") is None:
+            # RunPod uploads are forced to NATIVE_RSYNC; without rsync on PATH the run would fail
+            # only *after* a (billed) pod has been created. Surface it before launch instead.
+            errors.append(
+                "rsync was not found on PATH. RunPod uploads use NATIVE_RSYNC - install rsync or "
+                "run the backend under WSL/Linux before launching."
+            )
         return errors
 
     @staticmethod
@@ -347,6 +405,10 @@ class RunpodSetupService(SingletonMixin):
             warnings.append("RunPod setup will switch file sync to NATIVE_RSYNC for resumable cache uploads.")
         if config.only_cache:
             warnings.append("Only Cache is enabled locally; RunPod setup will disable it before starting training.")
+        if not RunpodSetupService._latest_backup(config):
+            warnings.append(
+                "No local backup found - RunPod will start a fresh sourceless run from the base model instead of continuing."
+            )
         return warnings
 
     def _git_summary(self) -> dict[str, Any]:

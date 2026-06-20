@@ -5,6 +5,7 @@ import time
 from modules.cloud.LinuxCloud import LinuxCloud
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.CloudAction import CloudAction
+from modules.util.enum.CloudFileSync import CloudFileSync
 
 import runpod
 
@@ -49,6 +50,23 @@ class RunpodCloud(LinuxCloud):
                 print(f"waiting for public IP... Status: https://www.runpod.io/console/pods?id={secrets.id}")
             time.sleep(5)
 
+    def setup(self):
+        super().setup()
+        self._ensure_remote_rsync()
+
+    def _ensure_remote_rsync(self):
+        # NATIVE_RSYNC needs the rsync binary on BOTH ends, but the RunPod pytorch base image and
+        # the OneTrainer template do not ship it. Install it once (apt + root are available on
+        # RunPod) before any upload, so the cache/backup sync does not fail with "command not found".
+        if self.config.cloud.file_sync != CloudFileSync.NATIVE_RSYNC:
+            return
+        self.connection.run(
+            "command -v rsync >/dev/null 2>&1 "
+            "|| (apt-get update && apt-get install -y --no-install-recommends rsync) "
+            "|| (echo 'failed to install rsync on the pod' >&2; exit 1)",
+            in_stream=False,
+        )
+
     def _connect(self):
         config = self.config.cloud
         secrets = self.config.secrets.cloud
@@ -86,15 +104,21 @@ class RunpodCloud(LinuxCloud):
                     country_code=country_code,
                     volume_in_gb=config.volume_size,
                     volume_mount_path="/workspace",
-                    min_download=config.min_download,
+                    min_download=config.min_download or None,
                     env={"JUPYTER_PASSWORD": pysecrets.token_urlsafe(16)},
                 )
-                break
+                # runpod returns None (rather than raising) when a region has no capacity for the
+                # requested GPU; keep trying the remaining countries instead of bailing on the
+                # first miss.
+                if pod:
+                    break
             except Exception as exc:
                 last_error = exc
 
-        if pod is None:
-            raise last_error or RuntimeError("Could not create RunPod pod")
+        if not pod:
+            raise last_error or RuntimeError(
+                f"Could not create a '{config.gpu_type}' pod in any European region (no capacity)"
+            )
         secrets.id = pod["id"]
 
     def delete(self):

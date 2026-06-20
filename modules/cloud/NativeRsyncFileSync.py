@@ -73,6 +73,12 @@ class NativeRsyncFileSync(BaseSSHFileSync):
                 self._run(["rsync", "-av", "-e", self.ssh_cmd, *map(str, files), self._remote(remote)])
             return
 
+        # rsync only creates the final destination component, not missing parents. On a fresh pod
+        # the remote cache/backup parents (e.g. /workspace/remote/<...>) do not exist yet, so create
+        # the full target path first - otherwise rsync aborts with "mkdir ... No such file or directory".
+        self.sync_connection.open()
+        self.sync_connection.run(f"mkdir -p {self._quote_remote(remote)}", in_stream=False)
+
         args = ["rsync", "-av", "--delete", "-e", self.ssh_cmd]
         if skip_hidden:
             args.extend(["--exclude", ".*"])

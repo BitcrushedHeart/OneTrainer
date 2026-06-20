@@ -32,11 +32,13 @@ def test_remote_path_mapping_matches_cloud_trainer():
     )
 
 
-def test_mutate_config_for_runpod_preserves_resume_and_sets_sourceless():
+def test_mutate_config_for_runpod_resumes_when_backup_exists(tmp_path):
     cfg = TrainConfig.default_values()
     cfg.only_cache = True
     cfg.continue_last_backup = False
     cfg.clear_cache_before_training = True
+    cfg.workspace_dir = str(tmp_path / "workspace")
+    (Path(cfg.workspace_dir) / "backup" / "2026-06-19_22-21-20-backup-1-0-1").mkdir(parents=True)
     service = RunpodSetupService()
 
     service._mutate_config_for_runpod(cfg, 300, {"pod_name": "Blend", "run_id": "runpod-v27", "min_download": 500})
@@ -52,6 +54,57 @@ def test_mutate_config_for_runpod_preserves_resume_and_sets_sourceless():
     assert cfg.only_cache is False
     assert cfg.continue_last_backup is True
     assert cfg.clear_cache_before_training is False
+
+
+def test_mutate_config_for_runpod_starts_fresh_without_backup(tmp_path):
+    cfg = TrainConfig.default_values()
+    cfg.continue_last_backup = True
+    cfg.workspace_dir = str(tmp_path / "workspace")  # no backup subdir
+    service = RunpodSetupService()
+
+    service._mutate_config_for_runpod(cfg, 200, {})
+
+    assert cfg.sourceless_training is True
+    assert cfg.latent_caching is True
+    assert cfg.continue_last_backup is False
+
+
+def test_ssh_auth_error_requires_existing_key_file(tmp_path):
+    assert RunpodSetupService._ssh_auth_error("") is not None
+    assert RunpodSetupService._ssh_auth_error("   ") is not None
+    assert RunpodSetupService._ssh_auth_error(str(tmp_path / "missing")) is not None
+    key = tmp_path / "id_ed25519"
+    key.write_text("private-key", encoding="utf-8")
+    assert RunpodSetupService._ssh_auth_error(str(key)) is None
+
+
+def test_validation_errors_flag_missing_rsync(monkeypatch):
+    import web.backend.services.runpod_setup_service as svc
+
+    monkeypatch.setattr(svc.shutil, "which", lambda name: None)
+    cfg = TrainConfig.default_values()
+    errors = RunpodSetupService._validation_errors(cfg, [])
+    assert any("rsync" in error for error in errors)
+
+
+def test_size_entries_backup_optional_and_transformer_only_if_local(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "a.pt").write_bytes(b"x")
+
+    cfg = TrainConfig.default_values()
+    cfg.cache_dir = str(cache)
+    cfg.workspace_dir = str(tmp_path / "workspace")  # no backup
+    cfg.transformer.model_name = "SomeOrg/HF-Repo-Id"  # remote id, not a local path
+    cfg.base_model_name = ""
+
+    entries = {entry.label: entry for entry in RunpodSetupService()._size_entries(cfg)}
+
+    assert entries["cache"].required is True and entries["cache"].exists is True
+    assert entries["latest_backup"].required is False and entries["latest_backup"].exists is False
+    # a Hugging Face id / empty override must not appear as a required upload
+    assert "transformer_override" not in entries
+    assert "base_model" not in entries
 
 
 def test_runpod_create_uses_5090_secure_europe(monkeypatch):
@@ -103,6 +156,74 @@ def test_runpod_create_falls_back_between_europe_codes(monkeypatch):
     assert [call["country_code"] for call in calls[:2]] == ["EU", "GB"]
 
 
+def test_runpod_create_tries_all_regions_when_capacity_returns_none(monkeypatch):
+    calls = []
+
+    def fake_create_pod(**kwargs):
+        calls.append(kwargs["country_code"])
+        # simulate no-capacity: runpod returns None instead of raising for the first two regions
+        if kwargs["country_code"] in ("EU", "GB"):
+            return None
+        return {"id": "pod-789"}
+
+    monkeypatch.setattr("modules.cloud.RunpodCloud.runpod.create_pod", fake_create_pod)
+
+    cfg = TrainConfig.default_values()
+    cfg.cloud.gpu_type = "NVIDIA GeForce RTX 5090"
+    cfg.cloud.sub_type = "SECURE"
+    cloud = RunpodCloud(cfg)
+    cloud._create()
+
+    assert cfg.secrets.cloud.id == "pod-789"
+    assert calls[:3] == ["EU", "GB", "NL"]
+
+
+def test_runpod_create_raises_when_no_region_has_capacity(monkeypatch):
+    monkeypatch.setattr("modules.cloud.RunpodCloud.runpod.create_pod", lambda **kwargs: None)
+
+    cfg = TrainConfig.default_values()
+    cfg.cloud.gpu_type = "NVIDIA GeForce RTX 5090"
+    cfg.cloud.sub_type = "SECURE"
+    cloud = RunpodCloud(cfg)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no capacity"):
+        cloud._create()
+
+
+def test_runpod_setup_installs_rsync_on_pod(monkeypatch):
+    cfg = TrainConfig.default_values()
+    cfg.cloud.file_sync = CloudFileSync.NATIVE_RSYNC
+    cloud = RunpodCloud(cfg)
+
+    commands = []
+
+    class DummyConnection:
+        def run(self, cmd, **kwargs):
+            commands.append(cmd)
+
+    cloud.connection = DummyConnection()
+    # bypass the SSH/install machinery in BaseCloud.setup; we only test the rsync guarantee
+    monkeypatch.setattr(RunpodCloud, "_connect", lambda self: None)
+    cloud._ensure_remote_rsync()
+
+    assert any("rsync" in cmd and "command -v rsync" in cmd for cmd in commands)
+
+
+def test_runpod_setup_skips_rsync_install_for_non_rsync_sync():
+    cfg = TrainConfig.default_values()
+    cfg.cloud.file_sync = CloudFileSync.FABRIC_SFTP
+    cloud = RunpodCloud(cfg)
+
+    class ExplodingConnection:
+        def run(self, cmd, **kwargs):
+            raise AssertionError("should not install rsync for non-rsync sync")
+
+    cloud.connection = ExplodingConnection()
+    cloud._ensure_remote_rsync()  # must be a no-op
+
+
 def test_runpod_detached_watchdog_stops_on_dead_process_or_missing_gpu():
     cfg = TrainConfig.default_values()
     cfg.cloud.remote_dir = "/workspace"
@@ -147,6 +268,7 @@ def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
         def _make_tensorboard_tunnel(self): ...
         def _upload_config_file(self, local):
             self.file_sync.sync_up_file(local, Path("/workspace/job.json"))
+
         def delete_workspace(self): ...
 
     cache = tmp_path / "cache"
@@ -171,7 +293,10 @@ def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
 
     uploaded_dirs = [(local.name, remote.as_posix()) for local, remote, _recursive in cloud.file_sync.dirs]
     assert ("cache", "/workspace/remote/F/workspace/cache") in uploaded_dirs
-    assert ("2026-06-19_22-21-20-backup-3928-0-3928", "/workspace/remote/F/workspace/Base/backup/2026-06-19_22-21-20-backup-3928-0-3928") in uploaded_dirs
+    assert (
+        "2026-06-19_22-21-20-backup-3928-0-3928",
+        "/workspace/remote/F/workspace/Base/backup/2026-06-19_22-21-20-backup-3928-0-3928",
+    ) in uploaded_dirs
 
 
 def test_native_rsync_syncs_directories_with_delete(monkeypatch, tmp_path):
@@ -189,7 +314,9 @@ def test_native_rsync_syncs_directories_with_delete(monkeypatch, tmp_path):
 
     monkeypatch.setattr("modules.cloud.NativeRsyncFileSync.shutil.which", lambda name: "rsync")
     monkeypatch.setattr("modules.cloud.BaseSSHFileSync.fabric.Connection", lambda *args, **kwargs: DummyConnection())
-    monkeypatch.setattr("modules.cloud.NativeRsyncFileSync.subprocess.run", lambda args: commands.append(args) or DummyResult())
+    monkeypatch.setattr(
+        "modules.cloud.NativeRsyncFileSync.subprocess.run", lambda args: commands.append(args) or DummyResult()
+    )
 
     local = tmp_path / "cache"
     local.mkdir()
@@ -210,6 +337,45 @@ def test_native_rsync_syncs_directories_with_delete(monkeypatch, tmp_path):
     assert "--delete" in commands[0]
     assert "-e" in commands[0]
     assert commands[0][-1] == "root@1.2.3.4:/workspace/cache"
+
+
+def test_native_rsync_recursive_creates_remote_parent(monkeypatch, tmp_path):
+    # Regression: rsync only creates the final dest component, so a fresh-pod cache/backup upload
+    # to a deep remote path must `mkdir -p` the target first or rsync aborts with "No such file".
+    from modules.cloud.NativeRsyncFileSync import NativeRsyncFileSync
+
+    runs = []
+
+    class DummyResult:
+        def check_returncode(self): ...
+
+    class DummyConnection:
+        def open(self): ...
+        def run(self, cmd, *args, **kwargs):
+            runs.append(cmd)
+
+        def close(self): ...
+
+    monkeypatch.setattr("modules.cloud.NativeRsyncFileSync.shutil.which", lambda name: "rsync")
+    monkeypatch.setattr("modules.cloud.BaseSSHFileSync.fabric.Connection", lambda *args, **kwargs: DummyConnection())
+    monkeypatch.setattr("modules.cloud.NativeRsyncFileSync.subprocess.run", lambda args: DummyResult())
+
+    local = tmp_path / "backup"
+    local.mkdir()
+    (local / "optimizer.pt").write_bytes(b"x")
+
+    cfg = TrainConfig.default_values()
+    secrets = cfg.secrets.cloud
+    secrets.host = "1.2.3.4"
+    secrets.port = 22
+    secrets.user = "root"
+    secrets.key_file = str(tmp_path / "id_ed25519")
+    sync = NativeRsyncFileSync(cfg.cloud, secrets)
+
+    remote = "/workspace/remote/F/workspace/backup/2026-06-19_22-21-20-backup-1-0-1"
+    sync.sync_up_dir(local=local, remote=Path(remote), recursive=True)
+
+    assert any(cmd.startswith("mkdir -p") and remote in cmd for cmd in runs)
 
 
 def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
@@ -265,9 +431,7 @@ def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
     assert list(json.loads((smoke_cache / "image" / "cache.json").read_text(encoding="utf-8"))["entries"]) == [
         image_path
     ]
-    assert list(json.loads((smoke_cache / "text" / "cache.json").read_text(encoding="utf-8"))["entries"]) == [
-        text_path
-    ]
+    assert list(json.loads((smoke_cache / "text" / "cache.json").read_text(encoding="utf-8"))["entries"]) == [text_path]
     assert cfg.cache_dir == str(smoke_cache)
     assert cfg.continue_last_backup is False
     assert cfg.epochs == 3

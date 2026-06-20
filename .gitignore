@@ -23,6 +23,16 @@ secrets.json
 .env*
 !.env.example
 
+# local job queue + personal artifacts (kept on disk, never committed)
+/Queue/
+/queue.json
+/_oft_compare.json
+/oldzimage.json
+/prompt.txt
+/dpo_dropped_resolution_mismatches.log
+/fix*.webp
+*.main.obj
+
 # environments
 /.venv*
 /venv*
