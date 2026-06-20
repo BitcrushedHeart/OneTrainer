@@ -8,6 +8,7 @@ from modules.cloud.BaseCloud import BaseCloud
 from modules.cloud.FabricFileSync import FabricFileSync
 from modules.cloud.NativeRsyncFileSync import NativeRsyncFileSync
 from modules.cloud.NativeSCPFileSync import NativeSCPFileSync
+from modules.cloud.WslRsyncFileSync import WslRsyncFileSync
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
@@ -68,6 +69,8 @@ class LinuxCloud(BaseCloud):
                     self.file_sync = NativeSCPFileSync(config, secrets)
                 case CloudFileSync.NATIVE_RSYNC:
                     self.file_sync = NativeRsyncFileSync(config, secrets)
+                case CloudFileSync.WSL_RSYNC:
+                    self.file_sync = WslRsyncFileSync(config, secrets)
                 case CloudFileSync.FABRIC_SFTP:
                     self.file_sync = FabricFileSync(config, secrets)
 

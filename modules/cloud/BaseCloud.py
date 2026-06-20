@@ -109,7 +109,9 @@ class BaseCloud(metaclass=ABCMeta):
                 return
             self.__sync_up_dir(local=Path(self.config.local_cache_dir), remote=Path(self.config.cache_dir))
 
-        if hasattr(self.config, "local_workspace_dir"):
+        # only upload a backup when the run is actually resuming from it; a fresh sourceless run
+        # (continue_last_backup disabled) trains from the base model and needs no checkpoint.
+        if self.config.continue_last_backup and hasattr(self.config, "local_workspace_dir"):
             latest_backup = self.__latest_backup(Path(self.config.local_workspace_dir))
             if latest_backup is not None:
                 print(f"uploading latest backup {latest_backup.name}...")

@@ -32,10 +32,17 @@ def test_remote_path_mapping_matches_cloud_trainer():
     )
 
 
-def test_mutate_config_for_runpod_resumes_when_backup_exists(tmp_path):
+def _force_native_rsync(monkeypatch):
+    import web.backend.services.runpod_setup_service as svc
+
+    monkeypatch.setattr(svc.shutil, "which", lambda name: "/usr/bin/rsync" if name == "rsync" else None)
+
+
+def test_mutate_config_for_runpod_resumes_when_user_opts_in_and_backup_exists(monkeypatch, tmp_path):
+    _force_native_rsync(monkeypatch)
     cfg = TrainConfig.default_values()
     cfg.only_cache = True
-    cfg.continue_last_backup = False
+    cfg.continue_last_backup = True  # user asked to continue
     cfg.clear_cache_before_training = True
     cfg.workspace_dir = str(tmp_path / "workspace")
     (Path(cfg.workspace_dir) / "backup" / "2026-06-19_22-21-20-backup-1-0-1").mkdir(parents=True)
@@ -56,16 +63,31 @@ def test_mutate_config_for_runpod_resumes_when_backup_exists(tmp_path):
     assert cfg.clear_cache_before_training is False
 
 
-def test_mutate_config_for_runpod_starts_fresh_without_backup(tmp_path):
+def test_mutate_config_for_runpod_starts_fresh_without_backup(monkeypatch, tmp_path):
+    _force_native_rsync(monkeypatch)
     cfg = TrainConfig.default_values()
-    cfg.continue_last_backup = True
-    cfg.workspace_dir = str(tmp_path / "workspace")  # no backup subdir
+    cfg.continue_last_backup = True  # asked to continue, but...
+    cfg.workspace_dir = str(tmp_path / "workspace")  # ...no backup subdir exists
     service = RunpodSetupService()
 
     service._mutate_config_for_runpod(cfg, 200, {})
 
     assert cfg.sourceless_training is True
     assert cfg.latent_caching is True
+    assert cfg.continue_last_backup is False
+
+
+def test_mutate_config_respects_continue_last_backup_opt_out(monkeypatch, tmp_path):
+    # user did NOT choose to continue: even though a backup exists, do not resume or upload it
+    _force_native_rsync(monkeypatch)
+    cfg = TrainConfig.default_values()
+    cfg.continue_last_backup = False
+    cfg.workspace_dir = str(tmp_path / "workspace")
+    (Path(cfg.workspace_dir) / "backup" / "2026-06-19_22-21-20-backup-1-0-1").mkdir(parents=True)
+    service = RunpodSetupService()
+
+    service._mutate_config_for_runpod(cfg, 200, {})
+
     assert cfg.continue_last_backup is False
 
 
@@ -78,33 +100,47 @@ def test_ssh_auth_error_requires_existing_key_file(tmp_path):
     assert RunpodSetupService._ssh_auth_error(str(key)) is None
 
 
-def test_validation_errors_flag_missing_rsync(monkeypatch):
+def test_select_file_sync_prefers_rsync_then_wsl_then_sftp(monkeypatch):
     import web.backend.services.runpod_setup_service as svc
 
+    # rsync on PATH -> native rsync
+    monkeypatch.setattr(svc.shutil, "which", lambda name: "/usr/bin/rsync" if name == "rsync" else None)
+    assert RunpodSetupService._select_file_sync() == CloudFileSync.NATIVE_RSYNC
+
+    # no rsync, Windows with WSL-rsync available -> WSL rsync
     monkeypatch.setattr(svc.shutil, "which", lambda name: None)
-    cfg = TrainConfig.default_values()
-    errors = RunpodSetupService._validation_errors(cfg, [])
-    assert any("rsync" in error for error in errors)
+    monkeypatch.setattr(svc.os, "name", "nt")
+    monkeypatch.setattr(RunpodSetupService, "_wsl_rsync_available", staticmethod(lambda: True))
+    assert RunpodSetupService._select_file_sync() == CloudFileSync.WSL_RSYNC
+
+    # no rsync, no WSL -> pure-Python SFTP fallback (never a hard failure)
+    monkeypatch.setattr(RunpodSetupService, "_wsl_rsync_available", staticmethod(lambda: False))
+    assert RunpodSetupService._select_file_sync() == CloudFileSync.FABRIC_SFTP
 
 
-def test_size_entries_backup_optional_and_transformer_only_if_local(tmp_path):
+def test_size_entries_skips_backup_when_not_continuing(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()
     (cache / "a.pt").write_bytes(b"x")
 
     cfg = TrainConfig.default_values()
     cfg.cache_dir = str(cache)
-    cfg.workspace_dir = str(tmp_path / "workspace")  # no backup
+    cfg.workspace_dir = str(tmp_path / "workspace")
+    (Path(cfg.workspace_dir) / "backup" / "2026-06-19_22-21-20-backup-1-0-1").mkdir(parents=True)
+    cfg.continue_last_backup = False  # not continuing -> backup must not be sized/uploaded
     cfg.transformer.model_name = "SomeOrg/HF-Repo-Id"  # remote id, not a local path
     cfg.base_model_name = ""
 
     entries = {entry.label: entry for entry in RunpodSetupService()._size_entries(cfg)}
 
     assert entries["cache"].required is True and entries["cache"].exists is True
-    assert entries["latest_backup"].required is False and entries["latest_backup"].exists is False
-    # a Hugging Face id / empty override must not appear as a required upload
-    assert "transformer_override" not in entries
+    assert "latest_backup" not in entries  # opted out of continuation
+    assert "transformer_override" not in entries  # HF id / empty override is not a local upload
     assert "base_model" not in entries
+
+    cfg.continue_last_backup = True  # opting in surfaces the backup for sizing
+    entries = {entry.label: entry for entry in RunpodSetupService()._size_entries(cfg)}
+    assert entries["latest_backup"].exists is True
 
 
 def test_runpod_create_uses_5090_secure_europe(monkeypatch):
@@ -281,6 +317,7 @@ def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
     cfg = TrainConfig.default_values()
     cfg.sourceless_training = True
     cfg.latent_caching = True
+    cfg.continue_last_backup = True  # resuming -> backup should be uploaded
     cfg.local_cache_dir = str(cache)
     cfg.cache_dir = "/workspace/remote/F/workspace/cache"
     cfg.local_workspace_dir = str(tmp_path / "workspace")
@@ -297,6 +334,56 @@ def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
         "2026-06-19_22-21-20-backup-3928-0-3928",
         "/workspace/remote/F/workspace/Base/backup/2026-06-19_22-21-20-backup-3928-0-3928",
     ) in uploaded_dirs
+
+
+def test_sourceless_upload_skips_backup_when_not_continuing(tmp_path):
+    from modules.cloud.BaseCloud import BaseCloud
+
+    class DummySync:
+        def __init__(self):
+            self.dirs = []
+
+        def sync_up_file(self, local, remote): ...
+        def sync_up(self, local, remote): ...
+
+        def sync_up_dir(self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None):
+            self.dirs.append(Path(remote).as_posix())
+
+    class DummyCloud(BaseCloud):
+        def run_trainer(self): ...
+        def close(self): ...
+        def exec_callback(self, callbacks): ...
+        def send_commands(self, commands): ...
+        def sync_workspace(self): ...
+        def can_reattach(self): ...
+        def _install_onetrainer(self, update=False): ...
+        def _make_tensorboard_tunnel(self): ...
+        def _upload_config_file(self, local): ...
+        def delete_workspace(self): ...
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "entry.pt").write_bytes(b"cache")
+    backup = tmp_path / "workspace" / "backup" / "2026-06-19_22-21-20-backup-3928-0-3928"
+    backup.mkdir(parents=True)
+    (backup / "meta.json").write_text("{}", encoding="utf-8")
+
+    cfg = TrainConfig.default_values()
+    cfg.sourceless_training = True
+    cfg.latent_caching = True
+    cfg.continue_last_backup = False  # fresh run -> backup must be skipped even though it exists
+    cfg.local_cache_dir = str(cache)
+    cfg.cache_dir = "/workspace/remote/F/workspace/cache"
+    cfg.local_workspace_dir = str(tmp_path / "workspace")
+    cfg.workspace_dir = "/workspace/remote/F/workspace/Base"
+    cfg.concepts = []
+
+    cloud = DummyCloud(cfg)
+    cloud.file_sync = DummySync()
+    cloud.upload_config()
+
+    assert "/workspace/remote/F/workspace/cache" in cloud.file_sync.dirs
+    assert not any("backup" in remote for remote in cloud.file_sync.dirs)
 
 
 def test_native_rsync_syncs_directories_with_delete(monkeypatch, tmp_path):
@@ -436,3 +523,54 @@ def test_build_live_test_cache_selects_matching_image_caption_pair(tmp_path):
     assert cfg.continue_last_backup is False
     assert cfg.epochs == 3
     assert cfg.cloud.run_id == "job1-live-test"
+
+
+def test_wsl_rsync_translates_windows_drive_paths():
+    from modules.cloud.WslRsyncFileSync import WslRsyncFileSync
+
+    t = WslRsyncFileSync._to_wsl_path
+    assert t(r"F:\workspace\SoReal!\cache") == "/mnt/f/workspace/SoReal!/cache"
+    assert t("C:/Users/calla/.ssh/id_ed25519") == "/mnt/c/Users/calla/.ssh/id_ed25519"
+    assert t("F:\\workspace\\backup\\") == "/mnt/f/workspace/backup/"  # trailing sep preserved
+    # remote specs and already-POSIX args must pass through untouched
+    assert t("root@1.2.3.4:/workspace/remote/cache") == "root@1.2.3.4:/workspace/remote/cache"
+    assert t("/usr/bin/ssh -p 22 -i /home/u/.ssh/k") == "/usr/bin/ssh -p 22 -i /home/u/.ssh/k"
+    assert t("rsync") == "rsync"
+
+
+def test_wsl_rsync_run_delegates_to_wsl_with_translated_paths(monkeypatch):
+    from modules.cloud.WslRsyncFileSync import WslRsyncFileSync
+
+    captured = {}
+
+    class DummyResult:
+        def check_returncode(self): ...
+
+    def fake_run(args, *a, **k):
+        captured["args"] = args
+        return DummyResult()
+
+    monkeypatch.setattr("modules.cloud.WslRsyncFileSync.subprocess.run", fake_run)
+
+    # build an instance without running __init__ (which would shell out to WSL)
+    sync = WslRsyncFileSync.__new__(WslRsyncFileSync)
+    sync.wsl = "wsl.exe"
+    sync.wsl_rsync = "/usr/bin/rsync"
+
+    sync._run(
+        [
+            "rsync",
+            "-av",
+            "--delete",
+            "-e",
+            "/usr/bin/ssh -i /home/u/.ssh/k",
+            "F:\\workspace\\cache\\",
+            "root@1.2.3.4:/workspace/remote/cache",
+        ]
+    )
+
+    args = captured["args"]
+    assert args[:3] == ["wsl.exe", "-e", "/usr/bin/rsync"]
+    assert "/mnt/f/workspace/cache/" in args  # drive path translated for WSL
+    assert "root@1.2.3.4:/workspace/remote/cache" in args  # remote spec untouched
+    assert "F:" not in " ".join(args)  # no Windows drive-colon reaches rsync

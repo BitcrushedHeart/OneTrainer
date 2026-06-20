@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -164,7 +165,7 @@ class RunpodSetupService(SingletonMixin):
     def _mutate_config_for_runpod(self, config: TrainConfig, volume_size: int, body: dict[str, Any]) -> None:
         config.cloud.enabled = True
         config.cloud.type = CloudType.RUNPOD
-        config.cloud.file_sync = CloudFileSync.NATIVE_RSYNC
+        config.cloud.file_sync = self._select_file_sync()
         config.cloud.create = True
         config.cloud.name = str(body.get("pod_name") or config.cloud.name or "OneTrainer").strip() or "OneTrainer"
         config.cloud.sub_type = "SECURE"
@@ -183,10 +184,11 @@ class RunpodSetupService(SingletonMixin):
         config.latent_caching = True
         config.sourceless_training = True
         config.only_cache = False
-        # Only resume from a backup when one actually exists locally to upload; otherwise start a
-        # fresh sourceless run from the base model (continue_last_backup=True with no backup would
-        # make the remote trainer fail looking for a checkpoint that was never uploaded).
-        config.continue_last_backup = bool(self._latest_backup(config))
+        # Respect the user's "Continue From Backup" choice: only resume when they asked for it AND a
+        # backup actually exists locally to upload. If they did not ask, start a fresh sourceless run
+        # and skip the backup upload entirely; if they asked but there is no backup, fall back to fresh
+        # (continue_last_backup=True with no uploaded checkpoint would make the remote trainer fail).
+        config.continue_last_backup = config.continue_last_backup and bool(self._latest_backup(config))
         config.clear_cache_before_training = False
 
     def _build_live_test_cache(self, config: TrainConfig, epochs: int) -> dict[str, Any]:
@@ -295,8 +297,11 @@ class RunpodSetupService(SingletonMixin):
         # value or a Hugging Face repo id is downloaded on the pod instead, so they must not block.
         entries = [
             self._entry("cache", config.cache_dir, required=True),
-            self._entry("latest_backup", self._latest_backup(config), required=False),
         ]
+        # the latest backup is only uploaded (and therefore only counts toward the volume) when the
+        # user actually wants to continue from it; a fresh run skips it entirely.
+        if config.continue_last_backup:
+            entries.append(self._entry("latest_backup", self._latest_backup(config), required=False))
 
         for label, path in (
             ("transformer_override", config.transformer.model_name),
@@ -389,23 +394,51 @@ class RunpodSetupService(SingletonMixin):
         ]
         if config.train_text_encoder_or_embedding():
             errors.append("Sourceless training cannot be used while text encoder or embedding training is enabled.")
-        if shutil.which("rsync") is None:
-            # RunPod uploads are forced to NATIVE_RSYNC; without rsync on PATH the run would fail
-            # only *after* a (billed) pod has been created. Surface it before launch instead.
-            errors.append(
-                "rsync was not found on PATH. RunPod uploads use NATIVE_RSYNC - install rsync or "
-                "run the backend under WSL/Linux before launching."
-            )
         return errors
+
+    @staticmethod
+    def _select_file_sync() -> CloudFileSync:
+        # Prefer native rsync (fast, resumable). On Windows, where rsync is absent and mis-parses
+        # drive paths, delegate rsync to WSL if available; otherwise fall back to pure-Python SFTP,
+        # which always works. There is therefore never a hard "no transfer available" failure.
+        if shutil.which("rsync") is not None:
+            return CloudFileSync.NATIVE_RSYNC
+        if os.name == "nt" and RunpodSetupService._wsl_rsync_available():
+            return CloudFileSync.WSL_RSYNC
+        return CloudFileSync.FABRIC_SFTP
+
+    @staticmethod
+    def _wsl_rsync_available() -> bool:
+        wsl = shutil.which("wsl.exe") or shutil.which("wsl")
+        if wsl is None:
+            return False
+        try:
+            result = subprocess.run(
+                [wsl, "-e", "bash", "-lc", "command -v rsync"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and bool(result.stdout.strip())
+
+    @staticmethod
+    def _transfer_label(file_sync: CloudFileSync) -> str:
+        return {
+            CloudFileSync.NATIVE_RSYNC: "native rsync",
+            CloudFileSync.WSL_RSYNC: "rsync via WSL (Windows backend)",
+            CloudFileSync.FABRIC_SFTP: "SFTP (rsync not found)",
+        }.get(file_sync, file_sync.name)
 
     @staticmethod
     def _warnings(config: TrainConfig) -> list[str]:
         warnings: list[str] = []
-        if config.cloud.file_sync.name != "NATIVE_RSYNC":
-            warnings.append("RunPod setup will switch file sync to NATIVE_RSYNC for resumable cache uploads.")
+        chosen = RunpodSetupService._select_file_sync()
+        warnings.append(f"RunPod uploads will use {RunpodSetupService._transfer_label(chosen)}.")
         if config.only_cache:
             warnings.append("Only Cache is enabled locally; RunPod setup will disable it before starting training.")
-        if not RunpodSetupService._latest_backup(config):
+        if config.continue_last_backup and not RunpodSetupService._latest_backup(config):
             warnings.append(
                 "No local backup found - RunPod will start a fresh sourceless run from the base model instead of continuing."
             )

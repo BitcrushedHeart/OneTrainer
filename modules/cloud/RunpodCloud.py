@@ -55,10 +55,10 @@ class RunpodCloud(LinuxCloud):
         self._ensure_remote_rsync()
 
     def _ensure_remote_rsync(self):
-        # NATIVE_RSYNC needs the rsync binary on BOTH ends, but the RunPod pytorch base image and
-        # the OneTrainer template do not ship it. Install it once (apt + root are available on
+        # rsync-based transfers need the rsync binary on BOTH ends, but the RunPod pytorch base image
+        # and the OneTrainer template do not ship it. Install it once (apt + root are available on
         # RunPod) before any upload, so the cache/backup sync does not fail with "command not found".
-        if self.config.cloud.file_sync != CloudFileSync.NATIVE_RSYNC:
+        if self.config.cloud.file_sync not in (CloudFileSync.NATIVE_RSYNC, CloudFileSync.WSL_RSYNC):
             return
         self.connection.run(
             "command -v rsync >/dev/null 2>&1 "

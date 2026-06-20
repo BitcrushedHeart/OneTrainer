@@ -109,6 +109,7 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "FABRIC_SFTP": "Fabric SFTP",
         "NATIVE_SCP": "Native SCP",
         "NATIVE_RSYNC": "Native rsync",
+        "WSL_RSYNC": "rsync via WSL",
     },
     "CloudType": {
         "RUNPOD": "RunPod",
@@ -789,6 +790,8 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "cloud.file_sync": (
         "Choose NATIVE_RSYNC to use rsync over SSH for resumable directory transfers."
+        " WSL_RSYNC runs that rsync inside WSL so a Windows backend can use it (drive paths are"
+        " translated to /mnt/...)."
         " Choose NATIVE_SCP to use scp.exe to transfer files."
         " FABRIC_SFTP uses the Paramiko/Fabric SFTP implementation for file transfers instead."
     ),
