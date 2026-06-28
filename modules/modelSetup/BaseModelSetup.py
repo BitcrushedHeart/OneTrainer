@@ -1,5 +1,5 @@
 from abc import ABCMeta, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
@@ -416,13 +416,22 @@ class BaseModelSetup(
             latent = latent.to(device=batch["latent_image"].device, dtype=batch["latent_image"].dtype)
 
         trajectory = [latent]
-        for step_index in range(config.distill_target_steps):
+        total_steps = config.distill_target_steps
+        for step_index in range(total_steps):
             sigma = sigmas[:, step_index]
             next_sigma = sigmas[:, step_index + 1]
-            velocity = self.predict_distill_velocity(
-                model, batch, config, train_progress, latent, sigma, conditioning="conditional"
-            )
-            latent = euler_flow_step(latent, velocity, sigma, next_sigma)
+            # DMD2 backward simulation: keep gradient only on the final step and
+            # detach the rest. Backpropagating through every step would run N
+            # adapter forwards into one graph, and OFT/DoRA mutate a shared
+            # rotation/weight buffer in place across passes -> autograd version
+            # error. (Already a no-op inside the no_grad fake-warmup sim.)
+            last_step = step_index == total_steps - 1
+            grad_ctx = nullcontext() if last_step else torch.no_grad()
+            with grad_ctx:
+                velocity = self.predict_distill_velocity(
+                    model, batch, config, train_progress, latent, sigma, conditioning="conditional"
+                )
+                latent = euler_flow_step(latent, velocity, sigma, next_sigma)
             trajectory.append(latent)
         return trajectory
 
