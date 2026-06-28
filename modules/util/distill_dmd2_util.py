@@ -45,7 +45,7 @@ def build_distill_sigmas(
     if teacher_steps <= 0:
         raise ValueError("teacher_steps must be greater than 0")
 
-    mode = mode.upper()
+    mode = str(mode).upper()
     teacher_grid = torch.linspace(1.0, 0.0, teacher_steps + 1, device=device, dtype=dtype)
 
     if mode in {"AUTO", "UNIFORM"}:

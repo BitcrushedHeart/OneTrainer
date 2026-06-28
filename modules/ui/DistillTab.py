@@ -1,4 +1,8 @@
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.DistillCfgMode import DistillCfgMode
+from modules.util.enum.DistillFakeAdapterType import DistillFakeAdapterType
+from modules.util.enum.DistillTimestepGridMode import DistillTimestepGridMode
+from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
 
@@ -71,7 +75,14 @@ class DistillTab:
             "Timestep Grid",
             tooltip="AUTO uses a monotonic grid from the teacher schedule to the configured target step count.",
         )
-        components.options(self.scroll_frame, 2, 1, ["AUTO", "TRAILING", "UNIFORM"], self.ui_state, "distill_timestep_grid_mode")
+        components.options(
+            self.scroll_frame,
+            2,
+            1,
+            [str(x) for x in list(DistillTimestepGridMode)],
+            self.ui_state,
+            "distill_timestep_grid_mode",
+        )
 
         components.label(
             self.scroll_frame,
@@ -80,7 +91,14 @@ class DistillTab:
             "VRAM Mode",
             tooltip="SPLIT runs teacher/fake/student forwards sequentially. CONCURRENT is reserved for higher VRAM setups.",
         )
-        components.options(self.scroll_frame, 2, 4, ["SPLIT", "CONCURRENT"], self.ui_state, "distill_vram_mode")
+        components.options(
+            self.scroll_frame,
+            2,
+            4,
+            [str(x) for x in list(DistillVramMode)],
+            self.ui_state,
+            "distill_vram_mode",
+        )
 
         components.label(
             self.scroll_frame,
@@ -125,7 +143,14 @@ class DistillTab:
             "CFG Mode",
             tooltip="AUTO reads CFG from metadata; CFG=1 uses one teacher pass, CFG>1 uses guided teacher mixing.",
         )
-        components.options(self.scroll_frame, 5, 1, ["AUTO", "FORCE_1", "METADATA"], self.ui_state, "distill_cfg_mode")
+        components.options(
+            self.scroll_frame,
+            5,
+            1,
+            [str(x) for x in list(DistillCfgMode)],
+            self.ui_state,
+            "distill_cfg_mode",
+        )
 
         components.label(
             self.scroll_frame,
@@ -134,7 +159,14 @@ class DistillTab:
             "Fake Adapter Type",
             tooltip="LoRA is the stable default. DoRA and OFT are experimental for the fake-score adapter.",
         )
-        components.options(self.scroll_frame, 5, 4, ["LORA", "DORA", "OFT"], self.ui_state, "distill_fake_adapter_type")
+        components.options(
+            self.scroll_frame,
+            5,
+            4,
+            [str(x) for x in list(DistillFakeAdapterType)],
+            self.ui_state,
+            "distill_fake_adapter_type",
+        )
 
         components.label(
             self.scroll_frame,

@@ -55,7 +55,7 @@ def _build_teacher_config_view(config: TrainConfig, teacher_state_dict: dict) ->
 
 def _build_fake_config_view(config: TrainConfig) -> TrainConfig:
     fake_config = copy.copy(config)
-    fake_type = config.distill_fake_adapter_type.upper()
+    fake_type = str(config.distill_fake_adapter_type).upper()
 
     fake_config.lora_rank = config.distill_fake_adapter_rank
     fake_config.lora_alpha = float(config.distill_fake_adapter_rank)

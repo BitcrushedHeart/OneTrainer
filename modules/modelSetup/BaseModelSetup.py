@@ -12,6 +12,7 @@ from modules.util.distill_dmd2_util import (
     euler_flow_step,
 )
 from modules.util.distill_metadata_util import extract_distill_metadata
+from modules.util.enum.DistillCfgMode import DistillCfgMode
 from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -277,7 +278,7 @@ class BaseModelSetup(
         return tensor
 
     def _distill_cfg_scale(self, batch: dict, config: TrainConfig, device: torch.device) -> Tensor:
-        if config.distill_cfg_mode == "FORCE_1":
+        if config.distill_cfg_mode == DistillCfgMode.FORCE_1:
             return torch.ones(self._distill_batch_size(batch), device=device, dtype=torch.float32)
         return self._distill_tensor_from_batch_or_sidecar(
             batch,

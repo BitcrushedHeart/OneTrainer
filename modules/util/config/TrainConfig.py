@@ -12,6 +12,10 @@ from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
+from modules.util.enum.DistillCfgMode import DistillCfgMode
+from modules.util.enum.DistillFakeAdapterType import DistillFakeAdapterType
+from modules.util.enum.DistillTimestepGridMode import DistillTimestepGridMode
+from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.EMAMode import EMAMode
@@ -607,15 +611,15 @@ class TrainConfig(BaseConfig):
     distill_target_steps: int
     distill_teacher_steps: int
     distill_teacher_steps_auto: bool
-    distill_timestep_grid_mode: str
+    distill_timestep_grid_mode: DistillTimestepGridMode
     distill_endpoint_loss_weight: float
     distill_endpoint_lpips_weight: float
     distill_kl_loss_weight: float
     distill_ttur_ratio: int
     distill_fake_warmup_steps: int
-    distill_vram_mode: str
-    distill_cfg_mode: str
-    distill_fake_adapter_type: str
+    distill_vram_mode: DistillVramMode
+    distill_cfg_mode: DistillCfgMode
+    distill_fake_adapter_type: DistillFakeAdapterType
     distill_fake_adapter_rank: int
 
     # dpo
@@ -1028,7 +1032,7 @@ class TrainConfig(BaseConfig):
             # single optimizer.step() spans the whole accumulation window, which
             # would blend fake-score and student gradients into one update.
             return "Distill requires gradient_accumulation_steps=1 (TTUR alternates the update target per step)."
-        if self.distill_vram_mode.upper() == "CONCURRENT":
+        if self.distill_vram_mode == DistillVramMode.CONCURRENT:
             # The loss path always runs the teacher/fake/student forwards
             # sequentially (split). Concurrent fused forwards are not implemented.
             return "Distill concurrent VRAM mode is not implemented yet; use split."
@@ -1449,15 +1453,15 @@ class TrainConfig(BaseConfig):
         data.append(("distill_target_steps", 4, int, False))
         data.append(("distill_teacher_steps", 12, int, False))
         data.append(("distill_teacher_steps_auto", True, bool, False))
-        data.append(("distill_timestep_grid_mode", "AUTO", str, False))
+        data.append(("distill_timestep_grid_mode", DistillTimestepGridMode.AUTO, DistillTimestepGridMode, False))
         data.append(("distill_endpoint_loss_weight", 0.25, float, False))
         data.append(("distill_endpoint_lpips_weight", 0.0, float, False))
         data.append(("distill_kl_loss_weight", 1.0, float, False))
         data.append(("distill_ttur_ratio", 5, int, False))
         data.append(("distill_fake_warmup_steps", 500, int, False))
-        data.append(("distill_vram_mode", "SPLIT", str, False))
-        data.append(("distill_cfg_mode", "AUTO", str, False))
-        data.append(("distill_fake_adapter_type", "LORA", str, False))
+        data.append(("distill_vram_mode", DistillVramMode.SPLIT, DistillVramMode, False))
+        data.append(("distill_cfg_mode", DistillCfgMode.AUTO, DistillCfgMode, False))
+        data.append(("distill_fake_adapter_type", DistillFakeAdapterType.LORA, DistillFakeAdapterType, False))
         data.append(("distill_fake_adapter_rank", 16, int, False))
 
         # dpo

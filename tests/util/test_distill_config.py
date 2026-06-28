@@ -1,4 +1,7 @@
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.DistillCfgMode import DistillCfgMode
+from modules.util.enum.DistillFakeAdapterType import DistillFakeAdapterType
+from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 
@@ -14,16 +17,16 @@ def test_distill_config_defaults_round_trip():
     assert config.distill_kl_loss_weight == 1.0
     assert config.distill_ttur_ratio == 5
     assert config.distill_fake_warmup_steps == 500
-    assert config.distill_vram_mode == "SPLIT"
-    assert config.distill_cfg_mode == "AUTO"
-    assert config.distill_fake_adapter_type == "LORA"
+    assert config.distill_vram_mode == DistillVramMode.SPLIT
+    assert config.distill_cfg_mode == DistillCfgMode.AUTO
+    assert config.distill_fake_adapter_type == DistillFakeAdapterType.LORA
     assert config.distill_fake_adapter_rank == 16
 
     loaded = TrainConfig.default_values().from_dict(config.to_dict())
 
     assert loaded.distill_enabled is False
     assert loaded.distill_target_steps == 4
-    assert loaded.distill_fake_adapter_type == "LORA"
+    assert loaded.distill_fake_adapter_type == DistillFakeAdapterType.LORA
 
 
 def test_distill_validation_rejects_conflicting_or_unsupported_modes():
