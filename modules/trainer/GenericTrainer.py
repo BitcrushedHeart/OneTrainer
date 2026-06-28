@@ -504,15 +504,28 @@ class GenericTrainer(BaseTrainer):
         # its own references) and must never crash a training run.
         if not multi.is_master():
             return
+        vae_restore_device = None
         try:
             self.callbacks.on_update_status("Distill validation")
             self.model_setup.setup_train_device(self.model, self.config)
+            # Bring the VAE on-device for the validation window so teacher-match
+            # LPIPS can decode (latent caching otherwise offloads it). Restored
+            # in finally so training continues on the expected device layout.
+            vae = getattr(self.model, "vae", None)
+            if vae is not None:
+                current_device = next(vae.parameters()).device
+                if current_device != self.model_setup.train_device:
+                    vae_restore_device = current_device
+                    self.model.vae_to(self.model_setup.train_device)
             torch_gc()
             metrics = self.model_setup.run_distill_validation(self.model, self.config, train_progress)
             for key, value in (metrics or {}).items():
                 self.tensorboard.add_scalar(f"distill_val/{key}", value, train_progress.global_step)
         except Exception as exception:  # noqa: BLE001 - validation must not abort training
             print(f"Distill validation skipped after error: {exception}")
+        finally:
+            if vae_restore_device is not None:
+                self.model.vae_to(vae_restore_device)
 
     def __validate(self, train_progress: TrainProgress):
         if self.config.distill_enabled and self.config.distill_validation:
