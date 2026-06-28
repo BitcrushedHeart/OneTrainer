@@ -621,6 +621,8 @@ class TrainConfig(BaseConfig):
     distill_cfg_mode: DistillCfgMode
     distill_fake_adapter_type: DistillFakeAdapterType
     distill_fake_adapter_rank: int
+    distill_validation: bool
+    distill_validation_prompts: int
 
     # dpo
     rlhf_mode: RLHFMode
@@ -1003,6 +1005,8 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("distill_cfg_mode", "AUTO")
         migrated_data.setdefault("distill_fake_adapter_type", "LORA")
         migrated_data.setdefault("distill_fake_adapter_rank", 16)
+        migrated_data.setdefault("distill_validation", False)
+        migrated_data.setdefault("distill_validation_prompts", 8)
         return migrated_data
 
     def from_dict(self, data: dict) -> "TrainConfig":
@@ -1463,6 +1467,8 @@ class TrainConfig(BaseConfig):
         data.append(("distill_cfg_mode", DistillCfgMode.AUTO, DistillCfgMode, False))
         data.append(("distill_fake_adapter_type", DistillFakeAdapterType.LORA, DistillFakeAdapterType, False))
         data.append(("distill_fake_adapter_rank", 16, int, False))
+        data.append(("distill_validation", False, bool, False))
+        data.append(("distill_validation_prompts", 8, int, False))
 
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))

@@ -499,7 +499,26 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
+    def __validate_distill(self, train_progress: TrainProgress):
+        # Teacher-match validation is self-contained (frozen teacher generates
+        # its own references) and must never crash a training run.
+        if not multi.is_master():
+            return
+        try:
+            self.callbacks.on_update_status("Distill validation")
+            self.model_setup.setup_train_device(self.model, self.config)
+            torch_gc()
+            metrics = self.model_setup.run_distill_validation(self.model, self.config, train_progress)
+            for key, value in (metrics or {}).items():
+                self.tensorboard.add_scalar(f"distill_val/{key}", value, train_progress.global_step)
+        except Exception as exception:  # noqa: BLE001 - validation must not abort training
+            print(f"Distill validation skipped after error: {exception}")
+
     def __validate(self, train_progress: TrainProgress):
+        if self.config.distill_enabled and self.config.distill_validation:
+            if self.__needs_validate(train_progress):
+                self.__validate_distill(train_progress)
+            return
         if self.__needs_validate(train_progress):
             self.validation_data_loader.get_data_set().start_next_epoch()
             current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
@@ -1289,6 +1308,7 @@ class GenericTrainer(BaseTrainer):
                         self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
                     elif self.config.distill_enabled:
                         loss = self.model_setup.calculate_distill_loss(self.model, batch, self.config, train_progress)
+                        self.model_setup.capture_distill_val_batch(batch, self.config)
                         micro_distill_metrics = self.model_setup.get_last_distill_metrics()
                         if accumulated_distill_metrics is None:
                             accumulated_distill_metrics = {

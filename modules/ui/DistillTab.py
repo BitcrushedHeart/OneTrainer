@@ -176,3 +176,21 @@ class DistillTab:
             tooltip="Rank/block-size used by the fake-score adapter.",
         )
         components.entry(self.scroll_frame, 6, 1, self.ui_state, "distill_fake_adapter_rank")
+
+        components.label(
+            self.scroll_frame,
+            7,
+            0,
+            "Validation",
+            tooltip="Per-epoch teacher-match validation. Generates teacher references itself (frozen, cached) and compares the student against them; no held-out samples needed.",
+        )
+        components.switch(self.scroll_frame, 7, 1, self.ui_state, "distill_validation")
+
+        components.label(
+            self.scroll_frame,
+            7,
+            3,
+            "Validation Prompts",
+            tooltip="Number of prompts (auto-sampled from the first training batches) used for teacher-match + diversity validation.",
+        )
+        components.entry(self.scroll_frame, 7, 4, self.ui_state, "distill_validation_prompts")

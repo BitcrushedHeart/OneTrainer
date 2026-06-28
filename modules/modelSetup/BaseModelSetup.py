@@ -527,6 +527,150 @@ class BaseModelSetup(
         }
         return loss
 
+    # ------------------------------------------------------------------
+    # Distill teacher-match validation (no held-out samples required: the
+    # frozen teacher generates its own references, computed once and reused).
+    # ------------------------------------------------------------------
+    def capture_distill_val_batch(self, batch: dict, config: TrainConfig):
+        """Stash the first N training batches' conditioning as the validation
+        set. No images are held out from training; we only reuse the prompt
+        conditioning + latent shape, paired later with fixed validation seeds."""
+        if not getattr(config, "distill_validation", False):
+            return
+        cache = getattr(self, "_distill_val_batches", None)
+        if cache is None:
+            cache = []
+            self._distill_val_batches = cache
+            self._distill_teacher_ref_cache = {}
+        if len(cache) >= max(1, int(config.distill_validation_prompts)):
+            return
+        keep: dict = {}
+        for key, value in batch.items():
+            if isinstance(value, Tensor):
+                keep[key] = value.detach().clone()
+            elif isinstance(value, (list, tuple, str, int, float)) or value is None:
+                keep[key] = value
+        cache.append(keep)
+
+    def _distill_val_noise(self, batch: dict, seed: int) -> Tensor:
+        latent = batch["latent_image"]
+        generator = torch.Generator(device=latent.device)
+        generator.manual_seed(seed)
+        return torch.randn(latent.shape, generator=generator, device=latent.device, dtype=latent.dtype)
+
+    def _distill_run_trajectory(
+        self, model, batch, config, train_progress, sigmas, cfg_scale, initial_latent, state
+    ) -> Tensor:
+        latent = initial_latent
+        for step_index in range(sigmas.shape[1] - 1):
+            sigma = sigmas[:, step_index]
+            next_sigma = sigmas[:, step_index + 1]
+            if state == "teacher":
+                velocity = self._cfg_baked_distill_velocity(
+                    model, batch, config, train_progress, latent, sigma, cfg_scale
+                )
+            else:
+                velocity = self.predict_distill_velocity(
+                    model, batch, config, train_progress, latent, sigma, conditioning="conditional"
+                )
+            latent = euler_flow_step(latent, velocity, sigma, next_sigma)
+        return latent
+
+    def _distill_diversity_ratio(
+        self, model, batch, config, train_progress, student_sigmas, teacher_sigmas, cfg_scale, index, cache
+    ) -> float | None:
+        seeds = [2_000_003 + index * 10 + s for s in range(3)]
+
+        def generate(state, sigmas):
+            outs = []
+            with self.adapter_state(model, config, state):
+                for seed in seeds:
+                    noise = self._distill_val_noise(batch, seed)
+                    outs.append(
+                        self._distill_run_trajectory(
+                            model, batch, config, train_progress, sigmas, cfg_scale, noise, state
+                        )
+                    )
+            return outs
+
+        def mean_pairwise(outs):
+            dists = [
+                (outs[a].float() - outs[b].float()).pow(2).mean().item()
+                for a in range(len(outs))
+                for b in range(a + 1, len(outs))
+            ]
+            return sum(dists) / len(dists) if dists else 0.0
+
+        teacher_key = ("div", index)
+        teacher_div = cache.get(teacher_key)
+        if teacher_div is None:
+            teacher_div = mean_pairwise(generate("teacher", teacher_sigmas))
+            cache[teacher_key] = teacher_div
+        student_div = mean_pairwise(generate("student", student_sigmas))
+        return (student_div / teacher_div) if teacher_div > 1e-8 else None
+
+    def run_distill_validation(self, model, config, train_progress) -> dict[str, float]:
+        """Teacher-match (latent MSE + LPIPS) + diversity ratio, teacher refs
+        cached because the teacher is frozen. Only the student re-runs."""
+        cache_batches = getattr(self, "_distill_val_batches", None)
+        if not cache_batches:
+            return {}
+        ref_cache = self._distill_teacher_ref_cache
+        device = cache_batches[0]["latent_image"].device
+        mses: list[float] = []
+        lpips_vals: list[float] = []
+        div_ratios: list[float] = []
+        with torch.no_grad():
+            for index, batch in enumerate(cache_batches):
+                cfg_scale = self._distill_cfg_scale(batch, config, device)
+                teacher_steps = self._distill_teacher_steps(batch, config, device)
+                teacher_target = int(teacher_steps.flatten()[0].item())
+                student_sigmas = build_distill_sigma_matrix(
+                    config.distill_target_steps, teacher_steps, config.distill_timestep_grid_mode, device=device
+                )
+                teacher_sigmas = build_distill_sigma_matrix(teacher_target, teacher_steps, "AUTO", device=device)
+                noise = self._distill_val_noise(batch, seed=1_000_003 + index)
+
+                ref = ref_cache.get(index)
+                if ref is None:
+                    with self.adapter_state(model, config, "teacher"):
+                        ref = self._distill_run_trajectory(
+                            model, batch, config, train_progress, teacher_sigmas, cfg_scale, noise, "teacher"
+                        ).detach()
+                    ref_cache[index] = ref
+                with self.adapter_state(model, config, "student"):
+                    student = self._distill_run_trajectory(
+                        model, batch, config, train_progress, student_sigmas, cfg_scale, noise, "student"
+                    )
+
+                mses.append((student.float() - ref.float()).pow(2).mean().item())
+                lpips_term = self._distill_perceptual_loss(model, student, ref, config)
+                if lpips_term is not None:
+                    lpips_vals.append(float(lpips_term))
+                if index < 2:
+                    ratio = self._distill_diversity_ratio(
+                        model,
+                        batch,
+                        config,
+                        train_progress,
+                        student_sigmas,
+                        teacher_sigmas,
+                        cfg_scale,
+                        index,
+                        ref_cache,
+                    )
+                    if ratio is not None:
+                        div_ratios.append(ratio)
+
+        metrics: dict[str, float] = {}
+        if mses:
+            metrics["teacher_match_mse"] = sum(mses) / len(mses)
+        if lpips_vals:
+            metrics["teacher_match_lpips"] = sum(lpips_vals) / len(lpips_vals)
+        if div_ratios:
+            metrics["diversity_ratio"] = sum(div_ratios) / len(div_ratios)
+        return metrics
+
     def set_dpo_runtime_beta(self, beta: float | None):
         # Adaptive-beta override from the trainer. The logged reward metrics
         # are computed before beta is applied, so adapting beta from them does
