@@ -23,8 +23,15 @@ def dmd2_kl_pseudo_loss(x_at_k: Tensor, real_velocity: Tensor, fake_velocity: Te
 
     The score direction is detached; gradients flow through ``x_at_k`` into the
     student trajectory only.
+
+    Sign note: flow models output velocity ``v = eps - x0``, and the score
+    relates to it as ``s = -(1-sigma)/sigma * v``. DMD2 needs the *score*
+    difference ``(s_fake - s_real)``, which therefore has the OPPOSITE sign of
+    the velocity difference. So we use ``(real - fake)`` here: minimizing this
+    moves the student TOWARD the teacher distribution. Using ``(fake - real)``
+    inverts the gradient and drives the student away from the teacher.
     """
-    score_delta = fake_velocity.detach().float() - real_velocity.detach().float()
+    score_delta = real_velocity.detach().float() - fake_velocity.detach().float()
     return (score_delta * x_at_k.float()).mean(dtype=torch.float32) * weight
 
 
