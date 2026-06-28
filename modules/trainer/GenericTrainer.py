@@ -1583,7 +1583,11 @@ class GenericTrainer(BaseTrainer):
 
                         self.one_step_trained = True
 
-                if (self.config.validation or self.config.rlhf_dpo_validation) and multi.is_master():
+                if (
+                    self.config.validation
+                    or self.config.rlhf_dpo_validation
+                    or (self.config.distill_enabled and self.config.distill_validation)
+                ) and multi.is_master():
                     self.__validate(train_progress)
 
                 train_progress.next_step(self.config.batch_size)
