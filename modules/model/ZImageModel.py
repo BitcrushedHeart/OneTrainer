@@ -102,6 +102,7 @@ class ZImageModel(BaseModel):
     # distillation teacher (frozen)
     transformer_teacher_lora: LoRAModuleWrapper | None
     teacher_lora_state_dict: dict | None
+    transformer_fake_lora: LoRAModuleWrapper | None
 
     def __init__(
         self,
@@ -129,6 +130,7 @@ class ZImageModel(BaseModel):
 
         self.transformer_teacher_lora = None
         self.teacher_lora_state_dict = None
+        self.transformer_fake_lora = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
         return [
@@ -144,6 +146,15 @@ class ZImageModel(BaseModel):
             a
             for a in [
                 self.transformer_teacher_lora,
+            ]
+            if a is not None
+        ]
+
+    def fake_adapters(self) -> list[LoRAModuleWrapper]:
+        return [
+            a
+            for a in [
+                self.transformer_fake_lora,
             ]
             if a is not None
         ]
@@ -175,6 +186,9 @@ class ZImageModel(BaseModel):
 
         if self.transformer_teacher_lora is not None:
             self.transformer_teacher_lora.to(device)
+
+        if self.transformer_fake_lora is not None:
+            self.transformer_fake_lora.to(device)
 
     def to(self, device: torch.device):
         self.vae_to(device)

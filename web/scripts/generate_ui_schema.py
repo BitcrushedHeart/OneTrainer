@@ -542,6 +542,7 @@ TAB_ORDER = [
     "lora",
     "embedding",
     "rlhf",
+    "distill",
     "performance",
     "run",
     "help",
@@ -591,6 +592,8 @@ def generate_schema() -> dict:
                 section["visibility"] = {"field": "peft_type", "eq": "OFT_2"}
     if "rlhf" in tab_dicts:
         tab_dicts["rlhf"]["visibility"] = {"field": "training_method", "eq": "LORA"}
+    if "distill" in tab_dicts:
+        tab_dicts["distill"]["visibility"] = {"field": "training_method", "eq": "LORA"}
     if "embedding" in tab_dicts:
         tab_dicts["embedding"]["visibility"] = {"field": "training_method", "eq": "EMBEDDING"}
     if "additionalembeddings" in tab_dicts:

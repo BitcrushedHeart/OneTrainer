@@ -117,6 +117,11 @@ class BaseModel(metaclass=ABCMeta):
         that don't (yet) support distillation training."""
         return []
 
+    def fake_adapters(self) -> list[LoRAModuleWrapper]:
+        """Fake-score adapters used by DMD2 distillation. Default empty for
+        models that don't (yet) support distillation training."""
+        return []
+
     @staticmethod
     def _add_embeddings_to_prompt(
         additional_embeddings: list[BaseModelEmbedding],

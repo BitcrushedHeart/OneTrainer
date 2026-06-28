@@ -53,6 +53,31 @@ def _build_teacher_config_view(config: TrainConfig, teacher_state_dict: dict) ->
     return teacher_config
 
 
+def _build_fake_config_view(config: TrainConfig) -> TrainConfig:
+    fake_config = copy.copy(config)
+    fake_type = config.distill_fake_adapter_type.upper()
+
+    fake_config.lora_rank = config.distill_fake_adapter_rank
+    fake_config.lora_alpha = float(config.distill_fake_adapter_rank)
+
+    if fake_type == "LORA":
+        fake_config.peft_type = PeftType.LORA
+        fake_config.lora_decompose = False
+        fake_config.dora_oft = False
+    elif fake_type == "DORA":
+        fake_config.peft_type = PeftType.LORA
+        fake_config.lora_decompose = True
+        fake_config.dora_oft = False
+    elif fake_type == "OFT":
+        fake_config.peft_type = PeftType.OFT_2
+        fake_config.dora_oft = False
+        fake_config.oft_block_size = config.distill_fake_adapter_rank
+    else:
+        raise ValueError(f"Unsupported distill fake adapter type: {config.distill_fake_adapter_type}")
+
+    return fake_config
+
+
 class ZImageLoRASetup(
     BaseZImageSetup,
 ):
@@ -78,6 +103,13 @@ class ZImageLoRASetup(
         self._create_model_part_parameters(
             parameter_group_collection, "transformer", model.transformer_lora, config.transformer
         )
+        if config.distill_enabled and model.transformer_fake_lora is not None:
+            self._create_model_part_parameters(
+                parameter_group_collection,
+                "transformer_fake",
+                model.transformer_fake_lora,
+                config.transformer,
+            )
         return parameter_group_collection
 
     def __setup_requires_grad(
@@ -92,6 +124,10 @@ class ZImageLoRASetup(
         self._setup_model_part_requires_grad(
             "transformer", model.transformer_lora, config.transformer, model.train_progress
         )
+        if config.distill_enabled and model.transformer_fake_lora is not None:
+            self._setup_model_part_requires_grad(
+                "transformer_fake", model.transformer_fake_lora, config.transformer, model.train_progress
+            )
 
     def setup_model(
         self,
@@ -134,6 +170,16 @@ class ZImageLoRASetup(
             model.transformer_teacher_lora.requires_grad_(False)
             # Intentionally do NOT call hook_to_module(); the distillation context
             # manager toggles this per training step.
+
+        if config.distill_enabled:
+            fake_config = _build_fake_config_view(config)
+            model.transformer_fake_lora = LoRAModuleWrapper(
+                model.transformer, "transformer_fake", fake_config, config.layer_filter.split(",")
+            )
+            model.transformer_fake_lora.set_dropout(config.dropout_probability)
+            model.transformer_fake_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
+            # Intentionally do NOT call hook_to_module(); DMD2 toggles the fake
+            # score adapter only during fake-score updates/forwards.
 
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)

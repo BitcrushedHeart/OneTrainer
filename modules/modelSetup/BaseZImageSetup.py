@@ -102,16 +102,60 @@ class BaseZImageSetup(
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
 
-            text_encoder_output = model.encode_text(
-                train_device=self.train_device,
-                batch_size=batch["latent_image"].shape[0],
-                rand=rand,
-                tokens=batch.get("tokens"),
-                tokens_mask=batch.get("tokens_mask"),
-                text_encoder_output=batch.get("text_encoder_hidden_state"),
-                text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
-            )
+            batch_size = batch["latent_image"].shape[0]
+            distill_conditioning = batch.get("_distill_conditioning", "conditional")
+            if distill_conditioning == "unconditional":
+                negative_prompt = batch.get("distill_negative_prompt", batch.get("negative_prompt", ""))
+                if isinstance(negative_prompt, str):
+                    negative_prompt = [negative_prompt] * batch_size
+                text_encoder_output = model.encode_text(
+                    train_device=self.train_device,
+                    batch_size=batch_size,
+                    rand=rand,
+                    text=list(negative_prompt),
+                    text_encoder_dropout_probability=None,
+                )
+            else:
+                text_encoder_output = model.encode_text(
+                    train_device=self.train_device,
+                    batch_size=batch_size,
+                    rand=rand,
+                    tokens=batch.get("tokens"),
+                    tokens_mask=batch.get("tokens_mask"),
+                    text_encoder_output=batch.get("text_encoder_hidden_state"),
+                    text_encoder_dropout_probability=config.text_encoder.dropout_probability
+                    if not deterministic
+                    else None,
+                )
             scaled_latent_image = model.scale_latents(batch["latent_image"])
+
+            if "_distill_latent_input" in batch:
+                scaled_noisy_latent_image = batch["_distill_latent_input"].to(
+                    device=scaled_latent_image.device, dtype=scaled_latent_image.dtype
+                )
+                sigma = batch["_distill_sigma"].to(device=scaled_latent_image.device, dtype=torch.float32).flatten()
+                latent_input = scaled_noisy_latent_image.unsqueeze(2).to(dtype=model.train_dtype.torch_dtype())
+                latent_input_list = list(latent_input.unbind(dim=0))
+                transformer_timestep = 1.0 - sigma
+
+                output_list = model.transformer(
+                    latent_input_list, transformer_timestep, text_encoder_output, return_dict=True
+                ).sample
+
+                predicted_flow = -torch.stack(output_list, dim=0).squeeze(dim=2)
+                while sigma.dim() < predicted_flow.dim():
+                    sigma = sigma.unsqueeze(-1)
+                predicted_scaled_latent_image = scaled_noisy_latent_image - predicted_flow * sigma
+                return {
+                    "loss_type": "target",
+                    "timestep": transformer_timestep,
+                    "predicted": predicted_flow,
+                    "target": torch.zeros_like(predicted_flow),
+                    "latent_image": scaled_latent_image,
+                    "noisy_latent_image": scaled_noisy_latent_image,
+                    "sigma": sigma,
+                    "predicted_latent": predicted_scaled_latent_image,
+                }
 
             latent_noise = self._create_noise(scaled_latent_image, config, generator)
 
@@ -151,16 +195,20 @@ class BaseZImageSetup(
             predicted_flow = -torch.stack(output_list, dim=0).squeeze(dim=2)
 
             flow = latent_noise - scaled_latent_image
+            predicted_scaled_latent_image = scaled_noisy_latent_image - predicted_flow * sigma
             model_output_data = {
                 "loss_type": "target",
                 "timestep": timestep,
                 "predicted": predicted_flow,
                 "target": flow,
+                "latent_image": scaled_latent_image,
+                "noisy_latent_image": scaled_noisy_latent_image,
+                "sigma": sigma,
+                "predicted_latent": predicted_scaled_latent_image,
             }
 
             if config.debug_mode:
                 with torch.no_grad():
-                    predicted_scaled_latent_image = scaled_noisy_latent_image - predicted_flow * sigma
                     self._save_tokens("7-prompt", batch["tokens"], model.tokenizer, config, train_progress)
                     self._save_latent("1-noise", latent_noise, config, train_progress)
                     self._save_latent("2-noisy_image", scaled_noisy_latent_image, config, train_progress)
@@ -185,6 +233,55 @@ class BaseZImageSetup(
             train_device=self.train_device,
             sigmas=model.noise_scheduler.sigmas,
         ).mean()
+
+    def _distill_perceptual_loss(
+        self,
+        model: ZImageModel,
+        generated_scaled_latent: Tensor,
+        target_scaled_latent: Tensor,
+        config: TrainConfig,
+    ) -> Tensor | None:
+        """Optional image-space LPIPS term for the endpoint regression.
+
+        Decodes both latents through the VAE and runs LPIPS. Off by default
+        (distill_endpoint_lpips_weight=0). Returns None and disables itself on
+        any failure (e.g. VAE offloaded under latent caching, missing lpips
+        package) so it can never break a real training run. Untested on GPU.
+        """
+        if getattr(self, "_distill_lpips_disabled", False):
+            return None
+        try:
+            vae_device = next(model.vae.parameters()).device
+            if vae_device != self.train_device:
+                # VAE is offloaded (latent caching); decoding here would thrash
+                # devices every step. Skip rather than pay that cost silently.
+                return None
+
+            lpips_net = getattr(self, "_distill_lpips_net", None)
+            if lpips_net is None:
+                import lpips
+
+                lpips_net = lpips.LPIPS(net="vgg").to(self.train_device)
+                lpips_net.eval()
+                for param in lpips_net.parameters():
+                    param.requires_grad_(False)
+                self._distill_lpips_net = lpips_net
+
+            generated_image = model.vae.decode(
+                model.unscale_latents(generated_scaled_latent.to(dtype=model.train_dtype.torch_dtype())),
+                return_dict=False,
+            )[0]
+            with torch.no_grad():
+                target_image = model.vae.decode(
+                    model.unscale_latents(target_scaled_latent.to(dtype=model.train_dtype.torch_dtype())),
+                    return_dict=False,
+                )[0]
+
+            return lpips_net(generated_image.float().clamp(-1, 1), target_image.float().clamp(-1, 1)).mean()
+        except Exception as exception:  # noqa: BLE001 - never let LPIPS abort a run
+            print(f"Distill LPIPS term disabled after error: {exception}")
+            self._distill_lpips_disabled = True
+            return None
 
     def prepare_text_caching(self, model: ZImageModel, config: TrainConfig):
         model.to(self.temp_device)

@@ -20,6 +20,7 @@ from modules.ui.CaptionUI import CaptionUI
 from modules.ui.CloudTab import CloudTab
 from modules.ui.ConceptTab import ConceptTab
 from modules.ui.ConvertModelUI import ConvertModelUI
+from modules.ui.DistillTab import DistillTab
 from modules.ui.LoraTab import LoraTab
 from modules.ui.MergeOFTUI import MergeOFTUI
 from modules.ui.ModelTab import ModelTab
@@ -133,6 +134,7 @@ class TrainUI(ctk.CTk):
         self.model_tab = None
         self.training_tab = None
         self.lora_tab = None
+        self.distill_tab = None
         self.rlhf_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
@@ -868,6 +870,7 @@ class TrainUI(ctk.CTk):
 
         self._update_rlhf_controls()
         self._update_rlhf_tab()
+        self._update_distill_tab()
 
     def _rlhf_is_supported(self) -> bool:
         return self.train_config.training_method == TrainingMethod.LORA
@@ -887,6 +890,21 @@ class TrainUI(ctk.CTk):
         elif not self._rlhf_is_supported() and "RLHF" in self.tabview._tab_dict:
             self.tabview.delete("RLHF")
             self.rlhf_tab = None
+
+    def _distill_is_supported(self) -> bool:
+        return self.train_config.training_method == TrainingMethod.LORA
+
+    def _update_distill_tab(self):
+        if not self.tabview:
+            return
+
+        if self._distill_is_supported() and "Distill" not in self.tabview._tab_dict:
+            self.distill_tab = DistillTab(self.tabview.add("Distill"), self.train_config, self.ui_state)
+        elif self._distill_is_supported() and self.distill_tab:
+            self.distill_tab.refresh_ui()
+        elif not self._distill_is_supported() and "Distill" in self.tabview._tab_dict:
+            self.tabview.delete("Distill")
+            self.distill_tab = None
 
     def load_preset(self):
         if not self.tabview:

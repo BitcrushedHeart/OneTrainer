@@ -3,6 +3,15 @@ from contextlib import contextmanager
 
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
+from modules.util.distill_dmd2_util import (
+    build_distill_sigma_matrix,
+    cfg_baked_velocity,
+    dmd2_endpoint_loss,
+    dmd2_fake_score_loss,
+    dmd2_kl_pseudo_loss,
+    euler_flow_step,
+)
+from modules.util.distill_metadata_util import extract_distill_metadata
 from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -38,6 +47,7 @@ class BaseModelSetup(
         self._last_dpo_metrics = None
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
+        self._last_distill_metrics = None
 
     @abstractmethod
     def create_parameters(
@@ -188,6 +198,333 @@ class BaseModelSetup(
 
     def get_last_dpo_metrics(self) -> dict[str, float]:
         return self._last_dpo_metrics or {}
+
+    def get_last_distill_metrics(self) -> dict[str, float | str]:
+        return self._last_distill_metrics or {}
+
+    @staticmethod
+    def _distill_update_mode(config: TrainConfig, train_progress: TrainProgress) -> str:
+        if train_progress.global_step < config.distill_fake_warmup_steps:
+            return "fake"
+        ratio = max(1, int(config.distill_ttur_ratio))
+        relative_step = train_progress.global_step - config.distill_fake_warmup_steps
+        return "student" if relative_step % (ratio + 1) == ratio else "fake"
+
+    @staticmethod
+    def _distill_batch_size(batch: dict) -> int:
+        latent = batch["latent_image"]
+        return latent.shape[0] if isinstance(latent, Tensor) and latent.ndim > 0 else 1
+
+    @staticmethod
+    def _distill_image_paths(batch: dict) -> list[str]:
+        paths = batch.get("image_path", [])
+        if isinstance(paths, str):
+            return [paths]
+        if isinstance(paths, (list, tuple)):
+            return [str(path) for path in paths]
+        return []
+
+    def _distill_sidecar_values(self, batch: dict, attr: str) -> list[float | int | None]:
+        values = []
+        for path in self._distill_image_paths(batch):
+            metadata = extract_distill_metadata(path)
+            values.append(getattr(metadata, attr) if metadata is not None else None)
+        return values
+
+    def _distill_sidecar_text_values(self, batch: dict, attr: str, default: str = "") -> list[str]:
+        values = []
+        for path in self._distill_image_paths(batch):
+            metadata = extract_distill_metadata(path)
+            value = getattr(metadata, attr) if metadata is not None else None
+            values.append(default if value is None else str(value))
+        return values
+
+    def _distill_tensor_from_batch_or_sidecar(
+        self,
+        batch: dict,
+        batch_key: str,
+        sidecar_attr: str,
+        default: float | int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        batch_size = self._distill_batch_size(batch)
+        if batch_key in batch:
+            value = batch[batch_key]
+            if isinstance(value, Tensor):
+                tensor = value.to(device=device, dtype=dtype).flatten()
+            elif isinstance(value, (list, tuple)):
+                tensor = torch.tensor(value, device=device, dtype=dtype).flatten()
+            else:
+                tensor = torch.tensor([value], device=device, dtype=dtype)
+        else:
+            sidecar_values = self._distill_sidecar_values(batch, sidecar_attr)
+            if sidecar_values:
+                tensor = torch.tensor(
+                    [default if value is None else value for value in sidecar_values],
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                tensor = torch.tensor([default], device=device, dtype=dtype)
+
+        if tensor.numel() == 1 and batch_size > 1:
+            tensor = tensor.repeat(batch_size)
+        if tensor.numel() != batch_size:
+            raise RuntimeError(
+                f"{batch_key} has {tensor.numel()} value(s), but the distillation batch has {batch_size} sample(s)."
+            )
+        return tensor
+
+    def _distill_cfg_scale(self, batch: dict, config: TrainConfig, device: torch.device) -> Tensor:
+        if config.distill_cfg_mode == "FORCE_1":
+            return torch.ones(self._distill_batch_size(batch), device=device, dtype=torch.float32)
+        return self._distill_tensor_from_batch_or_sidecar(
+            batch,
+            "distill_cfg_scale",
+            "cfg_scale",
+            1.0,
+            device,
+            torch.float32,
+        )
+
+    def _distill_teacher_steps(self, batch: dict, config: TrainConfig, device: torch.device) -> Tensor:
+        default = config.distill_teacher_steps
+        if not config.distill_teacher_steps_auto:
+            return torch.full((self._distill_batch_size(batch),), default, device=device, dtype=torch.long)
+        return self._distill_tensor_from_batch_or_sidecar(
+            batch,
+            "distill_teacher_steps",
+            "steps",
+            default,
+            device,
+            torch.long,
+        )
+
+    def predict_distill_velocity(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        latent: Tensor,
+        sigma: Tensor,
+        *,
+        conditioning: str = "conditional",
+    ) -> Tensor:
+        distill_batch = dict(batch)
+        distill_batch["_distill_latent_input"] = latent
+        distill_batch["_distill_sigma"] = sigma
+        distill_batch["_distill_conditioning"] = conditioning
+        if conditioning == "unconditional" and "distill_negative_prompt" not in distill_batch:
+            negative_prompts = self._distill_sidecar_text_values(batch, "negative_prompt")
+            if negative_prompts:
+                distill_batch["distill_negative_prompt"] = negative_prompts
+        return self.predict(model, distill_batch, config, train_progress, deterministic=True)["predicted"]
+
+    def _cfg_baked_distill_velocity(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        latent: Tensor,
+        sigma: Tensor,
+        cfg_scale: Tensor,
+    ) -> Tensor:
+        conditional = self.predict_distill_velocity(
+            model, batch, config, train_progress, latent, sigma, conditioning="conditional"
+        )
+        if bool(torch.all(cfg_scale == 1)):
+            return conditional
+        unconditional = self.predict_distill_velocity(
+            model, batch, config, train_progress, latent, sigma, conditioning="unconditional"
+        )
+        return cfg_baked_velocity(conditional, unconditional, cfg_scale)
+
+    @staticmethod
+    def _distill_scaled_image_latent(model: BaseModel, batch: dict) -> Tensor:
+        # The student trajectory lives in scaled-latent space (the transformer
+        # operates there), but the cached image latent is unscaled. Scale it so
+        # the endpoint regression compares like with like. Models without a
+        # scale_latents hook (e.g. the unit-test toy model) pass through.
+        image_latent = batch.get("target_latent", batch["latent_image"])
+        scale = getattr(model, "scale_latents", None)
+        return scale(image_latent) if callable(scale) else image_latent
+
+    def _distill_renoise(
+        self,
+        x0: Tensor,
+        train_progress: TrainProgress,
+        *,
+        seed_offset: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Re-noise a student sample x0 to a random interior sigma.
+
+        Returns ``(x_sigma, sigma, v_target)`` where ``x_sigma`` follows the
+        rectified-flow path ``(1 - sigma) * x0 + sigma * eps`` and ``v_target``
+        is the flow velocity ``eps - x0``. Used by both the DMD2 fake-score
+        update and the student KL update so the distribution-matching gradient
+        is evaluated at a genuinely noised point (never the sigma=0 endpoint).
+        """
+        batch_size = x0.shape[0]
+        generator = torch.Generator(device=x0.device)
+        generator.manual_seed(train_progress.global_step * 2 + seed_offset)
+        sigma = torch.rand(batch_size, generator=generator, device=x0.device, dtype=torch.float32)
+        sigma = sigma.clamp(0.02, 0.98)
+        eps = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
+        sigma_b = sigma.view(batch_size, *([1] * (x0.dim() - 1))).to(dtype=x0.dtype)
+        x_sigma = (1.0 - sigma_b) * x0 + sigma_b * eps
+        v_target = eps - x0
+        return x_sigma, sigma, v_target
+
+    def _distill_perceptual_loss(
+        self,
+        model: BaseModel,
+        generated_scaled_latent: Tensor,
+        target_scaled_latent: Tensor,
+        config: TrainConfig,
+    ) -> Tensor | None:
+        """Optional LPIPS term in image space. Default: not available.
+
+        Model-specific setups (BaseZImageSetup) override this to decode both
+        latents and run LPIPS. Returns None when unavailable so the caller skips
+        the term.
+        """
+        return None
+
+    def _simulate_student_distill_trajectory(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        sigmas: Tensor,
+    ) -> list[Tensor]:
+        latent = batch.get("distill_initial_latent")
+        if latent is None:
+            generator = torch.Generator(device=self.train_device)
+            generator.manual_seed(train_progress.global_step)
+            latent = torch.randn(
+                batch["latent_image"].shape,
+                generator=generator,
+                device=batch["latent_image"].device,
+                dtype=batch["latent_image"].dtype,
+            )
+        else:
+            latent = latent.to(device=batch["latent_image"].device, dtype=batch["latent_image"].dtype)
+
+        trajectory = [latent]
+        for step_index in range(config.distill_target_steps):
+            sigma = sigmas[:, step_index]
+            next_sigma = sigmas[:, step_index + 1]
+            velocity = self.predict_distill_velocity(
+                model, batch, config, train_progress, latent, sigma, conditioning="conditional"
+            )
+            latent = euler_flow_step(latent, velocity, sigma, next_sigma)
+            trajectory.append(latent)
+        return trajectory
+
+    def calculate_distill_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+    ) -> Tensor:
+        mode = self._distill_update_mode(config, train_progress)
+        device = batch["latent_image"].device
+        cfg_scale = self._distill_cfg_scale(batch, config, device)
+        teacher_steps = self._distill_teacher_steps(batch, config, device)
+        sigmas = build_distill_sigma_matrix(
+            config.distill_target_steps,
+            teacher_steps,
+            config.distill_timestep_grid_mode,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        if mode == "fake":
+            # DMD2 fake-score update: model the student's *output* distribution
+            # via denoising score-matching on a re-noised student sample.
+            with self.adapter_state(model, config, "student"), torch.no_grad():
+                student_trajectory = self._simulate_student_distill_trajectory(
+                    model, batch, config, train_progress, sigmas
+                )
+            x0 = student_trajectory[-1].detach()
+            x_sigma, sigma_k, v_target = self._distill_renoise(x0, train_progress, seed_offset=0)
+            with self.adapter_state(model, config, "fake"):
+                # Conditional only: the student bakes CFG into its weights, so its
+                # samples are conditional and mu_fake models that distribution.
+                fake_predicted = self.predict_distill_velocity(
+                    model, batch, config, train_progress, x_sigma.detach(), sigma_k, conditioning="conditional"
+                )
+
+            fake_loss = dmd2_fake_score_loss(fake_predicted, v_target)
+            self._last_distill_metrics = {
+                "mode": "fake",
+                "loss": fake_loss.detach().item(),
+                "fake_loss": fake_loss.detach().item(),
+                "kl_loss": 0.0,
+                "endpoint_loss": 0.0,
+                "lpips_loss": 0.0,
+                "target_steps": config.distill_target_steps,
+                "teacher_steps": teacher_steps.float().mean().item(),
+                "cfg_scale": cfg_scale.float().mean().item(),
+            }
+            return fake_loss
+
+        # Student update: generate x0 through the student trajectory (gradient
+        # retained), then evaluate the distribution-matching gradient at a random
+        # re-noised point x_sigma. Gradient flows (v_fake - v_real).detach() *
+        # x_sigma -> x0 -> student adapter. This is robust for target_steps=1..N;
+        # the clean sigma=0 endpoint is never used for the KL term.
+        with self.adapter_state(model, config, "student"):
+            student_trajectory = self._simulate_student_distill_trajectory(model, batch, config, train_progress, sigmas)
+        x0 = student_trajectory[-1]
+        x_sigma, sigma_k, _ = self._distill_renoise(x0, train_progress, seed_offset=1)
+
+        with self.adapter_state(model, config, "teacher"), torch.no_grad():
+            real_predicted = self._cfg_baked_distill_velocity(
+                model, batch, config, train_progress, x_sigma.detach(), sigma_k, cfg_scale
+            )
+        with self.adapter_state(model, config, "fake"), torch.no_grad():
+            fake_predicted = self.predict_distill_velocity(
+                model, batch, config, train_progress, x_sigma.detach(), sigma_k, conditioning="conditional"
+            )
+
+        kl_loss = dmd2_kl_pseudo_loss(
+            x_sigma,
+            real_predicted,
+            fake_predicted,
+            weight=config.distill_kl_loss_weight,
+        )
+        scaled_image_latent = self._distill_scaled_image_latent(model, batch)
+        endpoint_loss = dmd2_endpoint_loss(
+            x0,
+            scaled_image_latent,
+            weight=config.distill_endpoint_loss_weight,
+        )
+        lpips_loss = None
+        if config.distill_endpoint_lpips_weight > 0.0:
+            lpips_term = self._distill_perceptual_loss(model, x0, scaled_image_latent, config)
+            if lpips_term is not None:
+                lpips_loss = config.distill_endpoint_lpips_weight * lpips_term
+                endpoint_loss = endpoint_loss + lpips_loss
+
+        loss = kl_loss + endpoint_loss
+        self._last_distill_metrics = {
+            "mode": "student",
+            "loss": loss.detach().item(),
+            "fake_loss": 0.0,
+            "kl_loss": kl_loss.detach().item(),
+            "endpoint_loss": endpoint_loss.detach().item(),
+            "lpips_loss": lpips_loss.detach().item() if lpips_loss is not None else 0.0,
+            "target_steps": config.distill_target_steps,
+            "teacher_steps": teacher_steps.float().mean().item(),
+            "cfg_scale": cfg_scale.float().mean().item(),
+        }
+        return loss
 
     def set_dpo_runtime_beta(self, beta: float | None):
         # Adaptive-beta override from the trainer. The logged reward metrics
@@ -346,6 +683,46 @@ class BaseModelSetup(
             yield
         finally:
             for adapter in teachers:
+                adapter.remove_hook_from_module()
+            for adapter in students:
+                adapter.hook_to_module()
+
+    @contextmanager
+    def adapter_state(self, model: BaseModel, config: TrainConfig, state: str):
+        """Activate one named adapter state for a forward/backward section.
+
+        DMD2 uses three mutually-exclusive states: ``teacher`` is the base model
+        with no adapters, ``student`` is the trainable policy adapter, and
+        ``fake`` is the trainable fake-score adapter.
+        """
+        if config.training_method is not TrainingMethod.LORA:
+            raise NotImplementedError("Adapter states are only available with LoRA training")
+
+        students = model.adapters()
+        teachers = model.teacher_adapters()
+        fakes = model.fake_adapters()
+        all_adapters = [*students, *teachers, *fakes]
+
+        if state not in {"teacher", "student", "fake"}:
+            raise ValueError(f"Unsupported adapter state: {state}")
+        if state == "student" and len(students) == 0:
+            raise RuntimeError("student adapter state requested but no student adapters are attached to the model.")
+        if state == "fake" and len(fakes) == 0:
+            raise RuntimeError("fake adapter state requested but no fake-score adapters are attached to the model.")
+
+        for adapter in all_adapters:
+            adapter.remove_hook_from_module()
+        if state == "student":
+            for adapter in students:
+                adapter.hook_to_module()
+        elif state == "fake":
+            for adapter in fakes:
+                adapter.hook_to_module()
+
+        try:
+            yield
+        finally:
+            for adapter in all_adapters:
                 adapter.remove_hook_from_module()
             for adapter in students:
                 adapter.hook_to_module()

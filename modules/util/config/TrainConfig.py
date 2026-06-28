@@ -603,6 +603,20 @@ class TrainConfig(BaseConfig):
     # distillation
     distillation_teacher_lora_model_name: str
     distillation_base_anchor_weight: float
+    distill_enabled: bool
+    distill_target_steps: int
+    distill_teacher_steps: int
+    distill_teacher_steps_auto: bool
+    distill_timestep_grid_mode: str
+    distill_endpoint_loss_weight: float
+    distill_endpoint_lpips_weight: float
+    distill_kl_loss_weight: float
+    distill_ttur_ratio: int
+    distill_fake_warmup_steps: int
+    distill_vram_mode: str
+    distill_cfg_mode: str
+    distill_fake_adapter_type: str
+    distill_fake_adapter_rank: int
 
     # dpo
     rlhf_mode: RLHFMode
@@ -658,7 +672,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=19,
+            config_version=20,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -971,6 +985,20 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("rlhf_dpo_ipo_tau", 1000.0)
         migrated_data.setdefault("rlhf_dpo_adaptive_beta", False)
         migrated_data.setdefault("rlhf_dpo_timestep_margin_logging", False)
+        migrated_data.setdefault("distill_enabled", False)
+        migrated_data.setdefault("distill_target_steps", 4)
+        migrated_data.setdefault("distill_teacher_steps", 12)
+        migrated_data.setdefault("distill_teacher_steps_auto", True)
+        migrated_data.setdefault("distill_timestep_grid_mode", "AUTO")
+        migrated_data.setdefault("distill_endpoint_loss_weight", 0.25)
+        migrated_data.setdefault("distill_endpoint_lpips_weight", 0.0)
+        migrated_data.setdefault("distill_kl_loss_weight", 1.0)
+        migrated_data.setdefault("distill_ttur_ratio", 5)
+        migrated_data.setdefault("distill_fake_warmup_steps", 500)
+        migrated_data.setdefault("distill_vram_mode", "SPLIT")
+        migrated_data.setdefault("distill_cfg_mode", "AUTO")
+        migrated_data.setdefault("distill_fake_adapter_type", "LORA")
+        migrated_data.setdefault("distill_fake_adapter_rank", 16)
         return migrated_data
 
     def from_dict(self, data: dict) -> "TrainConfig":
@@ -985,6 +1013,26 @@ class TrainConfig(BaseConfig):
 
     def effective_dpo_ref_mode(self) -> DPORefMode:
         return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
+
+    def validate_distill_startup(self) -> str | None:
+        if not self.distill_enabled:
+            return None
+        if self.rlhf_enabled:
+            return "Distill and RLHF can not be enabled in the same training run."
+        if self.training_method != TrainingMethod.LORA:
+            return "Distill is currently implemented for LoRA training only."
+        if self.model_type != ModelType.Z_IMAGE:
+            return "Distill is currently implemented for Z-Image only."
+        if self.gradient_accumulation_steps > 1:
+            # The TTUR loop alternates fake/student updates per micro-step, but a
+            # single optimizer.step() spans the whole accumulation window, which
+            # would blend fake-score and student gradients into one update.
+            return "Distill requires gradient_accumulation_steps=1 (TTUR alternates the update target per step)."
+        if self.distill_vram_mode.upper() == "CONCURRENT":
+            # The loss path always runs the teacher/fake/student forwards
+            # sequentially (split). Concurrent fused forwards are not implemented.
+            return "Distill concurrent VRAM mode is not implemented yet; use split."
+        return None
 
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
@@ -1397,6 +1445,20 @@ class TrainConfig(BaseConfig):
         # distillation
         data.append(("distillation_teacher_lora_model_name", "", str, False))
         data.append(("distillation_base_anchor_weight", 0.0, float, False))
+        data.append(("distill_enabled", False, bool, False))
+        data.append(("distill_target_steps", 4, int, False))
+        data.append(("distill_teacher_steps", 12, int, False))
+        data.append(("distill_teacher_steps_auto", True, bool, False))
+        data.append(("distill_timestep_grid_mode", "AUTO", str, False))
+        data.append(("distill_endpoint_loss_weight", 0.25, float, False))
+        data.append(("distill_endpoint_lpips_weight", 0.0, float, False))
+        data.append(("distill_kl_loss_weight", 1.0, float, False))
+        data.append(("distill_ttur_ratio", 5, int, False))
+        data.append(("distill_fake_warmup_steps", 500, int, False))
+        data.append(("distill_vram_mode", "SPLIT", str, False))
+        data.append(("distill_cfg_mode", "AUTO", str, False))
+        data.append(("distill_fake_adapter_type", "LORA", str, False))
+        data.append(("distill_fake_adapter_rank", 16, int, False))
 
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))

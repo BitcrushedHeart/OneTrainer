@@ -75,6 +75,10 @@ class GenericTrainer(BaseTrainer):
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
 
+        distill_error = self.config.validate_distill_startup()
+        if distill_error is not None:
+            raise RuntimeError(distill_error)
+
         if multi.is_master():
             # TB writer creation is deferred to start() so a backup's tensorboard_subdir
             # can be reused and logging continues in the same TB run on resume.
@@ -1117,6 +1121,7 @@ class GenericTrainer(BaseTrainer):
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
         accumulated_dpo_metrics: dict[str, float] | None = None
+        accumulated_distill_metrics: dict[str, float | str] | None = None
         ema_loss = None
         ema_loss_steps = 0
         ema_reward_margin = None
@@ -1282,6 +1287,22 @@ class GenericTrainer(BaseTrainer):
                         # Mirror for Fix B save-side staging (after the SFT-anchor
                         # block so the mirror reflects the final dpo metrics dict).
                         self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
+                    elif self.config.distill_enabled:
+                        loss = self.model_setup.calculate_distill_loss(self.model, batch, self.config, train_progress)
+                        micro_distill_metrics = self.model_setup.get_last_distill_metrics()
+                        if accumulated_distill_metrics is None:
+                            accumulated_distill_metrics = {
+                                "mode": micro_distill_metrics.get("mode", ""),
+                                "_count": 0,
+                            }
+                            for key, value in micro_distill_metrics.items():
+                                if isinstance(value, int | float):
+                                    accumulated_distill_metrics[key] = 0.0
+                        accumulated_distill_metrics["mode"] = micro_distill_metrics.get("mode", "")
+                        for key, value in micro_distill_metrics.items():
+                            if isinstance(value, int | float):
+                                accumulated_distill_metrics[key] += value
+                        accumulated_distill_metrics["_count"] += 1
                     else:
                         # Standard training path
                         prior_pred_indices = [
@@ -1435,6 +1456,31 @@ class GenericTrainer(BaseTrainer):
                                         dpo_metrics["sft_anchor_loss"],
                                         train_progress.global_step,
                                     )
+                            if self.config.distill_enabled and accumulated_distill_metrics is not None:
+                                count = accumulated_distill_metrics.pop("_count")
+                                mode = accumulated_distill_metrics.pop("mode", "")
+                                distill_metrics = {
+                                    k: v / count
+                                    for k, v in accumulated_distill_metrics.items()
+                                    if isinstance(v, int | float)
+                                }
+                                self.tensorboard.add_scalar(
+                                    "loss/distill", distill_metrics["loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/fake_loss", distill_metrics["fake_loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/kl_loss", distill_metrics["kl_loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/endpoint_loss",
+                                    distill_metrics["endpoint_loss"],
+                                    train_progress.global_step,
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/mode_student", 1.0 if mode == "student" else 0.0, train_progress.global_step
+                                )
 
                                 # Reward-hacking signature: the margin keeps growing while
                                 # BOTH rewards go negative (the model degrades chosen and
@@ -1499,6 +1545,7 @@ class GenericTrainer(BaseTrainer):
 
                         accumulated_loss = 0.0
                         accumulated_dpo_metrics = None
+                        accumulated_distill_metrics = None
                         # Reset Fix B mirrors at the accumulator boundary so a
                         # backup taken immediately after this point captures a
                         # clean zero state.

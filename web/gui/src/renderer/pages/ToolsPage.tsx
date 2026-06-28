@@ -1,10 +1,23 @@
-import { Activity, Database, Grid3x3, Heart, Image, Layers, ListOrdered, RefreshCw, Video, Wand2 } from "lucide-react";
+import {
+  Activity,
+  Database,
+  Grid3x3,
+  Heart,
+  Image,
+  Layers,
+  ListOrdered,
+  RefreshCw,
+  Sparkles,
+  Video,
+  Wand2,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 
 import { BucketAnalysisModal } from "@/components/modals/BucketAnalysisModal";
 import { CaptionToolModal } from "@/components/modals/CaptionToolModal";
 import { ConvertModelModal } from "@/components/modals/ConvertModelModal";
+import { DistillDatasetModal } from "@/components/modals/DistillDatasetModal";
 import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { MergeOFTModal } from "@/components/modals/MergeOFTModal";
@@ -44,6 +57,7 @@ export default function ToolsPage() {
   const [convertOpen, setConvertOpen] = useState(false);
   const [samplingOpen, setSamplingOpen] = useState(false);
   const [dpoOpen, setDpoOpen] = useState(false);
+  const [distillOpen, setDistillOpen] = useState(false);
   const [bucketOpen, setBucketOpen] = useState(false);
   const [mergeOftOpen, setMergeOftOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
@@ -100,6 +114,12 @@ export default function ToolsPage() {
           onLaunch={() => setDpoOpen(true)}
         />
         <ToolCard
+          icon={<Sparkles className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Distillation Dataset"
+          description="Copy good images into a normalized metadata dataset for DMD2 distillation"
+          onLaunch={() => setDistillOpen(true)}
+        />
+        <ToolCard
           icon={<Grid3x3 className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="DPO Bucket Analysis"
           description="Analyze aspect-bucket counts and clean-up targets for your batch size"
@@ -120,6 +140,7 @@ export default function ToolsPage() {
       <ConvertModelModal open={convertOpen} onClose={() => setConvertOpen(false)} />
       <StandaloneSamplingModal open={samplingOpen} onClose={() => setSamplingOpen(false)} />
       <DPOToolModal open={dpoOpen} onClose={() => setDpoOpen(false)} />
+      <DistillDatasetModal open={distillOpen} onClose={() => setDistillOpen(false)} />
       <BucketAnalysisModal open={bucketOpen} onClose={() => setBucketOpen(false)} />
       <MergeOFTModal open={mergeOftOpen} onClose={() => setMergeOftOpen(false)} />
     </>
