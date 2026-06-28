@@ -63,8 +63,12 @@ class PeftBase(nn.Module):
             self.is_applied = True
 
     def remove_hook_from_module(self):
-        assert self.orig_forward is not None
+        # Guard on is_applied first: orig_forward is only assigned in
+        # hook_to_module(), so an adapter that was never hooked (e.g. the DMD2
+        # fake-score adapter before its first activation) has no orig_forward
+        # attribute at all. Make remove a safe no-op in that case.
         if self.is_applied:
+            assert self.orig_forward is not None
             self.orig_module.forward = self.orig_forward
             self.orig_module.train = self.orig_train
             self.orig_module.eval = self.orig_eval

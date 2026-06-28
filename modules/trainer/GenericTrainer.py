@@ -1456,32 +1456,6 @@ class GenericTrainer(BaseTrainer):
                                         dpo_metrics["sft_anchor_loss"],
                                         train_progress.global_step,
                                     )
-                            if self.config.distill_enabled and accumulated_distill_metrics is not None:
-                                count = accumulated_distill_metrics.pop("_count")
-                                mode = accumulated_distill_metrics.pop("mode", "")
-                                distill_metrics = {
-                                    k: v / count
-                                    for k, v in accumulated_distill_metrics.items()
-                                    if isinstance(v, int | float)
-                                }
-                                self.tensorboard.add_scalar(
-                                    "loss/distill", distill_metrics["loss"], train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "distill/fake_loss", distill_metrics["fake_loss"], train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "distill/kl_loss", distill_metrics["kl_loss"], train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "distill/endpoint_loss",
-                                    distill_metrics["endpoint_loss"],
-                                    train_progress.global_step,
-                                )
-                                self.tensorboard.add_scalar(
-                                    "distill/mode_student", 1.0 if mode == "student" else 0.0, train_progress.global_step
-                                )
-
                                 # Reward-hacking signature: the margin keeps growing while
                                 # BOTH rewards go negative (the model degrades chosen and
                                 # rejected alike) and held-out ranking saturates.
@@ -1531,6 +1505,31 @@ class GenericTrainer(BaseTrainer):
                                                 dpo_metrics[f"margin_t_q{quartile + 1}_sum"] / quartile_count,
                                                 train_progress.global_step,
                                             )
+                            if self.config.distill_enabled and accumulated_distill_metrics is not None:
+                                count = accumulated_distill_metrics.pop("_count")
+                                mode = accumulated_distill_metrics.pop("mode", "")
+                                distill_metrics = {
+                                    k: v / count
+                                    for k, v in accumulated_distill_metrics.items()
+                                    if isinstance(v, int | float)
+                                }
+                                self.tensorboard.add_scalar(
+                                    "loss/distill", distill_metrics["loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/fake_loss", distill_metrics["fake_loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/kl_loss", distill_metrics["kl_loss"], train_progress.global_step
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/endpoint_loss",
+                                    distill_metrics["endpoint_loss"],
+                                    train_progress.global_step,
+                                )
+                                self.tensorboard.add_scalar(
+                                    "distill/mode_student", 1.0 if mode == "student" else 0.0, train_progress.global_step
+                                )
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
