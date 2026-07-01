@@ -89,11 +89,25 @@ class LinuxCloud(BaseCloud):
     def _install_onetrainer(self, update: bool = False):
         config = self.config.cloud
         parent = Path(config.onetrainer_dir).parent.as_posix()
+        dir_q = shlex.quote(config.onetrainer_dir)
+        parent_q = shlex.quote(parent)
+        url_q = shlex.quote(config.git_url)
+        branch_q = shlex.quote(config.git_branch)
+        remote_ref_q = shlex.quote(f"origin/{config.git_branch}")
+        # If the OneTrainer dir is absent, run the install command (clone). If it is
+        # already present (many pod images pre-bake upstream), repoint the existing
+        # checkout onto the configured fork/branch and hard-reset — this preserves
+        # the pre-baked venv, and update.sh's git pull then tracks the fork.
         self.connection.run(
-            f"test -e {shlex.quote(config.onetrainer_dir)} \
-                              || (mkdir -p {shlex.quote(parent)} \
-                                  && cd {shlex.quote(parent)} \
-                                  && {config.install_cmd})",
+            f"if [ ! -e {dir_q} ]; then "
+            f"mkdir -p {parent_q} && cd {parent_q} && {config.install_cmd}; "
+            f"else "
+            f"cd {dir_q} "
+            f"&& (git remote set-url origin {url_q} || git remote add origin {url_q}) "
+            f"&& git fetch origin {branch_q} "
+            f"&& git checkout -B {branch_q} --track {remote_ref_q} "
+            f"&& git reset --hard {remote_ref_q}; "
+            f"fi",
             in_stream=False,
         )
 

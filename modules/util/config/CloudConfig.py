@@ -66,6 +66,8 @@ class CloudConfig(BaseConfig):
     install_onetrainer: bool
     update_onetrainer: bool
     install_cmd: str
+    git_url: str
+    git_branch: str
     detach_trainer: bool
     run_id: str
     download_sampels: bool
@@ -106,6 +108,11 @@ class CloudConfig(BaseConfig):
                 False,
             )
         )
+        # Used to repoint an already-present checkout (e.g. a pod image pre-baked
+        # with upstream) onto the fork/branch, since install_cmd only runs when the
+        # OneTrainer dir is absent.
+        data.append(("git_url", "https://github.com/BitcrushedHeart/OneTrainer", str, False))
+        data.append(("git_branch", "bitcrushed-blend", str, False))
         data.append(("install_onetrainer", True, bool, False))
         data.append(("update_onetrainer", True, bool, False))
         data.append(("detach_trainer", False, bool, False))

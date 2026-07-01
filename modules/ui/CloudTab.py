@@ -180,6 +180,24 @@ class CloudTab:
             self.frame, 6, 2, "Update OneTrainer", tooltip="Update OneTrainer if it already exists on the cloud."
         )
         components.switch(self.frame, 6, 3, self.ui_state, "cloud.update_onetrainer")
+        components.label(
+            self.frame,
+            7,
+            2,
+            "Git URL",
+            tooltip="Repo used to repoint an already-present checkout onto your fork/branch when the OneTrainer "
+            "directory already exists on the pod (e.g. images pre-baked with upstream). Install command only runs "
+            "when the directory is absent.",
+        )
+        components.entry(self.frame, 7, 3, self.ui_state, "cloud.git_url")
+        components.label(
+            self.frame,
+            7,
+            4,
+            "Git branch",
+            tooltip="Branch checked out and hard-reset when repointing an existing checkout.",
+        )
+        components.entry(self.frame, 7, 5, self.ui_state, "cloud.git_branch")
 
         components.label(
             self.frame,
