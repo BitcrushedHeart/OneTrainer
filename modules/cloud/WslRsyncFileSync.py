@@ -82,4 +82,10 @@ class WslRsyncFileSync(NativeRsyncFileSync):
         # args[0] is always "rsync"; replace it with the resolved WSL binary and translate any local
         # Windows drive paths in the remaining arguments to /mnt/<drive>/... form.
         translated = [self._to_wsl_path(arg) for arg in args[1:]]
-        subprocess.run([self.wsl, "-e", self.wsl_rsync, *translated]).check_returncode()
+        # Capture stderr so a non-zero exit surfaces rsync's actual "rsync: ..." diagnostic line
+        # (e.g. a failed chown/chmod/utime on a restrictive volume) instead of a bare exit code;
+        # stdout keeps streaming so -v progress still shows live.
+        result = subprocess.run([self.wsl, "-e", self.wsl_rsync, *translated], stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or "<no stderr captured>"
+            raise RuntimeError(f"rsync failed (exit {result.returncode}):\n{detail}")

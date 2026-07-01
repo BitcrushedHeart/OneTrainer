@@ -94,6 +94,28 @@ def analyze_multiplier(f, keys, mult_keys):
         print("  VERDICT: CHECK -- multiplier out of band, or dead rows / NaN present")
 
 
+def analyze_oft_only(f, keys):
+    """OFT-only adapter (no DoRA magnitude): report rotation strength only."""
+    oft_std = []
+    oft_absmax = 0.0
+    nan = inf = 0
+    for k in keys:
+        t = f.get_tensor(k).float()
+        nan += int(torch.isnan(t).sum())
+        inf += int(torch.isinf(t).sum())
+        if k.endswith("oft_R.weight"):
+            oft_std.append(float(t.std()))
+            oft_absmax = max(oft_absmax, float(t.abs().max()))
+    print(f"  format: OFT-only (no DoRA magnitude)  oft_R layers={len(oft_std)}")
+    if oft_std:
+        print(
+            f"  oft_R weight std (mean/min/max): {sum(oft_std) / len(oft_std):.5g} / "
+            f"{min(oft_std):.5g} / {max(oft_std):.5g}   abs_max={oft_absmax:.5g}"
+        )
+    print(f"  NaN: {nan}   Inf: {inf}")
+    print("  VERDICT: rotation strength above (compare vs prior gens ~3-5e-3); OFT is norm-preserving")
+
+
 def analyze(path: str):
     print(f"\n################ {path}")
     with safe_open(path, framework="pt", device="cpu") as f:
@@ -105,6 +127,9 @@ def analyze(path: str):
             return
 
         dora_keys = sorted(k for k in keys if k.endswith("dora_scale"))
+        if not dora_keys:
+            analyze_oft_only(f, keys)
+            return
 
         all_scale = []
         all_dora = []

@@ -5,8 +5,10 @@ import {
   CornerUpLeft,
   Eye,
   SkipForward,
+  Sparkles,
   ThumbsDown,
   ThumbsUp,
+  Trash2,
   Undo2,
   X,
   ZoomIn,
@@ -53,8 +55,17 @@ function aspectRatioStyle(ar: string): React.CSSProperties | undefined {
   return { aspectRatio: `${m[1]} / ${m[2]}` };
 }
 
-export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCancel }: TriageStepProps) {
+export function TriageStep({
+  group,
+  pairsDone,
+  onCommitPairs,
+  onAutoAlign,
+  onSkipGroup,
+  onDiscardGroup,
+  onCancel,
+}: TriageStepProps) {
   const [phase, setPhase] = useState<"voting" | "pairing">("voting");
+  const [aligning, setAligning] = useState(false);
   // Verdicts are keyed by image index and sparse: undefined = not yet scored.
   // The cursor moves freely (arrow keys, thumbnail clicks), so earlier votes
   // can be revisited and changed at any time without losing the rest.
@@ -87,6 +98,7 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
     setReview(null);
     setStripOpen(false);
     setCommitting(false);
+    setAligning(false);
   }, [group]);
 
   // Warm the browser HTTP cache for the next few images so advancing after a
@@ -340,11 +352,46 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
     setPhase("voting");
   }, []);
 
+  // Auto-align: hand the full good/bad sets to the backend, which pairs each
+  // chosen with its most visually-similar rejected (DINOv2). Surplus images land
+  // back in the pools; the user can still rearrange before confirming.
+  const autoAlign = useCallback(async () => {
+    if (aligning) return;
+    const good = [...pairs.map((p) => p.chosen), ...goodPool];
+    const bad = [...pairs.map((p) => p.rejected), ...badPool];
+    if (good.length === 0 || bad.length === 0) return;
+    setAligning(true);
+    try {
+      const res = await onAutoAlign(good, bad);
+      if (res) {
+        setPairs(res.pairs);
+        setGoodPool(res.chosenPool);
+        setBadPool(res.rejectedPool);
+        setPicked(null);
+      }
+    } finally {
+      setAligning(false);
+    }
+  }, [aligning, pairs, goodPool, badPool, onAutoAlign]);
+
   const handleConfirm = useCallback(async () => {
     if (pairs.length === 0 || committing) return;
     setCommitting(true);
     try {
-      await onCommitPairs(pairs);
+      await onCommitPairs(pairs, false);
+    } finally {
+      setCommitting(false);
+    }
+  }, [pairs, committing, onCommitPairs]);
+
+  // Save the formed pairs, then retire the entire group from the source tree:
+  // paired sources move to .chosen/.rejected, every leftover to .discard, so
+  // nothing here can resurface in a later session.
+  const handleSaveAndDiscard = useCallback(async () => {
+    if (pairs.length === 0 || committing) return;
+    setCommitting(true);
+    try {
+      await onCommitPairs(pairs, true);
     } finally {
       setCommitting(false);
     }
@@ -412,6 +459,16 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
         <Button variant="ghost" size="sm" onClick={onSkipGroup} style={{ background: "#8B4513", color: "#fff" }}>
           <SkipForward className="w-4 h-4" />
           Skip Group
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onDiscardGroup}
+          style={{ background: "#7f1d1d", color: "#fff" }}
+          title="Move every image in this group to a .discard subfolder so it never reappears (no pairs saved)"
+        >
+          <Trash2 className="w-4 h-4" />
+          Discard Group
         </Button>
         <Button variant="ghost" size="sm" onClick={onCancel}>
           <X className="w-4 h-4" />
@@ -776,6 +833,16 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
             <Eye className="w-4 h-4" />
             Review all
           </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void autoAlign()}
+            disabled={aligning || counts.good === 0 || counts.bad === 0}
+            title="Pair each chosen with its most visually similar rejected (DINOv2)"
+          >
+            <Sparkles className="w-4 h-4" />
+            {aligning ? "Aligning…" : "Auto-align"}
+          </Button>
           <span className="text-[10px] text-[var(--color-on-surface-secondary)]">
             Re-voting rebuilds pairs — manual swaps reset. Rescoring here keeps them.
           </span>
@@ -787,6 +854,17 @@ export function TriageStep({ group, pairsDone, onCommitPairs, onSkipGroup, onCan
               {picked.side === "good" ? "Good" : "Bad"} card (Esc to cancel)
             </span>
           )}
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={() => void handleSaveAndDiscard()}
+            disabled={pairs.length === 0 || committing}
+            style={pairs.length === 0 || committing ? undefined : { background: "#7f1d1d", color: "#fff" }}
+            title="Save these pairs, then move the paired sources to .chosen/.rejected and every remaining image to .discard so this group won't reappear"
+          >
+            <Trash2 className="w-4 h-4" />
+            {committing ? "Saving…" : "Save & Discard Rest"}
+          </Button>
           <Button
             variant="primary"
             size="md"

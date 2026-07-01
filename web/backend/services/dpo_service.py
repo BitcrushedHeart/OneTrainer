@@ -53,6 +53,12 @@ class DPOService(SingletonMixin):
         # matches the Ctk yes/no/cancel dialog semantics.
         self._pending_pair: dict | None = None
 
+        # Re-pair-by-similarity background job state (separate from curation
+        # sessions — it operates on already-exported concept folders).
+        self._repair_lock = threading.Lock()
+        self._repair_thread: threading.Thread | None = None
+        self._repair_state: dict = {"running": False}
+
         # Swiss tournament state (per-group)
         self._swiss: SwissTournament | None = None
         # Server-authoritative best-to-worst ranking for the review step;
@@ -68,16 +74,44 @@ class DPOService(SingletonMixin):
             with suppress(Exception):
                 self._ws_broadcast(message)
 
+    def _resolve_concepts(self) -> list:
+        """Concepts for the active config. The web stores concepts in a separate
+        file (``concept_file_name``) rather than inline on the config, so the
+        in-memory ``concepts`` list is usually empty — fall back to loading that
+        file (mirroring TrainerService) so the DPO tools actually see them."""
+        train_config = ConfigService.get_instance().get_config_for_training()
+        concepts = train_config.concepts or []
+        if not concepts and train_config.concept_file_name and os.path.isfile(train_config.concept_file_name):
+            from modules.util.config.ConceptConfig import ConceptConfig
+            from web.backend.services.concept_service import ConceptService
+
+            concepts = [
+                ConceptConfig.default_values().from_dict(entry)
+                for entry in ConceptService().load_concepts(train_config.concept_file_name)
+            ]
+        return concepts
+
+    def _no_pairs_reason(self, concepts: list) -> str:
+        """A specific message for why no DPO concept pairs were found, so the user
+        can tell 'no concepts at all' from 'concepts exist but lack DPO patterns'."""
+        if not concepts:
+            return "No concepts configured. Add concepts (with chosen/rejected DPO patterns) in the Concepts tab."
+        enabled = [c for c in concepts if getattr(c, "enabled", False)]
+        if not enabled:
+            return f"Found {len(concepts)} concept(s) but none are enabled."
+        return (
+            f"Found {len(enabled)} enabled concept(s), but none have DPO patterns set. "
+            "Set the chosen and rejected patterns on a concept (e.g. 'chosen/{}' and 'rejected/{}')."
+        )
+
     def check_pairs(self) -> dict:
         from modules.util.dpo_curation_util import check_dpo_pairs
         from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
-        config_service = ConfigService.get_instance()
-        concepts = config_service.get_config_for_training().concepts or []
-
+        concepts = self._resolve_concepts()
         concept_pairs = dpo_concept_pattern_dirs(concepts)
         if not concept_pairs:
-            return {"ok": False, "error": "No DPO concepts found. Set the chosen/rejected patterns on a concept."}
+            return {"ok": False, "error": self._no_pairs_reason(concepts)}
 
         result = check_dpo_pairs(concept_pairs)
         return {"ok": True, "result": result}
@@ -93,13 +127,12 @@ class DPOService(SingletonMixin):
         from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
         from modules.util.path_util import supported_image_extensions
 
-        config_service = ConfigService.get_instance()
-        concepts = config_service.get_config_for_training().concepts or []
+        concepts = self._resolve_concepts()
         exts = supported_image_extensions()
 
         concept_pairs = dpo_concept_pattern_dirs(concepts)
         if not concept_pairs:
-            return {"ok": False, "error": "No DPO concepts found. Set the chosen/rejected patterns on a concept."}
+            return {"ok": False, "error": self._no_pairs_reason(concepts)}
 
         result = check_dpo_pairs(concept_pairs)
         removed = 0
@@ -142,12 +175,10 @@ class DPOService(SingletonMixin):
         from modules.util.dpo_curation_util import scan_finalized_pairs
         from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
-        config_service = ConfigService.get_instance()
-        concepts = config_service.get_config_for_training().concepts or []
-
+        concepts = self._resolve_concepts()
         all_pairs = dpo_concept_pattern_dirs(concepts)
         if not all_pairs:
-            return {"ok": False, "error": "No DPO concept pairs found"}
+            return {"ok": False, "error": self._no_pairs_reason(concepts)}
 
         pairs = scan_finalized_pairs(all_pairs)
         return {"ok": True, "pairs": pairs}
@@ -162,19 +193,14 @@ class DPOService(SingletonMixin):
         from modules.util.dpo_curation_util import fix_multiline_captions
         from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
-        config_service = ConfigService.get_instance()
-        concepts = config_service.get_config_for_training().concepts or []
-
-        all_pairs = dpo_concept_pattern_dirs(concepts)
+        all_pairs = dpo_concept_pattern_dirs(self._resolve_concepts())
         fixed = fix_multiline_captions(all_pairs)
         return {"ok": True, "fixed": fixed}
 
     def _all_concept_pairs(self) -> list[tuple[str, str]]:
         from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 
-        config_service = ConfigService.get_instance()
-        concepts = config_service.get_config_for_training().concepts or []
-        return dpo_concept_pattern_dirs(concepts)
+        return dpo_concept_pattern_dirs(self._resolve_concepts())
 
     def _is_path_in_concept_pairs(self, path: str, concept_pairs: list[tuple[str, str]]) -> bool:
         """Verify `path` is inside one of the configured DPO concept folders.
@@ -219,6 +245,56 @@ class DPOService(SingletonMixin):
         mismatches = find_caption_mismatches(all_pairs)
         corrected = correct_all_captions_to_chosen(mismatches)
         return {"ok": True, "corrected": corrected}
+
+    def repair_rejected(self, quality_floor: float = 0.85) -> dict:
+        """Start a re-pair-by-similarity job in the background and return
+        immediately. Embedding a whole dataset with DINOv2 takes a while, so the
+        client polls :meth:`repair_status` for live progress instead of blocking
+        on one long request."""
+        from modules.util.dpo_curation_util import repair_rejected_pairs
+
+        all_pairs = self._all_concept_pairs()
+        if not all_pairs:
+            return {"ok": False, "error": self._no_pairs_reason(self._resolve_concepts())}
+
+        with self._repair_lock:
+            if self._repair_state.get("running"):
+                return {"ok": False, "error": "A re-pair is already running.", "running": True}
+            self._repair_state = {
+                "running": True,
+                "phase": "starting",
+                "images_done": 0,
+                "images_total": 0,
+                "groups_done": 0,
+                "groups_total": 0,
+                "pairs_repaired": 0,
+                "summary": None,
+                "error": None,
+            }
+
+        def _progress(p: dict) -> None:
+            with self._repair_lock:
+                for key in ("phase", "images_done", "images_total", "groups_done", "groups_total", "pairs_repaired"):
+                    if key in p:
+                        self._repair_state[key] = p[key]
+
+        def _worker() -> None:
+            try:
+                summary = repair_rejected_pairs(all_pairs, quality_floor=quality_floor, progress=_progress)
+                with self._repair_lock:
+                    self._repair_state.update(running=False, phase="done", summary=summary)
+            except Exception as ex:
+                logger.exception("DPO re-pair failed")
+                with self._repair_lock:
+                    self._repair_state.update(running=False, phase="error", error=str(ex))
+
+        self._repair_thread = threading.Thread(target=_worker, daemon=True)
+        self._repair_thread.start()
+        return {"ok": True, "started": True}
+
+    def repair_status(self) -> dict:
+        with self._repair_lock:
+            return {"ok": True, **self._repair_state}
 
     def apply_caption(self, chosen_image: str, rejected_image: str, caption: str) -> dict:
         from modules.util.dpo_curation_util import apply_caption_to_pair
@@ -533,7 +609,37 @@ class DPOService(SingletonMixin):
         self._ranked_order = None
         return {"ok": True}
 
-    def commit_triage_pairs(self, pairs: list[tuple[str, str]]) -> dict:
+    def triage_align(self, good: list[str], bad: list[str]) -> dict:
+        """Chosen-anchored similarity pairing for a triage group: pair each good
+        (chosen) image with its most visually-similar bad (rejected) image. Pure
+        suggestion — writes nothing; the client applies the result and the user
+        can still rearrange before committing. Validates both pools against the
+        current group's images so an arbitrary path can't be embedded."""
+        from modules.util.dpo_curation_util import align_pool_by_similarity
+
+        with self._lock:
+            if not self._current_group:
+                return {"ok": False, "error": "No active group"}
+            valid = set(self._current_group.get("images", []))
+
+        for path in list(good) + list(bad):
+            if path not in valid:
+                return {"ok": False, "error": "Image is not part of the current group"}
+
+        # Embedding (a model call) runs outside the lock so the UI stays responsive.
+        try:
+            result = align_pool_by_similarity(good, bad)
+        except RuntimeError as ex:
+            return {"ok": False, "error": str(ex)}
+
+        return {
+            "ok": True,
+            "pairs": [{"chosen": c, "rejected": r} for c, r in result["pairs"]],
+            "chosen_pool": result["chosen_pool"],
+            "rejected_pool": result["rejected_pool"],
+        }
+
+    def commit_triage_pairs(self, pairs: list[tuple[str, str]], discard_rest: bool = False) -> dict:
         """Batch-commit a triage group's pairs, then release the group.
 
         Triage voting/pairing happens entirely client-side, so this is the
@@ -541,8 +647,15 @@ class DPOService(SingletonMixin):
         _remaining_images (the dedup-filtered whitelist served by next_group)
         before anything is exported — a malformed batch writes nothing. An
         empty list just releases the group, equivalent to skip_group.
+
+        When ``discard_rest`` is set, the whole group is retired from the source
+        tree after the pairs are exported: each paired source image is moved into
+        a dot-prefixed ``.chosen``/``.rejected`` subfolder and every unpaired
+        leftover (unscored, skipped, or surplus) into ``.discard``. Dot-prefixed
+        folders are pruned by the scanner, so nothing in the group can reappear
+        in a later session.
         """
-        from modules.util.dpo_curation_util import export_single_pair
+        from modules.util.dpo_curation_util import export_single_pair, move_to_dot_bucket
 
         with self._lock:
             if not self._current_group:
@@ -573,13 +686,47 @@ class DPOService(SingletonMixin):
                 self._mark_pair_used(chosen, rejected)
                 self._pairs_created_in_group += 1
 
-            self._remaining_images = [i for i in self._remaining_images if i not in seen]
+            rest = [i for i in self._remaining_images if i not in seen]
+
+            discarded = 0
+            if discard_rest:
+                # export_single_pair already copied the sources to the output
+                # dir, so it's safe to relocate them now. Paired sources go to
+                # .chosen/.rejected, everything else to .discard — all pruned by
+                # walk_skipping_dotted so this group never rescans.
+                move_to_dot_bucket([chosen for chosen, _ in pairs], ".chosen")
+                move_to_dot_bucket([rejected for _, rejected in pairs], ".rejected")
+                discarded = move_to_dot_bucket(rest, ".discard")
+
+            self._remaining_images = rest
             # Release the group like skip_group so fetch_next_group advances.
             self._current_group = None
             self._pending_pair = None
             self._selected_best = None
             self._selection_phase = "best"
-            return {"ok": True, "pairs_done": self._pairs_created_in_group}
+            return {"ok": True, "pairs_done": self._pairs_created_in_group, "discarded": discarded}
+
+    def discard_group(self) -> dict:
+        """Retire the current group without saving any pair: move every remaining
+        source image into a dot-prefixed ``.discard`` subfolder and release the
+        group. Unlike :meth:`skip_group`, the images are physically removed from
+        the source tree (dot folders are pruned by the scanner), so a discarded
+        group never reappears in a later session. Mode-agnostic — the header
+        button sits next to Skip Group in every curation mode."""
+        from modules.util.dpo_curation_util import move_to_dot_bucket
+
+        with self._lock:
+            if not self._current_group:
+                return {"ok": False, "error": "No active group"}
+            discarded = move_to_dot_bucket(list(self._remaining_images), ".discard")
+            self._remaining_images = []
+            self._current_group = None
+            self._pending_pair = None
+            self._selected_best = None
+            self._selection_phase = "best"
+            self._swiss = None
+            self._ranked_order = None
+            return {"ok": True, "discarded": discarded}
 
     def finalize_session(self, val_percentage: float = 0.0) -> dict:
         from modules.util.dpo_curation_util import finalize_export

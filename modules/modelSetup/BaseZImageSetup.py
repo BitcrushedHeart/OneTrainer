@@ -234,6 +234,23 @@ class BaseZImageSetup(
             sigmas=model.noise_scheduler.sigmas,
         ).mean()
 
+    @staticmethod
+    def _lpips_vae_colocated(vae_device: torch.device, train_device: torch.device) -> bool:
+        """Whether the VAE sits on the compute device, so LPIPS can decode.
+
+        Compares by device *type*, treating an unindexed device (``cuda``) as
+        compatible with its indexed form (``cuda:0``). A strict ``!=`` skips LPIPS
+        even after the VAE is moved on-device for validation, because
+        ``torch.device("cuda") != torch.device("cuda:0")``. Distinct indices
+        (``cuda:1`` vs ``cuda:0``) and a CPU-offloaded VAE still count as not
+        co-located.
+        """
+        if vae_device.type != train_device.type:
+            return False
+        if vae_device.index is None or train_device.index is None:
+            return True
+        return vae_device.index == train_device.index
+
     def _distill_perceptual_loss(
         self,
         model: ZImageModel,
@@ -252,7 +269,7 @@ class BaseZImageSetup(
             return None
         try:
             vae_device = next(model.vae.parameters()).device
-            if vae_device != self.train_device:
+            if not self._lpips_vae_colocated(vae_device, self.train_device):
                 # VAE is offloaded (latent caching); decoding here would thrash
                 # devices every step. Skip rather than pay that cost silently.
                 return None

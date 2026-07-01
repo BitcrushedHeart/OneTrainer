@@ -23,21 +23,58 @@ class NativeRsyncFileSync(BaseSSHFileSync):
     def _remote(self, path: Path) -> str:
         return f"{self.secrets.user}@{self.secrets.host}:{path.as_posix()}"
 
+    # Windows CreateProcess caps the whole command line near 32767 chars (and the WSL backend prepends
+    # wsl.exe + the rsync path on top of that). Passing one argv entry per file overflows it on large
+    # concept folders, so split the file list into batches whose argument text stays well under the cap.
+    _MAX_ARG_CHARS = 24000
+
     def _run(self, args: list[str]) -> None:
-        subprocess.run(args).check_returncode()
+        # Capture stderr so a non-zero exit surfaces rsync's actual "rsync: ..." diagnostic line
+        # (e.g. a failed chown/chmod/utime on a restrictive volume) instead of a bare exit code;
+        # stdout keeps streaming so -v progress still shows live.
+        result = subprocess.run(args, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip() or "<no stderr captured>"
+            raise RuntimeError(f"rsync failed (exit {result.returncode}):\n{detail}")
+
+    def _run_upload_batched(self, files, remote_spec: str, extra_flags=()) -> None:
+        base = ["rsync", "-av", "--no-owner", "--no-group", *extra_flags, "-e", self.ssh_cmd]
+        batch: list[str] = []
+        length = 0
+        for file in files:
+            text = str(file)
+            if batch and length + len(text) + 1 > self._MAX_ARG_CHARS:
+                self._run([*base, *batch, remote_spec])
+                batch = []
+                length = 0
+            batch.append(text)
+            length += len(text) + 1
+        if batch:
+            self._run([*base, *batch, remote_spec])
 
     def upload_files(self, local_files, remote_dir: Path):
         if not local_files:
             return
         self.sync_connection.open()
         self.sync_connection.run(f"mkdir -p {self._quote_remote(remote_dir)}", in_stream=False)
-        self._run(["rsync", "-av", "-e", self.ssh_cmd, *map(str, local_files), self._remote(remote_dir)])
+        self._run_upload_batched(local_files, self._remote(remote_dir))
 
     def download_files(self, local_dir: Path, remote_files):
         if not remote_files:
             return
         local_dir.mkdir(parents=True, exist_ok=True)
-        self._run(["rsync", "-av", "-e", self.ssh_cmd, *[self._remote(path) for path in remote_files], str(local_dir)])
+        self._run(
+            [
+                "rsync",
+                "-av",
+                "--no-owner",
+                "--no-group",
+                "-e",
+                self.ssh_cmd,
+                *[self._remote(path) for path in remote_files],
+                str(local_dir),
+            ]
+        )
 
     def upload_file(self, local_file: Path, remote_file: Path):
         self.sync_up_file(local=local_file, remote=remote_file)
@@ -48,7 +85,7 @@ class NativeRsyncFileSync(BaseSSHFileSync):
     def sync_up_file(self, local: Path, remote: Path):
         self.sync_connection.open()
         self.sync_connection.run(f"mkdir -p {self._quote_remote(remote.parent)}", in_stream=False)
-        self._run(["rsync", "-av", "-e", self.ssh_cmd, str(local), self._remote(remote)])
+        self._run(["rsync", "-av", "--no-owner", "--no-group", "-e", self.ssh_cmd, str(local), self._remote(remote)])
 
     def sync_up_dir(
         self,
@@ -70,7 +107,7 @@ class NativeRsyncFileSync(BaseSSHFileSync):
                 and (not skip_hidden or not path.name.startswith("."))
             ]
             if files:
-                self._run(["rsync", "-av", "-e", self.ssh_cmd, *map(str, files), self._remote(remote)])
+                self._run_upload_batched(files, self._remote(remote))
             return
 
         # rsync only creates the final destination component, not missing parents. On a fresh pod
@@ -79,7 +116,7 @@ class NativeRsyncFileSync(BaseSSHFileSync):
         self.sync_connection.open()
         self.sync_connection.run(f"mkdir -p {self._quote_remote(remote)}", in_stream=False)
 
-        args = ["rsync", "-av", "--delete", "-e", self.ssh_cmd]
+        args = ["rsync", "-av", "--no-owner", "--no-group", "--delete", "-e", self.ssh_cmd]
         if skip_hidden:
             args.extend(["--exclude", ".*"])
         if allowed_extensions is not None:
@@ -93,12 +130,24 @@ class NativeRsyncFileSync(BaseSSHFileSync):
 
     def sync_down_file(self, local: Path, remote: Path):
         local.parent.mkdir(parents=True, exist_ok=True)
-        self._run(["rsync", "-av", "-e", self.ssh_cmd, self._remote(remote), str(local)])
+        self._run(["rsync", "-av", "--no-owner", "--no-group", "-e", self.ssh_cmd, self._remote(remote), str(local)])
 
     def sync_down_dir(self, local: Path, remote: Path, filter=None):
         if filter is None:
             local.mkdir(parents=True, exist_ok=True)
-            self._run(["rsync", "-av", "--delete", "-e", self.ssh_cmd, self._remote(remote) + "/", str(local)])
+            self._run(
+                [
+                    "rsync",
+                    "-av",
+                    "--no-owner",
+                    "--no-group",
+                    "--delete",
+                    "-e",
+                    self.ssh_cmd,
+                    self._remote(remote) + "/",
+                    str(local),
+                ]
+            )
             return
 
         super().sync_down_dir(local=local, remote=remote, filter=filter)

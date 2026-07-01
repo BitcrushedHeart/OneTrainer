@@ -205,7 +205,9 @@ def merge_oft_adapter(
             # ||merged_row|| == |dora_multiplier| * ||base_row||.
             base_row_norms[key] = w.reshape(w.shape[0], -1).to(torch.float32).norm(dim=1)
             if strength != 1.0:
-                base_snapshots[key] = w.clone()
+                # Keep the pre-merge snapshot on CPU -- holding all base weights on
+                # the compute device doubles VRAM (~2x model size) and OOMs the bake.
+                base_snapshots[key] = w.detach().to("cpu", copy=True)
 
     if pre_failures:
         raise MergeVerificationError(pre_failures)
@@ -220,8 +222,9 @@ def merge_oft_adapter(
             _, base_modules, _ = collect_oft_modules(wrapper)
             for key, base_module in base_modules.items():
                 merged = base_module.weight.data
-                base = base_snapshots[key]
-                mixed = (1.0 - strength) * base.to(torch.float32) + strength * merged.to(torch.float32)
+                # Move the CPU snapshot back one layer at a time (minimal extra VRAM).
+                base = base_snapshots[key].to(merged.device, torch.float32)
+                mixed = (1.0 - strength) * base + strength * merged.to(torch.float32)
                 base_module.weight.data.copy_(mixed.to(merged.dtype))
         base_snapshots.clear()
 

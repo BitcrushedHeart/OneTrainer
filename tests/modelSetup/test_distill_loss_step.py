@@ -1,12 +1,15 @@
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.distill_dmd2_util import build_distill_sigma_matrix
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
 
 import torch
 from torch import nn
+
+import pytest
 
 
 class ToggleAdapter:
@@ -97,7 +100,9 @@ class TinyDistillSetup(BaseModelSetup):
             state = "teacher"
             predicted = model.base(latent)
 
-        self.velocity_calls.append((state, conditioning, float(sigma.flatten()[0].detach().cpu())))
+        self.velocity_calls.append(
+            (state, conditioning, float(sigma.flatten()[0].detach().cpu()), torch.is_grad_enabled(), latent)
+        )
         if conditioning == "unconditional":
             return predicted * 0.5
         return predicted
@@ -162,6 +167,7 @@ def test_distill_loss_step_runs_metadata_cfg_baked_scheduler_trajectory():
     progress = TrainProgress()
     progress.global_step = 3
     config = _config()
+    config.distill_backprop_random_step = False  # pin k to the final step for a deterministic count
     batch = {
         "latent_image": torch.zeros(2, 2),
         "target_latent": torch.zeros(2, 2),
@@ -211,3 +217,216 @@ def test_distill_student_kl_gradient_is_nonzero_when_fake_differs_from_teacher()
     assert setup.get_last_distill_metrics()["mode"] == "student"
     assert model.student.weight.grad is not None
     assert model.student.weight.grad.abs().sum().item() > 0.0
+
+
+# --- Paired teacher-match + stochastic backprop-step (per-step one-step) tests ---
+
+
+def _setup():
+    return TinyDistillSetup(torch.device("cpu"), torch.device("cpu"), False)
+
+
+def _student_progress(global_step: int) -> TrainProgress:
+    progress = TrainProgress()
+    progress.global_step = global_step
+    return progress
+
+
+def test_x0_has_grad_for_an_early_backprop_step():
+    # Guards the autograd defect of the naive design: if steps after k run under
+    # no_grad and x0 is the final latent, x0 is detached for any non-final k.
+    # The one-step x0 = x_k - sigma_k * v_k must carry grad for ANY chosen k.
+    config = _config()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+    for global_step in range(3, 400, 3):  # student-mode steps under _config TTUR
+        model = TinyDistillModel()
+        setup = _setup()
+        loss = setup.calculate_distill_loss(model, batch, config, _student_progress(global_step))
+        if setup._last_grad_step_index == 0:  # an early, non-final step was chosen
+            assert loss.requires_grad
+            loss.backward()
+            assert model.student.weight.grad is not None
+            assert model.student.weight.grad.abs().sum().item() > 0.0
+            return
+    raise AssertionError("random backprop step never selected an early step")
+
+
+def test_teacher_match_target_depends_on_initial_noise():
+    # Well-posedness / diversity guard: different z (and k) -> different teacher
+    # target and different student gradient. The old unpaired-image objective
+    # produced a noise-independent target and collapsed.
+    config = _config()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+    model = TinyDistillModel()
+    setup = _setup()
+    out = []
+    for global_step in (3, 6):
+        model.student.weight.grad = None
+        loss = setup.calculate_distill_loss(model, batch, config, _student_progress(global_step))
+        assert setup.get_last_distill_metrics()["mode"] == "student"
+        loss.backward()
+        out.append((setup._last_distill_x0_teacher.clone(), model.student.weight.grad.clone()))
+    assert (out[0][0] - out[1][0]).abs().mean().item() > 1e-4
+    assert (out[0][1] - out[1][1]).abs().sum().item() > 1e-6
+
+
+def test_teacher_match_ignores_dataset_image_latent():
+    # Regression guard for the collapse bug: the target no longer depends on the
+    # dataset image, so changing the image leaves the student gradient unchanged.
+    config = _config()
+    model = TinyDistillModel()
+    setup = _setup()
+
+    def grad_for(image):
+        model.student.weight.grad = None
+        batch = {"latent_image": image, "target_latent": image}
+        loss = setup.calculate_distill_loss(model, batch, config, _student_progress(3))
+        loss.backward()
+        return model.student.weight.grad.clone()
+
+    g_zeros = grad_for(torch.zeros(4, 2))
+    g_fives = grad_for(torch.full((4, 2), 5.0))
+    assert torch.allclose(g_zeros, g_fives)
+
+
+def test_teacher_match_produces_student_gradient_in_isolation():
+    config = _config()
+    config.distill_kl_loss_weight = 0.0  # isolate the teacher-match term
+    model = TinyDistillModel()
+    with torch.no_grad():
+        model.base.weight.copy_(torch.eye(2) * 2.0)  # teacher != student -> nonzero MSE
+        model.student.weight.copy_(torch.eye(2))
+    setup = _setup()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+
+    loss = setup.calculate_distill_loss(model, batch, config, _student_progress(3))
+    loss.backward()
+
+    assert model.student.weight.grad is not None
+    assert model.student.weight.grad.abs().sum().item() > 0.0
+    assert model.fake.weight.grad is None
+
+
+def test_random_backprop_step_covers_all_steps_and_is_reproducible():
+    config = _config()  # distill_target_steps == 4
+    setup = _setup()
+    model = TinyDistillModel()
+    sigmas = build_distill_sigma_matrix(
+        config.distill_target_steps, torch.tensor([12, 12, 12, 12]), "AUTO", torch.device("cpu")
+    )
+    z = torch.randn(4, 2)
+    batch = {"latent_image": torch.randn(4, 2)}
+    seen = set()
+    with setup.adapter_state(model, config, "student"):
+        for global_step in range(200):
+            _, _, _, k = setup._student_onestep_x0(model, batch, config, _student_progress(global_step), z, sigmas)
+            seen.add(k)
+        # reproducible for a fixed global step
+        first = setup._student_onestep_x0(model, batch, config, _student_progress(42), z, sigmas)[3]
+        second = setup._student_onestep_x0(model, batch, config, _student_progress(42), z, sigmas)[3]
+    assert seen == {0, 1, 2, 3}
+    assert first == second
+
+
+def test_target_steps_one_selects_step_zero():
+    config = _config()
+    config.distill_target_steps = 1
+    model = TinyDistillModel()
+    setup = _setup()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+    loss = setup.calculate_distill_loss(model, batch, config, _student_progress(3))
+    loss.backward()
+    assert setup._last_grad_step_index == 0
+    assert model.student.weight.grad is not None
+    assert model.student.weight.grad.abs().sum().item() > 0.0
+
+
+def test_exactly_one_grad_bearing_student_forward():
+    config = _config()
+    model = TinyDistillModel()
+    setup = _setup()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+    setup.calculate_distill_loss(model, batch, config, _student_progress(3))
+    grad_student_calls = [c for c in setup.velocity_calls if c[0] == "student" and c[3] is True]
+    assert len(grad_student_calls) == 1
+
+
+def test_distill_metric_key_sets_match_across_modes():
+    config = _config()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+
+    setup_fake = _setup()
+    setup_fake.calculate_distill_loss(TinyDistillModel(), batch, config, _student_progress(0))  # warmup -> fake
+    fake_keys = set(setup_fake.get_last_distill_metrics().keys())
+
+    setup_student = _setup()
+    setup_student.calculate_distill_loss(TinyDistillModel(), batch, config, _student_progress(3))  # student
+    student_keys = set(setup_student.get_last_distill_metrics().keys())
+
+    assert setup_fake.get_last_distill_metrics()["mode"] == "fake"
+    assert setup_student.get_last_distill_metrics()["mode"] == "student"
+    assert fake_keys == student_keys
+    assert {"loss", "fake_loss", "kl_loss", "endpoint_loss"} <= student_keys
+
+
+def test_cfg_scale_controls_unconditional_teacher_pass():
+    config = _config()
+
+    setup_one = _setup()
+    batch_one = {
+        "latent_image": torch.zeros(2, 2),
+        "target_latent": torch.zeros(2, 2),
+        "distill_cfg_scale": torch.tensor([1.0, 1.0]),
+        "distill_teacher_steps": torch.tensor([12, 12]),
+    }
+    setup_one.calculate_distill_loss(TinyDistillModel(), batch_one, config, _student_progress(3))
+    assert not any(c[1] == "unconditional" for c in setup_one.velocity_calls)
+
+    setup_gt1 = _setup()
+    batch_gt1 = dict(batch_one, distill_cfg_scale=torch.tensor([2.0, 2.0]))
+    setup_gt1.calculate_distill_loss(TinyDistillModel(), batch_gt1, config, _student_progress(3))
+    assert any(c[0] == "teacher" and c[1] == "unconditional" for c in setup_gt1.velocity_calls)
+
+
+def test_lpips_unavailable_path_is_finite():
+    config = _config()
+    config.distill_endpoint_lpips_weight = 1.0  # base _distill_perceptual_loss returns None -> skipped
+    model = TinyDistillModel()
+    setup = _setup()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+    loss = setup.calculate_distill_loss(model, batch, config, _student_progress(3))
+    assert torch.isfinite(loss)
+    assert setup.get_last_distill_metrics()["lpips_loss"] == 0.0
+
+
+def test_one_grad_forward_with_inplace_buffer_is_autograd_safe():
+    # Proves the invariant behind "exactly one grad-bearing student forward":
+    # OFT spectral-norm mutates its u/v buffers in place each forward, so a second
+    # grad-bearing forward corrupts the first forward's saved graph.
+    class PowerIterModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, 2))
+            self.register_buffer("scale", torch.ones(2))
+
+        def forward(self, x):
+            with torch.no_grad():
+                self.scale.mul_(0.9).add_(0.1)  # power-iteration-style in-place update
+            return (x @ self.weight) * self.scale  # uses (and saves) the mutated buffer
+
+    module = PowerIterModule()
+    x0 = torch.randn(3, 2)
+    with torch.no_grad():  # no-grad rollout: mutates the buffer but builds no graph
+        h = module(x0)
+        h = module(h)
+    x_k = h.detach()
+
+    out = module(x_k)  # single grad-bearing forward
+    out.pow(2).mean().backward()  # must not raise
+    assert module.weight.grad is not None
+
+    module.weight.grad = None
+    a = module(x_k)
+    b = module(a)  # second grad forward re-mutates the buffer a's graph saved
+    with pytest.raises(RuntimeError):
+        b.pow(2).mean().backward()

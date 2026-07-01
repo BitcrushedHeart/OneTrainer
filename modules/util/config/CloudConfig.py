@@ -98,7 +98,14 @@ class CloudConfig(BaseConfig):
         data.append(("remote_dir", "/workspace", str, False))
         data.append(("huggingface_cache_dir", "/workspace/huggingface_cache", str, False))
         data.append(("onetrainer_dir", "/workspace/OneTrainer", str, False))
-        data.append(("install_cmd", "git clone https://github.com/Nerogar/OneTrainer", str, False))
+        data.append(
+            (
+                "install_cmd",
+                "git clone --branch bitcrushed-blend https://github.com/BitcrushedHeart/OneTrainer",
+                str,
+                False,
+            )
+        )
         data.append(("install_onetrainer", True, bool, False))
         data.append(("update_onetrainer", True, bool, False))
         data.append(("detach_trainer", False, bool, False))

@@ -141,6 +141,13 @@ export interface BucketAnalysisTarget {
   buckets: BucketAnalysisRow[];
 }
 
+export interface RepairRejectedResult {
+  groups_processed: number;
+  groups_skipped_single: number;
+  pairs_repaired: number;
+  pairs_total: number;
+}
+
 export interface BucketAnalysisResult {
   concept_path: string;
   batch_size: number;
@@ -233,10 +240,30 @@ export const dpoApi = {
 
   // Triage mode: all voting/pairing happens client-side; this commits the
   // whole group's pairs in one batch and releases the group.
-  commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>) =>
-    request<{ ok: boolean; pairs_done?: number; error?: string }>("/dpo/session/commit-pairs", {
+  // discardRest retires the whole group from the source tree after export:
+  // paired sources move to .chosen/.rejected, leftovers to .discard (all
+  // dot-pruned so the group can't reappear in a later session).
+  commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>, discardRest = false) =>
+    request<{ ok: boolean; pairs_done?: number; discarded?: number; error?: string }>("/dpo/session/commit-pairs", {
       method: "POST",
-      body: JSON.stringify({ pairs }),
+      body: JSON.stringify({ pairs, discard_rest: discardRest }),
+    }),
+
+  // Discard the whole current group without saving any pair — moves every
+  // remaining source image into a dot-prefixed .discard subfolder.
+  discardGroup: () =>
+    request<{ ok: boolean; discarded?: number; error?: string }>("/dpo/session/discard-group", { method: "POST" }),
+
+  triageAlign: (good: string[], bad: string[]) =>
+    request<{
+      ok: boolean;
+      pairs?: Array<{ chosen: string; rejected: string }>;
+      chosen_pool?: string[];
+      rejected_pool?: string[];
+      error?: string;
+    }>("/dpo/session/triage-align", {
+      method: "POST",
+      body: JSON.stringify({ good, bad }),
     }),
 
   finalizeSession: (valPercentage = 0) =>
@@ -277,6 +304,27 @@ export const dpoApi = {
       method: "POST",
       body: JSON.stringify({ concept_path, batch_size, target_resolutions, quantization }),
     }),
+
+  // Starts a background re-pair job; poll repairStatus for progress + result.
+  repairRejected: (qualityFloor = 0.85) =>
+    request<{ ok: boolean; started?: boolean; running?: boolean; error?: string }>("/dpo/repair-rejected", {
+      method: "POST",
+      body: JSON.stringify({ quality_floor: qualityFloor }),
+    }),
+
+  repairStatus: () =>
+    request<{
+      ok: boolean;
+      running: boolean;
+      phase?: string;
+      images_done?: number;
+      images_total?: number;
+      groups_done?: number;
+      groups_total?: number;
+      pairs_repaired?: number;
+      summary?: RepairRejectedResult | null;
+      error?: string | null;
+    }>("/dpo/repair-status"),
 
   imageUrl: (path: string) => `/api/dpo/session/image?path=${encodeURIComponent(path)}`,
 };

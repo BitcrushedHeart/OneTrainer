@@ -7,6 +7,7 @@ import {
   Layers,
   ListOrdered,
   RefreshCw,
+  Shuffle,
   Sparkles,
   Video,
   Wand2,
@@ -22,6 +23,7 @@ import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { MergeOFTModal } from "@/components/modals/MergeOFTModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
+import { RepairRejectedModal } from "@/components/modals/RepairRejectedModal";
 import { StandaloneSamplingModal } from "@/components/modals/StandaloneSamplingModal";
 import { VideoToolModal } from "@/components/modals/VideoToolModal";
 import { Button, Card } from "@/components/shared";
@@ -59,6 +61,7 @@ export default function ToolsPage() {
   const [dpoOpen, setDpoOpen] = useState(false);
   const [distillOpen, setDistillOpen] = useState(false);
   const [bucketOpen, setBucketOpen] = useState(false);
+  const [repairOpen, setRepairOpen] = useState(false);
   const [mergeOftOpen, setMergeOftOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
@@ -126,6 +129,12 @@ export default function ToolsPage() {
           onLaunch={() => setBucketOpen(true)}
         />
         <ToolCard
+          icon={<Shuffle className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Re-pair by Similarity"
+          description="Rename rejected images so each pairs with the most visually similar chosen image in its caption group"
+          onLaunch={() => setRepairOpen(true)}
+        />
+        <ToolCard
           icon={<Layers className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="Merge OFT"
           description="Bake an OFT / DoRA-OFT adapter into a base checkpoint using OneTrainer's training math"
@@ -142,6 +151,7 @@ export default function ToolsPage() {
       <DPOToolModal open={dpoOpen} onClose={() => setDpoOpen(false)} />
       <DistillDatasetModal open={distillOpen} onClose={() => setDistillOpen(false)} />
       <BucketAnalysisModal open={bucketOpen} onClose={() => setBucketOpen(false)} />
+      <RepairRejectedModal open={repairOpen} onClose={() => setRepairOpen(false)} />
       <MergeOFTModal open={mergeOftOpen} onClose={() => setMergeOftOpen(false)} />
     </>
   );

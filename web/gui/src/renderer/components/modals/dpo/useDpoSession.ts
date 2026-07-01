@@ -74,7 +74,16 @@ export interface UseDpoSessionResult {
     confirmPair: (keepScoring: boolean) => Promise<void>;
     cancelPendingPair: () => void;
     skipGroup: () => Promise<void>;
-    commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>) => Promise<void>;
+    discardGroup: () => Promise<void>;
+    commitTriagePairs: (pairs: Array<{ chosen: string; rejected: string }>, discardRest?: boolean) => Promise<void>;
+    triageAlign: (
+      good: string[],
+      bad: string[],
+    ) => Promise<{
+      pairs: Array<{ chosen: string; rejected: string }>;
+      chosenPool: string[];
+      rejectedPool: string[];
+    } | null>;
     cancelSession: () => Promise<void>;
     swissVote: (winner: "a" | "b" | "tie") => Promise<void>;
     swissFinishEarly: () => Promise<void>;
@@ -366,9 +375,18 @@ export function useDpoSession(): UseDpoSessionResult {
     await fetchNextGroup();
   }, [fetchNextGroup]);
 
+  const discardGroup = useCallback(async () => {
+    const res = await dpoApi.discardGroup();
+    if (!res.ok) {
+      setError(res.error ?? "Failed to discard group");
+      return;
+    }
+    await fetchNextGroup();
+  }, [fetchNextGroup]);
+
   const commitTriagePairs = useCallback(
-    async (pairs: Array<{ chosen: string; rejected: string }>) => {
-      const res = await dpoApi.commitTriagePairs(pairs);
+    async (pairs: Array<{ chosen: string; rejected: string }>, discardRest = false) => {
+      const res = await dpoApi.commitTriagePairs(pairs, discardRest);
       if (!res.ok) {
         setError(res.error ?? "Failed to commit pairs");
         return;
@@ -378,6 +396,19 @@ export function useDpoSession(): UseDpoSessionResult {
     },
     [fetchNextGroup],
   );
+
+  const triageAlign = useCallback(async (good: string[], bad: string[]) => {
+    const res = await dpoApi.triageAlign(good, bad);
+    if (!res.ok) {
+      setError(res.error ?? "Auto-align failed");
+      return null;
+    }
+    return {
+      pairs: res.pairs ?? [],
+      chosenPool: res.chosen_pool ?? [],
+      rejectedPool: res.rejected_pool ?? [],
+    };
+  }, []);
 
   const cancelSession = useCallback(async () => {
     scanAbortRef.current?.abort();
@@ -528,7 +559,9 @@ export function useDpoSession(): UseDpoSessionResult {
       confirmPair,
       cancelPendingPair,
       skipGroup,
+      discardGroup,
       commitTriagePairs,
+      triageAlign,
       cancelSession,
       swissVote,
       swissFinishEarly,

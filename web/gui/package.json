@@ -10,7 +10,7 @@
     "generate-types": "node ../scripts/run_generate_types.js",
     "copy:splash": "node -e \"require('fs').cpSync('src/main/splash.html','dist/main/main/splash.html')\"",
     "rename:cjs": "node scripts/rename-cjs.mjs",
-    "dev:electron": "tsc -p tsconfig.main.json && npm run copy:splash && npm run rename:cjs && concurrently -k --names \"vite,electron\" -c \"cyan,green\" \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev:electron": "tsc -p tsconfig.main.json && npm run copy:splash && npm run rename:cjs && concurrently -k --names \"vite,electron\" -c \"cyan,green\" \"vite\" \"wait-on http://localhost:5520 && electron .\"",
     "build": "vite build",
     "build:main": "tsc -p tsconfig.main.json && npm run copy:splash && npm run rename:cjs",
     "build:electron": "npm run generate-types && tsc -p tsconfig.main.json && npm run copy:splash && npm run rename:cjs && vite build",

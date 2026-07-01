@@ -7,6 +7,7 @@ from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.dataset_name_util import normalize_long_filenames
 from modules.util.time_util import get_string_timestamp
 
 
@@ -29,10 +30,21 @@ class BaseCloud(metaclass=ABCMeta):
         local = Path(self.config.local_output_model_destination)
         remote = Path(self.config.output_model_destination)
         self.file_sync.sync_down_file(local=local, remote=remote)
-        self.file_sync.sync_down_dir(
-            local=local.with_suffix(local.suffix + "_embeddings"),
-            remote=remote.with_suffix(remote.suffix + "_embeddings"),
-        )
+        # The "_embeddings" sidecar dir only exists when the run actually produced
+        # embeddings (embedding training / additional embeddings). A plain LoRA/OFT
+        # run never creates it, so a missing remote dir here is expected - rsync
+        # aborts with code 23 "change_dir ... No such file or directory". Treat that
+        # specific case as a no-op instead of failing the whole download.
+        try:
+            self.file_sync.sync_down_dir(
+                local=local.with_suffix(local.suffix + "_embeddings"),
+                remote=remote.with_suffix(remote.suffix + "_embeddings"),
+            )
+        except RuntimeError as e:
+            if "No such file or directory" in str(e):
+                print(f"no embeddings to download for {remote.name}; skipping")
+            else:
+                raise
 
     def upload_config(self, commands: TrainCommands = None):
         local_config_path = Path(self.config.local_workspace_dir, f"remote_config-{get_string_timestamp()}.json")
@@ -83,6 +95,14 @@ class BaseCloud(metaclass=ABCMeta):
                 return
 
             if hasattr(concept, "local_path"):
+                # Shorten any filenames that exceed the 255-byte component limit of WSL drvfs and the
+                # remote MooseFS volume before rsync stats them, or it aborts with ENAMETOOLONG.
+                renames = normalize_long_filenames(Path(concept.local_path), recursive=concept.include_subdirectories)
+                for old_name, new_name in renames:
+                    print(f"  shortened over-long filename: {old_name!r} -> {new_name!r}")
+                if renames:
+                    print(f"  shortened {len(renames)} over-long filename(s) in concept {concept.name}")
+
                 self.file_sync.sync_up_dir(
                     local=Path(concept.local_path),
                     remote=Path(concept.path),

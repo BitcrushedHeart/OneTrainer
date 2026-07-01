@@ -33,6 +33,9 @@ invisible-watermark==0.2.0 # needed for the SDXL pipeline
 pooch==1.8.2
 open-clip-torch==2.32.0
 
+# metrics
+lpips==0.1.4 # perceptual teacher-match metric for distillation validation
+
 # data loader
 -e git+https://github.com/BitcrushedHeart/mgds.git@0f75dc0724eb01dbc1e24647e99a78041d854757#egg=mgds
 xxhash

@@ -9,7 +9,6 @@ from typing import Any
 
 from modules.util import path_util
 
-
 DISTILL_MANIFEST_NAME = "distillation_manifest.json"
 
 
@@ -190,9 +189,69 @@ def _load_sidecar(image_path: str) -> DistillMetadata | None:
     return _normalise_metadata(raw, image_path)
 
 
+def _decode_user_comment_bytes(data: bytes) -> str | None:
+    # EXIF UserComment is an 8-byte character-code prefix followed by the payload.
+    prefixes = {
+        b"UNICODE\x00": ("utf-16-le", "utf-16-be"),
+        b"ASCII\x00\x00\x00": ("ascii", "latin-1"),
+        b"\x00\x00\x00\x00\x00\x00\x00\x00": ("utf-8", "utf-16-le"),
+    }
+    candidates: list[tuple[bytes, tuple[str, ...]]] = []
+    for prefix, encodings in prefixes.items():
+        if data.startswith(prefix):
+            candidates.append((data[len(prefix) :], encodings))
+            break
+    else:
+        candidates.append((data, ("utf-8", "utf-16-le", "utf-16-be")))
+
+    for payload, encodings in candidates:
+        for encoding in encodings:
+            try:
+                text = payload.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            if "{" in text:
+                return text.lstrip("﻿")
+    return None
+
+
+def _read_exif_user_comment(image_path: str) -> str | None:
+    # SwarmUI / many tools embed the generation JSON in the EXIF UserComment
+    # (and sometimes ImageDescription). This applies to WebP, JPEG and TIFF.
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            comment = None
+            try:
+                comment = exif.get_ifd(0x8769).get(0x9286)
+            except Exception:
+                comment = None
+            if comment is None:
+                comment = exif.get(0x9286) or exif.get(0x010E) or exif.get(0x010F)
+    except Exception:
+        return None
+    if isinstance(comment, bytes):
+        return _decode_user_comment_bytes(comment)
+    if isinstance(comment, str) and "{" in comment:
+        return comment
+    return None
+
+
 def _load_embedded_json(image_path: str) -> DistillMetadata | None:
     ext = os.path.splitext(image_path)[1].lower()
     blocks: list[str] = []
+
+    # Prefer the cleanly-delimited EXIF UserComment when present: brute-force
+    # scanning the whole file can be corrupted by stray braces in binary data.
+    comment = _read_exif_user_comment(image_path)
+    if comment:
+        blocks.extend(_iter_json_objects(comment))
+        if comment.strip().startswith("{"):
+            blocks.append(comment)
 
     if ext == ".png":
         for value in _read_png_text_chunks(image_path).values():

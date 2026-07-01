@@ -49,6 +49,8 @@ class BaseModelSetup(
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
         self._last_distill_metrics = None
+        self._last_grad_step_index = None  # student backprop step chosen this update (debug/tests)
+        self._last_distill_x0_teacher = None  # paired teacher target from the last student update
 
     @abstractmethod
     def create_parameters(
@@ -343,16 +345,6 @@ class BaseModelSetup(
         )
         return cfg_baked_velocity(conditional, unconditional, cfg_scale)
 
-    @staticmethod
-    def _distill_scaled_image_latent(model: BaseModel, batch: dict) -> Tensor:
-        # The student trajectory lives in scaled-latent space (the transformer
-        # operates there), but the cached image latent is unscaled. Scale it so
-        # the endpoint regression compares like with like. Models without a
-        # scale_latents hook (e.g. the unit-test toy model) pass through.
-        image_latent = batch.get("target_latent", batch["latent_image"])
-        scale = getattr(model, "scale_latents", None)
-        return scale(image_latent) if callable(scale) else image_latent
-
     def _distill_renoise(
         self,
         x0: Tensor,
@@ -435,6 +427,66 @@ class BaseModelSetup(
             trajectory.append(latent)
         return trajectory
 
+    def _distill_initial_latent(self, batch: dict, train_progress: TrainProgress) -> Tensor:
+        """Shared initial noise ``z`` for the student/teacher pairing.
+
+        Honors an explicit ``batch["distill_initial_latent"]`` (e.g. tests / a
+        future paired-noise cache), otherwise samples fresh noise seeded by the
+        global step so the same ``z`` can be handed to both rollouts this step.
+        """
+        reference = batch["latent_image"]
+        latent = batch.get("distill_initial_latent")
+        if latent is not None:
+            return latent.to(device=reference.device, dtype=reference.dtype)
+        generator = torch.Generator(device=reference.device)
+        generator.manual_seed(train_progress.global_step)
+        return torch.randn(reference.shape, generator=generator, device=reference.device, dtype=reference.dtype)
+
+    def _student_onestep_x0(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        initial_latent: Tensor,
+        sigmas: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, int]:
+        """Roll the student to a random step ``k`` and return its one-step ``x0``.
+
+        Steps ``0..k-1`` run under ``no_grad`` (detached ``x_k``); step ``k`` takes
+        a single grad-bearing forward ``v_k`` and the clean estimate is
+        ``x0 = x_k - sigma_k * v_k``. Exactly one grad-bearing adapter forward
+        keeps the in-place OFT/DoRA rotation buffers safe for autograd, while a
+        per-step random ``k`` (seeded by the global step) spreads the learning
+        signal across all denoising steps. ``distill_backprop_random_step=False``
+        pins ``k`` to the final step (the previous behavior).
+        """
+        total_steps = config.distill_target_steps
+        if config.distill_backprop_random_step and total_steps > 1:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(train_progress.global_step)
+            grad_step = int(torch.randint(0, total_steps, (1,), generator=generator).item())
+        else:
+            grad_step = total_steps - 1
+
+        latent = initial_latent
+        with torch.no_grad():
+            for step_index in range(grad_step):
+                sigma = sigmas[:, step_index]
+                next_sigma = sigmas[:, step_index + 1]
+                velocity = self.predict_distill_velocity(
+                    model, batch, config, train_progress, latent, sigma, conditioning="conditional"
+                )
+                latent = euler_flow_step(latent, velocity, sigma, next_sigma)
+        x_k = latent.detach()
+        sigma_step = sigmas[:, grad_step]
+        v_k = self.predict_distill_velocity(
+            model, batch, config, train_progress, x_k, sigma_step, conditioning="conditional"
+        )
+        sigma_step_b = sigma_step.view(x_k.shape[0], *([1] * (x_k.dim() - 1))).to(dtype=x_k.dtype)
+        x0 = x_k - sigma_step_b * v_k
+        return x0, x_k, sigma_step, grad_step
+
     def calculate_distill_loss(
         self,
         model: BaseModel,
@@ -484,16 +536,37 @@ class BaseModelSetup(
             }
             return fake_loss
 
-        # Student update: generate x0 through the student trajectory (gradient
-        # retained), then evaluate the distribution-matching gradient at a random
-        # re-noised point x_sigma. Gradient flows (v_fake - v_real).detach() *
-        # x_sigma -> x0 -> student adapter. This is robust for target_steps=1..N;
-        # the clean sigma=0 endpoint is never used for the KL term.
+        # Student update (DMD2 generator step). From a shared initial noise z, roll
+        # the student to a random interior step k, take ONE grad-bearing forward
+        # there, and form the one-step clean estimate x0 = x_k - sigma_k * v_k. The
+        # teacher's one-step denoise at the SAME x_k is the paired regression target
+        # (well-posed: each z/k gives a distinct target, so diversity is preserved
+        # instead of collapsing to a noise-independent mean). The distribution-
+        # matching KL is then evaluated at a random re-noise of x0.
+        z = self._distill_initial_latent(batch, train_progress)
         with self.adapter_state(model, config, "student"):
-            student_trajectory = self._simulate_student_distill_trajectory(model, batch, config, train_progress, sigmas)
-        x0 = student_trajectory[-1]
-        x_sigma, sigma_k, _ = self._distill_renoise(x0, train_progress, seed_offset=1)
+            x0, x_k, sigma_step, grad_step = self._student_onestep_x0(model, batch, config, train_progress, z, sigmas)
+        self._last_grad_step_index = grad_step
 
+        # Paired teacher-match: teacher one-step denoise at the same x_k.
+        sigma_step_b = sigma_step.view(x_k.shape[0], *([1] * (x_k.dim() - 1))).to(dtype=x_k.dtype)
+        with self.adapter_state(model, config, "teacher"), torch.no_grad():
+            teacher_velocity = self._cfg_baked_distill_velocity(
+                model, batch, config, train_progress, x_k, sigma_step, cfg_scale
+            )
+        x0_teacher = (x_k - sigma_step_b * teacher_velocity).detach()
+        self._last_distill_x0_teacher = x0_teacher
+
+        endpoint_loss = dmd2_endpoint_loss(x0, x0_teacher, weight=config.distill_endpoint_loss_weight)
+        lpips_loss = None
+        if config.distill_endpoint_lpips_weight > 0.0:
+            lpips_term = self._distill_perceptual_loss(model, x0, x0_teacher, config)
+            if lpips_term is not None:
+                lpips_loss = config.distill_endpoint_lpips_weight * lpips_term
+                endpoint_loss = endpoint_loss + lpips_loss
+
+        # Distribution-matching KL at a random re-noise of the student estimate.
+        x_sigma, sigma_k, _ = self._distill_renoise(x0, train_progress, seed_offset=1)
         with self.adapter_state(model, config, "teacher"), torch.no_grad():
             real_predicted = self._cfg_baked_distill_velocity(
                 model, batch, config, train_progress, x_sigma.detach(), sigma_k, cfg_scale
@@ -504,23 +577,14 @@ class BaseModelSetup(
             )
 
         kl_loss = dmd2_kl_pseudo_loss(
+            x0,
             x_sigma,
+            sigma_k,
             real_predicted,
             fake_predicted,
             weight=config.distill_kl_loss_weight,
+            normalize=config.distill_kl_normalize,
         )
-        scaled_image_latent = self._distill_scaled_image_latent(model, batch)
-        endpoint_loss = dmd2_endpoint_loss(
-            x0,
-            scaled_image_latent,
-            weight=config.distill_endpoint_loss_weight,
-        )
-        lpips_loss = None
-        if config.distill_endpoint_lpips_weight > 0.0:
-            lpips_term = self._distill_perceptual_loss(model, x0, scaled_image_latent, config)
-            if lpips_term is not None:
-                lpips_loss = config.distill_endpoint_lpips_weight * lpips_term
-                endpoint_loss = endpoint_loss + lpips_loss
 
         loss = kl_loss + endpoint_loss
         self._last_distill_metrics = {

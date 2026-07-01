@@ -113,8 +113,9 @@ class DistillTab:
             self.scroll_frame,
             3,
             3,
-            "Endpoint Weight",
-            tooltip="Weight for regression from the generated terminal latent to the actual image latent.",
+            "Teacher-match Weight",
+            tooltip="Weight for the paired teacher-match: regression of the student's one-step estimate "
+            "toward the frozen teacher's one-step denoise at the same trajectory point (shared noise).",
         )
         components.entry(self.scroll_frame, 3, 4, self.ui_state, "distill_endpoint_loss_weight")
 
@@ -194,3 +195,23 @@ class DistillTab:
             tooltip="Number of prompts (auto-sampled from the first training batches) used for teacher-match + diversity validation.",
         )
         components.entry(self.scroll_frame, 7, 4, self.ui_state, "distill_validation_prompts")
+
+        components.label(
+            self.scroll_frame,
+            8,
+            0,
+            "Normalize KL",
+            tooltip="Per-sample DMD gradient normalization for the distribution-matching term "
+            "(divides by mean|x0 - teacher_x0|). Keeps the KL signal scale-stable across noise levels.",
+        )
+        components.switch(self.scroll_frame, 8, 1, self.ui_state, "distill_kl_normalize")
+
+        components.label(
+            self.scroll_frame,
+            8,
+            3,
+            "Random Backprop Step",
+            tooltip="Spread the learning signal across all denoising steps: each update backprops through a "
+            "random trajectory step (one grad-bearing forward). Off pins it to the final step.",
+        )
+        components.switch(self.scroll_frame, 8, 4, self.ui_state, "distill_backprop_random_step")

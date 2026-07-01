@@ -623,6 +623,8 @@ class TrainConfig(BaseConfig):
     distill_fake_adapter_rank: int
     distill_validation: bool
     distill_validation_prompts: int
+    distill_kl_normalize: bool
+    distill_backprop_random_step: bool
 
     # dpo
     rlhf_mode: RLHFMode
@@ -678,7 +680,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=20,
+            config_version=21,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -700,6 +702,7 @@ class TrainConfig(BaseConfig):
                 17: self.__migration_17,
                 18: self.__migration_18,
                 19: self.__migration_19,
+                20: self.__migration_20,
             },
         )
 
@@ -1007,6 +1010,14 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("distill_fake_adapter_rank", 16)
         migrated_data.setdefault("distill_validation", False)
         migrated_data.setdefault("distill_validation_prompts", 8)
+        return migrated_data
+
+    def __migration_20(self, data: dict) -> dict:
+        # Paired teacher-match distillation rewrite: normalized x0-space DMD KL
+        # and stochastic backprop-step selection (both default on).
+        migrated_data = data.copy()
+        migrated_data.setdefault("distill_kl_normalize", True)
+        migrated_data.setdefault("distill_backprop_random_step", True)
         return migrated_data
 
     def from_dict(self, data: dict) -> "TrainConfig":
@@ -1469,6 +1480,8 @@ class TrainConfig(BaseConfig):
         data.append(("distill_fake_adapter_rank", 16, int, False))
         data.append(("distill_validation", False, bool, False))
         data.append(("distill_validation_prompts", 8, int, False))
+        data.append(("distill_kl_normalize", True, bool, False))
+        data.append(("distill_backprop_random_step", True, bool, False))
 
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))

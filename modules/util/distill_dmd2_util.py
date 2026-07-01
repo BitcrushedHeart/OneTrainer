@@ -18,26 +18,58 @@ def dmd2_fake_score_loss(fake_velocity: Tensor, target_velocity: Tensor) -> Tens
     return _mse_fp32(fake_velocity, target_velocity.detach())
 
 
-def dmd2_kl_pseudo_loss(x_at_k: Tensor, real_velocity: Tensor, fake_velocity: Tensor, weight: float = 1.0) -> Tensor:
-    """DMD2 pseudo-KL term.
+def dmd2_kl_pseudo_loss(
+    x0: Tensor,
+    x_sigma: Tensor,
+    sigma: Tensor | float,
+    real_velocity: Tensor,
+    fake_velocity: Tensor,
+    weight: float = 1.0,
+    normalize: bool = True,
+    eps: float = 1e-3,
+) -> Tensor:
+    """DMD2 distribution-matching pseudo-loss in clean-sample (``x0``) space.
 
-    The score direction is detached; gradients flow through ``x_at_k`` into the
-    student trajectory only.
+    Builds the teacher and fake one-step ``x0`` predictions from their velocities
+    at the (detached) re-noised point ``x_sigma`` and forms the DMD gradient
+    ``grad = pred_fake_x0 - pred_real_x0`` (which equals ``sigma * (v_real -
+    v_fake)``). The returned pseudo-loss ``0.5 * mse(x0, (x0 - grad).detach())``
+    has autograd gradient ``grad`` w.r.t. ``x0``, so gradient descent moves the
+    student's ``x0`` toward the teacher prediction and away from the fake one
+    (KL minimization). This matches the official DMD/DMD2 generator update.
 
-    Sign note: flow models output velocity ``v = eps - x0``, and the score
-    relates to it as ``s = -(1-sigma)/sigma * v``. DMD2 needs the *score*
-    difference ``(s_fake - s_real)``, which therefore has the OPPOSITE sign of
-    the velocity difference. So we use ``(real - fake)`` here: minimizing this
-    moves the student TOWARD the teacher distribution. Using ``(fake - real)``
-    inverts the gradient and drives the student away from the teacher.
+    Sign note: flow models output ``v = eps - x0`` and the score relates to it by
+    ``s = -(1-sigma)/sigma * v``; in x0-space the one-step prediction is
+    ``x0_pred = x_sigma - v * sigma``, so ``pred_fake - pred_real = sigma *
+    (v_real - v_fake)``. Moving x0 against this grad (toward ``pred_real``) is the
+    teacher direction — the same sign as the previous velocity-space surrogate.
+
+    When ``normalize`` is set, ``grad`` is divided per-sample by ``mean|x0 -
+    pred_real_x0|`` (the DMD normalizer, clamped by a scale-aware ``eps``) so the
+    signal magnitude is stable across noise levels. Score directions are detached;
+    only ``x0`` carries gradient.
     """
-    score_delta = real_velocity.detach().float() - fake_velocity.detach().float()
-    return (score_delta * x_at_k.float()).mean(dtype=torch.float32) * weight
+    sigma_t = _expand_like(sigma, x_sigma).float()
+    x_sigma_d = x_sigma.detach().float()
+    pred_real_x0 = x_sigma_d - real_velocity.detach().float() * sigma_t
+    pred_fake_x0 = x_sigma_d - fake_velocity.detach().float() * sigma_t
+    grad = pred_fake_x0 - pred_real_x0
+    if normalize:
+        reduce_dims = list(range(1, x0.dim())) or [0]
+        normalizer = (x0.detach().float() - pred_real_x0).abs().mean(dim=reduce_dims, keepdim=True).clamp_min(eps)
+        grad = grad / normalizer
+    grad = torch.nan_to_num(grad)
+    target = (x0.float() - grad).detach()
+    return 0.5 * (x0.float() - target).pow(2).mean(dtype=torch.float32) * weight
 
 
-def dmd2_endpoint_loss(generated_latent: Tensor, image_latent: Tensor, weight: float = 1.0) -> Tensor:
-    """Regression to the actual image latent at the terminal trajectory point."""
-    return _mse_fp32(generated_latent, image_latent) * weight
+def dmd2_endpoint_loss(generated_latent: Tensor, target_latent: Tensor, weight: float = 1.0) -> Tensor:
+    """Mean-squared regression of the student estimate toward a target latent.
+
+    The caller supplies the target: the paired teacher-match uses the frozen
+    teacher's one-step denoise at the same trajectory point (shared noise).
+    """
+    return _mse_fp32(generated_latent, target_latent) * weight
 
 
 def build_distill_sigmas(

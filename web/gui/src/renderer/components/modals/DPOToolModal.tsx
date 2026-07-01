@@ -180,7 +180,9 @@ export function DPOToolModal({ open, onClose }: Props) {
           group={group}
           pairsDone={pairsDone}
           onCommitPairs={actions.commitTriagePairs}
+          onAutoAlign={actions.triageAlign}
           onSkipGroup={() => void actions.skipGroup()}
+          onDiscardGroup={() => void actions.discardGroup()}
           onCancel={() => void actions.cancelSession()}
         />
       )}

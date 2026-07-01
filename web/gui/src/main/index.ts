@@ -36,7 +36,7 @@ function findFreePort(start: number): Promise<number> {
 
 const HEALTH_POLL_INTERVAL = 500;
 const MAX_HEALTH_RETRIES = 120;
-const DEV_SERVER_URL = "http://127.0.0.1:5173";
+const DEV_SERVER_URL = "http://127.0.0.1:5520";
 
 // When run_web.bat / run_web_dev.bat start the backend externally,
 // they set this env var so Electron doesn't spawn a duplicate.

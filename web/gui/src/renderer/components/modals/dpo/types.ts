@@ -96,8 +96,19 @@ export interface RankingStepProps {
 export interface TriageStepProps {
   group: GroupData;
   pairsDone: number;
-  onCommitPairs: (pairs: Array<{ chosen: string; rejected: string }>) => Promise<void>;
+  // discardRest also retires the whole group from the source tree (paired
+  // sources → .chosen/.rejected, leftovers → .discard) so it can't reappear.
+  onCommitPairs: (pairs: Array<{ chosen: string; rejected: string }>, discardRest?: boolean) => Promise<void>;
+  onAutoAlign: (
+    good: string[],
+    bad: string[],
+  ) => Promise<{
+    pairs: Array<{ chosen: string; rejected: string }>;
+    chosenPool: string[];
+    rejectedPool: string[];
+  } | null>;
   onSkipGroup: () => void;
+  onDiscardGroup: () => void;
   onCancel: () => void;
 }
 

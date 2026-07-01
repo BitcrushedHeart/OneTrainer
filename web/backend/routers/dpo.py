@@ -59,6 +59,12 @@ class TriagePair(BaseModel):
 
 class CommitPairsRequest(BaseModel):
     pairs: list[TriagePair]
+    discard_rest: bool = False
+
+
+class TriageAlignRequest(BaseModel):
+    good: list[str]
+    bad: list[str]
 
 
 class BucketAnalysisRequest(BaseModel):
@@ -72,6 +78,10 @@ class ApplyCaptionRequest(BaseModel):
     chosen_image: str
     rejected_image: str
     caption: str
+
+
+class RepairRejectedRequest(BaseModel):
+    quality_floor: float = 0.85
 
 
 @router.post("/dpo/check-pairs")
@@ -128,6 +138,18 @@ def apply_caption(req: ApplyCaptionRequest):
     )
 
 
+@router.post("/dpo/repair-rejected")
+def repair_rejected(req: RepairRejectedRequest):
+    service = DPOService.get_instance()
+    return service.repair_rejected(quality_floor=req.quality_floor)
+
+
+@router.get("/dpo/repair-status")
+def repair_status():
+    service = DPOService.get_instance()
+    return service.repair_status()
+
+
 @router.post("/dpo/bucket-analysis")
 def bucket_analysis(req: BucketAnalysisRequest):
     service = DPOService.get_instance()
@@ -181,7 +203,19 @@ def cancel_pair():
 @router.post("/dpo/session/commit-pairs")
 def commit_pairs(req: CommitPairsRequest):
     service = DPOService.get_instance()
-    return service.commit_triage_pairs([(p.chosen, p.rejected) for p in req.pairs])
+    return service.commit_triage_pairs([(p.chosen, p.rejected) for p in req.pairs], discard_rest=req.discard_rest)
+
+
+@router.post("/dpo/session/discard-group")
+def discard_group():
+    service = DPOService.get_instance()
+    return service.discard_group()
+
+
+@router.post("/dpo/session/triage-align")
+def triage_align(req: TriageAlignRequest):
+    service = DPOService.get_instance()
+    return service.triage_align(req.good, req.bad)
 
 
 @router.post("/dpo/session/skip-group", response_model=ActionResponse)
