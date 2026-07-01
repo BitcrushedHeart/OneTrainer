@@ -258,12 +258,12 @@ class BaseZImageSetup(
         target_scaled_latent: Tensor,
         config: TrainConfig,
     ) -> Tensor | None:
-        """Optional image-space LPIPS term for the endpoint regression.
+        """Optional image-space LPIPS term for the teacher-match / endpoint loss.
 
-        Decodes both latents through the VAE and runs LPIPS. Off by default
-        (distill_endpoint_lpips_weight=0). Returns None and disables itself on
-        any failure (e.g. VAE offloaded under latent caching, missing lpips
-        package) so it can never break a real training run. Untested on GPU.
+        Decodes both latents through the VAE and runs LPIPS. Skips (returns None)
+        when the VAE is offloaded, and — for any transient error — skips this call
+        but retries next time, so a fixable issue self-heals. Only a missing lpips
+        package hard-disables the term for the run. Never aborts training.
         """
         if getattr(self, "_distill_lpips_disabled", False):
             return None
@@ -276,7 +276,13 @@ class BaseZImageSetup(
 
             lpips_net = getattr(self, "_distill_lpips_net", None)
             if lpips_net is None:
-                import lpips
+                try:
+                    import lpips
+                except ImportError:
+                    # Not installed and won't change mid-run: hard-disable.
+                    print("Distill LPIPS term disabled: the 'lpips' package is not installed.")
+                    self._distill_lpips_disabled = True
+                    return None
 
                 lpips_net = lpips.LPIPS(net="vgg").to(self.train_device)
                 lpips_net.eval()
@@ -284,20 +290,25 @@ class BaseZImageSetup(
                     param.requires_grad_(False)
                 self._distill_lpips_net = lpips_net
 
+            # Decode in the VAE's own dtype. The cached latents / train_dtype can be
+            # bf16 while the VAE weights are float32 (or vice versa), which would
+            # otherwise raise "Input type and bias type should be the same".
+            vae_dtype = next(model.vae.parameters()).dtype
             generated_image = model.vae.decode(
-                model.unscale_latents(generated_scaled_latent.to(dtype=model.train_dtype.torch_dtype())),
+                model.unscale_latents(generated_scaled_latent.to(dtype=vae_dtype)),
                 return_dict=False,
             )[0]
             with torch.no_grad():
                 target_image = model.vae.decode(
-                    model.unscale_latents(target_scaled_latent.to(dtype=model.train_dtype.torch_dtype())),
+                    model.unscale_latents(target_scaled_latent.to(dtype=vae_dtype)),
                     return_dict=False,
                 )[0]
 
             return lpips_net(generated_image.float().clamp(-1, 1), target_image.float().clamp(-1, 1)).mean()
         except Exception as exception:  # noqa: BLE001 - never let LPIPS abort a run
-            print(f"Distill LPIPS term disabled after error: {exception}")
-            self._distill_lpips_disabled = True
+            # Transient/other error: skip this round but retry next validation
+            # rather than silently killing the metric for the whole run.
+            print(f"Distill LPIPS term skipped after error: {exception}")
             return None
 
     def prepare_text_caching(self, model: ZImageModel, config: TrainConfig):

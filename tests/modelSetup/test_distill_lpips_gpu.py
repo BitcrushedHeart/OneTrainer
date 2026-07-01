@@ -41,13 +41,15 @@ class _DummyVae(nn.Module):
 
 
 class _TrainDtype:
-    @staticmethod
-    def torch_dtype():
-        return torch.float32
+    def __init__(self, dt=torch.float32):
+        self._dt = dt
+
+    def torch_dtype(self):
+        return self._dt
 
 
 class _GpuModel(BaseModel):
-    def __init__(self, device):
+    def __init__(self, device, train_dtype=torch.float32):
         super().__init__(ModelType.Z_IMAGE)
         self.student_adapter = _ToggleAdapter()
         self.fake_adapter = _ToggleAdapter()
@@ -55,8 +57,8 @@ class _GpuModel(BaseModel):
         self.base = nn.Conv2d(4, 4, 3, padding=1).to(device)
         self.student = nn.Conv2d(4, 4, 3, padding=1).to(device)
         self.fake = nn.Conv2d(4, 4, 3, padding=1).to(device)
-        self.vae = _DummyVae().to(device)
-        self.train_dtype = _TrainDtype()
+        self.vae = _DummyVae().to(device)  # float32 weights
+        self.train_dtype = _TrainDtype(train_dtype)
 
     def unscale_latents(self, latent):
         return latent
@@ -131,6 +133,24 @@ def test_perceptual_loss_computes_on_gpu():
     # It must be differentiable back into the generated latent (real training use).
     value.backward()
     assert generated.grad is not None and torch.isfinite(generated.grad).all()
+
+
+def test_perceptual_loss_handles_bf16_train_dtype_vs_float_vae():
+    # The real pod scenario: train_dtype is bf16 but the VAE weights are float32.
+    # Casting the latent to train_dtype before decode raised "Input type
+    # (BFloat16) and bias type (float) should be the same"; decode must use the
+    # VAE's own dtype instead.
+    device = torch.device("cuda")
+    setup = _GpuSetup(device, torch.device("cpu"), False)
+    model = _GpuModel(device, train_dtype=torch.bfloat16)  # VAE stays float32
+
+    generated = torch.randn(1, 4, 64, 64, device=device, requires_grad=True)
+    target = torch.randn(1, 4, 64, 64, device=device)
+
+    value = setup._distill_perceptual_loss(model, generated, target, _val_config())
+
+    assert value is not None, "LPIPS returned None (dtype mismatch not handled)"
+    assert torch.isfinite(value)
 
 
 def test_validation_loop_populates_teacher_match_lpips_on_gpu():
