@@ -1,12 +1,15 @@
-import torch
-
 from modules.util.distill_dmd2_util import (
     build_distill_sigma_matrix,
     build_distill_sigmas,
     cfg_baked_velocity,
     euler_flow_step,
+    shift_distill_sigmas,
     simulate_flow_trajectory,
 )
+
+import torch
+
+import pytest
 
 
 def test_build_distill_sigmas_selects_teacher_scheduler_points():
@@ -51,6 +54,54 @@ def test_euler_flow_step_broadcasts_per_sample_sigmas():
     stepped = euler_flow_step(latent, velocity, sigma, next_sigma)
 
     assert torch.allclose(stepped, torch.zeros_like(latent))
+
+
+def test_shift_distill_sigmas_matches_flow_scheduler_map():
+    # sigma' = s*t / (1 + (s-1)*t), the FlowMatchEulerDiscreteScheduler /
+    # ComfyUI ModelSampling shift. Endpoints are fixed points.
+    t = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])
+
+    shifted = shift_distill_sigmas(t, 1.5)
+
+    expected = 1.5 * t / (1.0 + 0.5 * t)
+    assert torch.allclose(shifted, expected)
+    assert shifted[0] == 1.0
+    assert shifted[-1] == 0.0
+    # shift > 1 pushes interior points toward high noise
+    assert torch.all(shifted[1:-1] > t[1:-1])
+
+
+def test_shift_distill_sigmas_identity_and_validation():
+    t = torch.linspace(1.0, 0.0, 5)
+    assert torch.equal(shift_distill_sigmas(t, 1.0), t)
+    with pytest.raises(ValueError):
+        shift_distill_sigmas(t, 0.0)
+
+
+def test_build_distill_sigmas_applies_shift_to_teacher_grid():
+    unshifted = build_distill_sigmas(target_steps=4, teacher_steps=12, mode="AUTO", device=torch.device("cpu"))
+    shifted = build_distill_sigmas(target_steps=4, teacher_steps=12, mode="AUTO", device=torch.device("cpu"), shift=1.5)
+
+    assert torch.allclose(shifted, shift_distill_sigmas(unshifted, 1.5))
+    assert shifted[0] == 1.0
+    assert shifted[-1] == 0.0
+    assert torch.all(shifted[:-1] > shifted[1:])
+
+
+def test_build_distill_sigma_matrix_passes_shift_through():
+    teacher_steps = torch.tensor([12, 8])
+
+    sigmas = build_distill_sigma_matrix(
+        target_steps=4,
+        teacher_steps=teacher_steps,
+        mode="AUTO",
+        device=torch.device("cpu"),
+        shift=1.5,
+    )
+
+    expected = shift_distill_sigmas(torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]), 1.5)
+    assert torch.allclose(sigmas[0], expected)
+    assert torch.allclose(sigmas[1], expected)
 
 
 def test_build_distill_sigma_matrix_supports_mixed_teacher_steps():

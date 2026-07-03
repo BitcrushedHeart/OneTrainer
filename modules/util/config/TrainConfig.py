@@ -612,6 +612,7 @@ class TrainConfig(BaseConfig):
     distill_teacher_steps: int
     distill_teacher_steps_auto: bool
     distill_timestep_grid_mode: DistillTimestepGridMode
+    distill_sigma_shift: float
     distill_endpoint_loss_weight: float
     distill_endpoint_lpips_weight: float
     distill_kl_loss_weight: float
@@ -680,7 +681,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=21,
+            config_version=22,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -703,6 +704,7 @@ class TrainConfig(BaseConfig):
                 18: self.__migration_18,
                 19: self.__migration_19,
                 20: self.__migration_20,
+                21: self.__migration_21,
             },
         )
 
@@ -1020,6 +1022,12 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("distill_backprop_random_step", True)
         return migrated_data
 
+    def __migration_21(self, data: dict) -> dict:
+        # Shifted distill sigma grid: 1.0 keeps the old uniform-time behavior.
+        migrated_data = data.copy()
+        migrated_data.setdefault("distill_sigma_shift", 1.0)
+        return migrated_data
+
     def from_dict(self, data: dict) -> "TrainConfig":
         # oft_clipped_norm was briefly a bool on this branch (clip on/off at a
         # hard-coded 0.999) before upstream PR #1492 settled on float | None
@@ -1053,10 +1061,8 @@ class TrainConfig(BaseConfig):
             # single optimizer.step() spans the whole accumulation window, which
             # would blend fake-score and student gradients into one update.
             return "Distill requires gradient_accumulation_steps=1 (TTUR alternates the update target per step)."
-        if self.distill_vram_mode == DistillVramMode.CONCURRENT:
-            # The loss path always runs the teacher/fake/student forwards
-            # sequentially (split). Concurrent fused forwards are not implemented.
-            return "Distill concurrent VRAM mode is not implemented yet; use split."
+        if self.distill_sigma_shift <= 0.0:
+            return "Distill sigma shift must be greater than 0 (1.0 = uniform grid, no shift)."
         return None
 
     def weight_dtypes(self) -> ModelWeightDtypes:
@@ -1475,6 +1481,7 @@ class TrainConfig(BaseConfig):
         data.append(("distill_teacher_steps", 12, int, False))
         data.append(("distill_teacher_steps_auto", True, bool, False))
         data.append(("distill_timestep_grid_mode", DistillTimestepGridMode.AUTO, DistillTimestepGridMode, False))
+        data.append(("distill_sigma_shift", 1.0, float, False))
         data.append(("distill_endpoint_loss_weight", 0.25, float, False))
         data.append(("distill_endpoint_lpips_weight", 0.0, float, False))
         data.append(("distill_kl_loss_weight", 1.0, float, False))

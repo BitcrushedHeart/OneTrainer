@@ -2,6 +2,7 @@ from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.distill_dmd2_util import build_distill_sigma_matrix
+from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
@@ -140,8 +141,11 @@ def test_distill_loss_step_warmup_updates_fake_adapter_only():
     assert model.student.weight.grad is None
     assert model.base.weight.grad is None
     assert setup.get_last_distill_metrics()["mode"] == "fake"
+    # The critic sample is a random-k one-step estimate: k prefix steps + one
+    # one-step forward, all under no_grad.
     student_calls = [call for call in setup.velocity_calls if call[0] == "student"]
-    assert len(student_calls) == _config().distill_target_steps
+    assert 1 <= len(student_calls) <= _config().distill_target_steps
+    assert all(call[3] is False for call in student_calls)
 
 
 def test_distill_loss_step_ttur_student_update_excludes_fake_gradients():
@@ -397,6 +401,152 @@ def test_lpips_unavailable_path_is_finite():
     loss = setup.calculate_distill_loss(model, batch, config, _student_progress(3))
     assert torch.isfinite(loss)
     assert setup.get_last_distill_metrics()["lpips_loss"] == 0.0
+
+
+def _clone_model(source: TinyDistillModel) -> TinyDistillModel:
+    clone = TinyDistillModel()
+    with torch.no_grad():
+        clone.base.weight.copy_(source.base.weight)
+        clone.student.weight.copy_(source.student.weight)
+        clone.fake.weight.copy_(source.fake.weight)
+    return clone
+
+
+def test_concurrent_mode_matches_split_loss_and_gradient():
+    # CONCURRENT fuses the two frozen-teacher passes into one double-batch
+    # forward; the objective must be unchanged.
+    torch.manual_seed(11)
+    config_split = _config()
+    config_concurrent = _config()
+    config_concurrent.distill_vram_mode = DistillVramMode.CONCURRENT
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+
+    model_split = TinyDistillModel()
+    model_concurrent = _clone_model(model_split)
+
+    setup_split = _setup()
+    loss_split = setup_split.calculate_distill_loss(model_split, batch, config_split, _student_progress(3))
+    loss_split.backward()
+
+    setup_concurrent = _setup()
+    loss_concurrent = setup_concurrent.calculate_distill_loss(
+        model_concurrent, batch, config_concurrent, _student_progress(3)
+    )
+    loss_concurrent.backward()
+
+    assert setup_split.get_last_distill_metrics()["mode"] == "student"
+    assert setup_concurrent.get_last_distill_metrics()["mode"] == "student"
+    assert torch.allclose(loss_split, loss_concurrent, rtol=1e-6, atol=1e-7)
+    assert torch.allclose(model_split.student.weight.grad, model_concurrent.student.weight.grad, rtol=1e-6, atol=1e-7)
+    assert torch.allclose(
+        setup_split._last_distill_x0_teacher, setup_concurrent._last_distill_x0_teacher, rtol=1e-6, atol=1e-7
+    )
+
+
+def test_concurrent_mode_fuses_teacher_passes_into_one_call():
+    config = _config()
+    config.distill_vram_mode = DistillVramMode.CONCURRENT
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+
+    setup = _setup()
+    setup.calculate_distill_loss(TinyDistillModel(), batch, config, _student_progress(3))
+
+    teacher_calls = [c for c in setup.velocity_calls if c[0] == "teacher"]
+    assert len(teacher_calls) == 1
+    # Fused call carries [x_k; x_sigma]: double the batch of the student forwards.
+    student_latent = next(c[4] for c in setup.velocity_calls if c[0] == "student")
+    assert teacher_calls[0][4].shape[0] == 2 * student_latent.shape[0]
+
+
+def test_concurrent_mode_fuses_cfg_teacher_passes_per_conditioning():
+    # With CFG > 1 the teacher needs conditional + unconditional velocities;
+    # CONCURRENT still fuses x_k/x_sigma so exactly one call runs per conditioning.
+    config = _config()
+    config.distill_vram_mode = DistillVramMode.CONCURRENT
+    batch = {
+        "latent_image": torch.zeros(2, 2),
+        "target_latent": torch.zeros(2, 2),
+        "distill_cfg_scale": torch.tensor([2.0, 2.0]),
+        "distill_teacher_steps": torch.tensor([12, 12]),
+    }
+
+    setup = _setup()
+    setup.calculate_distill_loss(TinyDistillModel(), batch, config, _student_progress(3))
+
+    teacher_cond = [c for c in setup.velocity_calls if c[0] == "teacher" and c[1] == "conditional"]
+    teacher_uncond = [c for c in setup.velocity_calls if c[0] == "teacher" and c[1] == "unconditional"]
+    assert len(teacher_cond) == 1
+    assert len(teacher_uncond) == 1
+
+
+def test_sigma_shift_changes_training_grid_but_keeps_gradient_flow():
+    config = _config()
+    config.distill_sigma_shift = 1.5
+    model = TinyDistillModel()
+    setup = _setup()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+
+    loss = setup.calculate_distill_loss(model, batch, config, _student_progress(3))
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert model.student.weight.grad is not None
+    assert model.student.weight.grad.abs().sum().item() > 0.0
+
+
+def test_fake_mode_final_step_estimate_equals_full_rollout_endpoint():
+    # With random backprop step off, the critic's sample (one-step x0 from the
+    # final grid step) is mathematically the full rollout endpoint:
+    # x_final = x_k + (0 - sigma_k) * v_k = x_k - sigma_k * v_k. This makes the
+    # pinned-step configuration exactly reproduce the old full-rollout critic.
+    config = _config()
+    config.distill_backprop_random_step = False
+    model = TinyDistillModel()
+    setup = _setup()
+    sigmas = build_distill_sigma_matrix(
+        config.distill_target_steps, torch.tensor([12, 12, 12, 12]), "AUTO", torch.device("cpu")
+    )
+    z = torch.randn(4, 2)
+    batch = {"latent_image": torch.randn(4, 2)}
+
+    with setup.adapter_state(model, config, "student"), torch.no_grad():
+        x0, _, _, k = setup._student_onestep_x0(model, batch, config, _student_progress(0), z, sigmas)
+        latent = z
+        for step_index in range(config.distill_target_steps):
+            velocity = model.student(latent)
+            delta = (sigmas[:, step_index + 1] - sigmas[:, step_index]).unsqueeze(-1)
+            latent = latent + delta * velocity
+
+    assert k == config.distill_target_steps - 1
+    assert torch.allclose(x0, latent, rtol=1e-5, atol=1e-6)
+
+
+def test_fake_mode_pinned_step_runs_the_full_rollout():
+    config = _config()
+    config.distill_backprop_random_step = False
+    setup = _setup()
+    batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+
+    setup.calculate_distill_loss(TinyDistillModel(), batch, config, _student_progress(0))
+
+    student_calls = [c for c in setup.velocity_calls if c[0] == "student"]
+    assert len(student_calls) == config.distill_target_steps
+
+
+def test_fake_mode_critic_samples_cover_all_backprop_steps_over_time():
+    # The critic must be trained on one-step estimates from every trajectory
+    # step, matching the distribution the student update's KL queries.
+    config = _config()
+    counts = set()
+    for global_step in range(40):
+        progress = _student_progress(global_step)
+        if BaseModelSetup._distill_update_mode(config, progress) != "fake":
+            continue
+        setup = _setup()
+        batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
+        setup.calculate_distill_loss(TinyDistillModel(), batch, config, progress)
+        counts.add(len([c for c in setup.velocity_calls if c[0] == "student"]))
+    assert counts == {1, 2, 3, 4}
 
 
 def test_one_grad_forward_with_inplace_buffer_is_autograd_safe():

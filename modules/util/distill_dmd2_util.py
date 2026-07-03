@@ -72,12 +72,28 @@ def dmd2_endpoint_loss(generated_latent: Tensor, target_latent: Tensor, weight: 
     return _mse_fp32(generated_latent, target_latent) * weight
 
 
+def shift_distill_sigmas(sigmas: Tensor, shift: float) -> Tensor:
+    """Warp uniform-time sigmas by the flow-matching shift used at inference.
+
+    ``sigma' = shift * sigma / (1 + (shift - 1) * sigma)`` — the same map
+    ``FlowMatchEulerDiscreteScheduler`` and ComfyUI's ModelSampling nodes apply
+    to their uniform time grid. ``shift=1`` is the identity; 1 and 0 are fixed
+    points, so the grid keeps its endpoints.
+    """
+    if shift == 1.0:
+        return sigmas
+    if shift <= 0.0:
+        raise ValueError("sigma shift must be greater than 0")
+    return shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+
+
 def build_distill_sigmas(
     target_steps: int,
     teacher_steps: int,
     mode: str,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    shift: float = 1.0,
 ) -> Tensor:
     if target_steps <= 0:
         raise ValueError("target_steps must be greater than 0")
@@ -86,6 +102,7 @@ def build_distill_sigmas(
 
     mode = str(mode).upper()
     teacher_grid = torch.linspace(1.0, 0.0, teacher_steps + 1, device=device, dtype=dtype)
+    teacher_grid = shift_distill_sigmas(teacher_grid, shift)
 
     if mode in {"AUTO", "UNIFORM"}:
         indices = torch.linspace(0, teacher_steps, target_steps + 1, device=device)
@@ -110,10 +127,11 @@ def build_distill_sigma_matrix(
     mode: str,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    shift: float = 1.0,
 ) -> Tensor:
     teacher_steps = teacher_steps.to(device=device, dtype=torch.long).flatten()
     rows = [
-        build_distill_sigmas(target_steps, int(steps.item()), mode, device=device, dtype=dtype)
+        build_distill_sigmas(target_steps, int(steps.item()), mode, device=device, dtype=dtype, shift=shift)
         for steps in teacher_steps
     ]
     return torch.stack(rows, dim=0)

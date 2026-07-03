@@ -1,6 +1,6 @@
 import os
 from abc import ABCMeta, abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
@@ -14,6 +14,7 @@ from modules.util.distill_dmd2_util import (
 )
 from modules.util.distill_metadata_util import extract_distill_metadata
 from modules.util.enum.DistillCfgMode import DistillCfgMode
+from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -397,47 +398,6 @@ class BaseModelSetup(
         """
         return None
 
-    def _simulate_student_distill_trajectory(
-        self,
-        model: BaseModel,
-        batch: dict,
-        config: TrainConfig,
-        train_progress: TrainProgress,
-        sigmas: Tensor,
-    ) -> list[Tensor]:
-        latent = batch.get("distill_initial_latent")
-        if latent is None:
-            generator = torch.Generator(device=self.train_device)
-            generator.manual_seed(train_progress.global_step)
-            latent = torch.randn(
-                batch["latent_image"].shape,
-                generator=generator,
-                device=batch["latent_image"].device,
-                dtype=batch["latent_image"].dtype,
-            )
-        else:
-            latent = latent.to(device=batch["latent_image"].device, dtype=batch["latent_image"].dtype)
-
-        trajectory = [latent]
-        total_steps = config.distill_target_steps
-        for step_index in range(total_steps):
-            sigma = sigmas[:, step_index]
-            next_sigma = sigmas[:, step_index + 1]
-            # DMD2 backward simulation: keep gradient only on the final step and
-            # detach the rest. Backpropagating through every step would run N
-            # adapter forwards into one graph, and OFT/DoRA mutate a shared
-            # rotation/weight buffer in place across passes -> autograd version
-            # error. (Already a no-op inside the no_grad fake-warmup sim.)
-            last_step = step_index == total_steps - 1
-            grad_ctx = nullcontext() if last_step else torch.no_grad()
-            with grad_ctx:
-                velocity = self.predict_distill_velocity(
-                    model, batch, config, train_progress, latent, sigma, conditioning="conditional"
-                )
-                latent = euler_flow_step(latent, velocity, sigma, next_sigma)
-            trajectory.append(latent)
-        return trajectory
-
     def _distill_initial_latent(self, batch: dict, train_progress: TrainProgress) -> Tensor:
         """Shared initial noise ``z`` for the student/teacher pairing.
 
@@ -515,16 +475,23 @@ class BaseModelSetup(
             config.distill_timestep_grid_mode,
             device=device,
             dtype=torch.float32,
+            shift=config.distill_sigma_shift,
         )
 
         if mode == "fake":
             # DMD2 fake-score update: model the student's *output* distribution
-            # via denoising score-matching on a re-noised student sample.
+            # via denoising score-matching on a re-noised student sample. The
+            # sample is drawn exactly the way the student update draws the x0
+            # its KL is evaluated at (random-k one-step estimate when
+            # distill_backprop_random_step is on; with it off, the final-step
+            # one-step estimate equals the full rollout endpoint), so the
+            # critic trains on the same distribution it is queried at — DMD2's
+            # multi-step backward simulation. This also skips the rollout
+            # steps after k.
+            z = self._distill_initial_latent(batch, train_progress)
             with self.adapter_state(model, config, "student"), torch.no_grad():
-                student_trajectory = self._simulate_student_distill_trajectory(
-                    model, batch, config, train_progress, sigmas
-                )
-            x0 = student_trajectory[-1].detach()
+                x0, _, _, _ = self._student_onestep_x0(model, batch, config, train_progress, z, sigmas)
+            x0 = x0.detach()
             x_sigma, sigma_k, v_target = self._distill_renoise(x0, train_progress, seed_offset=0)
             with self.adapter_state(model, config, "fake"):
                 # Conditional only: the student bakes CFG into its weights, so its
@@ -559,12 +526,36 @@ class BaseModelSetup(
             x0, x_k, sigma_step, grad_step = self._student_onestep_x0(model, batch, config, train_progress, z, sigmas)
         self._last_grad_step_index = grad_step
 
-        # Paired teacher-match: teacher one-step denoise at the same x_k.
+        # The KL is evaluated at a random re-noise of the student estimate;
+        # drawing it up front lets CONCURRENT mode fuse both teacher passes.
+        x_sigma, sigma_k, _ = self._distill_renoise(x0, train_progress, seed_offset=1)
+
+        # Two frozen-teacher predictions are needed: the paired teacher-match
+        # one-step denoise at x_k, and the real-score velocity at x_sigma for the
+        # KL. CONCURRENT batches them into one double-batch forward (same
+        # weights, no grad) instead of two passes; SPLIT keeps them separate.
         sigma_step_b = sigma_step.view(x_k.shape[0], *([1] * (x_k.dim() - 1))).to(dtype=x_k.dtype)
-        with self.adapter_state(model, config, "teacher"), torch.no_grad():
-            teacher_velocity = self._cfg_baked_distill_velocity(
-                model, batch, config, train_progress, x_k, sigma_step, cfg_scale
-            )
+        if config.distill_vram_mode == DistillVramMode.CONCURRENT:
+            batch_size = x_k.shape[0]
+            fused_latent = torch.cat([x_k, x_sigma.detach().to(dtype=x_k.dtype)], dim=0)
+            fused_sigma = torch.cat([sigma_step, sigma_k], dim=0)
+            fused_cfg = torch.cat([cfg_scale, cfg_scale], dim=0)
+            with self.adapter_state(model, config, "teacher"), torch.no_grad():
+                fused_velocity = self._cfg_baked_distill_velocity(
+                    model, batch, config, train_progress, fused_latent, fused_sigma, fused_cfg
+                )
+            teacher_velocity = fused_velocity[:batch_size]
+            real_predicted = fused_velocity[batch_size:]
+        else:
+            with self.adapter_state(model, config, "teacher"), torch.no_grad():
+                teacher_velocity = self._cfg_baked_distill_velocity(
+                    model, batch, config, train_progress, x_k, sigma_step, cfg_scale
+                )
+                real_predicted = self._cfg_baked_distill_velocity(
+                    model, batch, config, train_progress, x_sigma.detach(), sigma_k, cfg_scale
+                )
+
+        # Paired teacher-match: teacher one-step denoise at the same x_k.
         x0_teacher = (x_k - sigma_step_b * teacher_velocity).detach()
         self._last_distill_x0_teacher = x0_teacher
 
@@ -576,12 +567,7 @@ class BaseModelSetup(
                 lpips_loss = config.distill_endpoint_lpips_weight * lpips_term
                 endpoint_loss = endpoint_loss + lpips_loss
 
-        # Distribution-matching KL at a random re-noise of the student estimate.
-        x_sigma, sigma_k, _ = self._distill_renoise(x0, train_progress, seed_offset=1)
-        with self.adapter_state(model, config, "teacher"), torch.no_grad():
-            real_predicted = self._cfg_baked_distill_velocity(
-                model, batch, config, train_progress, x_sigma.detach(), sigma_k, cfg_scale
-            )
+        # Distribution-matching KL at the re-noised student estimate.
         with self.adapter_state(model, config, "fake"), torch.no_grad():
             fake_predicted = self.predict_distill_velocity(
                 model, batch, config, train_progress, x_sigma.detach(), sigma_k, conditioning="conditional"
@@ -710,9 +696,15 @@ class BaseModelSetup(
                 teacher_steps = self._distill_teacher_steps(batch, config, device)
                 teacher_target = int(teacher_steps.flatten()[0].item())
                 student_sigmas = build_distill_sigma_matrix(
-                    config.distill_target_steps, teacher_steps, config.distill_timestep_grid_mode, device=device
+                    config.distill_target_steps,
+                    teacher_steps,
+                    config.distill_timestep_grid_mode,
+                    device=device,
+                    shift=config.distill_sigma_shift,
                 )
-                teacher_sigmas = build_distill_sigma_matrix(teacher_target, teacher_steps, "AUTO", device=device)
+                teacher_sigmas = build_distill_sigma_matrix(
+                    teacher_target, teacher_steps, "AUTO", device=device, shift=config.distill_sigma_shift
+                )
                 noise = self._distill_val_noise(batch, seed=1_000_003 + index)
 
                 ref = ref_cache.get(index)

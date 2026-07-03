@@ -136,6 +136,16 @@ class BaseZImageSetup(
                 sigma = batch["_distill_sigma"].to(device=scaled_latent_image.device, dtype=torch.float32).flatten()
                 latent_input = scaled_noisy_latent_image.unsqueeze(2).to(dtype=model.train_dtype.torch_dtype())
                 latent_input_list = list(latent_input.unbind(dim=0))
+                # CONCURRENT distill mode fuses several latents per prompt into
+                # one forward; tile the per-sample embeddings to match.
+                if len(latent_input_list) != len(text_encoder_output):
+                    repeat, remainder = divmod(len(latent_input_list), len(text_encoder_output))
+                    if remainder != 0:
+                        raise RuntimeError(
+                            f"Distill latent batch ({len(latent_input_list)}) is not a multiple of the "
+                            f"conditioning batch ({len(text_encoder_output)})."
+                        )
+                    text_encoder_output = list(text_encoder_output) * repeat
                 transformer_timestep = 1.0 - sigma
 
                 output_list = model.transformer(

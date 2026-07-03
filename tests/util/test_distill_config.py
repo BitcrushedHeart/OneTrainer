@@ -21,6 +21,7 @@ def test_distill_config_defaults_round_trip():
     assert config.distill_cfg_mode == DistillCfgMode.AUTO
     assert config.distill_fake_adapter_type == DistillFakeAdapterType.LORA
     assert config.distill_fake_adapter_rank == 16
+    assert config.distill_sigma_shift == 1.0
 
     loaded = TrainConfig.default_values().from_dict(config.to_dict())
 
@@ -44,4 +45,12 @@ def test_distill_validation_rejects_conflicting_or_unsupported_modes():
     assert config.validate_distill_startup() == "Distill is currently implemented for Z-Image only."
 
     config.model_type = ModelType.Z_IMAGE
+    assert config.validate_distill_startup() is None
+
+    config.distill_vram_mode = DistillVramMode.CONCURRENT
+    assert config.validate_distill_startup() is None
+
+    config.distill_sigma_shift = 0.0
+    assert config.validate_distill_startup() is not None
+    config.distill_sigma_shift = 1.5
     assert config.validate_distill_startup() is None

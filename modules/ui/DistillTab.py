@@ -89,7 +89,8 @@ class DistillTab:
             2,
             3,
             "VRAM Mode",
-            tooltip="SPLIT runs teacher/fake/student forwards sequentially. CONCURRENT is reserved for higher VRAM setups.",
+            tooltip="SPLIT runs the two frozen-teacher passes of a student update separately. CONCURRENT fuses "
+            "them into one double-batch forward: slightly higher transient VRAM, less per-pass overhead.",
         )
         components.options(
             self.scroll_frame,
@@ -212,6 +213,18 @@ class DistillTab:
             3,
             "Random Backprop Step",
             tooltip="Spread the learning signal across all denoising steps: each update backprops through a "
-            "random trajectory step (one grad-bearing forward). Off pins it to the final step.",
+            "random trajectory step (one grad-bearing forward). The fake-score critic draws its training "
+            "samples the same way, so it models the distribution the KL queries. Off pins both to the final step.",
         )
         components.switch(self.scroll_frame, 8, 4, self.ui_state, "distill_backprop_random_step")
+
+        components.label(
+            self.scroll_frame,
+            9,
+            0,
+            "Sigma Shift",
+            tooltip="Flow-matching shift applied to the distill sigma grid (sigma = s*t / (1 + (s-1)*t)). "
+            "Set this to the shift your sampler uses at inference so the student trains on the exact "
+            "sigmas it will be stepped at. 1.0 = uniform grid (no shift).",
+        )
+        components.entry(self.scroll_frame, 9, 1, self.ui_state, "distill_sigma_shift")
