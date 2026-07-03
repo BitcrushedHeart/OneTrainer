@@ -617,8 +617,12 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         # The DPO patterns change which rows a concept produces, so they join
         # the variation group keys. Group keys only organize balancing and
-        # sampling — they never invalidate cached .pt files.
-        variations_group_extra = ["concept.dpo_chosen_pattern", "concept.dpo_rejected_pattern"]
+        # sampling — they never invalidate cached .pt files. Gate on rlhf_enabled
+        # so non-DPO runs keep the byte-identical upstream group key rather than a
+        # 6-element key carrying two always-empty pattern fields.
+        variations_group_extra = (
+            ["concept.dpo_chosen_pattern", "concept.dpo_rejected_pattern"] if config.rlhf_enabled else []
+        )
 
         image_disk_cache = SmartDiskCache(
             cache_dir=image_cache_dir,

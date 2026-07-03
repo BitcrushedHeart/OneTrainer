@@ -127,6 +127,7 @@ class GenericTrainer(BaseTrainer):
 
         model_names = self.config.model_names()
 
+        last_backup_path = None
         if self.config.continue_last_backup:
             self.callbacks.on_update_status("searching for previous backups")
             last_backup_path = self.config.get_last_backup_path()
@@ -177,6 +178,11 @@ class GenericTrainer(BaseTrainer):
         if self.config.rlhf_enabled and self.config.training_method != TrainingMethod.LORA:
             raise NotImplementedError("RLHF DPO is currently implemented for adapter training in the LoRA tab only.")
 
+        # Resuming a DPO run: restore the frozen reference saved with the backup so
+        # it is not re-captured from the already-trained adapter weights.
+        if self.config.rlhf_enabled and last_backup_path:
+            self.model_setup.load_dpo_reference(last_backup_path, self.model)
+
         self.callbacks.on_update_status("creating the data loader/caching")
 
         self.data_loader = self.create_data_loader(self.model, self.model_setup, self.model.train_progress)
@@ -212,7 +218,7 @@ class GenericTrainer(BaseTrainer):
                 )
                 self.sft_anchor_data_loader.stop_check_fun = self.commands.get_stop_command
 
-        if self.config.validation or self.config.rlhf_dpo_validation:
+        if self.config.validation or self.config.dpo_validation_active():
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
@@ -550,7 +556,7 @@ class GenericTrainer(BaseTrainer):
                 total=current_epoch_length_validation,
             )
 
-            if self.config.rlhf_dpo_validation:
+            if self.config.dpo_validation_active():
                 dpo_val_accuracy = []
                 dpo_val_chosen_reward = []
                 dpo_val_rejected_reward = []
@@ -776,6 +782,7 @@ class GenericTrainer(BaseTrainer):
             )
 
             self.__save_backup_config(backup_path)
+            self.model_setup.save_dpo_reference(backup_path)
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -1441,6 +1448,30 @@ class GenericTrainer(BaseTrainer):
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
 
+                        # Adaptive beta must be applied on EVERY rank and driven by
+                        # the global margin: otherwise non-master ranks keep the
+                        # static beta and the averaged gradients mix losses at
+                        # different beta scales. All ranks all-reduce the margin and
+                        # run the same deterministic controller, so they stay in
+                        # lockstep without a broadcast. reduce_tensor_mean is a
+                        # collective, so this must sit outside the is_master() block.
+                        adaptive_beta = None
+                        if (
+                            self.config.rlhf_enabled
+                            and accumulated_dpo_metrics is not None
+                            and self.config.rlhf_dpo_adaptive_beta
+                            and self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
+                        ):
+                            margin_t = torch.tensor(
+                                accumulated_dpo_metrics["reward_margin"] / accumulated_dpo_metrics["_count"],
+                                device=train_device,
+                            )
+                            multi.reduce_tensor_mean(margin_t)
+                            if self._dpo_beta_controller is None:
+                                self._dpo_beta_controller = DPOBetaController(self.config.rlhf_dpo_beta)
+                            adaptive_beta = self._dpo_beta_controller.update(margin_t.item())
+                            self.model_setup.set_dpo_runtime_beta(adaptive_beta)
+
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(
                                 self.model, self.config, lr_scheduler, self.tensorboard
@@ -1514,14 +1545,9 @@ class GenericTrainer(BaseTrainer):
                                     print(warning)
                                     self.tensorboard.add_text("dpo/warnings", warning, train_progress.global_step)
 
-                                if (
-                                    self.config.rlhf_dpo_adaptive_beta
-                                    and self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
-                                ):
-                                    if self._dpo_beta_controller is None:
-                                        self._dpo_beta_controller = DPOBetaController(self.config.rlhf_dpo_beta)
-                                    adaptive_beta = self._dpo_beta_controller.update(dpo_metrics["reward_margin"])
-                                    self.model_setup.set_dpo_runtime_beta(adaptive_beta)
+                                if adaptive_beta is not None:
+                                    # Controller already ran on every rank above; here we
+                                    # only log the (globally-consistent) beta it produced.
                                     self.tensorboard.add_scalar("dpo/beta", adaptive_beta, train_progress.global_step)
                                     self.tensorboard.add_scalar(
                                         "dpo/raw_margin_ema",
@@ -1561,7 +1587,9 @@ class GenericTrainer(BaseTrainer):
                                     train_progress.global_step,
                                 )
                                 self.tensorboard.add_scalar(
-                                    "distill/mode_student", 1.0 if mode == "student" else 0.0, train_progress.global_step
+                                    "distill/mode_student",
+                                    1.0 if mode == "student" else 0.0,
+                                    train_progress.global_step,
                                 )
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
@@ -1598,7 +1626,7 @@ class GenericTrainer(BaseTrainer):
 
                 if (
                     self.config.validation
-                    or self.config.rlhf_dpo_validation
+                    or self.config.dpo_validation_active()
                     or (self.config.distill_enabled and self.config.distill_validation)
                 ) and multi.is_master():
                     self.__validate(train_progress)

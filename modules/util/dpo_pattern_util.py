@@ -1,4 +1,5 @@
 import os
+from functools import cache
 
 from modules.util import path_util
 
@@ -7,6 +8,13 @@ import parse
 
 def _normalize_relpath(relpath: str) -> str:
     return relpath.replace("\\", "/")
+
+
+@cache
+def _compiled_pattern(pattern: str):
+    # parse.compile rebuilds a regex from the format string; cache one Parser per
+    # distinct pattern so match_chosen doesn't recompile it on every image.
+    return parse.compile(pattern)
 
 
 def pattern_has_extension(pattern: str) -> bool:
@@ -37,7 +45,7 @@ def match_chosen(chosen_pattern: str, concept_path: str, image_path: str) -> str
         return None
     pattern = _normalize_relpath(chosen_pattern)
     target = relpath if pattern_has_extension(pattern) else os.path.splitext(relpath)[0]
-    result = parse.parse(pattern, target)
+    result = _compiled_pattern(pattern).parse(target)
     if result is None or not result.fixed:
         return None
     return result.fixed[0]

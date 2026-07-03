@@ -132,7 +132,7 @@ class BaseDataLoader(
             config = copy.copy(config)
             config.batch_size = 1
             config.multi_gpu = False
-            config.rlhf_enabled = config.rlhf_dpo_validation and config.rlhf_enabled
+            config.rlhf_enabled = config.dpo_validation_active()
         elif is_sft_anchor:
             # Parallel SFT-anchor loader for DPO runs that include STANDARD
             # concepts: re-use the standard (non-DPO) data pipeline so the

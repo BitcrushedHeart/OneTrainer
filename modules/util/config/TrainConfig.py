@@ -1033,6 +1033,12 @@ class TrainConfig(BaseConfig):
     def effective_dpo_ref_mode(self) -> DPORefMode:
         return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
 
+    def dpo_validation_active(self) -> bool:
+        # DPO validation only makes sense inside a DPO run: the paired
+        # chosen/rejected validation pipeline is built only when both flags are
+        # set, so every consumer must gate on both to avoid a mid-run crash.
+        return self.rlhf_enabled and self.rlhf_dpo_validation
+
     def validate_distill_startup(self) -> str | None:
         if not self.distill_enabled:
             return None
@@ -1486,14 +1492,14 @@ class TrainConfig(BaseConfig):
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
         data.append(("rlhf_enabled", False, bool, False))
-        data.append(("rlhf_dpo_beta", 300.0, float, False))
+        data.append(("rlhf_dpo_beta", 200.0, float, False))
         data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
         data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
         data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
-        data.append(("rlhf_supervised_mix", 0.0, float, False))
+        data.append(("rlhf_supervised_mix", 0.25, float, False))
         data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
         data.append(("rlhf_dpo_validation", False, bool, False))
         data.append(("rlhf_dpo_validation_percentage", 10.0, float, False))
