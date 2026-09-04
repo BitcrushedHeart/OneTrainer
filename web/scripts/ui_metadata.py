@@ -66,6 +66,15 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "ON": "On",
         "CPU_OFFLOADED": "CPU Offloaded",
     },
+    "AttentionBackend": {
+        "DEFAULT": "Default",
+        "NATIVE_FLASH": "Flash",
+        "NATIVE_EFFICIENT": "Memory Efficient",
+        "NATIVE_CUDNN": "cuDNN",
+        "NATIVE_MATH": "Math",
+        "FLEX": "Flex",
+        "EFFICIENT_NOCOPY": "Efficient, no mask copy",
+    },
     "GradientReducePrecision": {
         "WEIGHT_DTYPE": "Weight Dtype",
         "WEIGHT_DTYPE_STOCHASTIC": "Weight Dtype Stochastic",
@@ -389,6 +398,13 @@ FIELD_TOOLTIPS: dict[str, str] = {
         "Keeps the torch.compile result on disk so the next run (e.g. the next queue entry) skips the "
         "compile warm-up instead of retracing every block. Only applies when compile is enabled. "
         "Disable if a run misbehaves right after a code or torch update."
+    ),
+    "attention_backend": (
+        "Which scaled dot product attention kernel the transformer uses."
+        " Default leaves the choice to diffusers/PyTorch (flash without a mask, memory-efficient with one)."
+        " 'Efficient, no mask copy' is the memory-efficient kernel behind a custom op, so torch.compile"
+        " cannot copy the batch padding mask into a dense (batch, heads, tokens, tokens) buffer in the backward."
+        " Currently only applied to Z-Image."
     ),
     "unet.weight_dtype": "The unet weight data type",
     "transformer.model_name": (
@@ -1040,6 +1056,7 @@ FIELD_TOOLTIPS: dict[str, str] = {
 
 WIDE_TOOLTIPS: set[str] = {
     "secrets.huggingface_token",
+    "attention_backend",
     "timestep_distribution",
     "dynamic_timestep_shifting",
     "gradient_reduce_precision",

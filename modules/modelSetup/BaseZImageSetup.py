@@ -12,6 +12,7 @@ from modules.modelSetup.mixin.ModelSetupFlowMatchingMixin import ModelSetupFlowM
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
 from modules.modelSetup.mixin.ModelSetupPerceptualLossMixin import ModelSetupPerceptualLossMixin
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
+from modules.util.attention_backend_util import apply_attention_backend
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_qwen3_encoder_layers,
     enable_checkpointing_for_z_image_transformer,
@@ -65,6 +66,8 @@ class BaseZImageSetup(
         model: ZImageModel,
         config: TrainConfig,
     ):
+        apply_attention_backend(model.transformer, config.attention_backend)
+
         if config.gradient_checkpointing.enabled():
             model.transformer_offload_conductor = enable_checkpointing_for_z_image_transformer(
                 model.transformer, config

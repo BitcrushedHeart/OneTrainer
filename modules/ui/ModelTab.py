@@ -1,5 +1,6 @@
 from modules.util import create
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.AttentionBackend import AttentionBackend
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelFormat import ModelFormat
@@ -418,6 +419,35 @@ class ModelTab:
             tooltip="Keeps the torch.compile result on disk so the next run (e.g. the next queue entry) skips the compile warm-up instead of retracing every block. Only applies when compile is enabled. Disable if a run misbehaves right after a code or torch update.",
         )
         components.switch(frame, row, 4, self.ui_state, "compile_cache")
+
+        row += 1
+
+        # attention backend
+        components.label(
+            frame,
+            row,
+            3,
+            "Attention Backend",
+            tooltip="Which scaled dot product attention kernel the transformer uses. "
+            "Default leaves the choice to diffusers/PyTorch. Currently only applied to Z-Image.",
+            wide_tooltip=True,
+        )
+        components.options_kv(
+            frame,
+            row,
+            4,
+            [
+                ("Default", AttentionBackend.DEFAULT),
+                ("Flash", AttentionBackend.NATIVE_FLASH),
+                ("Memory Efficient", AttentionBackend.NATIVE_EFFICIENT),
+                ("cuDNN", AttentionBackend.NATIVE_CUDNN),
+                ("Math", AttentionBackend.NATIVE_MATH),
+                ("Flex", AttentionBackend.FLEX),
+                ("Efficient, no mask copy", AttentionBackend.EFFICIENT_NOCOPY),
+            ],
+            self.ui_state,
+            "attention_backend",
+        )
 
         row += 1
 

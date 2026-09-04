@@ -9,6 +9,7 @@ from modules.util.config.CloudConfig import CloudConfig
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
+from modules.util.enum.AttentionBackend import AttentionBackend
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
@@ -505,6 +506,7 @@ class TrainConfig(BaseConfig):
     force_circular_padding: bool
     compile: bool
     compile_cache: bool
+    attention_backend: AttentionBackend
 
     # data settings
     concept_file_name: str
@@ -1818,6 +1820,7 @@ class TrainConfig(BaseConfig):
         # Dynamo precompile cache: reuse traced graphs across processes so queued
         # runs skip the per-run torch.compile warm-up. Only meaningful with compile.
         data.append(("compile_cache", True, bool, False))
+        data.append(("attention_backend", AttentionBackend.DEFAULT, AttentionBackend, False))
 
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
