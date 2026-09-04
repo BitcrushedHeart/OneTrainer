@@ -1,11 +1,12 @@
-import pytest
-import torch
-
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
+
+import torch
+
+import pytest
 
 
 class FakeAdapter:
@@ -106,9 +107,8 @@ def test_distill_adapter_state_restores_after_exception():
     setup = TinySetup(torch.device("cpu"), torch.device("cpu"), False)
     config = _config()
 
-    with pytest.raises(ValueError):
-        with setup.adapter_state(model, config, "fake"):
-            raise ValueError("boom")
+    with pytest.raises(ValueError), setup.adapter_state(model, config, "fake"):
+        raise ValueError("boom")
 
     assert model.student_adapter.hooked is True
     assert model.teacher_adapter.hooked is False

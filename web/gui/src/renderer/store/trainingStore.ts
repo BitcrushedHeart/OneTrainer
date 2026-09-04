@@ -81,7 +81,9 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   fetchStatus: async () => {
     try {
       const res = await trainingApi.getStatus();
-      if (res.status === "running") {
+      if (res.status === "starting") {
+        set({ status: "preparing", statusText: "Starting training..." });
+      } else if (res.status === "running") {
         set({ status: "training" });
       } else if (res.status === "stopping") {
         set({ status: "training", statusText: "Stopping..." });

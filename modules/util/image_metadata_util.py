@@ -50,6 +50,9 @@ def _extract_png_metadata(path: str) -> dict:
                         "prompt": data["prompt"],
                         "aspectratio": data.get("aspectratio", ""),
                     }
+                nested = _extract_nested_params(data)
+                if nested is not None:
+                    return nested
                 prompt = _extract_comfyui_prompt(data)
                 if prompt:
                     return {"prompt": prompt, "aspectratio": ""}
@@ -63,6 +66,35 @@ def _extract_png_metadata(path: str) -> dict:
         "prompt": info.get("prompt", ""),
         "aspectratio": info.get("aspectratio", ""),
     }
+
+
+#: Chunk payloads that nest the generation settings one level down instead of
+#: putting ``prompt`` at the top. SwarmUI writes a single ``parameters`` chunk of
+#: this shape, so reading only the top level loses every PNG it produces — WEBP
+#: survives the same generator only because the raw byte scanner regexes the
+#: nested key incidentally.
+_NESTED_PARAM_KEYS = ("sui_image_params",)
+
+
+def _extract_nested_params(data: dict) -> dict | None:
+    """Return prompt/aspectratio from a nested settings dict, or None.
+
+    Returns None (rather than a blank prompt) when nothing usable is nested, so
+    the caller keeps looking at the remaining chunks instead of settling for an
+    empty result from the first one that happened to parse.
+    """
+    for key in _NESTED_PARAM_KEYS:
+        params = data.get(key)
+        if not isinstance(params, dict):
+            continue
+        prompt = params.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            aspectratio = params.get("aspectratio")
+            return {
+                "prompt": prompt,
+                "aspectratio": aspectratio if isinstance(aspectratio, str) else "",
+            }
+    return None
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"

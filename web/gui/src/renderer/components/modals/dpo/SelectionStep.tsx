@@ -1,4 +1,4 @@
-import { SkipForward, X } from "lucide-react";
+import { Ban, Cpu, Loader2, SkipForward, Sparkles, Trash2, X, Zap } from "lucide-react";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -7,7 +7,20 @@ import { Button } from "@/components/shared";
 
 import { PreviewOverlay } from "./PreviewOverlay";
 import { PromptExpander } from "./PromptExpander";
-import type { SelectionStepProps } from "./types";
+import type { RealismDevice, SelectionStepProps } from "./types";
+
+// The scoring control cycles rather than opening a menu: three positions is
+// short enough to click through, and it is the same setting the setup screen
+// exposes as a dropdown before the session starts.
+const SCORING_CYCLE: Record<RealismDevice, RealismDevice> = { auto: "cpu", cpu: "off", off: "auto" };
+
+const SCORING_LABEL: Record<RealismDevice, string> = { auto: "GPU", cpu: "CPU", off: "Scoring off" };
+
+const SCORING_TITLE: Record<RealismDevice, string> = {
+  auto: "Scoring on the GPU when one is available. Click to run on the CPU instead, leaving VRAM to training.",
+  cpu: "Scoring on the CPU — slower, but it leaves the GPU free. Click to turn scoring off entirely.",
+  off: "Scoring is off: no model, no sort, no badges. Click to score on the GPU again.",
+};
 
 function basename(path: string | null): string {
   if (!path) return "";
@@ -39,12 +52,23 @@ function columnsForRatio(ratio: number | null, count: number): number {
   return Math.max(1, Math.min(cols, count));
 }
 
+// Colour ramp for the realism badge: green = the model finds it convincing,
+// red = it does not. Deliberately coarse — the number is a hint, the ordering
+// is the real signal.
+function realismColor(pAi: number): string {
+  if (pAi < 0.5) return "#22c55e";
+  if (pAi < 0.8) return "#eab308";
+  if (pAi < 0.95) return "#f97316";
+  return "#ef4444";
+}
+
 export function SelectionStep({
   group,
   onPick,
   onAcceptPair,
   onDismissPair,
   onSkipGroup,
+  onDiscardGroup,
   onCancel,
   phase,
   bestImage,
@@ -53,6 +77,15 @@ export function SelectionStep({
   showAcceptDialog,
   pendingBest,
   pendingWorst,
+  realismScores,
+  realismError,
+  backfill,
+  onStartBackfill,
+  onStopBackfill,
+  // Optional on the props so tests and modes that do not wire scoring still
+  // render; "auto" is what the server starts on.
+  realismDevice = "auto",
+  onSetRealismDevice,
 }: SelectionStepProps) {
   const [previewPath, setPreviewPath] = useState<string | null>(null);
 
@@ -107,9 +140,26 @@ export function SelectionStep({
   // exactly 1 image remains and the UI falsely reported "not enough images".
   const minRemaining = phase === "worst" ? 1 : 2;
   const hasEnoughImages = remainingImages.length >= minRemaining;
+
+  // Most photorealistic first — the lowest P(AI) is the strongest DPO winner
+  // candidate. Unscored images keep their source position relative to each
+  // other (Array.sort is stable), so a partially-scored or unavailable model
+  // degrades to the original order rather than to a scrambled one.
+  const scored = realismScores ?? {};
+  const displayImages =
+    Object.keys(scored).length > 0
+      ? [...remainingImages].sort((a, b) => {
+          const sa = scored[a];
+          const sb = scored[b];
+          if (sa === undefined && sb === undefined) return 0;
+          if (sa === undefined) return 1;
+          if (sb === undefined) return -1;
+          return sa - sb;
+        })
+      : remainingImages;
   const ar = parseAspectRatio(group.aspectratio);
   const arStyle: React.CSSProperties | undefined = ar ? { aspectRatio: ar.css } : undefined;
-  const gridCols = columnsForRatio(ar?.ratio ?? null, remainingImages.length);
+  const gridCols = columnsForRatio(ar?.ratio ?? null, displayImages.length);
 
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
@@ -125,11 +175,94 @@ export function SelectionStep({
           <span>
             Pair {pairsDone + 1}/{group.pairs_target}
           </span>
+          {realismDevice === "off" ? (
+            <>
+              <span className="text-[var(--color-border-subtle)]">·</span>
+              <span>scoring off — source order</span>
+            </>
+          ) : realismError ? (
+            <>
+              <span className="text-[var(--color-border-subtle)]">·</span>
+              <span title={realismError} style={{ color: "#f97316" }}>
+                realism scoring unavailable
+              </span>
+            </>
+          ) : Object.keys(scored).length > 0 ? (
+            <>
+              <span className="text-[var(--color-border-subtle)]">·</span>
+              <span style={{ color: "#22c55e" }}>sorted most photorealistic first</span>
+            </>
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
+          {/* Score the whole source tree once so no group ever waits on the
+              model. Hidden when scoring is unavailable — there would be nothing
+              to backfill. */}
+          {/* Move scoring off the GPU when something else needs the VRAM. The
+              server applies it from the next call on, so a backfill in flight
+              switches at its next chunk instead of restarting. */}
+          {/* Stays visible with scoring off — it is the way back on, and the
+              "unavailable" case is the only one where there is nothing to pick
+              between. */}
+          {onSetRealismDevice && (!realismError || realismDevice === "off") ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onSetRealismDevice(SCORING_CYCLE[realismDevice])}
+              title={SCORING_TITLE[realismDevice]}
+              style={
+                realismDevice === "cpu"
+                  ? { color: "#60a5fa" }
+                  : realismDevice === "off"
+                    ? { color: "#f97316" }
+                    : undefined
+              }
+            >
+              {realismDevice === "cpu" ? (
+                <Cpu className="w-4 h-4" />
+              ) : realismDevice === "off" ? (
+                <Ban className="w-4 h-4" />
+              ) : (
+                <Zap className="w-4 h-4" />
+              )}
+              {SCORING_LABEL[realismDevice]}
+            </Button>
+          ) : null}
+          {onStartBackfill && !realismError && realismDevice !== "off" ? (
+            backfill?.running ? (
+              <Button variant="ghost" size="sm" onClick={onStopBackfill} title="Stop after the current chunk">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {backfill.total > 0 ? `Scoring ${backfill.done}/${backfill.total}` : "Scoring…"}
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onStartBackfill}
+                title={
+                  backfill?.error ??
+                  "Score every image in the source folder once, so each group is instant from then on"
+                }
+                style={backfill?.error ? { color: "#f97316" } : undefined}
+              >
+                <Sparkles className="w-4 h-4" />
+                {backfill?.error ? "Backfill failed" : "Backfill Scores"}
+              </Button>
+            )
+          ) : null}
           <Button variant="ghost" size="sm" onClick={onSkipGroup} style={{ background: "#8B4513", color: "#fff" }}>
             <SkipForward className="w-4 h-4" />
             Skip Group
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDiscardGroup}
+            style={{ background: "#7f1d1d", color: "#fff" }}
+            title="Move every image still in this group to a .discard subfolder so it never reappears (pairs already saved are kept)"
+          >
+            <Trash2 className="w-4 h-4" />
+            Discard Group
           </Button>
           <Button variant="ghost" size="sm" onClick={onCancel}>
             <X className="w-4 h-4" />
@@ -155,7 +288,7 @@ export function SelectionStep({
           className="grid gap-2 flex-1 min-h-0 overflow-y-auto auto-rows-min content-start"
           style={{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }}
         >
-          {remainingImages.map((imgPath) => {
+          {displayImages.map((imgPath) => {
             const isBest = imgPath === bestImage;
             return (
               <button
@@ -188,6 +321,15 @@ export function SelectionStep({
                     style={{ background: "#22c55e", color: "#0b2c13" }}
                   >
                     BEST
+                  </div>
+                )}
+                {scored[imgPath] !== undefined && (
+                  <div
+                    className="absolute top-1 right-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                    style={{ background: realismColor(scored[imgPath]), color: "#0b0b0b" }}
+                    title={`Model thinks this is ${(scored[imgPath] * 100).toFixed(1)}% AI-generated`}
+                  >
+                    {(scored[imgPath] * 100).toFixed(0)}% AI
                   </div>
                 )}
                 <div
@@ -277,8 +419,9 @@ export function SelectionStep({
                 Best: {basename(pendingBest)} / Worst: {basename(pendingWorst)}
               </div>
               <div className="text-[11px] text-[var(--color-on-surface-secondary)] text-center mb-2">
-                Confirm = accept and move to next group · Pick More = accept and keep scoring this group · Cancel =
-                discard this pair (nothing written)
+                Confirm = accept and move to next group · Pick More = accept and keep scoring this group · Save &
+                Discard Rest = accept, then retire the whole group from the source tree · Cancel = discard this pair
+                (nothing written)
               </div>
               <div className="flex items-center justify-center gap-2 flex-wrap">
                 <Button variant="primary" size="sm" onClick={() => onAcceptPair(false)}>
@@ -286,6 +429,16 @@ export function SelectionStep({
                 </Button>
                 <Button variant="secondary" size="sm" onClick={() => onAcceptPair(true)}>
                   Pick More
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onAcceptPair(false, true)}
+                  style={{ background: "#7f1d1d", color: "#fff" }}
+                  title="Save this pair, then move the paired sources to .chosen/.rejected and every remaining image to .discard so this group won't reappear"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Save &amp; Discard Rest
                 </Button>
                 <Button variant="ghost" size="sm" onClick={onDismissPair}>
                   Cancel

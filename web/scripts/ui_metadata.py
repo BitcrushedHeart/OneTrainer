@@ -79,6 +79,7 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
     },
     "RLHFMode": {
         "DPO": "DPO (Direct Preference Optimization)",
+        "SFT_DPO": "SFT + DPO (finetune primary, DPO add-on)",
     },
     "DPOObjective": {
         "SIGMOID": "DPO (Sigmoid)",
@@ -766,6 +767,13 @@ FIELD_TOOLTIPS: dict[str, str] = {
     "save_skip_first": "Start saving automatically after this interval has elapsed",
     "save_filename_prefix": "The prefix for filenames used when saving the model during training",
     "aspect_ratio_bucketing": "Aspect ratio bucketing enables training on images with different aspect ratios",
+    "adaptive_resolution": (
+        "Train each image at the highest configured resolution tier it supports without enlargement."
+        " The smallest active ladder tier is the intentional fallback and batches remain grouped by exact crop size"
+    ),
+    "adaptive_resolution_ladder": (
+        "Comma-separated scalar tiers available to Adaptive Resolution. The training resolution remains the maximum"
+    ),
     "latent_caching": "Caching of intermediate training data that can be re-used between epochs",
     "clear_cache_before_training": (
         "Clears the cache directory before starting to train."

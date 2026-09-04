@@ -20,6 +20,13 @@ from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
+from modules.util.transfer_util import (
+    TransferForkState,
+    run_late_stack,
+    run_prefix_and_capture,
+    split_layer_key,
+    swap_module_weights,
+)
 
 import torch
 from torch import Tensor
@@ -86,6 +93,53 @@ class BaseZImageSetup(
         quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype, config)
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
+
+    def _prepare_flow_inputs(
+        self,
+        model: ZImageModel,
+        config: TrainConfig,
+        deterministic: bool,
+        generator: torch.Generator,
+        rand: Random,
+        scaled_latent_image: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, list[Tensor]]:
+        """The standard training branch's noise/timestep preamble, shared with
+        transfer_fork_forward so transfer activations stay exactly on the
+        training distribution. Behavior-preserving extraction from predict().
+
+        Returns (latent_noise, timestep, sigma, scaled_noisy_latent_image,
+        latent_input_list)."""
+        latent_noise = self._create_noise(scaled_latent_image, config, generator)
+
+        shift = model.calculate_timestep_shift(scaled_latent_image.shape[-2], scaled_latent_image.shape[-1])
+        timestep = self._get_timestep_discrete(
+            model.noise_scheduler.config["num_train_timesteps"],
+            deterministic,
+            generator,
+            scaled_latent_image.shape[0],
+            config,
+            shift=shift if config.dynamic_timestep_shifting else config.timestep_shift,
+        )
+
+        scaled_noisy_latent_image, sigma = self._add_noise_discrete(
+            scaled_latent_image,
+            latent_noise,
+            timestep,
+            model.noise_scheduler.timesteps,
+        )
+
+        if not deterministic:
+            scaled_noisy_latent_image, latent_noise = self._apply_ciop(
+                scaled_noisy_latent_image,
+                latent_noise,
+                config,
+                generator,
+                rand,
+            )
+
+        latent_input = scaled_noisy_latent_image.unsqueeze(2).to(dtype=model.train_dtype.torch_dtype())
+        latent_input_list = list(latent_input.unbind(dim=0))
+        return latent_noise, timestep, sigma, scaled_noisy_latent_image, latent_input_list
 
     def predict(
         self,
@@ -167,36 +221,9 @@ class BaseZImageSetup(
                     "predicted_latent": predicted_scaled_latent_image,
                 }
 
-            latent_noise = self._create_noise(scaled_latent_image, config, generator)
-
-            shift = model.calculate_timestep_shift(scaled_latent_image.shape[-2], scaled_latent_image.shape[-1])
-            timestep = self._get_timestep_discrete(
-                model.noise_scheduler.config["num_train_timesteps"],
-                deterministic,
-                generator,
-                scaled_latent_image.shape[0],
-                config,
-                shift=shift if config.dynamic_timestep_shifting else config.timestep_shift,
+            latent_noise, timestep, sigma, scaled_noisy_latent_image, latent_input_list = self._prepare_flow_inputs(
+                model, config, deterministic, generator, rand, scaled_latent_image
             )
-
-            scaled_noisy_latent_image, sigma = self._add_noise_discrete(
-                scaled_latent_image,
-                latent_noise,
-                timestep,
-                model.noise_scheduler.timesteps,
-            )
-
-            if not deterministic:
-                scaled_noisy_latent_image, latent_noise = self._apply_ciop(
-                    scaled_noisy_latent_image,
-                    latent_noise,
-                    config,
-                    generator,
-                    rand,
-                )
-
-            latent_input = scaled_noisy_latent_image.unsqueeze(2).to(dtype=model.train_dtype.torch_dtype())
-            latent_input_list = list(latent_input.unbind(dim=0))
 
             output_list = model.transformer(
                 latent_input_list, (1000 - timestep) / 1000, text_encoder_output, return_dict=True
@@ -228,6 +255,116 @@ class BaseZImageSetup(
                     self._save_latent("6-image", scaled_latent_image, config, train_progress)
 
         return model_output_data
+
+    def _transfer_swap_modules(self, model: ZImageModel, config: TrainConfig) -> dict[str, torch.nn.Module]:
+        """Bare-stem -> orig Linear for EVERY late adapter-covered module (all
+        stems the adapter wraps at layers >= transfer_late_start, families or
+        not -- the teacher education must also land on e.g. attention.to_out.0).
+        Cached: the module set is fixed for the run."""
+        cache = getattr(self, "_transfer_swap_modules_cache", None)
+        if cache is None:
+            cache = {}
+            for name, peft_module in model.transformer_lora.lora_modules.items():
+                parsed = split_layer_key(name)
+                if parsed is not None and parsed[0] >= config.transfer_late_start:
+                    cache[parsed[1]] = peft_module.orig_module
+            self._transfer_swap_modules_cache = cache
+        return cache
+
+    def transfer_fork_forward(
+        self,
+        model: ZImageModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
+        seed: int | None = None,
+        latent_input: Tensor | None = None,
+        sigma: Tensor | None = None,
+    ) -> TransferForkState:
+        """Run the shared prefix (embedders, refiners, layers < late_start) once
+        and capture the fork block's inputs. The student adapter stays hooked:
+        its early/mid parameters are the transplanted education, which is
+        exactly correct there, so this prefix equals the teacher's prefix.
+
+        ``latent_input``/``sigma`` (both or neither) inject an explicit noisy
+        latent at an explicit sigma instead of noising the batch's image latent
+        -- redistill's student-trajectory samples, using the same timestep
+        convention as predict()'s ``_distill_latent_input`` path."""
+        if (latent_input is None) != (sigma is None):
+            raise ValueError("latent_input and sigma must be provided together")
+        with model.autocast_context:
+            if seed is not None:
+                batch_seed = seed
+            elif deterministic:
+                batch_seed = 0
+            else:
+                batch_seed = train_progress.global_step * multi.world_size() + multi.rank()
+            generator = torch.Generator(device=config.train_device)
+            generator.manual_seed(batch_seed)
+            rand = Random(batch_seed)
+
+            batch_size = batch["latent_image"].shape[0]
+            text_encoder_output = model.encode_text(
+                train_device=self.train_device,
+                batch_size=batch_size,
+                rand=rand,
+                tokens=batch.get("tokens"),
+                tokens_mask=batch.get("tokens_mask"),
+                text_encoder_output=batch.get("text_encoder_hidden_state"),
+                text_encoder_dropout_probability=None,
+            )
+            if latent_input is not None:
+                latent_input_list = list(
+                    latent_input.unsqueeze(2).to(dtype=model.train_dtype.torch_dtype()).unbind(dim=0)
+                )
+                transformer_timestep = 1.0 - sigma.to(device=latent_input.device, dtype=torch.float32).flatten()
+            else:
+                scaled_latent_image = model.scale_latents(batch["latent_image"])
+                _, timestep, _, _, latent_input_list = self._prepare_flow_inputs(
+                    model, config, deterministic, generator, rand, scaled_latent_image
+                )
+                transformer_timestep = (1000 - timestep) / 1000
+
+            fork_block = model.transformer.layers[config.transfer_late_start]
+            args, kwargs = run_prefix_and_capture(
+                lambda: model.transformer(
+                    latent_input_list, transformer_timestep, text_encoder_output, return_dict=True
+                ),
+                fork_block,
+            )
+
+        # Stack call is positional: (unified, unified_mask, unified_freqs,
+        # adaln_input, unified_noise_tensor, t_noisy, t_clean); the mask is
+        # (batch, tokens) bool or None when all sequences share a length.
+        mask = args[1] if len(args) > 1 and isinstance(args[1], Tensor) else kwargs.get("attn_mask")
+        return TransferForkState(block_args=args, block_kwargs=kwargs, mask=mask)
+
+    def transfer_late_forward(
+        self,
+        model: ZImageModel,
+        state: TransferForkState,
+        config: TrainConfig,
+        *,
+        weights: dict[str, Tensor] | None = None,
+    ) -> list[Tensor]:
+        transformer = model.transformer
+        blocks = list(transformer.layers[config.transfer_late_start :])
+        checkpointing_fn = (
+            transformer._gradient_checkpointing_func
+            if torch.is_grad_enabled() and getattr(transformer, "gradient_checkpointing", False)
+            else None
+        )
+        with model.autocast_context:
+            if weights is not None:
+                with swap_module_weights(self._transfer_swap_modules(model, config), weights):
+                    return run_late_stack(
+                        blocks, state.block_args[0], state.block_args[1:], state.block_kwargs, checkpointing_fn
+                    )
+            return run_late_stack(
+                blocks, state.block_args[0], state.block_args[1:], state.block_kwargs, checkpointing_fn
+            )
 
     def calculate_loss(
         self,

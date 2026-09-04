@@ -45,6 +45,86 @@ class ImageMetadataUtilTest(unittest.TestCase):
                 },
             )
 
+    def test_extract_metadata_reads_swarmui_png_nested_under_parameters(self):
+        # SwarmUI writes one tEXt chunk keyed "parameters" whose value is JSON
+        # with the generation settings nested a level down under
+        # "sui_image_params" — there is no top-level "prompt". Reading only the
+        # top level loses every PNG the tool produces, while WEBP survives
+        # because the raw scanner regexes the nested key incidentally.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "sample.png"
+            png_info = PngInfo()
+            png_info.add_text(
+                "parameters",
+                json.dumps(
+                    {
+                        "sui_image_params": {
+                            "prompt": "portrait, <wildcard:hair>, sharp focus",
+                            "negativeprompt": "blurry",
+                            "aspectratio": "3:2",
+                            "width": 1200,
+                            "height": 800,
+                        },
+                        "sui_extra_data": {"date": "2026-08-11"},
+                        "sui_models": [{"name": "some-model"}],
+                    }
+                ),
+            )
+
+            Image.new("RGB", (8, 8), color="blue").save(image_path, pnginfo=png_info)
+
+            self.assertEqual(
+                extract_metadata(str(image_path)),
+                {
+                    "prompt": "portrait, <wildcard:hair>, sharp focus",
+                    "aspectratio": "3:2",
+                },
+            )
+
+    def test_extract_metadata_prefers_top_level_prompt_over_nested_params(self):
+        # A top-level "prompt" is the explicit shape; nesting is the fallback.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "sample.png"
+            png_info = PngInfo()
+            png_info.add_text(
+                "parameters",
+                json.dumps(
+                    {
+                        "prompt": "top level wins",
+                        "aspectratio": "1:1",
+                        "sui_image_params": {"prompt": "nested loses", "aspectratio": "16:9"},
+                    }
+                ),
+            )
+
+            Image.new("RGB", (8, 8), color="red").save(image_path, pnginfo=png_info)
+
+            self.assertEqual(
+                extract_metadata(str(image_path)),
+                {"prompt": "top level wins", "aspectratio": "1:1"},
+            )
+
+    def test_extract_metadata_ignores_nested_params_with_blank_prompt(self):
+        # An empty nested prompt must not shadow a later chunk that has one.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "sample.png"
+            png_info = PngInfo()
+            png_info.add_text(
+                "parameters",
+                json.dumps({"sui_image_params": {"prompt": "   ", "aspectratio": "3:2"}}),
+            )
+            png_info.add_text(
+                "Comment",
+                json.dumps({"prompt": "the real one", "aspectratio": "4:3"}),
+            )
+
+            Image.new("RGB", (8, 8), color="black").save(image_path, pnginfo=png_info)
+
+            self.assertEqual(
+                extract_metadata(str(image_path)),
+                {"prompt": "the real one", "aspectratio": "4:3"},
+            )
+
     def test_extract_metadata_reads_raw_json_and_preserves_unicode(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "sample.webp"

@@ -50,6 +50,8 @@ DISPLAY_NAMES: dict[str, str] = {
     "compile": "Compile",
     "concept_file_name": "Concept File",
     "aspect_ratio_bucketing": "Aspect Ratio Bucketing",
+    "adaptive_resolution": "Adaptive Resolution (No Upscaling)",
+    "adaptive_resolution_ladder": "Adaptive Resolution Ladder",
     "latent_caching": "Latent Caching",
     "clear_cache_before_training": "Clear Cache Before Training",
     "skip_cache_validation": "Skip Cache Validation",
@@ -214,6 +216,8 @@ SECTION_MAP: "OrderedDict[str, list[str]]" = OrderedDict(
             "Data",
             [
                 "aspect_ratio_bucketing",
+                "adaptive_resolution",
+                "adaptive_resolution_ladder",
                 "latent_caching",
                 "clear_cache_before_training",
                 "skip_cache_validation",

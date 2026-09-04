@@ -1,4 +1,5 @@
-from modules.util.distill_metadata_util import DistillBuildFilters, DistillBuildRequest as DistillDatasetBuildRequest
+from modules.util.distill_metadata_util import DistillBuildFilters
+from modules.util.distill_metadata_util import DistillBuildRequest as DistillDatasetBuildRequest
 from web.backend.services.distill_service import DistillService
 
 from fastapi import APIRouter

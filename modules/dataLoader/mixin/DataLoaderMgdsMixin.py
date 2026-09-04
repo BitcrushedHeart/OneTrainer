@@ -5,6 +5,7 @@ from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dpo_pattern_util import validate_dpo_patterns
 from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.MGDS import MGDS
@@ -27,7 +28,7 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
         return [PlaceholderModule()]
 
     @staticmethod
-    def __filter_dpo_concepts(concepts: list[ConceptConfig]) -> list[ConceptConfig]:
+    def __filter_dpo_concepts(concepts: list[ConceptConfig], config: TrainConfig) -> list[ConceptConfig]:
         # An RLHF DPO run trains on chosen/rejected pairs only. Concepts without
         # patterns have no pair data, so they are dropped here; in a DPO run
         # they feed the SFT-anchor loader instead (when enabled).
@@ -49,6 +50,17 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
                 "(they feed the SFT-anchor loader when enabled): " + ", ".join(skipped)
             )
 
+        # IPO regresses the margin toward 1/(2*tau) and never multiplies by beta,
+        # so a per-concept beta there is a silent no-op. Say so rather than let
+        # the setting look effective.
+        if config.rlhf_dpo_objective == DPOObjective.IPO:
+            overriding = [c.name or c.path for c in dpo_concepts if c.enabled and c.dpo_beta_override > 0]
+            if overriding:
+                print(
+                    "RLHF DPO: the IPO objective ignores beta (tau plays its role), so the per-concept "
+                    f"beta override on {len(overriding)} concepts has no effect: " + ", ".join(overriding)
+                )
+
         return dpo_concepts
 
     def _create_mgds(
@@ -63,16 +75,17 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
             with open(config.concept_file_name, "r") as f:
                 concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
 
-        # The SFT-anchor parallel loader for DPO runs reaches this method with
+        # The standard-side loader of an RLHF run (SFT-anchor loader, or the
+        # main loader in SFT + DPO mode) reaches this method with
         # config.rlhf_enabled forced to False by BaseDataLoader, so it falls
         # into the standard branch; DPO pattern concepts are excluded there so
-        # their chosen images aren't double-trained as anchor data.
+        # their chosen images aren't double-trained as supervised data.
         valid_types = (
             {ConceptType.VALIDATION} if is_validation else {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         )
         concepts = [concept for concept in concepts if ConceptType(concept.type) in valid_types]
         if config.rlhf_enabled:
-            concepts = self.__filter_dpo_concepts(concepts)
+            concepts = self.__filter_dpo_concepts(concepts, config)
         elif getattr(self, "is_sft_anchor", False):
             concepts = [c for c in concepts if not c.is_dpo()]
         concepts = [c.to_dict() for c in concepts]

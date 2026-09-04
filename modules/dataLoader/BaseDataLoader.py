@@ -134,11 +134,12 @@ class BaseDataLoader(
             config.multi_gpu = False
             config.rlhf_enabled = config.dpo_validation_active()
         elif is_sft_anchor:
-            # Parallel SFT-anchor loader for DPO runs that include STANDARD
-            # concepts: re-use the standard (non-DPO) data pipeline so the
-            # rejected-image wiring is skipped and STANDARD samples flow as
-            # ordinary supervised batches. DPO pattern concepts are excluded
-            # in DataLoaderMgdsMixin via is_sft_anchor.
+            # Standard-side loader of an RLHF run (the parallel SFT-anchor
+            # loader in DPO mode, or the main loader in SFT + DPO mode): re-use
+            # the standard (non-DPO) data pipeline so the rejected-image wiring
+            # is skipped and STANDARD samples flow as ordinary supervised
+            # batches. DPO pattern concepts are excluded in
+            # DataLoaderMgdsMixin via is_sft_anchor.
             config = copy.copy(config)
             config.rlhf_enabled = False
 

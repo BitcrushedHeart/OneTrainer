@@ -4,8 +4,11 @@ from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
+from modules.dataLoader.dpo.CoverScaleCropImage import CoverScaleCropImage
 from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
 from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
+from modules.dataLoader.promptOnly.CollectPromptPaths import CollectPromptPaths
+from modules.dataLoader.promptOnly.SynthesizeResolution import SynthesizeResolution
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -46,6 +49,7 @@ from mgds.pipelineModules.RandomMaskRotateCrop import RandomMaskRotateCrop
 from mgds.pipelineModules.RandomRotate import RandomRotate
 from mgds.pipelineModules.RandomSaturation import RandomSaturation
 from mgds.pipelineModules.RescaleImageChannels import RescaleImageChannels
+from mgds.pipelineModules.ResolutionPolicy import target_resolutions_for_spec
 from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.ScaleCropImage import ScaleCropImage
 from mgds.pipelineModules.SelectFirstInput import SelectFirstInput
@@ -112,6 +116,21 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         sample_prompt_path = ModifyPath(
             in_name="image_path", out_name="sample_prompt_path", postfix="", extension=".txt"
         )
+
+        if config.prompt_only_data:
+            # Enumerate captions instead of images; image_path becomes the
+            # synthetic (never opened) .png sibling. Mask/cond/DPO paths are
+            # excluded by startup validation.
+            collect_prompt_paths = CollectPromptPaths(
+                concept_in_name="concept",
+                path_in_name="path",
+                include_subdirectories_in_name="concept.include_subdirectories",
+                enabled_in_name="enabled",
+                path_out_name="image_path",
+                concept_out_name="concept",
+                exclude_postfix=["-masklabel", "-condlabel"],
+            )
+            return [download_datasets, collect_prompt_paths, sample_prompt_path]
 
         modules = [download_datasets, collect_paths, FilterDPOChosenPaths(), sample_prompt_path]
 
@@ -192,6 +211,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         )
         select_random_text = SelectRandomText(texts_in_name="prompts", text_out_name="prompt")
 
+        if config.prompt_only_data:
+            return [load_sample_prompts, load_concept_prompts, filename_prompt, select_prompt_input, select_random_text]
+
         modules = [load_image, load_video]
 
         if config.rlhf_enabled:
@@ -230,6 +252,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         return modules
 
     def _mask_augmentation_modules(self, config: TrainConfig) -> list:
+        if config.prompt_only_data:
+            return []
+
         inputs = ["image"]
 
         if config.rlhf_enabled:
@@ -266,7 +291,23 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     def _aspect_bucketing_in(
         self, config: TrainConfig, aspect_bucketing_quantization: int, frame_dim_enabled: bool = False
     ):
-        calc_aspect = CalcAspect(image_in_name="image", resolution_out_name="original_resolution")
+        if config.prompt_only_data:
+            calc_aspect = SynthesizeResolution(
+                path_in_name="image_path",
+                resolution_out_name="original_resolution",
+                target_resolution_in_name="settings.target_resolution",
+                enable_resolution_override_in_name="concept.image.enable_resolution_override",
+                resolution_override_in_name="concept.image.resolution_override",
+            )
+        else:
+            calc_aspect = CalcAspect(image_in_name="image", resolution_out_name="original_resolution")
+        additional_resolution_names = []
+        if config.rlhf_enabled and config.adaptive_resolution:
+            additional_resolution_names.append("original_resolution_rejected")
+            calc_rejected_aspect = CalcAspect(
+                image_in_name="image_rejected",
+                resolution_out_name="original_resolution_rejected",
+            )
 
         # DPO pairs no longer need a bucketing subclass: the rejected image is
         # a second tensor inside the chosen sample's row, so it inherits the
@@ -282,6 +323,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             scale_resolution_out_name="scale_resolution",
             crop_resolution_out_name="crop_resolution",
             possible_resolutions_out_name="possible_resolutions",
+            adaptive_resolution=config.adaptive_resolution,
+            additional_resolution_in_names=additional_resolution_names,
+            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -292,9 +336,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             scale_resolution_out_name="scale_resolution",
             crop_resolution_out_name="crop_resolution",
             possible_resolutions_out_name="possible_resolutions",
+            adaptive_resolution=config.adaptive_resolution,
+            additional_resolution_in_names=additional_resolution_names,
+            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
         )
 
         modules = [calc_aspect]
+        if config.rlhf_enabled and config.adaptive_resolution:
+            modules.append(calc_rejected_aspect)
 
         if config.aspect_ratio_bucketing:
             modules.append(aspect_bucketing_quantization)
@@ -304,17 +353,16 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             self._aspect_bucketing_for_cache = aspect_bucketing_quantization
         else:
             modules.append(single_aspect_calculation)
-            self._aspect_bucketing_for_cache = None
+            self._aspect_bucketing_for_cache = single_aspect_calculation
 
         return modules
 
     def _crop_modules(self, config: TrainConfig):
-        inputs = ["image"]
+        if config.prompt_only_data:
+            # Nothing to crop; crop_offset is emitted by GenerateZeroLatent.
+            return []
 
-        if config.rlhf_enabled:
-            # Same ScaleCropImage instance -> same scale, jitter and crop offsets
-            # for both halves of each DPO pair, like masks stay aligned today.
-            inputs.append("image_rejected")
+        inputs = ["image"]
 
         if config.masked_training or config.model_type.has_mask_input():
             inputs.append("mask")
@@ -334,6 +382,25 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         )
 
         modules = [scale_crop]
+
+        if config.rlhf_enabled:
+            # The rejected image is NOT run through ScaleCropImage: that module
+            # resizes every name to the chosen image's scale_resolution, which
+            # stretches a rejected image whose aspect differs from the chosen
+            # image's bucket — and a stretched generation is trivially
+            # discriminable, so the pair teaches "stretched vs not". Instead it
+            # is cover-scaled (aspect kept, one factor, covers the crop box)
+            # and cropped with the chosen image's *relative* crop offset, so a
+            # jittered pair keeps the same framing. Same-bucket pairs come out
+            # identical to the old path.
+            modules.append(
+                CoverScaleCropImage(
+                    names=["image_rejected"],
+                    scale_resolution_in_name="scale_resolution",
+                    crop_resolution_in_name="crop_resolution",
+                    crop_offset_in_name="crop_offset",
+                )
+            )
 
         return modules
 
@@ -424,6 +491,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             text_out_name="prompt",
         )
 
+        if config.prompt_only_data:
+            return [drop_tags, caps_randomize, shuffle_tags]
+
         modules = [
             random_flip,
             random_rotate,
@@ -439,6 +509,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         return modules
 
     def _inpainting_modules(self, config: TrainConfig):
+        if config.prompt_only_data:
+            return []
+
         conditioning_image = GenerateMaskedConditioningImage(
             image_in_name="image",
             mask_in_name="mask",
@@ -490,6 +563,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             ("concept.loss_weight", "loss_weight"),
             ("concept.type", "concept_type"),
         ]
+
+        if config.rlhf_enabled:
+            # Per-concept DPO beta (0 = inherit the global beta). A batch mixes
+            # concepts - AspectBatchSorting buckets by resolution across the whole
+            # dataset - so beta has to travel per sample, exactly like loss_weight.
+            # Concept fields never key the disk cache, so betas can be retuned
+            # between runs without re-caching latents.
+            output_names.append(("concept.dpo_beta_override", "dpo_beta_override"))
 
         if config.validation:
             output_names.append(("concept.name", "concept_name"))
@@ -607,13 +688,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # The rejected latent is a new split tensor inside the chosen
             # row's .pt: SmartDiskCache's schema-drift augmentation encodes it
             # in place without invalidating the existing chosen latents.
-            # image_path_rejected is deliberately NOT in extra_watched_paths:
-            # a newly-resolving sidecar forces a full entry rebuild, which
-            # would throw away every cached chosen latent. Consequence: an
-            # in-place edit or re-pairing of a rejected file does not
-            # auto-invalidate its cached latent (clear the cache or bump the
-            # concept seed to force a refresh).
+            # In adaptive mode the rejected source constrains tier eligibility,
+            # so edits and re-pairing must invalidate the bundled image entry.
             image_split_names = image_split_names + ["latent_image_rejected"]
+            if config.adaptive_resolution:
+                image_extra_watched.append("image_path_rejected")
 
         # The DPO patterns change which rows a concept produces, so they join
         # the variation group keys. Group keys only organize balancing and
@@ -649,6 +728,23 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             aspect_bucketing=aspect_bucketing,
             extra_watched_paths_in_names=image_extra_watched or None,
             trust_cache=config.skip_cache_validation,
+            adaptive_resolution=config.adaptive_resolution,
+            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
+            additional_resolution_in_names=(
+                ["original_resolution_rejected"] if config.rlhf_enabled and config.adaptive_resolution else None
+            ),
+            adaptive_resolution_max=(
+                max(
+                    target_resolutions_for_spec(
+                        config.resolution,
+                        True,
+                        config.adaptive_resolution_ladder,
+                    ),
+                    default=None,
+                )
+                if config.adaptive_resolution
+                else None
+            ),
         )
 
         text_disk_cache = SmartDiskCache(
@@ -687,10 +783,15 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         modules = []
 
         if config.latent_caching:
-            modules.append(image_disk_cache)
+            if not config.prompt_only_data:
+                modules.append(image_disk_cache)
 
-            sort_names = [x for x in sort_names if x not in image_aggregate_names]
-            sort_names = [x for x in sort_names if x not in image_split_names]
+                sort_names = [x for x in sort_names if x not in image_aggregate_names]
+                sort_names = [x for x in sort_names if x not in image_split_names]
+            # Prompt-only: no image cache (zeros are cheaper to regenerate than
+            # to read, and its edit checks would stat nonexistent files). The
+            # image names stay in sort_names so VariationSorting still carries
+            # the live zero-latent rows.
 
             if text_caching:
                 modules.append(text_disk_cache)

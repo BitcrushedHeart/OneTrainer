@@ -1,5 +1,6 @@
 import {
   Activity,
+  Camera,
   Database,
   Grid3x3,
   Heart,
@@ -22,9 +23,11 @@ import { DistillDatasetModal } from "@/components/modals/DistillDatasetModal";
 import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { MergeOFTModal } from "@/components/modals/MergeOFTModal";
+import { OffPolicyDpoModal } from "@/components/modals/OffPolicyDpoModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
 import { RepairRejectedModal } from "@/components/modals/RepairRejectedModal";
 import { StandaloneSamplingModal } from "@/components/modals/StandaloneSamplingModal";
+import { SwarmGenerateModal } from "@/components/modals/SwarmGenerateModal";
 import { VideoToolModal } from "@/components/modals/VideoToolModal";
 import { Button, Card } from "@/components/shared";
 import { useUiStore } from "@/store/uiStore";
@@ -63,6 +66,8 @@ export default function ToolsPage() {
   const [bucketOpen, setBucketOpen] = useState(false);
   const [repairOpen, setRepairOpen] = useState(false);
   const [mergeOftOpen, setMergeOftOpen] = useState(false);
+  const [offPolicyOpen, setOffPolicyOpen] = useState(false);
+  const [swarmOpen, setSwarmOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   return (
@@ -117,6 +122,18 @@ export default function ToolsPage() {
           onLaunch={() => setDpoOpen(true)}
         />
         <ToolCard
+          icon={<Wand2 className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Generate Off-policy Negatives"
+          description="Generate images in SwarmUI from captions that need them, at each photo's exact trainer bucket size"
+          onLaunch={() => setSwarmOpen(true)}
+        />
+        <ToolCard
+          icon={<Camera className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Off-policy DPO Builder"
+          description="Pair real photos (chosen) against the model's own generations of their captions (rejected), with a caption check"
+          onLaunch={() => setOffPolicyOpen(true)}
+        />
+        <ToolCard
           icon={<Sparkles className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="Distillation Dataset"
           description="Copy good images into a normalized metadata dataset for DMD2 distillation"
@@ -153,6 +170,8 @@ export default function ToolsPage() {
       <BucketAnalysisModal open={bucketOpen} onClose={() => setBucketOpen(false)} />
       <RepairRejectedModal open={repairOpen} onClose={() => setRepairOpen(false)} />
       <MergeOFTModal open={mergeOftOpen} onClose={() => setMergeOftOpen(false)} />
+      <OffPolicyDpoModal open={offPolicyOpen} onClose={() => setOffPolicyOpen(false)} />
+      <SwarmGenerateModal open={swarmOpen} onClose={() => setSwarmOpen(false)} />
     </>
   );
 }

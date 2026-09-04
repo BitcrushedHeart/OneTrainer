@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowLeft, ArrowRight, Flag, Loader2, SkipForward, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, Flag, Loader2, SkipForward, Trash2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { API_BASE } from "@/api/request";
@@ -26,6 +26,7 @@ export function TournamentStep({
   onVote,
   onFinishEarly,
   onSkipGroup,
+  onDiscardGroup,
   onCancel,
   pairsDone,
 }: TournamentStepProps) {
@@ -99,6 +100,16 @@ export function TournamentStep({
           <Button variant="ghost" size="sm" onClick={onSkipGroup} style={{ background: "#8B4513", color: "#fff" }}>
             <SkipForward className="w-4 h-4" />
             Skip Group
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDiscardGroup}
+            style={{ background: "#7f1d1d", color: "#fff" }}
+            title="Move every image in this group to a .discard subfolder so it never reappears (nothing exported)"
+          >
+            <Trash2 className="w-4 h-4" />
+            Discard Group
           </Button>
           <Button variant="ghost" size="sm" onClick={onCancel}>
             <X className="w-4 h-4" />

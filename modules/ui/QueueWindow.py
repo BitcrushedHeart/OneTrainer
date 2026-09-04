@@ -90,6 +90,8 @@ DISPLAY_NAMES = {
     "compile": "Compile",
     "concept_file_name": "Concept File",
     "aspect_ratio_bucketing": "Aspect Ratio Bucketing",
+    "adaptive_resolution": "Adaptive Resolution (No Upscaling)",
+    "adaptive_resolution_ladder": "Adaptive Resolution Ladder",
     "latent_caching": "Latent Caching",
     "clear_cache_before_training": "Clear Cache Before Training",
     "learning_rate_scheduler": "LR Scheduler",
@@ -200,6 +202,23 @@ DISPLAY_NAMES = {
     "text_encoder_2_sequence_length": "TE2 Sequence Length",
     "text_encoder_3_layer_skip": "TE3 Layer Skip",
     "text_encoder_4_layer_skip": "TE4 Layer Skip",
+    "transfer_enabled": "Enable Transfer",
+    "transfer_base_model_name": "Base Checkpoint (teacher frame)",
+    "transfer_teacher_adapter_name": "Teacher Adapter (original)",
+    "transfer_late_start": "Late Start Layer",
+    "transfer_families": "Trainable Families",
+    "transfer_block_loss_normalize": "Normalize Block Loss",
+    "transfer_mask_padded_tokens": "Mask Padded Tokens",
+    "transfer_validation": "Transfer Validation",
+    "transfer_validation_batches": "Validation Batches",
+    "transfer_patience_enabled": "Auto-stop (Patience)",
+    "transfer_patience_checks": "Patience Checks",
+    "transfer_min_relative_improvement": "Min Improvement",
+    "transfer_target_residual": "Target Residual",
+    "prompt_only_data": "Prompt-only Data",
+    "redistill_enabled": "Enable Redistill",
+    "redistill_turbo_model_name": "Old Distilled Model",
+    "redistill_transfer_steps": "Phase A Steps",
 }
 
 PATH_FIELDS = {
@@ -210,8 +229,11 @@ PATH_FIELDS = {
     "output_model_destination": "file",
     "concept_file_name": "file",
     "lora_model_name": "file",
+    "redistill_turbo_model_name": "file",
     "sample_definition_file_name": "file",
     "model_name": "file",
+    "transfer_base_model_name": "file",
+    "transfer_teacher_adapter_name": "file",
 }
 
 # fork authors: prefix custom fields (e.g. myfork_*) for auto-grouped sections
@@ -272,6 +294,8 @@ SECTION_MAP = OrderedDict(
             "Data",
             [
                 "aspect_ratio_bucketing",
+                "adaptive_resolution",
+                "adaptive_resolution_ladder",
                 "latent_caching",
                 "clear_cache_before_training",
             ],
@@ -388,6 +412,33 @@ SECTION_MAP = OrderedDict(
             ],
         ),
         ("Optimizer", ["optimizer"]),
+        (
+            "Transfer",
+            [
+                "transfer_enabled",
+                "transfer_base_model_name",
+                "transfer_teacher_adapter_name",
+                "transfer_late_start",
+                "transfer_families",
+                "transfer_block_loss_normalize",
+                "transfer_mask_padded_tokens",
+                "transfer_validation",
+                "transfer_validation_batches",
+                "transfer_patience_enabled",
+                "transfer_patience_checks",
+                "transfer_min_relative_improvement",
+                "transfer_target_residual",
+            ],
+        ),
+        (
+            "Redistill",
+            [
+                "redistill_enabled",
+                "redistill_turbo_model_name",
+                "redistill_transfer_steps",
+                "prompt_only_data",
+            ],
+        ),
         (
             "Sampling",
             [

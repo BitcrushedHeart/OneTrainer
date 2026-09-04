@@ -27,32 +27,31 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.oft_merge import merge_oft_adapter
 from modules.util.oft_verify import MergeVerificationError
 
-# Adapters: a style/preference OFT (partial-baked into Base + Distilled), and the
-# few-step Lightning OFT (full-baked onto the distilled result).
-STYLE_ADAPTER = r"E:\AI\Data\Models\Lora\DPO\SoReal!_DPO_6.safetensors"
-LIGHTNING_ADAPTER = r"E:\AI\Data\Models\Lora\Lightning\SoReal!_Lightning_OFT_2.safetensors"
+# Style/preference OFT (V30) full-baked onto every V0.94 release variant to produce V0.95.
+STYLE_ADAPTER = r"E:\AI\Data\Models\Lora\SoReal!_V30_OFT.safetensors"
 
 ORIGIN = r"E:\AI\Data\Models\StableDiffusion\SoReal!"
 
-# NEW_VER outputs go to the date-stamped out_dir below.
-NEW_VER = "V0.94"
+# Source (previous) and target (new) release versions.
+PREV_VER = "V0.94"
+NEW_VER = "V0.95"
 
 out_dir = os.path.join(ORIGIN, datetime.now().strftime("%d%b"))
 
 # (label, adapter, transformer source, output filename, strength)
-# LIGHTNING RE-BAKE (2026-07-02): the Lightning adapter was retrained, so re-full-bake
-# the new OFT onto the ALREADY-EXISTING Distilled V0.94 (in 28Jun) and replace the
-# existing Lightning V0.94 in the date-stamped out_dir. strength=1.0 reproduces the
-# trained few-step model exactly. Base/Distilled are unchanged and intentionally omitted.
-DISTILLED_SRC = os.path.join(ORIGIN, "28Jun", f"SoReal!_Distilled_{NEW_VER}.safetensors")
+# V0.95 BAKE (2026-07-03): the V30 style/preference OFT full-baked (strength=1.0) onto each
+# of the four V0.94 checkpoints independently -- Base/Turbo/Distilled/Lightning each get the
+# same adapter applied directly to their own V0.94 source.
+PREV_DIR = os.path.join(ORIGIN, "28Jun")
 TARGETS = [
     (
-        "lightning",
-        LIGHTNING_ADAPTER,
-        DISTILLED_SRC,
-        f"SoReal!_Lightning_{NEW_VER}.safetensors",
+        variant.lower(),
+        STYLE_ADAPTER,
+        os.path.join(PREV_DIR, f"SoReal!_{variant}_{PREV_VER}.safetensors"),
+        f"SoReal!_{variant}_{NEW_VER}.safetensors",
         1.0,
-    ),
+    )
+    for variant in ("Base", "Turbo", "Distilled", "Lightning")
 ]
 
 os.makedirs(out_dir, exist_ok=True)
@@ -92,7 +91,7 @@ for label, adapter, transformer, out_name, strength in TARGETS:
             os.remove(output)
         continue
 
-    os.replace(output, final_output)  # atomic overwrite of the prior Lightning V0.94
+    os.replace(output, final_output)  # atomically publish the V0.95 output only on success
     print(f"\n=== MERGE REPORT ({label}) ===")
     print("modules merged:", len(report.post_zero_rows))
     new_dead = sum(max(0, report.post_zero_rows[k] - report.pre_zero_rows.get(k, 0)) for k in report.post_zero_rows)

@@ -540,9 +540,11 @@ def test_fake_mode_critic_samples_cover_all_backprop_steps_over_time():
     counts = set()
     for global_step in range(40):
         progress = _student_progress(global_step)
-        if BaseModelSetup._distill_update_mode(config, progress) != "fake":
-            continue
         setup = _setup()
+        # Instance method since redistill: the update mode counts from the
+        # setup's phase offset (0 here).
+        if setup._distill_update_mode(config, progress) != "fake":
+            continue
         batch = {"latent_image": torch.randn(4, 2), "target_latent": torch.zeros(4, 2)}
         setup.calculate_distill_loss(TinyDistillModel(), batch, config, progress)
         counts.add(len([c for c in setup.velocity_calls if c[0] == "student"]))

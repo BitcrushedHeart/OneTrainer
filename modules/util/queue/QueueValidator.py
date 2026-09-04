@@ -38,6 +38,22 @@ class QueueValidator:
         if getattr(merged, "patience", False) and not merged.validation:
             errors.append("Patience is enabled but validation is disabled")
 
+        transfer_error = merged.validate_transfer_startup()
+        if transfer_error is not None:
+            errors.append(transfer_error)
+
+        redistill_error = merged.validate_redistill_startup()
+        if redistill_error is not None:
+            errors.append(redistill_error)
+
+        prompt_only_error = merged.validate_prompt_only_startup()
+        if prompt_only_error is not None:
+            errors.append(prompt_only_error)
+
+        rlhf_error = merged.validate_rlhf_startup()
+        if rlhf_error is not None:
+            errors.append(rlhf_error)
+
         if hasattr(merged, "continue_last_backup") and merged.continue_last_backup:
             backup_path = merged.get_last_backup_path()
             if backup_path is None:

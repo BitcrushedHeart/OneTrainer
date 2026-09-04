@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { SwissStateResponse } from "@/api/dpoApi";
+import type { GroupOrder, RealismDevice, SwissStateResponse } from "@/api/dpoApi";
 import { dpoApi } from "@/api/dpoApi";
 
 import type {
@@ -38,6 +38,8 @@ export interface UseDpoSessionResult {
   sourceFolder: string;
   outputDir: string;
   pairsPerGroup: number;
+  groupOrder: GroupOrder;
+  captionFilter: string;
   mode: CurationMode;
   scanCount: number;
   scanTotal: number;
@@ -48,6 +50,20 @@ export interface UseDpoSessionResult {
   bestImage: string | null;
   remainingImages: string[];
   pairsDone: number;
+  /** P(AI-generated) per image path for the current group; empty until scored. */
+  realismScores: Record<string, number>;
+  realismError: string | null;
+  /**
+   * Where the realism head runs. Server-owned — this mirrors it so the toggle
+   * can render the truth rather than an optimistic guess.
+   */
+  realismDevice: RealismDevice;
+  /**
+   * Whole-tree realism backfill. Scoring a group on first view is the default,
+   * so this only exists to pay that cost once up front instead of a group at a
+   * time — after it runs, every group is a cache hit.
+   */
+  backfill: BackfillState;
   swissMatch: [string, string] | null;
   swissRound: number;
   swissTotalRounds: number;
@@ -69,9 +85,11 @@ export interface UseDpoSessionResult {
     setSourceFolder: (v: string) => void;
     setOutputDir: (v: string) => void;
     setPairsPerGroup: (n: number) => void;
+    setGroupOrder: (order: GroupOrder) => void;
+    setCaptionFilter: (text: string) => void;
     startSession: (config: SessionConfig) => Promise<void>;
     pickImage: (path: string) => Promise<void>;
-    confirmPair: (keepScoring: boolean) => Promise<void>;
+    confirmPair: (keepScoring: boolean, discardRest?: boolean) => Promise<void>;
     cancelPendingPair: () => void;
     skipGroup: () => Promise<void>;
     discardGroup: () => Promise<void>;
@@ -89,13 +107,25 @@ export interface UseDpoSessionResult {
     swissFinishEarly: () => Promise<void>;
     swapRanked: (i: number, j: number) => Promise<void>;
     setPairCount: (n: number) => void;
-    swissExportPairs: () => Promise<void>;
+    swissExportPairs: (discardRest?: boolean) => Promise<void>;
     finalize: (valPct: number) => Promise<void>;
     setError: (msg: string | null) => void;
     setToast: (msg: string | null) => void;
     loadOutputManifest: (outputDir: string) => void;
     goToReview: () => void;
+    startRealismBackfill: () => Promise<void>;
+    stopRealismBackfill: () => Promise<void>;
+    setRealismDevice: (device: RealismDevice) => Promise<void>;
   };
+}
+
+export interface BackfillState {
+  running: boolean;
+  done: number;
+  total: number;
+  /** Served from the scan cache rather than recomputed. */
+  cached: number;
+  error: string | null;
 }
 
 export function useDpoSession(): UseDpoSessionResult {
@@ -103,6 +133,8 @@ export function useDpoSession(): UseDpoSessionResult {
   const [sourceFolder, setSourceFolder] = useState("");
   const [outputDir, setOutputDir] = useState("");
   const [pairsPerGroup, setPairsPerGroup] = useState(1);
+  const [groupOrder, setGroupOrder] = useState<GroupOrder>("most_realistic");
+  const [captionFilter, setCaptionFilter] = useState("");
   const [mode, setMode] = useState<CurationMode>("selection");
   const [scanCount, setScanCount] = useState(0);
   const [scanTotal, setScanTotal] = useState(0);
@@ -114,6 +146,104 @@ export function useDpoSession(): UseDpoSessionResult {
   const [bestImage, setBestImage] = useState<string | null>(null);
   const [remainingImages, setRemainingImages] = useState<string[]>([]);
   const [pairsDone, setPairsDone] = useState(0);
+
+  // P(AI-generated) per image for the current group. Lives here rather than in
+  // SelectionStep because the step components wipe their per-group state on
+  // group change, which would throw the scores away and re-request them.
+  const [realismScores, setRealismScores] = useState<Record<string, number>>({});
+  const [realismError, setRealismError] = useState<string | null>(null);
+  // Guards against a slow score response landing after the user has already
+  // moved on, which would decorate the wrong group.
+  const realismRequestRef = useRef(0);
+
+  // Whole-tree backfill. Polled rather than pushed: it is minutes of work on a
+  // background thread and a coarse progress read is all the UI needs.
+  const [backfill, setBackfill] = useState<BackfillState>({
+    running: false,
+    done: 0,
+    total: 0,
+    cached: 0,
+    error: null,
+  });
+  const backfillTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const pollBackfill = useCallback(async () => {
+    const res = await dpoApi.realismBackfillStatus().catch(() => null);
+    if (!res) return;
+    setBackfill({
+      running: res.running,
+      done: res.done ?? 0,
+      total: res.total ?? 0,
+      cached: res.cached ?? 0,
+      error: res.error ?? null,
+    });
+    if (!res.running && backfillTimerRef.current) {
+      clearInterval(backfillTimerRef.current);
+      backfillTimerRef.current = null;
+    }
+  }, []);
+
+  const startRealismBackfill = useCallback(async () => {
+    const res = await dpoApi.startRealismBackfill().catch(() => null);
+    if (!res?.ok) {
+      setBackfill((b) => ({ ...b, error: res?.error ?? "Could not start the backfill" }));
+      return;
+    }
+    setBackfill({ running: true, done: 0, total: res.total ?? 0, cached: 0, error: null });
+    if (backfillTimerRef.current) clearInterval(backfillTimerRef.current);
+    backfillTimerRef.current = setInterval(() => void pollBackfill(), 1000);
+  }, [pollBackfill]);
+
+  const stopRealismBackfill = useCallback(async () => {
+    await dpoApi.stopRealismBackfill().catch(() => null);
+    await pollBackfill();
+  }, [pollBackfill]);
+
+  // Scoring device, "off" included. The server is the source of truth (a
+  // backfill thread reads it per chunk), so the toggle sends and then adopts
+  // whatever comes back rather than assuming the write landed.
+  const [realismDevice, setRealismDeviceState] = useState<RealismDevice>("auto");
+  // Mirrored into a ref because loadRealismScores is a stable callback: reading
+  // the state variable there would pin it to whatever the device was when the
+  // session mounted, and the whole point of "off" is that it takes effect now.
+  const realismDeviceRef = useRef<RealismDevice>("auto");
+  const adoptRealismDevice = useCallback((device: RealismDevice) => {
+    realismDeviceRef.current = device;
+    setRealismDeviceState(device);
+  }, []);
+
+  useEffect(() => {
+    void dpoApi
+      .realismDevice()
+      .then((res) => {
+        if (res?.ok && res.device) adoptRealismDevice(res.device);
+      })
+      .catch(() => undefined);
+  }, [adoptRealismDevice]);
+
+  const setRealismDevice = useCallback(
+    async (device: RealismDevice) => {
+      const res = await dpoApi.setRealismDevice(device).catch(() => null);
+      if (res?.device) adoptRealismDevice(res.device);
+      // Scores on screen were produced by a setting that no longer holds, and
+      // with scoring off nothing will replace them until the next group.
+      if (res?.device === "off") {
+        realismRequestRef.current += 1;
+        setRealismScores({});
+        setRealismError(null);
+      }
+    },
+    [adoptRealismDevice],
+  );
+
+  // The interval outlives any single render, so it has to be torn down on
+  // unmount or it keeps polling a closed modal for ever.
+  useEffect(
+    () => () => {
+      if (backfillTimerRef.current) clearInterval(backfillTimerRef.current);
+    },
+    [],
+  );
 
   const [swissMatch, setSwissMatch] = useState<[string, string] | null>(null);
   const [swissRound, setSwissRound] = useState(0);
@@ -182,6 +312,33 @@ export function useDpoSession(): UseDpoSessionResult {
     await applySwissState(await dpoApi.swissState());
   }, [applySwissState]);
 
+  // Fire-and-forget on purpose: group advance must not wait on a model call.
+  // Scores arrive a moment later and the grid re-sorts, which is far better
+  // than stalling every group behind inference.
+  const loadRealismScores = useCallback(async (images: string[]) => {
+    const token = ++realismRequestRef.current;
+    setRealismScores({});
+    setRealismError(null);
+    if (images.length === 0) return;
+    // The server refuses too; not asking keeps a disabled session from making a
+    // round trip per group, and keeps realismError clear so the UI shows
+    // "scoring off" rather than "scoring unavailable".
+    if (realismDeviceRef.current === "off") return;
+    try {
+      const res = await dpoApi.realismScores(images);
+      if (token !== realismRequestRef.current) return; // user already moved on
+      if (res.ok && res.scores) {
+        setRealismScores(res.scores);
+      } else if (res.error) {
+        setRealismError(res.error);
+      }
+    } catch {
+      if (token === realismRequestRef.current) {
+        setRealismError("Realism scoring is unavailable.");
+      }
+    }
+  }, []);
+
   const fetchNextGroup = useCallback(async () => {
     const signal = scanAbortRef.current?.signal;
     while (!signal?.aborted) {
@@ -206,6 +363,7 @@ export function useDpoSession(): UseDpoSessionResult {
       if (res.group) {
         setGroup(res.group);
         setRemainingImages(res.group.images);
+        void loadRealismScores(res.group.images);
         setPhase("best");
         setBestImage(null);
         setPendingBest(null);
@@ -229,7 +387,7 @@ export function useDpoSession(): UseDpoSessionResult {
       }
       return;
     }
-  }, [refreshSwissState]);
+  }, [refreshSwissState, loadRealismScores]);
 
   const pollScan = useCallback(
     async (signal: AbortSignal) => {
@@ -265,12 +423,21 @@ export function useDpoSession(): UseDpoSessionResult {
       setToast(null);
       setMode(config.mode);
       setPairsPerGroup(config.pairsPerGroup);
+      setGroupOrder(config.groupOrder);
+      setCaptionFilter(config.captionFilter);
       setScanCount(0);
       setScanTotal(0);
       setHashCount(0);
       setCacheHits(0);
 
-      const res = await dpoApi.startSession(config.sourceFolder, config.outputDir, config.pairsPerGroup, config.mode);
+      const res = await dpoApi.startSession(
+        config.sourceFolder,
+        config.outputDir,
+        config.pairsPerGroup,
+        config.mode,
+        config.groupOrder,
+        config.captionFilter,
+      );
       if (!res.ok) {
         setError(res.error ?? "Failed to start session");
         return;
@@ -332,8 +499,8 @@ export function useDpoSession(): UseDpoSessionResult {
   );
 
   const confirmPair = useCallback(
-    async (keepScoring: boolean) => {
-      const res = await dpoApi.confirmPair(keepScoring);
+    async (keepScoring: boolean, discardRest = false) => {
+      const res = await dpoApi.confirmPair(keepScoring, discardRest);
       if (!res.ok) {
         setError(res.error ?? "Confirm failed");
         return;
@@ -481,15 +648,18 @@ export function useDpoSession(): UseDpoSessionResult {
     [rankedOrder],
   );
 
-  const swissExportPairs = useCallback(async () => {
-    const res = await dpoApi.swissExport(pairCount);
-    if (!res.ok) {
-      setError(res.error ?? "Export failed");
-      return;
-    }
-    if (res.pairs_done !== undefined) setPairsDone(res.pairs_done);
-    await fetchNextGroup();
-  }, [pairCount, fetchNextGroup]);
+  const swissExportPairs = useCallback(
+    async (discardRest = false) => {
+      const res = await dpoApi.swissExport(pairCount, discardRest);
+      if (!res.ok) {
+        setError(res.error ?? "Export failed");
+        return;
+      }
+      if (res.pairs_done !== undefined) setPairsDone(res.pairs_done);
+      await fetchNextGroup();
+    },
+    [pairCount, fetchNextGroup],
+  );
 
   const finalize = useCallback(async (valPct: number) => {
     const res = await dpoApi.finalizeSession(valPct);
@@ -523,6 +693,8 @@ export function useDpoSession(): UseDpoSessionResult {
     sourceFolder,
     outputDir,
     pairsPerGroup,
+    groupOrder,
+    captionFilter,
     mode,
     scanCount,
     scanTotal,
@@ -533,6 +705,10 @@ export function useDpoSession(): UseDpoSessionResult {
     bestImage,
     remainingImages,
     pairsDone,
+    realismScores,
+    realismError,
+    realismDevice,
+    backfill,
     swissMatch,
     swissRound,
     swissTotalRounds,
@@ -554,6 +730,8 @@ export function useDpoSession(): UseDpoSessionResult {
       setSourceFolder,
       setOutputDir,
       setPairsPerGroup,
+      setGroupOrder,
+      setCaptionFilter,
       startSession,
       pickImage,
       confirmPair,
@@ -573,6 +751,9 @@ export function useDpoSession(): UseDpoSessionResult {
       setToast,
       loadOutputManifest,
       goToReview,
+      startRealismBackfill,
+      stopRealismBackfill,
+      setRealismDevice,
     },
   };
 }

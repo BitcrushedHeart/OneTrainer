@@ -25,6 +25,8 @@ class DPOService(SingletonMixin):
         self._output_dir: str | None = None
         self._manifest: dict = {"pairs": []}
         self._pairs_per_group = 1
+        self._group_order = "most_realistic"
+        self._caption_keywords: list[str] = []
         self._ready_queue: Queue = Queue(maxsize=10)
         self._worker_thread: threading.Thread | None = None
         self._worker_stop = threading.Event()
@@ -39,6 +41,11 @@ class DPOService(SingletonMixin):
         # the lock-free style of the other counters here.
         self._hash_cache = None
         self._used_pixel_hashes: set[str] = set()
+        # Source paths committed to *other* configured DPO concepts (e.g. the
+        # off-policy builder's output): an image that is already a chosen or
+        # rejected sample somewhere must not be offered again here. Filled by
+        # the scan worker, read by next_group alongside this session's manifest.
+        self._foreign_used_sources: set[str] = set()
         self._groups_queued = 0
         self._groups_shown = 0
         self._current_group: dict | None = None
@@ -47,6 +54,11 @@ class DPOService(SingletonMixin):
         self._selection_phase = "best"  # "best" or "worst"
         self._selected_best: str | None = None
         self._pairs_created_in_group = 0
+        # (chosen, rejected) source paths exported from the current group in
+        # this session. Only used when the group is retired from the source
+        # tree (discard group / discard rest) so the paired sources land in
+        # .chosen/.rejected instead of being left behind in the scan tree.
+        self._exported_in_group: list[tuple[str, str]] = []
         # Held when the user has picked both best and worst but has not yet
         # confirmed the pair. No file is written and no counters advance
         # until confirm_pair commits or cancel_pending_pair discards it —
@@ -58,6 +70,18 @@ class DPOService(SingletonMixin):
         self._repair_lock = threading.Lock()
         self._repair_thread: threading.Thread | None = None
         self._repair_state: dict = {"running": False}
+
+        # Realism backfill: score the whole source tree once, ahead of curation,
+        # so Selection never waits on the model. Its own thread and state, kept
+        # apart from the scan worker because it outlives any single group.
+        self._backfill_thread: threading.Thread | None = None
+        self._backfill_stop = threading.Event()
+        self._backfill_state: dict = {"running": False}
+        # Where the realism head runs: "auto" (CUDA when usable), "cpu", or
+        # "off" for no scoring at all. Deliberately not persisted to the config
+        # — it answers "what else is using this box right now", which is true of
+        # a sitting, not a project.
+        self._realism_device = "auto"
 
         # Swiss tournament state (per-group)
         self._swiss: SwissTournament | None = None
@@ -343,11 +367,21 @@ class DPOService(SingletonMixin):
         output_dir: str,
         pairs_per_group: int = 1,
         mode: str = "selection",
+        group_order: str = "most_realistic",
+        caption_filter: str = "",
     ) -> dict:
-        from modules.util.dpo_curation_util import DpoScanCache, load_manifest, prune_orphaned_pairs
+        from modules.util.dpo_curation_util import (
+            GROUP_ORDERS,
+            DpoScanCache,
+            load_manifest,
+            parse_caption_keywords,
+            prune_orphaned_pairs,
+        )
 
         if mode not in ("selection", "swiss", "triage"):
             return {"ok": False, "error": "mode must be 'selection', 'swiss' or 'triage'"}
+        if group_order not in GROUP_ORDERS:
+            return {"ok": False, "error": f"group_order must be one of {', '.join(GROUP_ORDERS)}"}
 
         with self._lock:
             if self._session_active:
@@ -361,12 +395,15 @@ class DPOService(SingletonMixin):
         # the sentinel disables the cap in next_group and the scan worker.
         self._pairs_per_group = 10**9 if mode == "triage" else max(1, pairs_per_group)
         self._mode = mode
+        self._group_order = group_order
+        self._caption_keywords = parse_caption_keywords(caption_filter)
         self._manifest = load_manifest(output_dir)
         pruned = prune_orphaned_pairs(output_dir, self._manifest)
         existing = len(self._manifest.get("pairs", []))
 
         self._hash_cache = DpoScanCache(os.path.join(output_dir, ".dpo_hash_cache.json"))
         self._used_pixel_hashes = set()
+        self._foreign_used_sources = set()
 
         self._scan_count = 0
         self._scan_total = 0
@@ -376,6 +413,7 @@ class DPOService(SingletonMixin):
         self._worker_finished = False
         self._current_group = None
         self._remaining_images = []
+        self._exported_in_group = []
         self._ready_queue = Queue(maxsize=10)
         self._worker_stop = threading.Event()
 
@@ -429,7 +467,7 @@ class DPOService(SingletonMixin):
             # copies committed under a different path (e.g. a duplicate that
             # lives in another group); these lookups hit the in-memory cache
             # because the scan worker already hashed every queued image.
-            used_sources = manifest_used_sources(self._manifest)
+            used_sources = manifest_used_sources(self._manifest) | self._foreign_used_sources
             available_images = [
                 i for i in group["images"] if not is_source_used(used_sources, i) and not self._is_pixel_hash_used(i)
             ]
@@ -440,6 +478,7 @@ class DPOService(SingletonMixin):
             self._groups_shown += 1
             self._pairs_created_in_group = pairs_done
             self._remaining_images = available_images
+            self._exported_in_group = []
             self._selection_phase = "best"
             self._selected_best = None
             self._pending_pair = None
@@ -516,6 +555,7 @@ class DPOService(SingletonMixin):
                 group["aspectratio"],
             )
             self._mark_pair_used(chosen, rejected)
+            self._exported_in_group.append((chosen, rejected))
             self._remaining_images = potential_remaining
             self._pairs_created_in_group += 1
             self._selection_phase = "best"
@@ -529,10 +569,42 @@ class DPOService(SingletonMixin):
                 "pairs_done": self._pairs_created_in_group,
             }
 
-    def confirm_pair(self, continue_scoring: bool) -> dict:
+    def _retire_group_sources(self, rest: list[str]) -> int:
+        """Move this group's source images out of the scan tree: each pair
+        exported from the group into ``.chosen``/``.rejected``, everything in
+        ``rest`` into ``.discard``. Dot-prefixed folders are pruned by the
+        scanner, so nothing relocated here can resurface in a later session.
+        Returns the number of images discarded. Callers hold ``self._lock``."""
+        from modules.util.dpo_curation_util import move_to_dot_bucket
+
+        # export_single_pair already copied the paired sources into the output
+        # dir, so relocating the originals now is safe.
+        move_to_dot_bucket([chosen for chosen, _ in self._exported_in_group], ".chosen")
+        move_to_dot_bucket([rejected for _, rejected in self._exported_in_group], ".rejected")
+        return move_to_dot_bucket(rest, ".discard")
+
+    def _release_group(self) -> None:
+        """Clear per-group state so fetch_next_group advances. Callers hold
+        ``self._lock`` (or own the session, as skip_group does)."""
+        self._current_group = None
+        self._pending_pair = None
+        self._selected_best = None
+        self._selection_phase = "best"
+        self._exported_in_group = []
+        self._swiss = None
+        self._ranked_order = None
+
+    def confirm_pair(self, continue_scoring: bool, discard_rest: bool = False) -> dict:
         """Commit the pending pair picked via select_image and decide whether to
         stay in the current group or advance. Mirrors Ctk Yes (keep scoring) /
-        No (next group) from the askyesnocancel dialog."""
+        No (next group) from the askyesnocancel dialog.
+
+        With ``discard_rest`` the group is also retired from the source tree
+        after the write: every source paired in this group moves into
+        ``.chosen``/``.rejected`` and every leftover into ``.discard``, so the
+        group can't reappear in a later session. Overrides ``continue_scoring``
+        — there is nothing left to keep scoring.
+        """
         from modules.util.dpo_curation_util import export_single_pair
 
         with self._lock:
@@ -554,10 +626,24 @@ class DPOService(SingletonMixin):
                 group["aspectratio"],
             )
             self._mark_pair_used(chosen, rejected)
+            self._exported_in_group.append((chosen, rejected))
 
             self._remaining_images = [i for i in self._remaining_images if i not in {chosen, rejected}]
             self._pairs_created_in_group += 1
             self._pending_pair = None
+
+            if discard_rest:
+                discarded = self._retire_group_sources(list(self._remaining_images))
+                pairs_done = self._pairs_created_in_group
+                self._remaining_images = []
+                self._release_group()
+                return {
+                    "ok": True,
+                    "committed": True,
+                    "continue_group": False,
+                    "pairs_done": pairs_done,
+                    "discarded": discarded,
+                }
 
             is_unconditional = group["prompt"] == "UNCONDITIONAL"
             keep_going = continue_scoring or is_unconditional or self._pairs_created_in_group < self._pairs_per_group
@@ -601,12 +687,7 @@ class DPOService(SingletonMixin):
         # Clear per-group selection state so a stale _pending_pair or
         # _selected_best can't leak into the next group if, for any reason,
         # fetch_next_group isn't the immediate next call.
-        self._current_group = None
-        self._pending_pair = None
-        self._selected_best = None
-        self._selection_phase = "best"
-        self._swiss = None
-        self._ranked_order = None
+        self._release_group()
         return {"ok": True}
 
     def triage_align(self, good: list[str], bad: list[str]) -> dict:
@@ -639,6 +720,192 @@ class DPOService(SingletonMixin):
             "rejected_pool": result["rejected_pool"],
         }
 
+    def _scoring_disabled(self) -> bool:
+        """True when the user has turned image scoring off for this sitting.
+
+        Every entry point that could reach the model consults this, so "off"
+        means the weights are never loaded — not merely that the scores are
+        hidden. That is the whole point: the setting exists for when the GPU is
+        busy with something else.
+        """
+        from modules.util.realism_detect_util import REALISM_DEVICE_OFF
+
+        return self._realism_device == REALISM_DEVICE_OFF
+
+    def realism_scores(self, paths: list[str]) -> dict:
+        """P(AI-generated) per path, for sorting a group most-realistic-first.
+
+        Same shape as :meth:`triage_align`: paths are validated against the
+        current group under the lock, then the model call runs outside it so the
+        UI stays responsive. Reuses the session's scan cache, so a group costs
+        the model once and is free on every revisit.
+
+        A missing model is reported rather than raised — the tool stays usable
+        without the weights, just without scores.
+        """
+        from modules.util.realism_detect_util import score_images_realism
+
+        # Not an error: with scoring off the grid simply keeps source order, so
+        # report "no scores" rather than a failure the UI would have to explain.
+        if self._scoring_disabled():
+            return {"ok": True, "scores": {}, "disabled": True}
+
+        with self._lock:
+            if not self._current_group:
+                return {"ok": False, "error": "No active group"}
+            valid = set(self._current_group.get("images", []))
+            cache = self._hash_cache
+            device = self._realism_device
+
+        for path in paths:
+            if path not in valid:
+                return {"ok": False, "error": "Image is not part of the current group"}
+
+        try:
+            scores = score_images_realism(list(paths), cache=cache, device=device)
+        except RuntimeError as ex:
+            return {"ok": False, "error": str(ex)}
+
+        return {"ok": True, "scores": scores}
+
+    # ------------------------------------------------------------------ #
+    # Realism backfill
+    # ------------------------------------------------------------------ #
+
+    #: Images per `score_images_realism` call. This is a correctness bound, not
+    #: a tuning knob: that function preprocesses its ENTIRE argument list before
+    #: running a batch, holding one ~3 MB tensor per image. Handing it a whole
+    #: source tree asks for tens of gigabytes — 11.9k images reached a 39 GB
+    #: working set on a 64 GB machine before being killed. Chunking caps peak
+    #: memory at roughly `CHUNK x 3 MB`. Scores are identical either way: each
+    #: TTA draw is keyed on the file path, so nothing depends on which images
+    #: share a call.
+    _BACKFILL_CHUNK = 200
+
+    def start_realism_backfill(self) -> dict:
+        """Score every image in the session's source tree, in the background.
+
+        Selection sorts a group most-photorealistic-first, so the first view of
+        each group otherwise pays for the model. Doing the whole tree once up
+        front means every group is a cache hit from then on.
+
+        Idempotent by construction: scores already cached under the current
+        model version are served from the cache, so re-running after adding new
+        images only pays for the new ones.
+        """
+        from modules.util.dpo_curation_util import walk_skipping_dotted
+        from modules.util.path_util import supported_image_extensions
+
+        if self._scoring_disabled():
+            return {"ok": False, "error": "Image scoring is turned off"}
+
+        with self._lock:
+            if not self._session_active or not self._source_folder:
+                return {"ok": False, "error": "No active session"}
+            if self._backfill_thread is not None and self._backfill_thread.is_alive():
+                return {"ok": False, "error": "A realism backfill is already running"}
+            source = self._source_folder
+            cache = self._hash_cache
+
+        supported = supported_image_extensions()
+        paths: list[str] = []
+        for root, files in walk_skipping_dotted(source):
+            paths.extend(
+                os.path.join(root, filename)
+                for filename in sorted(files)
+                if os.path.splitext(filename)[1].lower() in supported
+            )
+
+        if not paths:
+            return {"ok": False, "error": f"No images found under {source}"}
+
+        self._backfill_stop.clear()
+        self._backfill_state = {
+            "running": True,
+            "done": 0,
+            "total": len(paths),
+            "scored": 0,
+            "cached": 0,
+            "error": None,
+            "finished": False,
+        }
+        self._backfill_thread = threading.Thread(target=self._realism_backfill_worker, args=(paths, cache), daemon=True)
+        self._backfill_thread.start()
+        return {"ok": True, "total": len(paths)}
+
+    def _realism_backfill_worker(self, paths: list[str], cache) -> None:
+        from modules.util.realism_detect_util import score_images_realism
+
+        state = self._backfill_state
+        try:
+            for start in range(0, len(paths), self._BACKFILL_CHUNK):
+                # Same chunk boundary the device switch is honoured at, for the
+                # same reason: turning scoring off mid-run has to stop the work,
+                # not just stop displaying it.
+                if self._backfill_stop.is_set() or self._scoring_disabled():
+                    break
+                chunk = paths[start : start + self._BACKFILL_CHUNK]
+                before_hits = cache.hits if cache is not None else 0
+                # Read per chunk, not once up front: the session is created per
+                # call, so flipping the device mid-run takes effect at the next
+                # chunk boundary instead of needing the backfill restarted.
+                score_images_realism(chunk, cache=cache, device=self._realism_device)
+                if cache is not None:
+                    state["cached"] += cache.hits - before_hits
+                state["done"] = start + len(chunk)
+                state["scored"] = state["done"] - state["cached"]
+                # Persist as we go: a tree this size is minutes of work and a
+                # late failure should not throw all of it away. `save()` is a
+                # no-op when nothing changed.
+                if cache is not None:
+                    cache.save()
+        except RuntimeError as ex:
+            # The model is missing — reported, not raised, same as realism_scores.
+            state["error"] = str(ex)
+        except Exception as ex:  # noqa: BLE001 — a backfill must never kill the session
+            state["error"] = f"{type(ex).__name__}: {ex}"
+        finally:
+            if cache is not None:
+                cache.save()
+            state["running"] = False
+            state["finished"] = True
+
+    def realism_backfill_status(self) -> dict:
+        state = dict(self._backfill_state)
+        state["ok"] = True
+        state["device"] = self._realism_device
+        return state
+
+    def realism_device(self) -> dict:
+        return {"ok": True, "device": self._realism_device}
+
+    def set_realism_device(self, device: str) -> dict:
+        """Pin the realism head to the CPU, turn scoring off, or let it choose.
+
+        Costs nothing to change and needs no teardown: every scoring call builds
+        its own ONNX session, so the next one — including the next backfill
+        chunk — simply picks different providers.
+
+        Switching to ``off`` also stops a backfill in flight. Leaving one
+        running would contradict the setting outright, and the work it has
+        already written to the cache is kept either way, so a later run resumes
+        rather than starting over.
+        """
+        from modules.util.realism_detect_util import REALISM_DEVICE_OFF, REALISM_DEVICE_SETTINGS
+
+        if device not in REALISM_DEVICE_SETTINGS:
+            return {"ok": False, "error": f"Unknown device {device!r}", "device": self._realism_device}
+        self._realism_device = device
+        if device == REALISM_DEVICE_OFF:
+            self._backfill_stop.set()
+        return {"ok": True, "device": device}
+
+    def stop_realism_backfill(self) -> dict:
+        """Ask the backfill to stop after the current chunk. Work already
+        written to the cache is kept, so a later run resumes from it."""
+        self._backfill_stop.set()
+        return {"ok": True}
+
     def commit_triage_pairs(self, pairs: list[tuple[str, str]], discard_rest: bool = False) -> dict:
         """Batch-commit a triage group's pairs, then release the group.
 
@@ -655,7 +922,7 @@ class DPOService(SingletonMixin):
         folders are pruned by the scanner, so nothing in the group can reappear
         in a later session.
         """
-        from modules.util.dpo_curation_util import export_single_pair, move_to_dot_bucket
+        from modules.util.dpo_curation_util import export_single_pair
 
         with self._lock:
             if not self._current_group:
@@ -684,27 +951,18 @@ class DPOService(SingletonMixin):
                     group["aspectratio"],
                 )
                 self._mark_pair_used(chosen, rejected)
+                self._exported_in_group.append((chosen, rejected))
                 self._pairs_created_in_group += 1
 
             rest = [i for i in self._remaining_images if i not in seen]
 
-            discarded = 0
-            if discard_rest:
-                # export_single_pair already copied the sources to the output
-                # dir, so it's safe to relocate them now. Paired sources go to
-                # .chosen/.rejected, everything else to .discard — all pruned by
-                # walk_skipping_dotted so this group never rescans.
-                move_to_dot_bucket([chosen for chosen, _ in pairs], ".chosen")
-                move_to_dot_bucket([rejected for _, rejected in pairs], ".rejected")
-                discarded = move_to_dot_bucket(rest, ".discard")
+            discarded = self._retire_group_sources(rest) if discard_rest else 0
 
-            self._remaining_images = rest
+            self._remaining_images = [] if discard_rest else rest
+            pairs_done = self._pairs_created_in_group
             # Release the group like skip_group so fetch_next_group advances.
-            self._current_group = None
-            self._pending_pair = None
-            self._selected_best = None
-            self._selection_phase = "best"
-            return {"ok": True, "pairs_done": self._pairs_created_in_group, "discarded": discarded}
+            self._release_group()
+            return {"ok": True, "pairs_done": pairs_done, "discarded": discarded}
 
     def discard_group(self) -> dict:
         """Retire the current group without saving any pair: move every remaining
@@ -712,20 +970,16 @@ class DPOService(SingletonMixin):
         group. Unlike :meth:`skip_group`, the images are physically removed from
         the source tree (dot folders are pruned by the scanner), so a discarded
         group never reappears in a later session. Mode-agnostic — the header
-        button sits next to Skip Group in every curation mode."""
-        from modules.util.dpo_curation_util import move_to_dot_bucket
-
+        button sits next to Skip Group in every curation mode. Pairs already
+        exported from the group (selection/tournament modes commit as they go)
+        are not unwritten — their sources move to ``.chosen``/``.rejected``
+        rather than ``.discard`` so the whole group leaves the scan tree."""
         with self._lock:
             if not self._current_group:
                 return {"ok": False, "error": "No active group"}
-            discarded = move_to_dot_bucket(list(self._remaining_images), ".discard")
+            discarded = self._retire_group_sources(list(self._remaining_images))
             self._remaining_images = []
-            self._current_group = None
-            self._pending_pair = None
-            self._selected_best = None
-            self._selection_phase = "best"
-            self._swiss = None
-            self._ranked_order = None
+            self._release_group()
             return {"ok": True, "discarded": discarded}
 
     def finalize_session(self, val_percentage: float = 0.0) -> dict:
@@ -758,6 +1012,7 @@ class DPOService(SingletonMixin):
         self._session_active = False
         self._current_group = None
         self._pending_pair = None
+        self._exported_in_group = []
         self._swiss = None
         self._ranked_order = None
         # Keep the hash work done so far — a restarted session over the same
@@ -855,9 +1110,14 @@ class DPOService(SingletonMixin):
         self._ranked_order = list(order)
         return {"ok": True}
 
-    def swiss_export(self, pair_count: int) -> dict:
+    def swiss_export(self, pair_count: int, discard_rest: bool = False) -> dict:
         """Export the outermost pairs of the (possibly reordered) ranking, then
-        release the group. pair_count=0 just skips the group."""
+        release the group. pair_count=0 just skips the group.
+
+        With ``discard_rest`` the group is also retired from the source tree:
+        exported sources move into ``.chosen``/``.rejected`` and every
+        unexported image into ``.discard``, so the mid-ranked leftovers this
+        mode never uses can't come back in a later session."""
         from modules.util.dpo_curation_util import export_single_pair
 
         if error := self._swiss_guard():
@@ -879,15 +1139,19 @@ class DPOService(SingletonMixin):
                     group["aspectratio"],
                 )
                 self._mark_pair_used(chosen, rejected)
+                self._exported_in_group.append((chosen, rejected))
                 self._pairs_created_in_group += 1
 
             exported = {img for pair in pairs for img in pair}
-            self._remaining_images = [i for i in self._remaining_images if i not in exported]
+            rest = [i for i in self._remaining_images if i not in exported]
+
+            discarded = self._retire_group_sources(rest) if discard_rest else 0
+
+            self._remaining_images = [] if discard_rest else rest
+            pairs_done = self._pairs_created_in_group
             # Release the group like skip_group so fetch_next_group advances.
-            self._current_group = None
-            self._swiss = None
-            self._ranked_order = None
-            return {"ok": True, "exported": len(pairs), "pairs_done": self._pairs_created_in_group}
+            self._release_group()
+            return {"ok": True, "exported": len(pairs), "pairs_done": pairs_done, "discarded": discarded}
 
     # ---- Background worker ----
 
@@ -941,6 +1205,23 @@ class DPOService(SingletonMixin):
                 )
         return paths
 
+    def _foreign_concept_usage(self) -> tuple[set[str], list[str]]:
+        """Source paths and exported image files of every configured DPO
+        concept other than this session's output dir. Read errors (a concept
+        with a bad pattern, an unreadable manifest) degrade to nothing foreign
+        rather than failing the scan."""
+        from modules.util.dpo_curation_util import concept_usage_for_exclusion
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
+
+        try:
+            sources, _fingerprints, paths = concept_usage_for_exclusion(
+                dpo_concept_pattern_dirs(self._resolve_concepts()), exclude_dir=self._output_dir
+            )
+            return sources, paths
+        except Exception as ex:
+            logger.warning("could not read configured DPO concepts for image exclusion: %s", ex)
+            return set(), []
+
     def _hash_paths(self, pool, paths: list[str]) -> dict[str, str]:
         """Hash ``paths`` through the persistent cache on ``pool``. Returns
         ``{path: hash}`` for files that could be hashed; returns early
@@ -978,6 +1259,7 @@ class DPOService(SingletonMixin):
 
         from modules.util import path_util
         from modules.util.dpo_curation_util import (
+            group_matches_keywords,
             is_source_used,
             manifest_pair_counts,
             manifest_used_sources,
@@ -1046,17 +1328,31 @@ class DPOService(SingletonMixin):
             for (prompt, ar), images in groups_dict.items()
             if len(images) >= 2
         ]
+        # A caption filter narrows the session to groups whose prompt carries
+        # every keyword; it runs before the ordering so the order applies to
+        # the filtered list rather than to everything the scan found.
+        if self._caption_keywords:
+            keywords = self._caption_keywords
+            raw_groups = [g for g in raw_groups if group_matches_keywords(g, keywords)]
+        # Shuffle first so ties and unscored groups are not presented in
+        # filesystem order, then rank: the sort is stable, so the shuffle
+        # survives wherever the scores cannot separate two groups (and is the
+        # whole order when the session asked for "random").
         random.shuffle(raw_groups)
+        raw_groups = self._order_by_realism(raw_groups)
 
         existing_counts = manifest_pair_counts(self._manifest)
-        used_sources = manifest_used_sources(self._manifest)
+        foreign_sources, foreign_paths = self._foreign_concept_usage()
+        self._foreign_used_sources = foreign_sources
+        used_sources = manifest_used_sources(self._manifest) | foreign_sources
 
         with ThreadPoolExecutor(max_workers=self._hash_worker_count()) as hash_pool:
-            # Fingerprint everything already exported so a byte/pixel-identical
-            # copy of a used image can never be presented again, no matter how
-            # it was renamed or where it lives in the source tree. The
-            # path-based used_sources filter alone misses those.
-            exported = self._hash_paths(hash_pool, self._exported_image_paths())
+            # Fingerprint everything already exported — here and in every other
+            # configured DPO concept — so a byte/pixel-identical copy of a used
+            # image can never be presented again, no matter how it was renamed
+            # or where it lives in the source tree. The path-based used_sources
+            # filter alone misses those.
+            exported = self._hash_paths(hash_pool, self._exported_image_paths() + foreign_paths)
             self._used_pixel_hashes.update(exported.values())
             if self._worker_stop.is_set():
                 return
@@ -1088,6 +1384,35 @@ class DPOService(SingletonMixin):
                             continue
 
         self._worker_finished = True
+
+    def _order_by_realism(self, groups: list[dict]) -> list[dict]:
+        """Rank groups by realism in the session's ``group_order`` (most
+        photorealistic first by default), from cached scores only.
+
+        Reads the cache and never the model: the scan is CPU work that must not
+        take VRAM from the generator, and a score that is not cached is simply
+        treated as unknown. Run the backfill and every group is ranked; skip it
+        and the order degrades to the shuffle it always was.
+        """
+        from modules.util.dpo_curation_util import GROUP_ORDER_RANDOM, order_groups_by_realism
+        from modules.util.realism_detect_util import realism_model_version
+
+        # Random is the shuffle the caller already applied; nothing to rank.
+        if self._group_order == GROUP_ORDER_RANDOM:
+            return groups
+        # Off means off, cache or no cache. Reading cached scores would cost
+        # nothing, but a group order the user cannot see the reason for — no
+        # badges, no model — is worse than the shuffle they asked for.
+        if self._scoring_disabled():
+            return groups
+
+        cache = self._hash_cache
+        if cache is None:
+            return groups
+        version = realism_model_version()
+        if version is None:
+            return groups
+        return order_groups_by_realism(groups, lambda path: cache.peek_realism(path, version), self._group_order)
 
     def _dedup_by_content_hash(self, images: list[str], hash_pool) -> list[str]:
         """Drop pixel-identical files within a group, keeping the latest

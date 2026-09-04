@@ -1,8 +1,6 @@
 import json
 from pathlib import Path
 
-from PIL import Image, PngImagePlugin
-
 from modules.util.distill_metadata_util import (
     DISTILL_MANIFEST_NAME,
     DistillBuildFilters,
@@ -10,6 +8,8 @@ from modules.util.distill_metadata_util import (
     build_distillation_dataset,
     extract_distill_metadata,
 )
+
+from PIL import Image, PngImagePlugin
 
 
 def test_extracts_swarm_utf16_webp_metadata(tmp_path: Path):

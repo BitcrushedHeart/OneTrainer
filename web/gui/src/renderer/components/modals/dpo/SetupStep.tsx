@@ -12,10 +12,46 @@ import {
 import { useCallback, useState } from "react";
 
 import { type CaptionMismatch, dpoApi, type PairCheckResult } from "@/api/dpoApi";
-import { Button, DirPicker, FormEntry, SectionCard } from "@/components/shared";
+import { Button, DirPicker, FormEntry, SectionCard, Select } from "@/components/shared";
 
 import { CaptionMismatchModal } from "./CaptionMismatchModal";
-import type { SetupStepProps } from "./types";
+import type { GroupOrder, RealismDevice, SetupStepProps } from "./types";
+
+// Realism scoring runs a small local model over every image to sort each group
+// most-photorealistic-first. "Off" is here rather than only in Selection
+// because the scan itself orders groups by score: a session started with
+// scoring on has already touched the model before Selection's toggle is
+// reachable.
+const SCORING_OPTIONS = [
+  { label: "On (GPU when available)", value: "auto" },
+  { label: "On (CPU only)", value: "cpu" },
+  { label: "Off", value: "off" },
+];
+
+const SCORING_HELP: Record<RealismDevice, string> = {
+  auto: "Sorts each group most-photorealistic-first and shows a per-image score. Uses the GPU when one is free.",
+  cpu: "Same scoring, run on the CPU — slower, but it leaves the VRAM to a training or generation run.",
+  off: "No scoring: the model is never loaded, groups keep their source order and no score badges are shown. Pick this when the GPU is busy.",
+};
+
+// Which groups the session shows first. The realism orders rank each group on
+// its cached scores (a group counts for its best image when most-realistic
+// first, its worst when least-realistic first, and the spread between the two
+// under largest gap); unscored groups always trail.
+const GROUP_ORDER_OPTIONS: Array<{ label: string; value: GroupOrder }> = [
+  { label: "Highest realism first", value: "most_realistic" },
+  { label: "Lowest realism first", value: "least_realistic" },
+  { label: "Largest gap first", value: "largest_gap" },
+  { label: "Random", value: "random" },
+];
+
+const GROUP_ORDER_HELP: Record<GroupOrder, string> = {
+  most_realistic: "Groups holding the most photorealistic image come first — the strongest DPO winners early.",
+  least_realistic: "Groups holding the least convincing image come first — the clearest rejects early.",
+  largest_gap:
+    "Groups with the widest realism spread between their best and worst image come first — the starkest winner/loser contrast early. Groups with fewer than two scored images trail.",
+  random: "Groups are shuffled; realism scores still show as badges but do not affect the order.",
+};
 
 function CheckResults({ result }: { result: PairCheckResult }) {
   return (
@@ -56,15 +92,21 @@ export function SetupStep({
   sourceFolder,
   outputDir,
   pairsPerGroup,
+  groupOrder,
+  captionFilter,
   onSourceChange,
   onOutputChange,
   onPairsPerGroupChange,
+  onGroupOrderChange,
+  onCaptionFilterChange,
   onStart,
   onReview,
   onClose,
   resume,
   onSelectOutput,
   error,
+  realismDevice,
+  onSetRealismDevice,
 }: SetupStepProps) {
   const [managementOpen, setManagementOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -211,19 +253,61 @@ export function SetupStep({
       )}
 
       <SectionCard title="Settings">
-        <div className="flex items-end gap-3">
-          <div className="w-32">
-            <FormEntry
-              label="Pairs per group"
-              type="number"
-              value={pairsPerGroup}
-              onChange={(v) => onPairsPerGroupChange(Math.max(1, Number(v)))}
-            />
+        <div className="space-y-3">
+          <div className="flex items-end gap-3">
+            <div className="w-32">
+              <FormEntry
+                label="Pairs per group"
+                type="number"
+                value={pairsPerGroup}
+                onChange={(v) => onPairsPerGroupChange(Math.max(1, Number(v)))}
+              />
+            </div>
+            <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
+              How many pairs to collect before moving on. Triage mode ignores this — it pairs as many good/bad images as
+              each group allows.
+            </p>
           </div>
-          <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
-            How many pairs to collect before moving on. Triage mode ignores this — it pairs as many good/bad images as
-            each group allows.
-          </p>
+          <div className="flex items-end gap-3">
+            <div className="w-56">
+              <Select
+                label="Image scoring"
+                options={SCORING_OPTIONS}
+                value={realismDevice}
+                onChange={(v) => onSetRealismDevice(v as RealismDevice)}
+              />
+            </div>
+            <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">{SCORING_HELP[realismDevice]}</p>
+          </div>
+          <div className="flex items-end gap-3">
+            <div className="w-56">
+              <Select
+                label="Group order"
+                options={GROUP_ORDER_OPTIONS}
+                value={groupOrder}
+                onChange={(v) => onGroupOrderChange(v as GroupOrder)}
+              />
+            </div>
+            <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
+              {realismDevice === "off" && groupOrder !== "random"
+                ? "Scoring is off, so there are no realism scores to rank on — groups will be shuffled."
+                : GROUP_ORDER_HELP[groupOrder]}
+            </p>
+          </div>
+          <div className="flex items-end gap-3">
+            <div className="w-56">
+              <FormEntry
+                label="Caption keywords"
+                value={captionFilter}
+                onChange={(v) => onCaptionFilterChange(String(v))}
+                placeholder="e.g. red dress, night"
+              />
+            </div>
+            <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
+              Only show groups whose caption contains every comma-separated term (case-insensitive). The group order
+              above applies to the filtered list. Leave empty for all groups.
+            </p>
+          </div>
         </div>
       </SectionCard>
 
@@ -238,7 +322,9 @@ export function SetupStep({
         <Button
           variant="primary"
           disabled={!canStart}
-          onClick={() => void onStart({ sourceFolder, outputDir, pairsPerGroup, mode: "selection" })}
+          onClick={() =>
+            void onStart({ sourceFolder, outputDir, pairsPerGroup, groupOrder, captionFilter, mode: "selection" })
+          }
         >
           <MousePointer2 className="w-4 h-4" />
           Start (Selection)
@@ -246,7 +332,9 @@ export function SetupStep({
         <Button
           variant="primary"
           disabled={!canStart}
-          onClick={() => void onStart({ sourceFolder, outputDir, pairsPerGroup, mode: "swiss" })}
+          onClick={() =>
+            void onStart({ sourceFolder, outputDir, pairsPerGroup, groupOrder, captionFilter, mode: "swiss" })
+          }
         >
           <MousePointer2 className="w-4 h-4" />
           Start (Tournament)
@@ -254,7 +342,9 @@ export function SetupStep({
         <Button
           variant="primary"
           disabled={!canStart}
-          onClick={() => void onStart({ sourceFolder, outputDir, pairsPerGroup, mode: "triage" })}
+          onClick={() =>
+            void onStart({ sourceFolder, outputDir, pairsPerGroup, groupOrder, captionFilter, mode: "triage" })
+          }
         >
           <Zap className="w-4 h-4" />
           Start (Triage)

@@ -228,3 +228,45 @@ class DistillTab:
             "sigmas it will be stepped at. 1.0 = uniform grid (no shift).",
         )
         components.entry(self.scroll_frame, 9, 1, self.ui_state, "distill_sigma_shift")
+
+        components.label(
+            self.scroll_frame,
+            9,
+            3,
+            "Prompt-only Data",
+            tooltip="Train from the concept directories' .txt captions alone: no images are loaded or "
+            "VAE-encoded (the distill losses never read image content). Optional <name>.json sidecars "
+            "still provide per-prompt cfg/steps/negative prompt/resolution.",
+        )
+        components.switch(self.scroll_frame, 9, 4, self.ui_state, "prompt_only_data")
+
+        components.label(
+            self.scroll_frame,
+            10,
+            0,
+            "Enable Redistill",
+            tooltip="Phased re-distillation of an updated Base: Phase A activation-matches the late blocks "
+            "toward the OLD distilled checkpoint below, Phase B continues with the DMD2 distill loss "
+            "(teacher = the loaded Base). Uses the Transfer tab's late-start/families/validation settings. "
+            "Cannot be combined with Distill or Transfer.",
+        )
+        components.switch(self.scroll_frame, 10, 1, self.ui_state, "redistill_enabled")
+
+        components.label(
+            self.scroll_frame,
+            10,
+            3,
+            "Old Distilled Model",
+            tooltip="The OLD Turbo/Lightning checkpoint whose late tensors are the Phase A teacher.",
+        )
+        components.path_entry(self.scroll_frame, 10, 4, self.ui_state, "redistill_turbo_model_name")
+
+        components.label(
+            self.scroll_frame,
+            11,
+            0,
+            "Phase A Steps",
+            tooltip="Step budget for the Phase A activation warm start. Phase A can end earlier via the "
+            "Transfer tab's convergence settings (patience / target residual, needs transfer validation).",
+        )
+        components.entry(self.scroll_frame, 11, 1, self.ui_state, "redistill_transfer_steps")

@@ -38,6 +38,10 @@ from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
 
+from mgds.pipelineModules.ResolutionPolicy import DEFAULT_ADAPTIVE_RESOLUTION_LADDER
+
+DEFAULT_ADAPTIVE_RESOLUTION_LADDER_STRING = ",".join(str(value) for value in DEFAULT_ADAPTIVE_RESOLUTION_LADDER)
+
 
 class TrainOptimizerConfig(BaseConfig):
     optimizer: Optimizer
@@ -443,6 +447,8 @@ class TrainConfig(BaseConfig):
     concept_file_name: str
     concepts: list[ConceptConfig]
     aspect_ratio_bucketing: bool
+    adaptive_resolution: bool
+    adaptive_resolution_ladder: str
     latent_caching: bool
     clear_cache_before_training: bool
     skip_cache_validation: bool
@@ -626,6 +632,28 @@ class TrainConfig(BaseConfig):
     distill_validation_prompts: int
     distill_kl_normalize: bool
     distill_backprop_random_step: bool
+    prompt_only_data: bool
+
+    # redistillation (Phase A activation warm start toward an old distilled
+    # variant's late tensors, then Phase B DMD2 distillation)
+    redistill_enabled: bool
+    redistill_turbo_model_name: str
+    redistill_transfer_steps: int
+
+    # knowledge transfer (activation matching against Base + original adapter)
+    transfer_enabled: bool
+    transfer_base_model_name: str
+    transfer_teacher_adapter_name: str
+    transfer_late_start: int
+    transfer_families: str
+    transfer_block_loss_normalize: bool
+    transfer_mask_padded_tokens: bool
+    transfer_validation: bool
+    transfer_validation_batches: int
+    transfer_patience_enabled: bool
+    transfer_patience_checks: int
+    transfer_min_relative_improvement: float
+    transfer_target_residual: float
 
     # dpo
     rlhf_mode: RLHFMode
@@ -633,12 +661,16 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_beta: float
     rlhf_dpo_label_smoothing: float
     rlhf_dpo_ref_mode: DPORefMode
+    rlhf_dpo_ref_rebase: bool
+    rlhf_dpo_ref_rebase_interval: int
     rlhf_dpo_objective: DPOObjective
     rlhf_dpo_ipo_tau: float
     rlhf_dpo_adaptive_beta: bool
     rlhf_dpo_timestep_margin_logging: bool
     rlhf_supervised_mix: float
     rlhf_sft_anchor_weight: float
+    rlhf_dpo_addon_weight: float
+    rlhf_dpo_addon_interval: int
     rlhf_dpo_validation: bool
     rlhf_dpo_validation_percentage: float
     rlhf_dpo_patience_enabled: bool
@@ -681,7 +713,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=22,
+            config_version=28,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -705,6 +737,12 @@ class TrainConfig(BaseConfig):
                 19: self.__migration_19,
                 20: self.__migration_20,
                 21: self.__migration_21,
+                22: self.__migration_22,
+                23: self.__migration_23,
+                24: self.__migration_24,
+                25: self.__migration_25,
+                26: self.__migration_26,
+                27: self.__migration_27,
             },
         )
 
@@ -1028,6 +1066,57 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("distill_sigma_shift", 1.0)
         return migrated_data
 
+    def __migration_22(self, data: dict) -> dict:
+        # Knowledge-transfer (activation-matching) training mode.
+        migrated_data = data.copy()
+        migrated_data.setdefault("transfer_enabled", False)
+        migrated_data.setdefault("transfer_base_model_name", "")
+        migrated_data.setdefault("transfer_teacher_adapter_name", "")
+        migrated_data.setdefault("transfer_late_start", 22)
+        migrated_data.setdefault("transfer_families", "qkv,mlp")
+        migrated_data.setdefault("transfer_block_loss_normalize", True)
+        migrated_data.setdefault("transfer_mask_padded_tokens", True)
+        migrated_data.setdefault("transfer_validation", True)
+        migrated_data.setdefault("transfer_validation_batches", 8)
+        migrated_data.setdefault("transfer_patience_enabled", True)
+        migrated_data.setdefault("transfer_patience_checks", 5)
+        migrated_data.setdefault("transfer_min_relative_improvement", 0.005)
+        migrated_data.setdefault("transfer_target_residual", 0.0)
+        return migrated_data
+
+    def __migration_23(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("adaptive_resolution", False)
+        return migrated_data
+
+    def __migration_24(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("adaptive_resolution_ladder", DEFAULT_ADAPTIVE_RESOLUTION_LADDER_STRING)
+        return migrated_data
+
+    def __migration_25(self, data: dict) -> dict:
+        # Prompt-only distill data + phased redistill mode.
+        migrated_data = data.copy()
+        migrated_data.setdefault("prompt_only_data", False)
+        migrated_data.setdefault("redistill_enabled", False)
+        migrated_data.setdefault("redistill_turbo_model_name", "")
+        migrated_data.setdefault("redistill_transfer_steps", 2000)
+        return migrated_data
+
+    def __migration_26(self, data: dict) -> dict:
+        # SFT + DPO mode: standard finetune primary, DPO pairs interleaved.
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_dpo_addon_weight", 1.0)
+        migrated_data.setdefault("rlhf_dpo_addon_interval", 0)
+        return migrated_data
+
+    def __migration_27(self, data: dict) -> dict:
+        # DPO reference rebase: re-anchor the EXISTING_ADAPTER snapshot.
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_dpo_ref_rebase", False)
+        migrated_data.setdefault("rlhf_dpo_ref_rebase_interval", 0)
+        return migrated_data
+
     def from_dict(self, data: dict) -> "TrainConfig":
         # oft_clipped_norm was briefly a bool on this branch (clip on/off at a
         # hard-coded 0.999) before upstream PR #1492 settled on float | None
@@ -1038,14 +1127,140 @@ class TrainConfig(BaseConfig):
             data["oft_clipped_norm"] = 0.999 if data["oft_clipped_norm"] else None
         return super().from_dict(data)
 
+    def rlhf_sft_primary(self) -> bool:
+        # SFT + DPO: the standard finetune is the main loader; DPO pairs ride along.
+        return self.rlhf_enabled and self.rlhf_mode == RLHFMode.SFT_DPO
+
+    def rlhf_dpo_primary(self) -> bool:
+        # Classic DPO run: pairs are the main loader; STANDARD concepts anchor it.
+        return self.rlhf_enabled and not self.rlhf_sft_primary()
+
     def effective_dpo_ref_mode(self) -> DPORefMode:
-        return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
+        # A loaded adapter is always the reference. Without one, an explicit
+        # EXISTING_ADAPTER still wins: resuming a finetune from a backup has no
+        # lora_model_name, yet the reference must be the adapter as it stands at
+        # the first DPO step (captured lazily, persisted with later backups),
+        # not the bare base model.
+        if self.lora_model_name or self.rlhf_dpo_ref_mode == DPORefMode.EXISTING_ADAPTER:
+            return DPORefMode.EXISTING_ADAPTER
+        return DPORefMode.NEW_ADAPTER
+
+    def validate_rlhf_startup(self) -> str | None:
+        if not self.rlhf_enabled:
+            return None
+        if self.training_method != TrainingMethod.LORA:
+            return "RLHF DPO is currently implemented for adapter training in the LoRA tab only."
+        if self.rlhf_dpo_ref_rebase_interval < 0:
+            return "The DPO reference rebase interval must be 0 (never) or a positive number of steps."
+        if (
+            self.rlhf_dpo_ref_rebase or self.rlhf_dpo_ref_rebase_interval > 0
+        ) and self.effective_dpo_ref_mode() != DPORefMode.EXISTING_ADAPTER:
+            return (
+                "Rebasing the DPO reference needs the Existing Adapter reference mode; "
+                "New Adapter always measures against the bare base model."
+            )
+        if self.rlhf_sft_primary():
+            if self.rlhf_dpo_addon_weight <= 0:
+                return "SFT + DPO mode needs a positive DPO add-on weight."
+            if self.rlhf_dpo_addon_interval < 0:
+                return "The DPO add-on interval must be 0 (auto) or a positive number of micro-batches."
+            if self.optimizer is not None and getattr(self.optimizer, "fused_back_pass", False):
+                # Add-on micro-steps run two backwards (standard, then DPO pair)
+                # to keep peak memory at one graph; a fused back pass would
+                # apply the optimizer inside the first of them.
+                return "SFT + DPO mode does not support the optimizer's fused back pass; disable it."
+        return None
 
     def dpo_validation_active(self) -> bool:
         # DPO validation only makes sense inside a DPO run: the paired
         # chosen/rejected validation pipeline is built only when both flags are
         # set, so every consumer must gate on both to avoid a mid-run crash.
         return self.rlhf_enabled and self.rlhf_dpo_validation
+
+    def distill_phase_active(self) -> bool:
+        # True when the DMD2 distill machinery must exist (plain distill, or
+        # redistill whose Phase B is the distill loss).
+        return self.distill_enabled or self.redistill_enabled
+
+    def validate_prompt_only_startup(self) -> str | None:
+        if not self.prompt_only_data:
+            return None
+        if not self.distill_phase_active():
+            return (
+                "prompt_only_data requires a distillation mode (distill or redistill); "
+                "the standard loss would train toward zero latents."
+            )
+        if self.rlhf_enabled:
+            return "prompt_only_data can not be combined with RLHF."
+        if self.masked_training:
+            return "prompt_only_data can not be combined with masked_training (there are no images to mask)."
+        if self.custom_conditioning_image:
+            return "prompt_only_data can not be combined with custom_conditioning_image."
+        if self.sourceless_training:
+            return "prompt_only_data can not be combined with sourceless_training."
+        if self.validation:
+            return "prompt_only_data can not be combined with standard validation (it would score zero latents)."
+        return None
+
+    def validate_redistill_startup(self) -> str | None:
+        if not self.redistill_enabled:
+            return None
+        # Redistill is its own top-level mode: the plain distill/transfer
+        # dispatch branches must stay unreachable.
+        if self.distill_enabled:
+            return "Redistill and Distill can not be enabled in the same training run (redistill includes distill)."
+        if self.transfer_enabled:
+            return "Redistill and Transfer can not be enabled in the same training run (redistill includes transfer)."
+        if self.rlhf_enabled:
+            return "Redistill and RLHF can not be enabled in the same training run."
+        if self.distillation_teacher_lora_model_name:
+            return (
+                "Redistill conflicts with the legacy distillation teacher adapter; "
+                "clear distillation_teacher_lora_model_name."
+            )
+        if self.training_method != TrainingMethod.LORA:
+            return "Redistill is implemented for LoRA training only."
+        if self.model_type != ModelType.Z_IMAGE:
+            return "Redistill is implemented for Z-Image only."
+        if self.peft_type != PeftType.OFT_2:
+            return "Redistill requires an OFT or DoRA-OFT adapter (peft_type OFT_2)."
+        if self.gradient_accumulation_steps > 1:
+            # Phase B TTUR alternates the update target per micro-step.
+            return "Redistill requires gradient_accumulation_steps=1 (TTUR alternates the update target per step)."
+        if self.distill_sigma_shift <= 0.0:
+            return "Distill sigma shift must be greater than 0 (1.0 = uniform grid, no shift)."
+        if self.transfer_late_start < 0:
+            return "transfer_late_start must be >= 0."
+        if self.dropout_probability > 0.0:
+            return "Redistill requires dropout_probability = 0 (dropout breaks the deterministic validation)."
+        if (self.transfer_patience_enabled or self.transfer_target_residual > 0.0) and not self.transfer_validation:
+            return "Redistill Phase A auto-stop (patience / target residual) requires transfer_validation."
+        if not self.redistill_turbo_model_name or not os.path.isfile(self.redistill_turbo_model_name):
+            return (
+                "Redistill requires an existing distilled checkpoint file (redistill_turbo_model_name) -- "
+                "the OLD Turbo/Lightning whose late tensors are the Phase A teacher."
+            )
+        if self.redistill_transfer_steps < 0:
+            return "redistill_transfer_steps must be >= 0."
+        if self.ema != EMAMode.OFF:
+            # The Phase A best-weights restore snapshots only self.parameters;
+            # EMA shadows and the LR scheduler are not restored with it.
+            return "Redistill does not support EMA (the Phase A best-weights restore does not cover EMA state)."
+        try:
+            # Local import: transfer_util -> oft_merge -> TrainConfig would cycle at module level.
+            from modules.util.transfer_util import parse_transfer_families
+
+            parse_transfer_families(self.transfer_families)
+        except ValueError as e:
+            return str(e)
+        if self.redistill_transfer_steps == 0:
+            print("WARN: redistill_transfer_steps is 0 -- Phase A is skipped, this is a plain distill run.")
+        if not self.prompt_only_data:
+            print(
+                "WARN: redistill without prompt_only_data -- images will be loaded and VAE-encoded "
+                "even though neither phase reads their content."
+            )
+        return None
 
     def validate_distill_startup(self) -> str | None:
         if not self.distill_enabled:
@@ -1063,6 +1278,65 @@ class TrainConfig(BaseConfig):
             return "Distill requires gradient_accumulation_steps=1 (TTUR alternates the update target per step)."
         if self.distill_sigma_shift <= 0.0:
             return "Distill sigma shift must be greater than 0 (1.0 = uniform grid, no shift)."
+        return None
+
+    def validate_transfer_startup(self) -> str | None:
+        if not self.transfer_enabled:
+            return None
+        if self.distill_enabled:
+            return "Transfer and Distill can not be enabled in the same training run."
+        if self.rlhf_enabled:
+            return "Transfer and RLHF can not be enabled in the same training run."
+        if self.distillation_teacher_lora_model_name:
+            return (
+                "Transfer conflicts with the legacy distillation teacher adapter; "
+                "clear distillation_teacher_lora_model_name."
+            )
+        if self.training_method != TrainingMethod.LORA:
+            return "Transfer is implemented for LoRA training only."
+        if self.model_type != ModelType.Z_IMAGE:
+            return "Transfer is implemented for Z-Image only."
+        if self.peft_type != PeftType.OFT_2:
+            return "Transfer requires an OFT or DoRA-OFT adapter (peft_type OFT_2)."
+        if not self.lora_model_name:
+            return "Transfer requires the warm-start adapter in lora_model_name."
+        if self.transfer_late_start < 0:
+            return "transfer_late_start must be >= 0."
+        if self.dropout_probability > 0.0:
+            # Adapter dropout draws from the GLOBAL RNG (MultiplicativeDropoutLayer),
+            # which would make the deterministic convergence validation stochastic:
+            # patience would count noise and best-snapshot would select the minimum
+            # of a noise process. It also puts a dropout-induced floor under the
+            # teacher-match loss (the teacher pass runs hook-free).
+            return "Transfer requires dropout_probability = 0 (dropout breaks the deterministic validation)."
+        if (self.transfer_patience_enabled or self.transfer_target_residual > 0.0) and not self.transfer_validation:
+            return "Transfer auto-stop (patience / target residual) requires transfer_validation."
+        if not self.transfer_base_model_name or not os.path.isfile(self.transfer_base_model_name):
+            return "Transfer requires an existing Base checkpoint file (transfer_base_model_name)."
+        if not self.transfer_teacher_adapter_name or not os.path.isfile(self.transfer_teacher_adapter_name):
+            return (
+                "Transfer requires an existing teacher adapter file (transfer_teacher_adapter_name) -- "
+                "the ORIGINAL Base-trained adapter, not the warm-start."
+            )
+        try:
+            # Local import: transfer_util -> oft_merge -> TrainConfig would cycle at module level.
+            from modules.util.transfer_util import parse_transfer_families
+
+            parse_transfer_families(self.transfer_families)
+        except ValueError as e:
+            return str(e)
+        if os.path.normcase(os.path.abspath(self.transfer_teacher_adapter_name)) == os.path.normcase(
+            os.path.abspath(self.lora_model_name)
+        ):
+            print(
+                "WARN: transfer_teacher_adapter_name equals lora_model_name. The teacher must be the "
+                "ORIGINAL Base-frame adapter; lora_model_name should hold the conjugated warm-start file."
+            )
+        if self.output_dtype != DataType.FLOAT_32:
+            print(
+                "WARN: transfer output_dtype is not FLOAT_32. The save cast rounds scalar marker "
+                "buffers (e.g. clipped_oft 0.99 -> 0.98828125 at bf16); fp32 adapter saves avoid it."
+            )
         return None
 
     def weight_dtypes(self) -> ModelWeightDtypes:
@@ -1269,6 +1543,8 @@ class TrainConfig(BaseConfig):
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))
         data.append(("concepts", None, list[ConceptConfig], True))
         data.append(("aspect_ratio_bucketing", True, bool, False))
+        data.append(("adaptive_resolution", False, bool, False))
+        data.append(("adaptive_resolution_ladder", DEFAULT_ADAPTIVE_RESOLUTION_LADDER_STRING, str, False))
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", False, bool, False))
         data.append(("skip_cache_validation", False, bool, False))
@@ -1495,6 +1771,27 @@ class TrainConfig(BaseConfig):
         data.append(("distill_validation_prompts", 8, int, False))
         data.append(("distill_kl_normalize", True, bool, False))
         data.append(("distill_backprop_random_step", True, bool, False))
+        data.append(("prompt_only_data", False, bool, False))
+
+        # redistillation
+        data.append(("redistill_enabled", False, bool, False))
+        data.append(("redistill_turbo_model_name", "", str, False))
+        data.append(("redistill_transfer_steps", 2000, int, False))
+
+        # knowledge transfer
+        data.append(("transfer_enabled", False, bool, False))
+        data.append(("transfer_base_model_name", "", str, False))
+        data.append(("transfer_teacher_adapter_name", "", str, False))
+        data.append(("transfer_late_start", 22, int, False))
+        data.append(("transfer_families", "qkv,mlp", str, False))
+        data.append(("transfer_block_loss_normalize", True, bool, False))
+        data.append(("transfer_mask_padded_tokens", True, bool, False))
+        data.append(("transfer_validation", True, bool, False))
+        data.append(("transfer_validation_batches", 8, int, False))
+        data.append(("transfer_patience_enabled", True, bool, False))
+        data.append(("transfer_patience_checks", 5, int, False))
+        data.append(("transfer_min_relative_improvement", 0.005, float, False))
+        data.append(("transfer_target_residual", 0.0, float, False))
 
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
@@ -1502,12 +1799,16 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_beta", 200.0, float, False))
         data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
+        data.append(("rlhf_dpo_ref_rebase", False, bool, False))
+        data.append(("rlhf_dpo_ref_rebase_interval", 0, int, False))
         data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
         data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
         data.append(("rlhf_supervised_mix", 0.25, float, False))
         data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
+        data.append(("rlhf_dpo_addon_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_addon_interval", 0, int, False))
         data.append(("rlhf_dpo_validation", False, bool, False))
         data.append(("rlhf_dpo_validation_percentage", 10.0, float, False))
         data.append(("rlhf_dpo_patience_enabled", False, bool, False))

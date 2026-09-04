@@ -1,13 +1,17 @@
-import torch
-from torch import nn
-
-from modules.util import create  # noqa: F401 - primes model setup factory imports before direct setup import
-import modules.modelSetup.ZImageLoRASetup as zimage_lora_setup_module
+# Plain-import form so isort keeps the priming import before the direct
+# modelSetup imports (create -> factory.import_dir resolves the circular
+# optimizer_util dependency once, in bootstrap order). The module alias below
+# uses the from-import form so it sorts AFTER this line.
+import modules.util.create  # noqa: F401 -- import-side-effect required
 from modules.model.ZImageModel import ZImageModel
+from modules.modelSetup import ZImageLoRASetup as zimage_lora_setup_module
 from modules.modelSetup.ZImageLoRASetup import ZImageLoRASetup
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
+
+import torch
+from torch import nn
 
 
 class FakeLoRAWrapper(nn.Module):

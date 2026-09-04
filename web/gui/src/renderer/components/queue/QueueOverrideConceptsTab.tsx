@@ -24,6 +24,7 @@ const DEFAULT_CONCEPT: ConceptConfig = {
   loss_weight: 1.0,
   dpo_chosen_pattern: "",
   dpo_rejected_pattern: "",
+  dpo_beta_override: 0,
   concept_stats: {},
   image: {
     enable_crop_jitter: true,

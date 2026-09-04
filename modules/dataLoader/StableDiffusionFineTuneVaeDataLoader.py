@@ -29,6 +29,7 @@ from mgds.pipelineModules.RandomHue import RandomHue
 from mgds.pipelineModules.RandomMaskRotateCrop import RandomMaskRotateCrop
 from mgds.pipelineModules.RandomRotate import RandomRotate
 from mgds.pipelineModules.RandomSaturation import RandomSaturation
+from mgds.pipelineModules.ResolutionPolicy import target_resolutions_for_spec
 from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.SaveImage import SaveImage
 from mgds.pipelineModules.ScaleCropImage import ScaleCropImage
@@ -139,6 +140,8 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             scale_resolution_out_name="scale_resolution",
             crop_resolution_out_name="crop_resolution",
             possible_resolutions_out_name="possible_resolutions",
+            adaptive_resolution=config.adaptive_resolution,
+            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -149,6 +152,8 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             scale_resolution_out_name="scale_resolution",
             crop_resolution_out_name="crop_resolution",
             possible_resolutions_out_name="possible_resolutions",
+            adaptive_resolution=config.adaptive_resolution,
+            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
         )
 
         modules = [calc_aspect]
@@ -158,7 +163,7 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             self._aspect_bucketing_for_cache = aspect_bucketing
         else:
             modules.append(single_aspect_calculation)
-            self._aspect_bucketing_for_cache = None
+            self._aspect_bucketing_for_cache = single_aspect_calculation
 
         return modules
 
@@ -299,6 +304,20 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             aspect_bucketing=aspect_bucketing,
             extra_watched_paths_in_names=extra_watched or None,
             trust_cache=config.skip_cache_validation,
+            adaptive_resolution=config.adaptive_resolution,
+            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
+            adaptive_resolution_max=(
+                max(
+                    target_resolutions_for_spec(
+                        config.resolution,
+                        True,
+                        config.adaptive_resolution_ladder,
+                    ),
+                    default=None,
+                )
+                if config.adaptive_resolution
+                else None
+            ),
         )
         variation_sorting = VariationSorting(
             names=sort_names,

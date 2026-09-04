@@ -95,6 +95,15 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
         onChange={(v) => update("dpo_rejected_pattern", v)}
         tooltip="Pattern locating the rejected image for each chosen image, e.g. 'rejected/{}'. '{}' is the stem matched by the chosen pattern; the extension may differ."
       />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">DPO Beta Override</span>
+      <FormEntry
+        label=""
+        type="number"
+        value={draft.dpo_beta_override}
+        onChange={(v) => update("dpo_beta_override", v)}
+        tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. 0 inherits the global beta. Adaptive beta still applies, scaling every concept by the same factor. Ignored by the IPO objective, which uses tau."
+      />
     </div>
   );
 }

@@ -1,10 +1,11 @@
-import { Search, Trash2 } from "lucide-react";
+import { Search, SlidersHorizontal, Trash2 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { lazy, Suspense } from "react";
 
 import { request } from "@/api/request";
 import { Button, SchemaField, SectionCard } from "@/components/shared";
 import { useConfigStore } from "@/store/configStore";
+import { useTrainingStore } from "@/store/trainingStore";
 import { useUiSchemaStore } from "@/store/uiSchemaStore";
 import type { LossWeight, ModelType } from "@/types/generated/enums";
 import { LOSS_WEIGHT_SUPPORTS_FLOW_MATCHING } from "@/types/generated/lossWeightInfo";
@@ -29,6 +30,11 @@ const OffloadingModal = lazy(() =>
 const ValidationCheckerModal = lazy(() =>
   import("@/components/modals/ValidationCheckerModal").then((m) => ({ default: m.ValidationCheckerModal })),
 );
+const AdaptiveResolutionLadderModal = lazy(() =>
+  import("@/components/modals/AdaptiveResolutionLadderModal").then((m) => ({
+    default: m.AdaptiveResolutionLadderModal,
+  })),
+);
 
 const CUSTOM_MODAL_RENDERERS: Record<
   string,
@@ -39,6 +45,7 @@ const CUSTOM_MODAL_RENDERERS: Record<
   "timestep-dist": TimestepDistModal,
   offloading: OffloadingModal,
   "validation-checker": ValidationCheckerModal,
+  "adaptive-resolution-ladder": AdaptiveResolutionLadderModal,
 };
 
 interface SchemaTabRendererProps {
@@ -50,6 +57,9 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
   const config = useConfigStore((s) => s.config);
   const [activeModal, setActiveModal] = useState<string | null>(null);
   const [cleanCacheBusy, setCleanCacheBusy] = useState(false);
+  const [pruneCacheBusy, setPruneCacheBusy] = useState(false);
+  const trainingStatus = useTrainingStore((s) => s.status);
+  const trainingActive = trainingStatus === "preparing" || trainingStatus === "training";
 
   const predicates = useMemo(() => schema?.predicates ?? {}, [schema]);
   const configRecord = useMemo(() => (config ?? {}) as Record<string, unknown>, [config]);
@@ -157,6 +167,19 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
               resolveKvOptions={resolveKvOptions}
             />
           ))}
+          {tab.id === "data" && fields.some((field) => field.key === "adaptive_resolution") && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setActiveModal("adaptive-resolution-ladder")}
+                aria-label="Configure Resolution Ladder"
+              >
+                <SlidersHorizontal className="h-4 w-4" />
+                Configure Ladder
+              </Button>
+            </div>
+          )}
           {tab.id === "general" && fields.some((f) => f.key === "validation") && (
             <div className="flex items-center gap-2">
               <Button
@@ -215,6 +238,77 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
                 <Trash2 className="w-4 h-4 mr-1" />
                 {cleanCacheBusy ? "Scanning…" : "Clean Cache"}
               </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={pruneCacheBusy}
+                disabled={pruneCacheBusy || trainingActive || configRecord.adaptive_resolution !== true}
+                title={
+                  configRecord.adaptive_resolution !== true
+                    ? "Enable Adaptive Resolution first"
+                    : trainingActive
+                      ? "Unavailable while training is active"
+                      : "Preview and remove only cache variants that enlarged source images"
+                }
+                onClick={async () => {
+                  if (pruneCacheBusy || trainingActive || configRecord.adaptive_resolution !== true) return;
+                  setPruneCacheBusy(true);
+                  try {
+                    const preview = await request<{
+                      ok: boolean;
+                      affected_entries: number;
+                      removed_variants: number;
+                      files: number;
+                      bytes: number;
+                      skipped_missing_metadata: number;
+                      entries_without_usable_variant: number;
+                      message?: string;
+                      error?: string;
+                    }>("/system/cache/adaptive-prune-preview", { method: "POST" });
+                    if (!preview.ok) {
+                      alert(preview.error ?? "Failed to preview adaptive cache cleanup");
+                      return;
+                    }
+                    if (preview.removed_variants === 0) {
+                      alert(preview.message ?? "No upscaled image-cache variants were found.");
+                      return;
+                    }
+                    const warnings = [
+                      preview.entries_without_usable_variant > 0
+                        ? `${preview.entries_without_usable_variant} entries will require sourced recaching or be dropped in sourceless mode.`
+                        : "",
+                      preview.skipped_missing_metadata > 0
+                        ? `${preview.skipped_missing_metadata} legacy entries lack dimensions and will be skipped.`
+                        : "",
+                    ]
+                      .filter(Boolean)
+                      .join("\n");
+                    const mb = (preview.bytes / (1024 * 1024)).toFixed(1);
+                    const prompt = `Remove ${preview.removed_variants} upscaled variants from ${preview.affected_entries} entries and delete ${preview.files} unreferenced files (${mb} MB)?${warnings ? `\n\n${warnings}` : ""}`;
+                    if (!confirm(prompt)) return;
+                    const result = await request<{
+                      ok: boolean;
+                      removed_variants: number;
+                      deleted_files: number;
+                      error?: string;
+                    }>("/system/cache/adaptive-prune-clean", { method: "POST" });
+                    if (!result.ok) {
+                      alert(result.error ?? "Failed to prune upscaled cache variants");
+                    } else {
+                      alert(
+                        `Removed ${result.removed_variants} variants and ${result.deleted_files} unreferenced files.`,
+                      );
+                    }
+                  } catch (err) {
+                    alert(`Prune cache failed: ${err instanceof Error ? err.message : String(err)}`);
+                  } finally {
+                    setPruneCacheBusy(false);
+                  }
+                }}
+              >
+                <Trash2 className="w-4 h-4 mr-1" />
+                {pruneCacheBusy ? "Scanning…" : "Prune Upscaled Cache"}
+              </Button>
             </div>
           )}
         </div>
@@ -223,7 +317,9 @@ export function SchemaTabRenderer({ tab }: SchemaTabRendererProps) {
   };
 
   const activeModalDef = activeModal ? schema?.modals[activeModal] : undefined;
-  const CustomModalComponent = activeModal ? CUSTOM_MODAL_RENDERERS[activeModalDef?.renderer ?? ""] : undefined;
+  const CustomModalComponent = activeModal
+    ? CUSTOM_MODAL_RENDERERS[activeModalDef?.renderer ?? activeModal]
+    : undefined;
 
   return (
     <>

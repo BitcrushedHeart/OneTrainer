@@ -17,6 +17,8 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
+from collections.abc import Callable
 
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
@@ -27,6 +29,7 @@ from modules.util.enum.ModelType import PeftType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
+from modules.util.oft_families import DEFAULT_LATE_FAMILY_STEMS
 from modules.util.oft_verify import (
     MergeReport,
     MergeVerificationError,
@@ -40,6 +43,44 @@ from modules.util.oft_verify import (
 import torch
 
 from safetensors import safe_open
+
+# DEFAULT_LATE_FAMILY_STEMS lives in modules/util/oft_families.py (leaf module,
+# avoids a circular import via create.py) and is re-exported here for existing
+# callers.
+__all__ = ["DEFAULT_LATE_FAMILY_STEMS", "make_late_family_strength", "merge_oft_adapter"]
+
+_LAYER_FAMILY_RE = re.compile(r"\.layers\.(\d+)\.(.+)$")
+
+
+def make_late_family_strength(
+    late_start: int,
+    family_strength: dict[str, float],
+    *,
+    base_strength: float = 1.0,
+    family_stems: dict[str, tuple[str, ...]] | None = None,
+) -> Callable[[str], float]:
+    """Build a per-key strength resolver: ``base_strength`` everywhere EXCEPT the
+    given families at layer >= ``late_start``, which get ``family_strength[family]``.
+
+    Intended for the SoReal! lineup where Base/Turbo/Lightning differ only in the
+    late qkv/mlp rotations: bake the shared blocks identically (1.0) and only vary
+    the late qkv_late / mlp_late strengths. Any key not matching a listed family
+    stem (e.g. ``attention.to_out.0``) stays at ``base_strength``.
+    """
+    stems = family_stems or DEFAULT_LATE_FAMILY_STEMS
+    stem_to_family = {s: f for f, ss in stems.items() for s in ss}
+
+    def resolver(key: str) -> float:
+        m = _LAYER_FAMILY_RE.search(key)
+        if not m:
+            return base_strength
+        layer, stem = int(m.group(1)), m.group(2)
+        fam = stem_to_family.get(stem)
+        if fam is not None and layer >= late_start and fam in family_strength:
+            return float(family_strength[fam])
+        return base_strength
+
+    return resolver
 
 
 def _train_config_from_adapter(oft_adapter_path: str) -> TrainConfig:
@@ -72,6 +113,7 @@ def merge_oft_adapter(
     *,
     ui_train_config: TrainConfig,
     strength: float = 1.0,
+    key_strength: Callable[[str], float] | None = None,
     compute_device: torch.device | str | None = None,
 ) -> MergeReport:
     """Bake an OFT/DoRA-OFT adapter into a base checkpoint.
@@ -83,9 +125,19 @@ def merge_oft_adapter(
     those settings already in place.
 
     ``strength`` interpolates between the base and the fully-baked weights
-    (same semantics as ComfyUI's LoRA strength). DoRA row-norm invariant
-    check is skipped at strength != 1.0.
+    (same semantics as ComfyUI's LoRA strength).
+
+    ``key_strength`` optionally overrides the strength per adapter module: it
+    receives the module key (e.g. ``transformer.layers.22.attention.to_q``) and
+    returns that module's strength; keys it does not special-case should return
+    ``strength``. Use ``make_late_family_strength`` to bake shared blocks at 1.0
+    and only vary the late qkv/mlp blocks. The DoRA row-norm invariant is checked
+    only for modules baked at exactly 1.0 (a partial blend breaks it).
     """
+
+    def eff_strength(key: str) -> float:
+        return float(key_strength(key)) if key_strength is not None else strength
+
     if compute_device is None:
         compute_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -204,7 +256,7 @@ def merge_oft_adapter(
             # Pre-merge per-output-row L2 norm -- baked DoRA-OFT invariant is
             # ||merged_row|| == |dora_multiplier| * ||base_row||.
             base_row_norms[key] = w.reshape(w.shape[0], -1).to(torch.float32).norm(dim=1)
-            if strength != 1.0:
+            if eff_strength(key) != 1.0:
                 # Keep the pre-merge snapshot on CPU -- holding all base weights on
                 # the compute device doubles VRAM (~2x model size) and OOMs the bake.
                 base_snapshots[key] = w.detach().to("cpu", copy=True)
@@ -213,18 +265,27 @@ def merge_oft_adapter(
         raise MergeVerificationError(pre_failures)
 
     # -------- apply --------
-    print(f"[merge_oft] applying adapter to {len(pre_zero_rows)} module(s) at strength={strength}")
+    if key_strength is not None:
+        applied = sorted({round(eff_strength(k), 6) for k in pre_zero_rows})
+        print(f"[merge_oft] applying adapter to {len(pre_zero_rows)} module(s) at per-key strengths {applied}")
+    else:
+        print(f"[merge_oft] applying adapter to {len(pre_zero_rows)} module(s) at strength={strength}")
     for wrapper in adapters:
         wrapper.apply_to_module()
 
-    if strength != 1.0:
+    # apply_to_module bakes at full strength; blend each partial-strength module back
+    # toward its pre-merge base by its own effective strength (1.0 modules stay baked).
+    if any(eff_strength(k) != 1.0 for k in pre_zero_rows):
         for wrapper in adapters:
             _, base_modules, _ = collect_oft_modules(wrapper)
             for key, base_module in base_modules.items():
+                s = eff_strength(key)
+                if s == 1.0:
+                    continue
                 merged = base_module.weight.data
                 # Move the CPU snapshot back one layer at a time (minimal extra VRAM).
                 base = base_snapshots[key].to(merged.device, torch.float32)
-                mixed = (1.0 - strength) * base + strength * merged.to(torch.float32)
+                mixed = (1.0 - s) * base + s * merged.to(torch.float32)
                 base_module.weight.data.copy_(mixed.to(merged.dtype))
         base_snapshots.clear()
 
@@ -237,10 +298,12 @@ def merge_oft_adapter(
         all_base_modules.update(base_modules)
         all_dora_multipliers.update(dora_multipliers)
 
-    # DoRA invariant only holds at full strength (strength<1 blends baked with
-    # base, breaking ||merged_row|| == |mult|*||base_row||).
-    dora_mult_for_gate = all_dora_multipliers if strength == 1.0 else None
-    base_norms_for_gate = base_row_norms if strength == 1.0 else None
+    # DoRA invariant only holds at full strength (a partial blend of baked with
+    # base breaks ||merged_row|| == |mult|*||base_row||). Check it per module,
+    # restricted to those baked at exactly 1.0.
+    full_keys = {k for k in all_base_modules if eff_strength(k) == 1.0}
+    dora_mult_for_gate = {k: v for k, v in all_dora_multipliers.items() if k in full_keys} or None
+    base_norms_for_gate = {k: base_row_norms[k] for k in full_keys if k in base_row_norms} or None
     post_failures, report = gate_post_merge(all_base_modules, pre_zero_rows, dora_mult_for_gate, base_norms_for_gate)
     report.orthogonality_max_err = ortho_max_by_key
     if post_failures:

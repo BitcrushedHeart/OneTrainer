@@ -6,7 +6,7 @@ export interface TrainingActionResponse {
 }
 
 export interface TrainingStatusResponse {
-  status: "idle" | "running" | "stopping" | "error";
+  status: "idle" | "starting" | "running" | "stopping" | "error";
   error: string | null;
   start_time: number | null;
 }

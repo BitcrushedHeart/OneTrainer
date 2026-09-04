@@ -13,21 +13,51 @@ from modules.util.distill_dmd2_util import (
     euler_flow_step,
 )
 from modules.util.distill_metadata_util import extract_distill_metadata
+from modules.util.dpo_light_util import dpo_objective, dpo_surrogate_weights, split_dpo_pair_batch
 from modules.util.enum.DistillCfgMode import DistillCfgMode
 from modules.util.enum.DistillVramMode import DistillVramMode
-from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.TimedActionMixin import TimedActionMixin
 from modules.util.TrainProgress import TrainProgress
+from modules.util.transfer_util import transfer_activation_loss
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
+
+
+def _dpo_reference_storage_dtype(config: TrainConfig, policy_dtype: torch.dtype) -> torch.dtype:
+    """Use the forward-pass dtype for the frozen DPO snapshot, not the FP32 master-weight dtype."""
+    train_dtype = config.train_dtype.torch_dtype()
+    return train_dtype if train_dtype in {torch.float16, torch.bfloat16, torch.float32} else policy_dtype
+
+
+def _dpo_reference_matches(
+    ref_snapshot: list[list[Tensor]] | None,
+    policy: list[list[Tensor]],
+    config: TrainConfig,
+) -> bool:
+    # Whether a frozen DPO reference lines up tensor for tensor with the live
+    # params, which is what makes an in-place rebase safe. A first capture has
+    # no snapshot at all, and one restored from a backup still sits on the CPU
+    # until the first reference pass moves it onto the policy's device.
+    if ref_snapshot is None or len(ref_snapshot) != len(policy):
+        return False
+    for ref_params, params in zip(ref_snapshot, policy, strict=True):
+        if len(ref_params) != len(params):
+            return False
+        for ref_data, param in zip(ref_params, params, strict=True):
+            if (
+                ref_data.shape != param.data.shape
+                or ref_data.device != param.data.device
+                or ref_data.dtype != _dpo_reference_storage_dtype(config, param.data.dtype)
+            ):
+                return False
+    return True
 
 
 class BaseModelSetup(
@@ -53,6 +83,10 @@ class BaseModelSetup(
         self._last_distill_metrics = None
         self._last_grad_step_index = None  # student backprop step chosen this update (debug/tests)
         self._last_distill_x0_teacher = None  # paired teacher target from the last student update
+        self._last_transfer_metrics = None
+        # Redistill Phase B start step: distill warmup/TTUR counting is offset
+        # so Phase B's fake-critic warmup begins at the phase boundary.
+        self._distill_step_offset = 0
 
     @abstractmethod
     def create_parameters(
@@ -217,12 +251,15 @@ class BaseModelSetup(
     def get_last_distill_metrics(self) -> dict[str, float | str]:
         return self._last_distill_metrics or {}
 
-    @staticmethod
-    def _distill_update_mode(config: TrainConfig, train_progress: TrainProgress) -> str:
-        if train_progress.global_step < config.distill_fake_warmup_steps:
+    def set_redistill_phase_b_start(self, global_step: int):
+        self._distill_step_offset = max(0, int(global_step))
+
+    def _distill_update_mode(self, config: TrainConfig, train_progress: TrainProgress) -> str:
+        effective_step = train_progress.global_step - self._distill_step_offset
+        if effective_step < config.distill_fake_warmup_steps:
             return "fake"
         ratio = max(1, int(config.distill_ttur_ratio))
-        relative_step = train_progress.global_step - config.distill_fake_warmup_steps
+        relative_step = effective_step - config.distill_fake_warmup_steps
         return "student" if relative_step % (ratio + 1) == ratio else "fake"
 
     @staticmethod
@@ -747,11 +784,245 @@ class BaseModelSetup(
             metrics["diversity_ratio"] = sum(div_ratios) / len(div_ratios)
         return metrics
 
+    # ------------------------------------------------------------------
+    # Knowledge transfer (activation matching): one shared prefix forward,
+    # then the late stack twice -- teacher weights swapped in vs student.
+    # ------------------------------------------------------------------
+    def transfer_fork_forward(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
+        seed: int | None = None,
+        latent_input: Tensor | None = None,
+        sigma: Tensor | None = None,
+    ):
+        raise NotImplementedError("transfer mode is not implemented for this model type")
+
+    def transfer_late_forward(self, model: BaseModel, state, config: TrainConfig, *, weights=None) -> list[Tensor]:
+        raise NotImplementedError("transfer mode is not implemented for this model type")
+
+    def _transfer_activation_match(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
+        seed: int | None = None,
+        latent_input: Tensor | None = None,
+        sigma: Tensor | None = None,
+    ) -> Tensor:
+        """Shared core of the transfer losses: one prefix forward, then the
+        late stack twice (teacher weights swapped in vs student), per-block
+        activation MSE."""
+        teacher_weights = getattr(model, "transfer_teacher_late_tensors", None)
+        if not teacher_weights:
+            raise RuntimeError(
+                "transfer teacher tensors are not loaded; setup_model must run with transfer or redistill enabled."
+            )
+
+        # Injection kwargs only when set: keeps overrides with the plain
+        # transfer signature working.
+        fork_kwargs = {} if latent_input is None else {"latent_input": latent_input, "sigma": sigma}
+        with torch.no_grad():
+            state = self.transfer_fork_forward(
+                model,
+                batch,
+                config,
+                train_progress,
+                deterministic=deterministic,
+                seed=seed,
+                **fork_kwargs,
+            )
+            # Teacher late pass: every adapter hook off, late weights swapped in
+            # (the teacher tensor dict covers ALL late adapter-covered modules,
+            # including non-family adapted modules like attention.to_out.0).
+            with self.prior_model(model, config):
+                teacher_outs = self.transfer_late_forward(model, state, config, weights=teacher_weights)
+
+        student_outs = self.transfer_late_forward(model, state, config, weights=None)
+
+        loss, metrics = transfer_activation_loss(
+            student_outs,
+            teacher_outs,
+            mask=state.mask if config.transfer_mask_padded_tokens else None,
+            normalize=config.transfer_block_loss_normalize,
+            block_index_offset=config.transfer_late_start,
+        )
+        self._last_transfer_metrics = {**metrics, "loss": float(loss.detach())}
+        return loss
+
+    def calculate_transfer_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
+        seed: int | None = None,
+    ) -> Tensor:
+        return self._transfer_activation_match(
+            model, batch, config, train_progress, deterministic=deterministic, seed=seed
+        )
+
+    def _redistill_rollout_x_k(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        initial_latent: Tensor,
+        sigmas: Tensor,
+        *,
+        seed: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Roll the student (no_grad) along its own inference grid to a random
+        step k and return ``(x_k, sigma_k)`` -- redistill Phase A's input
+        distribution. k is seeded like the distill grad step so a fixed seed
+        gives a reproducible validation trajectory."""
+        total_steps = config.distill_target_steps
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(train_progress.global_step if seed is None else seed)
+        k = int(torch.randint(0, total_steps, (1,), generator=generator).item()) if total_steps > 1 else 0
+
+        latent = initial_latent
+        with torch.no_grad():
+            for step_index in range(k):
+                velocity = self.predict_distill_velocity(
+                    model, batch, config, train_progress, latent, sigmas[:, step_index], conditioning="conditional"
+                )
+                latent = euler_flow_step(latent, velocity, sigmas[:, step_index], sigmas[:, step_index + 1])
+        return latent.detach(), sigmas[:, k]
+
+    def calculate_redistill_transfer_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        *,
+        deterministic: bool = False,
+        seed: int | None = None,
+    ) -> Tensor:
+        """Redistill Phase A: match the late stack's activations to the OLD
+        distilled variant's raw late tensors, evaluated on the student's own
+        few-step inference trajectory (needs no image latents -- prompt-only
+        batches work)."""
+        device = batch["latent_image"].device
+        teacher_steps = self._distill_teacher_steps(batch, config, device)
+        sigmas = build_distill_sigma_matrix(
+            config.distill_target_steps,
+            teacher_steps,
+            config.distill_timestep_grid_mode,
+            device=device,
+            dtype=torch.float32,
+            shift=config.distill_sigma_shift,
+        )
+
+        if seed is not None:
+            z = self._distill_val_noise(batch, seed)
+        else:
+            z = self._distill_initial_latent(batch, train_progress)
+        with self.adapter_state(model, config, "student"):
+            x_k, sigma_k = self._redistill_rollout_x_k(model, batch, config, train_progress, z, sigmas, seed=seed)
+
+        return self._transfer_activation_match(
+            model,
+            batch,
+            config,
+            train_progress,
+            deterministic=deterministic,
+            seed=seed,
+            latent_input=x_k,
+            sigma=sigma_k,
+        )
+
+    def get_last_transfer_metrics(self) -> dict[str, float]:
+        return self._last_transfer_metrics or {}
+
+    def capture_transfer_val_batch(self, batch: dict, config: TrainConfig):
+        """Stash the first N training batches for the deterministic convergence
+        validation (mirrors capture_distill_val_batch; nothing is held out)."""
+        if not getattr(config, "transfer_validation", False):
+            return
+        cache = getattr(self, "_transfer_val_batches", None)
+        if cache is None:
+            cache = []
+            self._transfer_val_batches = cache
+        if len(cache) >= max(1, int(config.transfer_validation_batches)):
+            return
+        keep: dict = {}
+        for key, value in batch.items():
+            if isinstance(value, Tensor):
+                keep[key] = value.detach().clone()
+            elif isinstance(value, (list, tuple, str, int, float)) or value is None:
+                keep[key] = value
+        cache.append(keep)
+
+    def run_transfer_validation(self, model: BaseModel, config: TrainConfig, train_progress) -> dict[str, float]:
+        """Averaged teacher-match residuals over the cached batches, with fixed
+        per-batch seeds so successive validations are comparable."""
+        batches = getattr(self, "_transfer_val_batches", None)
+        if not batches:
+            return {}
+        sums: dict[str, float] = {}
+        # Redistill's Phase A residual must be measured with the redistill loss
+        # (student-trajectory inputs), else convergence-stop scores the wrong
+        # distribution.
+        loss_fn = self.calculate_redistill_transfer_loss if config.redistill_enabled else self.calculate_transfer_loss
+        with torch.no_grad():
+            for index, batch in enumerate(batches):
+                loss_fn(model, batch, config, train_progress, deterministic=True, seed=1_000_003 + index)
+                for key, value in self.get_last_transfer_metrics().items():
+                    if isinstance(value, (int, float)):
+                        sums[key] = sums.get(key, 0.0) + float(value)
+        return {key: value / len(batches) for key, value in sums.items()}
+
     def set_dpo_runtime_beta(self, beta: float | None):
         # Adaptive-beta override from the trainer. The logged reward metrics
         # are computed before beta is applied, so adapting beta from them does
-        # not create a feedback loop.
+        # not create a feedback loop. Applied as a ratio over the configured
+        # beta - see _resolve_dpo_beta - so it composes with per-concept
+        # overrides instead of replacing them.
         self._dpo_runtime_beta = beta
+
+    def _resolve_dpo_beta(self, config: TrainConfig, batch: dict) -> float | Tensor:
+        """Beta for this batch: a per-sample [B] tensor when the dataloader
+        supplies per-concept overrides, otherwise the global scalar.
+
+        A concept's ``dpo_beta_override`` <= 0 means "inherit the global beta"
+        (a negative beta would invert the preference direction, so it is never
+        taken literally).
+
+        The adaptive controller is applied as a *ratio* over the configured
+        beta rather than substituted for it. beta-DPO's rule is multiplicative
+        around beta0 (it returns beta0 * f, clamped to beta0/4 .. beta0*4), so
+        scaling every concept by that same f preserves the controller's intent
+        while keeping the concepts' betas in their configured proportions;
+        substituting its scalar output would flatten every override onto one
+        value.
+        """
+        global_beta = config.rlhf_dpo_beta
+
+        override = batch.get("dpo_beta_override")
+        if not isinstance(override, Tensor):
+            # No per-concept column (non-DPO loaders, older configs): the
+            # original scalar path, bit-for-bit.
+            return global_beta if self._dpo_runtime_beta is None else self._dpo_runtime_beta
+
+        adaptive_scale = 1.0
+        if self._dpo_runtime_beta is not None and global_beta > 0:
+            adaptive_scale = self._dpo_runtime_beta / global_beta
+
+        override = override.float()
+        per_sample = torch.where(override > 0, override, torch.full_like(override, global_beta))
+        return per_sample if adaptive_scale == 1.0 else per_sample * adaptive_scale
 
     def calculate_dpo_loss(
         self,
@@ -770,7 +1041,7 @@ class BaseModelSetup(
             # [2B,C,H,W] tensors - avoids four fp32 copies per step.
             return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
 
-        beta = config.rlhf_dpo_beta if self._dpo_runtime_beta is None else self._dpo_runtime_beta
+        beta = self._resolve_dpo_beta(config, batch)
         supervised_loss = None
 
         # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
@@ -819,49 +1090,155 @@ class BaseModelSetup(
             del chosen_output
         del policy_output, policy_predicted, policy_target
 
-        chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
-        rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()
-        margin = chosen_ratio - rejected_ratio
-
-        if config.rlhf_dpo_objective == DPOObjective.IPO:
-            # IPO regresses the raw margin toward the fixed target 1/(2*tau)
-            # instead of pushing it to infinity, which structurally resists
-            # reward hacking. tau plays beta's role; label smoothing and beta
-            # do not apply.
-            dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
-            loss = dpo_loss
-        else:
-            logits = beta * margin
-            dpo_loss = -F.logsigmoid(logits).mean()
-            loss = dpo_loss
-
-            if config.rlhf_dpo_label_smoothing > 0:
-                s = config.rlhf_dpo_label_smoothing
-                loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
+        loss, dpo_loss, chosen_ratio, rejected_ratio, margin = dpo_objective(
+            policy_chosen_logp,
+            policy_rejected_logp,
+            ref_chosen_logp,
+            ref_rejected_logp,
+            **self._dpo_objective_kwargs(config, beta),
+        )
 
         if supervised_loss is not None:
             loss = loss + config.rlhf_supervised_mix * supervised_loss
             del supervised_loss
 
-        # Stack the six scalar metrics and sync them in a single .tolist() rather
-        # than one .item() (one GPU->CPU sync) per metric.
-        metric_values = torch.stack(
-            [
-                loss.detach().float(),
-                dpo_loss.detach().float(),
-                chosen_ratio.detach().mean(),
-                rejected_ratio.detach().mean(),
-                margin.detach().mean(),
-                (chosen_ratio > rejected_ratio).float().mean(),
-            ]
-        ).tolist()
-        self._last_dpo_metrics = dict(
-            zip(
-                ("loss", "dpo_loss", "chosen_reward", "rejected_reward", "reward_margin", "accuracy"),
-                metric_values,
-                strict=True,
-            )
+        self._record_dpo_metrics(
+            model, config, loss, dpo_loss, chosen_ratio, rejected_ratio, margin, policy_timestep, chosen_b, beta
         )
+
+        return loss
+
+    @staticmethod
+    def _dpo_objective_kwargs(config: TrainConfig, beta: float | Tensor) -> dict:
+        return {
+            "beta": beta,
+            "objective": config.rlhf_dpo_objective,
+            "ipo_tau": config.rlhf_dpo_ipo_tau,
+            "label_smoothing": config.rlhf_dpo_label_smoothing,
+        }
+
+    @staticmethod
+    def _dpo_mse_per_sample(pred: Tensor, target: Tensor) -> Tensor:
+        # fp32 accumulation in the reduction instead of upcasting the full
+        # [B,C,H,W] tensors - avoids fp32 copies per step.
+        return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
+
+    def calculate_dpo_loss_light(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        backward_fn,
+    ) -> Tensor:
+        """DPO on a chosen/rejected pair with single-sample forwards and only one
+        half's autograd graph alive at a time (SFT + DPO add-on steps, where the
+        fused [chosen; rejected] graph on top of the standard sample OOMs).
+
+        Gradients are accumulated here through ``backward_fn`` (which applies
+        the caller's loss scaling and AMP scaler); the returned loss is detached
+        and only for logging. The math is exact: the loss is a scalar function
+        of the two per-sample log-probs, so each half is backwarded with its
+        chain-rule weight (see dpo_surrogate_weights). Every predict() call
+        reseeds from global_step, so all single-sample forwards draw the same
+        noise and timestep: ref/policy agree per half and the two halves share
+        noise exactly like the fused path.
+        """
+        if "latent_image_rejected" not in batch:
+            raise RuntimeError(
+                "RLHF DPO requires paired chosen/rejected batches, but the dataloader did not provide rejected samples."
+            )
+
+        beta = self._resolve_dpo_beta(config, batch)
+        objective_kwargs = self._dpo_objective_kwargs(config, beta)
+        chosen_batch, rejected_batch = split_dpo_pair_batch(batch)
+        mse = self._dpo_mse_per_sample
+
+        # Same conditioning-dropout neutralization as the fused path: both
+        # halves must see identical prompts.
+        te_configs = (config.text_encoder, config.text_encoder_2, config.text_encoder_3, config.text_encoder_4)
+        saved_dropout = [te.dropout_probability for te in te_configs]
+        try:
+            for te in te_configs:
+                te.dropout_probability = 0.0
+
+            with torch.no_grad(), self.reference_model(model, config):
+                out = self.predict(model, chosen_batch, config, train_progress)
+                ref_chosen_logp = -mse(out["predicted"], out["target"])
+                del out
+                out = self.predict(model, rejected_batch, config, train_progress)
+                ref_rejected_logp = -mse(out["predicted"], out["target"])
+                del out
+
+            # The rejected half's value is needed before the chosen half can be
+            # backwarded (the chain-rule weight depends on the margin).
+            with torch.no_grad():
+                out = self.predict(model, rejected_batch, config, train_progress)
+                policy_rejected_value = -mse(out["predicted"], out["target"])
+                del out
+
+            chosen_output = self.predict(model, chosen_batch, config, train_progress)
+            policy_timestep = chosen_output.get("timestep")
+            if isinstance(policy_timestep, torch.Tensor):
+                policy_timestep = policy_timestep.detach()
+            policy_chosen_live = -mse(chosen_output["predicted"], chosen_output["target"])
+            g_chosen, g_rejected, (loss, dpo_loss, chosen_ratio, rejected_ratio, margin) = dpo_surrogate_weights(
+                policy_chosen_live, policy_rejected_value, ref_chosen_logp, ref_rejected_logp, **objective_kwargs
+            )
+            chosen_term = (g_chosen.to(policy_chosen_live.dtype) * policy_chosen_live).sum()
+            if config.rlhf_supervised_mix > 0:
+                supervised_loss = self.calculate_loss(model, chosen_batch, chosen_output, config)
+                chosen_term = chosen_term + config.rlhf_supervised_mix * supervised_loss
+                loss = loss + config.rlhf_supervised_mix * supervised_loss.detach().float()
+                del supervised_loss
+            backward_fn(chosen_term)
+            del chosen_output, policy_chosen_live, chosen_term
+
+            rejected_output = self.predict(model, rejected_batch, config, train_progress)
+            policy_rejected_live = -mse(rejected_output["predicted"], rejected_output["target"])
+            backward_fn((g_rejected.to(policy_rejected_live.dtype) * policy_rejected_live).sum())
+            del rejected_output, policy_rejected_live
+        finally:
+            for te, saved in zip(te_configs, saved_dropout, strict=True):
+                te.dropout_probability = saved
+
+        self._record_dpo_metrics(
+            model, config, loss, dpo_loss, chosen_ratio, rejected_ratio, margin, policy_timestep, margin.shape[0], beta
+        )
+        return loss
+
+    def _record_dpo_metrics(
+        self,
+        model: BaseModel,
+        config: TrainConfig,
+        loss: Tensor,
+        dpo_loss: Tensor,
+        chosen_ratio: Tensor,
+        rejected_ratio: Tensor,
+        margin: Tensor,
+        policy_timestep,
+        chosen_b: int,
+        beta: float | Tensor | None = None,
+    ) -> None:
+        # Stack the scalar metrics and sync them in a single .tolist() rather
+        # than one .item() (one GPU->CPU sync) per metric.
+        metric_names = ["loss", "dpo_loss", "chosen_reward", "rejected_reward", "reward_margin", "accuracy"]
+        metric_tensors = [
+            loss.detach().float(),
+            dpo_loss.detach().float(),
+            chosen_ratio.detach().mean(),
+            rejected_ratio.detach().mean(),
+            margin.detach().mean(),
+            (chosen_ratio > rejected_ratio).float().mean(),
+        ]
+        if isinstance(beta, Tensor):
+            # Per-concept betas are live: report the batch mean so the effective
+            # beta stays visible (dpo/beta only tracks the global scalar). Folded
+            # into the same stack, so it costs no extra GPU->CPU sync.
+            metric_names.append("beta_mean")
+            metric_tensors.append(beta.detach().float().mean().to(metric_tensors[0].device))
+        metric_values = torch.stack(metric_tensors).tolist()
+        self._last_dpo_metrics = dict(zip(metric_names, metric_values, strict=True))
 
         if config.rlhf_dpo_timestep_margin_logging and policy_timestep is not None:
             # Per-sample raw margins bucketed by the chosen half's timestep
@@ -889,8 +1266,6 @@ class BaseModelSetup(
             for quartile in range(4):
                 self._last_dpo_metrics[f"margin_t_q{quartile + 1}_sum"] = sums_l[quartile]
                 self._last_dpo_metrics[f"margin_t_q{quartile + 1}_count"] = counts_l[quartile]
-
-        return loss
 
     def stop_embedding_training_elapsed(
         self,
@@ -1026,27 +1401,83 @@ class BaseModelSetup(
             # Reference params are captured once at first call and frozen for the
             # entire training run. This is intentional: DPO requires a fixed
             # reference policy from the start of training.
+            policy_params = [list(adapter.parameters()) for adapter in adapters]
             if self._dpo_ref_params is None:
-                self._dpo_ref_params = [[p.data.clone() for p in adapter.parameters()] for adapter in adapters]
+                self._dpo_ref_params = [
+                    [
+                        p.data.to(
+                            dtype=_dpo_reference_storage_dtype(config, p.data.dtype),
+                            copy=True,
+                        )
+                        for p in params
+                    ]
+                    for params in policy_params
+                ]
 
-            policy_data = [[p.data for p in adapter.parameters()] for adapter in adapters]
+            policy_data = [[p.data for p in params] for params in policy_params]
+            policy_grads = [[p.grad for p in params] for params in policy_params]
             try:
-                for adapter, ref_params in zip(adapters, self._dpo_ref_params, strict=True):
-                    for i, (param, ref_data) in enumerate(zip(adapter.parameters(), ref_params, strict=True)):
+                # A gradient accumulated by an earlier micro-batch remains FP32.
+                # TorchDynamo rejects a BF16 Parameter carrying that FP32 grad,
+                # even under no_grad. Keep the tensor alive but detach it from the
+                # Parameter while its data points at the BF16 reference snapshot.
+                for params in policy_params:
+                    for param in params:
+                        param.grad = None
+
+                for params, ref_params in zip(policy_params, self._dpo_ref_params, strict=True):
+                    for i, (param, ref_data) in enumerate(zip(params, ref_params, strict=True)):
                         # Reference params restored from a backup live on CPU; move
-                        # them onto the live param's device/dtype once and cache the
-                        # moved tensor (a no-op for the lazily-cloned in-run case).
-                        if ref_data.device != param.data.device or ref_data.dtype != param.data.dtype:
-                            ref_data = ref_data.to(device=param.data.device, dtype=param.data.dtype)
+                        # them onto the live param's device in the forward-pass dtype
+                        # once and cache that tensor.
+                        reference_dtype = _dpo_reference_storage_dtype(config, param.data.dtype)
+                        if ref_data.device != param.data.device or ref_data.dtype != reference_dtype:
+                            ref_data = ref_data.to(device=param.data.device, dtype=reference_dtype)
                             ref_params[i] = ref_data
                         param.data = ref_data
                 yield
             finally:
-                for adapter, policy_ptrs in zip(adapters, policy_data, strict=True):
-                    for param, policy_ptr in zip(adapter.parameters(), policy_ptrs, strict=True):
+                for params, policy_ptrs, grad_ptrs in zip(policy_params, policy_data, policy_grads, strict=True):
+                    for param, policy_ptr, grad_ptr in zip(params, policy_ptrs, grad_ptrs, strict=True):
                         param.data = policy_ptr
+                        param.grad = grad_ptr
         else:
             raise ValueError(f"Unsupported DPO reference mode: {ref_mode}")
+
+    def rebase_dpo_reference(self, model: BaseModel, config: TrainConfig) -> None:
+        # Re-anchor the frozen EXISTING_ADAPTER reference to the adapter as it
+        # stands now. Once the policy has drifted far enough from the reference
+        # the implicit rewards saturate and the pairs stop contributing
+        # gradient; rebasing resets every margin to zero so the same pairs bite
+        # again.
+        adapters = model.adapters()
+        if len(adapters) == 0:
+            return
+
+        # Overwrite the snapshot in place wherever it already mirrors the live
+        # params. Building the replacement first and rebinding would hold both
+        # snapshots at once: allocation peaks at twice the reference, and the
+        # caching allocator keeps that extra block reserved for the rest of the
+        # run even though it is free again. Anything that does not line up
+        # falls back to fresh clones, so the snapshot always ends up on the
+        # policy's device in the configured forward-pass dtype.
+        policy = [list(adapter.parameters()) for adapter in adapters]
+        if _dpo_reference_matches(self._dpo_ref_params, policy, config):
+            for ref_params, params in zip(self._dpo_ref_params, policy, strict=True):
+                for ref_data, param in zip(ref_params, params, strict=True):
+                    ref_data.copy_(param.data)
+            return
+
+        self._dpo_ref_params = [
+            [
+                p.data.to(
+                    dtype=_dpo_reference_storage_dtype(config, p.data.dtype),
+                    copy=True,
+                )
+                for p in params
+            ]
+            for params in policy
+        ]
 
     _DPO_REFERENCE_FILENAME = "dpo_reference.pt"
 
@@ -1063,7 +1494,7 @@ class BaseModelSetup(
         except OSError:
             pass
 
-    def load_dpo_reference(self, backup_path: str, model: BaseModel) -> bool:
+    def load_dpo_reference(self, backup_path: str, model: BaseModel, config: TrainConfig) -> bool:
         # Restore the frozen reference saved next to the backup we are resuming
         # from. Returns True on success; on any structural mismatch it leaves
         # _dpo_ref_params unset so the caller falls back to lazy capture rather
@@ -1082,7 +1513,12 @@ class BaseModelSetup(
                 return False
             if any(tuple(t.shape) != tuple(p.shape) for t, p in zip(adapter_saved, params, strict=True)):
                 return False
-            restored.append(list(adapter_saved))
+            restored.append(
+                [
+                    tensor.to(dtype=_dpo_reference_storage_dtype(config, param.data.dtype))
+                    for tensor, param in zip(adapter_saved, params, strict=True)
+                ]
+            )
         self._dpo_ref_params = restored
         return True
 

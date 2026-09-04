@@ -5,6 +5,7 @@ import random
 import re
 import shutil
 import threading
+import time
 from contextlib import suppress
 
 _SHA256_CHUNK_BYTES = 65536
@@ -356,6 +357,44 @@ class DpoScanCache:
             return None
         return tuple(value)
 
+    def merge_from(self, other_path: str) -> int:
+        """Import entries from another cache file of the same version — e.g.
+        the curation tool's cache for the same generated tree — for keys this
+        cache does not have yet. Entries are only ever *served* after the
+        per-file (size, mtime) check in ``_get_field`` / ``peek_*``, so a
+        stale import is harmless: it misses and is recomputed. Returns the
+        number of entries imported; a missing or unreadable file imports
+        nothing."""
+        try:
+            with open(other_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if not (
+            isinstance(data, dict) and data.get("version") == self._VERSION and isinstance(data.get("entries"), dict)
+        ):
+            return 0
+        imported = 0
+        with self._lock:
+            for key, entry in data["entries"].items():
+                if key not in self._entries and isinstance(entry, dict):
+                    self._entries[key] = entry
+                    imported += 1
+            if imported:
+                self._dirty = True
+        return imported
+
+    def get_image_size(self, path: str, compute) -> tuple[int, int] | None:
+        """Cached (width, height). ``compute(path)`` returns that pair or None.
+        Additive field like ``embedding`` — the off-policy builder needs pixel
+        sizes for its aspect check on both the real and generated trees."""
+        value = self._get_field(
+            path, "image_size", lambda p: (lambda s: [int(s[0]), int(s[1])] if s else None)(compute(p))
+        )
+        if value is None:
+            return None
+        return int(value[0]), int(value[1])
+
     def get_embedding(self, path: str, compute) -> list[float] | None:
         """Cached perceptual embedding (a plain ``list[float]``) for ``path``.
         ``compute(path)`` must return a sequence of floats. Additive field — it
@@ -405,6 +444,59 @@ class DpoScanCache:
             entry["embedding"] = value
             self._dirty = True
 
+    def peek_realism(self, path: str, model_version: str | None = None) -> float | None:
+        """Cached P(AI-generated) for ``path`` if present and still valid, else
+        None — *without* computing one.
+
+        Validity is (size, mtime) **and** ``model_version``. Keying on the model
+        is what lets a retrained head invalidate its scores everywhere at once:
+        these caches live in each DPO session's output folder, so there is no
+        single file to go and edit, and a stale score is indistinguishable from
+        a fresh one by inspection. A version mismatch is simply reported as a
+        miss and recomputed.
+
+        Additive field, like ``embedding``: it coexists with hash/group_key, so
+        adding realism scores to an existing curation cache does not invalidate
+        a scan the user has already paid for. That is also why ``_VERSION``
+        stays where it is — bumping it to introduce one new column would throw
+        away every cached pixel hash and group key."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            if (
+                entry is not None
+                and entry.get("size") == st.st_size
+                and entry.get("mtime_ns") == st.st_mtime_ns
+                and "realism" in entry
+                and entry.get("realism_model") == model_version
+            ):
+                self.hits += 1
+                return float(entry["realism"])
+        self.misses += 1
+        return None
+
+    def store_realism(self, path: str, score: float, model_version: str | None = None) -> None:
+        """Write a realism score for ``path``, validated by the file's current
+        (size, mtime) and stamped with the model that produced it. Pairs with
+        :meth:`peek_realism` for batched use."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.get("size") != st.st_size or entry.get("mtime_ns") != st.st_mtime_ns:
+                entry = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+                self._entries[key] = entry
+            entry["realism"] = float(score)
+            entry["realism_model"] = model_version
+            self._dirty = True
+
     def save(self) -> None:
         """Persist to disk (atomic replace). Entries whose file no longer exists
         are pruned so renames/finalize moves don't grow the cache forever. No-op
@@ -423,6 +515,101 @@ class DpoScanCache:
                 os.replace(tmp_path, self._cache_path)
             except OSError:
                 pass
+
+
+def parse_caption_keywords(text: str) -> list[str]:
+    """Split a user-typed caption filter into match terms.
+
+    Terms are comma-separated so a term can be a phrase ("red dress"), trimmed,
+    casefolded for case-insensitive matching, and empties dropped. An empty or
+    whitespace-only filter yields no terms, which means "match everything".
+    """
+    return [term.strip().casefold() for term in (text or "").split(",") if term.strip()]
+
+
+def group_matches_keywords(group: dict, keywords: list[str]) -> bool:
+    """True when every keyword appears (case-insensitively) in the group's
+    prompt. All terms are required — the filter narrows, it does not widen —
+    and no terms at all keeps every group."""
+    if not keywords:
+        return True
+    prompt = str(group.get("prompt", "")).casefold()
+    return all(keyword in prompt for keyword in keywords)
+
+
+# How the scan presents groups. RANDOM keeps the pre-sort shuffle; the others
+# rank on cached realism scores (P(AI) per image, lower = more convincing).
+GROUP_ORDER_RANDOM = "random"
+GROUP_ORDER_LEAST_REALISTIC = "least_realistic"
+GROUP_ORDER_MOST_REALISTIC = "most_realistic"
+GROUP_ORDER_LARGEST_GAP = "largest_gap"
+GROUP_ORDERS = (
+    GROUP_ORDER_RANDOM,
+    GROUP_ORDER_LEAST_REALISTIC,
+    GROUP_ORDER_MOST_REALISTIC,
+    GROUP_ORDER_LARGEST_GAP,
+)
+
+
+def order_groups_by_realism(groups: list[dict], score_of, order: str = GROUP_ORDER_MOST_REALISTIC) -> list[dict]:
+    """Order ``groups`` by realism, most photorealistic first by default.
+
+    A group is worth curating for the best winner it can yield, so under
+    ``GROUP_ORDER_MOST_REALISTIC`` its rank is the **lowest** P(AI) among its
+    images — the single most convincing one — not the mean. Averaging would bury
+    a group holding one outstanding image behind a uniformly mediocre one, which
+    is the opposite of what curation wants. ``GROUP_ORDER_LEAST_REALISTIC`` is
+    the mirror: a group ranks on its **highest** P(AI) — its least convincing
+    image — and the most obviously artificial material comes first.
+    ``GROUP_ORDER_RANDOM`` returns the groups untouched, so whatever shuffle the
+    caller applied is what the user sees.
+
+    ``score_of(path)`` returns a cached score or ``None``; it is injected so the
+    caller decides where scores come from (in practice ``peek_realism``, which
+    never runs the model). Groups with no usable score keep their incoming order
+    and sit at the back under either ranking — a partly-filled cache or a
+    missing model degrades to the previous behaviour instead of to a
+    confident-looking wrong order, and a default of 0.0 would have let unscored
+    groups pose as the best ones.
+
+    Groups are reordered and never rewritten: the images inside one stay exactly
+    as they were, because dedup and pairing downstream depend on them and
+    Selection does its own within-group sort.
+    """
+    if order == GROUP_ORDER_RANDOM:
+        return list(groups)
+    if order not in GROUP_ORDERS:
+        raise ValueError(f"unknown group order {order!r}; expected one of {GROUP_ORDERS}")
+
+    def rank(group: dict) -> tuple[int, float]:
+        lowest: float | None = None
+        highest: float | None = None
+        scored = 0
+        for path in group.get("images", ()):
+            try:
+                score = score_of(path)
+            except Exception:  # noqa: BLE001 — a vanished file is not a scan failure
+                score = None
+            if score is None:
+                continue
+            score = float(score)
+            scored += 1
+            lowest = score if lowest is None else min(lowest, score)
+            highest = score if highest is None else max(highest, score)
+        # Unscored groups sort after every scored one regardless of direction.
+        if lowest is None or highest is None:
+            return (1, 0.0)
+        if order == GROUP_ORDER_MOST_REALISTIC:
+            return (0, lowest)
+        if order == GROUP_ORDER_LEAST_REALISTIC:
+            return (0, -highest)
+        # Largest gap: one scored image has no spread to rank on, so it trails
+        # with the unscored rather than posing as a zero-contrast group.
+        if scored < 2:
+            return (1, 0.0)
+        return (0, lowest - highest)
+
+    return sorted(groups, key=rank)
 
 
 def _backfill_pair_fingerprint(entry: dict, output_dir: str) -> bool:
@@ -499,17 +686,43 @@ def is_byte_identical_used(used_fingerprints: dict[int, set[str]], path: str) ->
 
 
 def load_manifest(output_dir: str) -> dict:
+    """The pair manifest for an output dir, or an empty one when there is none.
+
+    A file that exists but does not parse is moved aside rather than treated
+    as empty: returning ``{"pairs": []}`` would let the next save overwrite the
+    record of every exported pair with a blank one. The caller sees the error
+    and the operator keeps the evidence."""
     manifest_path = os.path.join(output_dir, "manifest.json")
-    if os.path.isfile(manifest_path):
+    if not os.path.isfile(manifest_path):
+        return {"pairs": []}
+    try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"pairs": []}
+    except (json.JSONDecodeError, UnicodeDecodeError) as ex:
+        aside = f"{manifest_path}.corrupt-{time.strftime('%Y%m%dT%H%M%S')}"
+        with suppress(OSError):
+            os.replace(manifest_path, aside)
+        raise RuntimeError(
+            f"manifest.json in {output_dir} is corrupt ({ex}). It has been moved to "
+            f"{os.path.basename(aside)}; the exported pairs themselves are untouched in "
+            "chosen/ and rejected/."
+        ) from ex
 
 
 def save_manifest(output_dir: str, manifest: dict):
+    """Write the manifest atomically.
+
+    A plain in-place write can leave a truncated — or, on Windows, a
+    zero-filled — file if the process dies before the data reaches disk, which
+    destroys the record of every pair exported so far. Writing a temp file and
+    renaming it means the manifest is either the old one or the new one."""
     manifest_path = os.path.join(output_dir, "manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    tmp_path = manifest_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, manifest_path)
 
 
 def manifest_pair_counts(manifest: dict) -> dict[tuple[str, str], int]:
@@ -600,6 +813,51 @@ def export_single_pair(
         }
     )
     save_manifest(output_dir, manifest)
+
+
+def concept_usage_for_exclusion(
+    concept_pairs: list[tuple[str, str]], exclude_dir: str | None = None
+) -> tuple[set[str], dict[int, set[str]], list[str]]:
+    """Everything already committed to the given DPO concepts, for a tool that
+    must not pick it again: ``(source paths, byte fingerprints, exported image
+    paths)``.
+
+    ``concept_pairs`` is ``dpo_concept_pattern_dirs`` output; each concept's
+    manifest (at the parent of its chosen dir, where ``export_single_pair``
+    writes it) contributes source paths and sha256+size fingerprints, and the
+    chosen/rejected trees contribute every image file for the caller to
+    pixel-hash. ``exclude_dir`` skips the caller's own output dir, which it
+    already tracks. A concept without a manifest still contributes its files.
+    This is what keeps an image that became an off-policy rejected sample out
+    of the curation tool's groups, and vice versa."""
+    exclude = _normalize_source_path(exclude_dir) if exclude_dir else None
+    used_sources: set[str] = set()
+    fingerprints: dict[int, set[str]] = {}
+    image_paths: list[str] = []
+    seen_roots: set[str] = set()
+    supported = supported_image_extensions()
+    for chosen_dir, rejected_dir in concept_pairs:
+        root = os.path.dirname(chosen_dir)
+        root_n = _normalize_source_path(root)
+        if root_n in seen_roots or (exclude and root_n == exclude):
+            continue
+        seen_roots.add(root_n)
+        if os.path.isfile(os.path.join(root, "manifest.json")):
+            try:
+                manifest = load_manifest(root)
+            except (OSError, json.JSONDecodeError, ValueError):
+                manifest = {"pairs": []}
+            used_sources |= manifest_used_sources(manifest)
+            for size, digests in manifest_used_fingerprints(manifest, root).items():
+                fingerprints.setdefault(size, set()).update(digests)
+        for folder in {chosen_dir, rejected_dir}:
+            if not os.path.isdir(folder):
+                continue
+            for walk_root, _dirs, files in os.walk(folder):
+                image_paths.extend(
+                    os.path.join(walk_root, f) for f in files if os.path.splitext(f)[1].lower() in supported
+                )
+    return used_sources, fingerprints, image_paths
 
 
 def find_exported_file(base_dir: str, filename: str) -> str | None:

@@ -686,7 +686,14 @@ class OFTModule(PeftBase):
                     f"option is disabled in the current config; continuing with the config setting."
                 )
                 state_dict.pop(full_key)
-        return super().load_state_dict(state_dict, strict, assign)
+        result = super().load_state_dict(state_dict, strict, assign)
+        if self.oft_R is not None:
+            # u_state/v_state are non-persistent: a load restarts them from
+            # random vectors, which underestimates sigma and lifts the spectral
+            # clip on a trained adapter. Re-converge them against the loaded
+            # weights so the effective rotation is continuous across a resume.
+            self.oft_R.warm_start_spectral_state()
+        return result
 
     def initialize_weights(self):
         self._initialized = True
@@ -888,19 +895,38 @@ class DoRAOFTModule(OFTModule):
         super().check_initialized()
         assert self.dora_multiplier is not None
 
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
+        # Enabling dora_oft and resuming from a non-DoRA OFT backup: the saved
+        # state has no dora_multiplier. Because the OFT rotation is norm-
+        # preserving, identity magnitude (all ones) is a no-op that continues
+        # training seamlessly, so backfill it rather than failing the strict
+        # load. initialize_weights() has already created the target parameter,
+        # so clone its shape/dtype/device. A DoRA backup carries the real key
+        # and skips this branch.
+        state_dict = dict(state_dict)
+        full_key = self.prefix + "dora_multiplier"
+        if full_key not in state_dict and self.dora_multiplier is not None:
+            state_dict[full_key] = torch.ones_like(self.dora_multiplier)
+        return super().load_state_dict(state_dict, strict, assign)
+
     def forward(self, x, *args, **kwargs):
         # Standard OFT output: W_orig @ R^T @ x + bias
         result = super().forward(x, *args, **kwargs)
 
         # Strip bias, apply the relative per-output-row multiplier, re-add bias.
-        # dora_multiplier broadcasts on the output-feature axis: (out,) over (..., out)
-        # for Linear, (out, 1, 1, 1) over (B, out, H, W) for Conv2d.
+        # dora_multiplier broadcasts on the output-feature axis: (out,) over
+        # (..., out) for Linear; for Conv2d the stored (out, 1, 1, 1) must be
+        # viewed as (1, out, 1, 1) to align with the (B, out, H, W) activation
+        # (right-aligned broadcasting would otherwise pit out against B).
         bias = self.orig_module.bias
         if bias is not None:
             bias_view = bias.view(1, -1, 1, 1) if isinstance(self.orig_module, nn.Conv2d) else bias
             result = result - bias_view
 
-        result = result * self.dora_multiplier.to(result.dtype)
+        multiplier = self.dora_multiplier.to(result.dtype)
+        if isinstance(self.orig_module, nn.Conv2d):
+            multiplier = multiplier.view(1, -1, 1, 1)
+        result = result * multiplier
 
         if bias is not None:
             result = result + bias_view

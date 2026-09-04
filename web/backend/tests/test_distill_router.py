@@ -1,10 +1,10 @@
 import json
 
+from web.backend.routers.distill import router
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
-
-from web.backend.routers.distill import router
 
 
 def test_distill_build_dataset_endpoint_returns_manifest(tmp_path):

@@ -1232,15 +1232,38 @@ def create_optimizer(
             state_index = 0
 
             for new_group_index, unique_group_name in enumerate(new_group_mapping):
-                if (
+                new_group = new_param_groups[new_group_index]
+
+                group_state_saved = (
                     unique_group_name in old_group_mapping
                     and str(config.optimizer.optimizer)
                     == old_group_optimizer_mapping[old_group_mapping.index(unique_group_name)]
-                ):
-                    # the group state was saved in state_dict
+                )
+
+                if group_state_saved:
                     old_group_index = old_group_mapping.index(unique_group_name)
-                    new_group = new_param_groups[new_group_index]
                     old_group = old_param_groups[old_group_index]
+                    # Optimizer state binds to parameters positionally within a
+                    # group. If the group's parameter count changed since the
+                    # state was saved -- e.g. enabling dora_oft adds a
+                    # dora_multiplier interleaved after each module's oft_R --
+                    # positional reuse would bind saved momentum onto the wrong
+                    # parameters. There is no per-parameter identity in the saved
+                    # state to remap by, so drop this group's state and start it
+                    # fresh rather than silently corrupt it. Model weights still
+                    # resume from the adapter backup; only the optimizer momentum
+                    # for this group is reset and re-warms over the next steps.
+                    if len(old_group["params"]) != len(new_group["params"]):
+                        print(
+                            f"WARN: optimizer group '{unique_group_name}' changed parameter count "
+                            f"({len(old_group['params'])} saved vs {len(new_group['params'])} current); "
+                            f"the layout is no longer positionally comparable, so this group's optimizer "
+                            f"state is reinitialized (momentum reset). Model weights resume normally."
+                        )
+                        group_state_saved = False
+
+                if group_state_saved:
+                    # the group state was saved in state_dict
                     for i, old_state_index in enumerate(old_group["params"]):
                         if old_state_index in old_state:
                             state[state_index] = old_state[old_state_index]
@@ -1251,8 +1274,8 @@ def create_optimizer(
                     old_group["lr"] = new_group["lr"]
                     old_group["initial_lr"] = new_group["initial_lr"]
                 else:
-                    # the group state was not saved, initialize with an empty group state
-                    new_group = new_param_groups[new_group_index]
+                    # the group state was not saved (or was dropped above);
+                    # initialize with an empty group state
                     new_group["params"][:] = range(state_index, state_index + len(new_group["params"]))
                     state_index += len(new_group["params"])
                     param_groups.append(new_group)
@@ -1285,7 +1308,7 @@ def create_optimizer(
             "actual_state_precision": "auto",
             "centered_wd_mode": "full",
         }
-        # feature flags the current config must control on resume: torch's
+        # Feature flags the current config must control on resume: torch's
         # load_state_dict keeps the saved group hyperparameters, so a flag
         # toggled in the config between save and resume would silently revert
         # (e.g. spectral_normalization baked as False into backups saved while
@@ -1293,6 +1316,17 @@ def create_optimizer(
         # entries like Prodigy's d-estimates are learned state that must NOT
         # be reset from the config.
         config_wins_keys = {"spectral_normalization"}
+
+        # Dense optimizer-state storage modes share the same tensor layout, so
+        # they can be changed safely on resume. adv_optm's post-load processing
+        # below converts tensors such as AdamW's exp_avg to the requested dtype
+        # without discarding momentum. Full factorization and int8 storage use
+        # different state structures (factor/sign tensors or quantization
+        # scales), so silently changing to/from those modes would produce a
+        # group whose metadata disagrees with its tensors. Keep the saved mode
+        # for structural changes; those require an explicit state reset or
+        # conversion routine.
+        dense_state_precisions = {"auto", "fp32", "fp16", "bf16_sr"}
 
         def _normalize_groups(groups: list[dict], reference_groups: list[dict], where: str):
             if len(groups) != len(reference_groups):
@@ -1303,6 +1337,29 @@ def create_optimizer(
                 )
                 return
             for saved_group, current_group in zip(groups, reference_groups, strict=True):
+                saved_precision = saved_group.get("state_precision")
+                current_precision = current_group.get("state_precision")
+                if (
+                    saved_precision is not None
+                    and current_precision is not None
+                    and saved_precision != current_precision
+                ):
+                    if saved_precision in dense_state_precisions and current_precision in dense_state_precisions:
+                        print(
+                            "INFO: optimizer state_precision differs from the current config "
+                            f"({saved_precision!r} -> {current_precision!r}) [{where}]; converting the resumed "
+                            "dense optimizer state without resetting momentum."
+                        )
+                        saved_group["state_precision"] = current_precision
+                        saved_group["actual_state_precision"] = current_group.get(
+                            "actual_state_precision", current_precision
+                        )
+                    else:
+                        print(
+                            "WARN: optimizer state_precision differs from the current config "
+                            f"({saved_precision!r} -> {current_precision!r}) [{where}], but this change needs "
+                            "a structural optimizer-state conversion; keeping the saved precision."
+                        )
                 for key, value in current_group.items():
                     if key == "params":
                         continue
@@ -1345,6 +1402,37 @@ def create_optimizer(
         # Belt and braces: torch may merge rather than replace some group content,
         # so re-check the live groups after loading.
         _normalize_groups(optimizer.param_groups, current_groups, "after load")
+
+        # config_wins_keys above can flip a group's spectral_normalization back to
+        # True on resume, but the per-parameter state saved in the backup was
+        # created while the flag was False and therefore has no spectral_u/_v.
+        # AdamW_adv.__init_state short-circuits on 'step' in state, so it never
+        # backfills them, and the first step then KeyErrors on 'spectral_u' inside
+        # apply_spectral_riemannian_oft. Initialize the missing singular vectors
+        # for any spectral parameter whose state predates the flag being enabled.
+        try:
+            from adv_optm.util.scaled_optm import init_spectral_norm, is_spectral
+        except ImportError:
+            init_spectral_norm = is_spectral = None
+        if init_spectral_norm is not None:
+            backfilled = 0
+            for group in optimizer.param_groups:
+                if not group.get("spectral_normalization", False):
+                    continue
+                for p in group["params"]:
+                    state = optimizer.state.get(p)
+                    # Only touch already-initialized states missing spectral data;
+                    # fresh params are handled by __init_state on first step.
+                    if not state or "step" not in state or "spectral_u" in state:
+                        continue
+                    if is_spectral(p):
+                        init_spectral_norm(state, p)
+                        backfilled += 1
+            if backfilled:
+                print(
+                    f"INFO: backfilled spectral normalization state for {backfilled} "
+                    f"parameter(s) whose backup predates spectral_normalization=True."
+                )
 
     return optimizer
 

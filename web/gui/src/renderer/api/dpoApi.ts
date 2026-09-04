@@ -1,4 +1,15 @@
-import { request } from "./request";
+import { API_BASE, request } from "./request";
+
+/**
+ * Where the realism head runs. "auto" prefers CUDA; "cpu" pins it to the
+ * processor and system RAM, which is slower but leaves the GPU alone; "off"
+ * disables scoring entirely, so the model is never loaded and groups keep
+ * their source order.
+ */
+export type RealismDevice = "auto" | "cpu" | "off";
+
+/** Presentation order of scanned groups; the realism orders rank on P(AI). */
+export type GroupOrder = "random" | "least_realistic" | "most_realistic" | "largest_gap";
 
 export interface PairCheckResult {
   total_matched: number;
@@ -112,6 +123,7 @@ export interface ConfirmPairResponse {
   continue_group?: boolean;
   remaining_images?: string[];
   pairs_done?: number;
+  discarded?: number;
 }
 
 export interface CancelPairResponse {
@@ -207,6 +219,8 @@ export const dpoApi = {
     outputDir: string,
     pairsPerGroup = 1,
     mode: "selection" | "swiss" | "triage" = "selection",
+    groupOrder: GroupOrder = "most_realistic",
+    captionFilter = "",
   ) =>
     request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
       method: "POST",
@@ -215,6 +229,8 @@ export const dpoApi = {
         output_dir: outputDir,
         pairs_per_group: pairsPerGroup,
         mode,
+        group_order: groupOrder,
+        caption_filter: captionFilter,
       }),
     }),
 
@@ -228,10 +244,12 @@ export const dpoApi = {
       body: JSON.stringify({ path }),
     }),
 
-  confirmPair: (continueScoring: boolean) =>
+  // discardRest commits the pair and then retires the whole group from the
+  // source tree (paired sources → .chosen/.rejected, leftovers → .discard).
+  confirmPair: (continueScoring: boolean, discardRest = false) =>
     request<ConfirmPairResponse>("/dpo/session/confirm-pair", {
       method: "POST",
-      body: JSON.stringify({ continue_scoring: continueScoring }),
+      body: JSON.stringify({ continue_scoring: continueScoring, discard_rest: discardRest }),
     }),
 
   cancelPair: () => request<CancelPairResponse>("/dpo/session/cancel-pair", { method: "POST" }),
@@ -266,6 +284,56 @@ export const dpoApi = {
       body: JSON.stringify({ good, bad }),
     }),
 
+  // P(AI-generated) per image, used to sort a group most-photorealistic-first.
+  // Backed by the session scan cache, so a group costs the model once and is
+  // free on every revisit.
+  realismScores: (paths: string[]) =>
+    request<{
+      ok: boolean;
+      scores?: Record<string, number>;
+      // Set when scoring is turned off: an empty result that is not a failure.
+      disabled?: boolean;
+      error?: string;
+    }>("/dpo/session/realism-scores", {
+      method: "POST",
+      body: JSON.stringify({ paths }),
+    }),
+
+  // Score the whole source tree once, ahead of curation, so Selection never
+  // waits on the model. Returns immediately — poll realismBackfillStatus.
+  // Re-running is cheap: anything already cached under the current model
+  // version is a hit, so a second pass only costs newly added images.
+  startRealismBackfill: () =>
+    request<{ ok: boolean; total?: number; error?: string }>("/dpo/session/realism-backfill", {
+      method: "POST",
+    }),
+
+  realismBackfillStatus: () =>
+    request<{
+      ok: boolean;
+      running: boolean;
+      done: number;
+      total: number;
+      scored: number;
+      cached: number;
+      finished: boolean;
+      device?: RealismDevice;
+      error?: string | null;
+    }>("/dpo/session/realism-backfill/status"),
+
+  stopRealismBackfill: () => request<{ ok: boolean }>("/dpo/session/realism-backfill/stop", { method: "POST" }),
+
+  // Where the realism head runs. "cpu" keeps it off the GPU entirely, for when
+  // training or generation is using the VRAM; "auto" takes CUDA when it can.
+  // Not session-scoped — readable and settable before curation starts.
+  realismDevice: () => request<{ ok: boolean; device: RealismDevice }>("/dpo/realism/device"),
+
+  setRealismDevice: (device: RealismDevice) =>
+    request<{ ok: boolean; device: RealismDevice; error?: string }>("/dpo/realism/device", {
+      method: "POST",
+      body: JSON.stringify({ device }),
+    }),
+
   finalizeSession: (valPercentage = 0) =>
     request<{ ok: boolean; total_pairs?: number; train_count?: number; val_count?: number }>("/dpo/session/finalize", {
       method: "POST",
@@ -293,11 +361,17 @@ export const dpoApi = {
       body: JSON.stringify({ order }),
     }),
 
-  swissExport: (pairCount: number) =>
-    request<{ ok: boolean; exported?: number; pairs_done?: number; error?: string }>("/dpo/session/swiss-export", {
-      method: "POST",
-      body: JSON.stringify({ pair_count: pairCount }),
-    }),
+  // discardRest additionally retires the group from the source tree after the
+  // export: exported sources → .chosen/.rejected, mid-ranked leftovers →
+  // .discard (all dot-pruned so the group can't reappear).
+  swissExport: (pairCount: number, discardRest = false) =>
+    request<{ ok: boolean; exported?: number; pairs_done?: number; discarded?: number; error?: string }>(
+      "/dpo/session/swiss-export",
+      {
+        method: "POST",
+        body: JSON.stringify({ pair_count: pairCount, discard_rest: discardRest }),
+      },
+    ),
 
   bucketAnalysis: (concept_path: string, batch_size: number, target_resolutions: number[], quantization: number) =>
     request<{ ok: boolean; result?: BucketAnalysisResult; error?: string }>("/dpo/bucket-analysis", {
@@ -326,5 +400,210 @@ export const dpoApi = {
       error?: string | null;
     }>("/dpo/repair-status"),
 
-  imageUrl: (path: string) => `/api/dpo/session/image?path=${encodeURIComponent(path)}`,
+  // Absolute against API_BASE: under Electron the page is file://, so a bare
+  // "/api/..." would resolve to file:///api/... and render a broken image.
+  imageUrl: (path: string) => `${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`,
+};
+
+// ---- Off-policy DPO builder: real photo (chosen) vs own generation (rejected) ----
+
+export interface OffPolicyStatus {
+  active: boolean;
+  phase: "idle" | "indexing" | "scanning" | "matching" | "scoring" | "ready" | "error";
+  progress_done: number;
+  progress_total: number;
+  worker_finished: boolean;
+  error: string | null;
+  warning: string | null;
+  // Candidates whose generations had no cached realism score (random pick, shown UNSCORED).
+  unscored: number;
+  photos: number;
+  generated: number;
+  excluded_captions: number;
+  // Photos that matched a generation on caption and aspect but were smaller
+  // than every one of them (a smaller photo would be upscaled relative to the
+  // generation, teaching a resampling cue instead of realism).
+  too_small: number;
+  cache_imported: number;
+  // Files listed so far while indexing (the walk phase has no other progress).
+  listed: number;
+  can_undo: boolean;
+  undo_action: "confirm" | "skip" | "skip_forever" | "caption" | null;
+  candidates: number;
+  ready: number;
+  shown: number;
+  confirmed: number;
+  skipped: number;
+  // Caption lines removed this session (photo kept).
+  captions_removed: number;
+  // Photos permanently skipped this session, and the size of the saved list.
+  skipped_forever: number;
+  permanently_skipped: number;
+  total_pairs: number;
+  has_candidate: boolean;
+}
+
+export interface OffPolicyCandidate {
+  real_path: string;
+  caption_path: string;
+  real_size: [number, number];
+  caption: string;
+  caption_lines: string[];
+  generated_count: number;
+  // How many of this photo's generations have been shown (re-roll history).
+  shown_count: number;
+  rejected_path: string | null;
+  rejected_size: [number, number] | null;
+  rejected_score: number | null;
+  // P(AI) of the real photo itself, when scored — a photo the head trusts
+  // less than the generation deserves a second look before it becomes chosen.
+  real_score: number | null;
+  scored: boolean;
+  aspect_mismatch?: number | null;
+  aspect_bucket: string;
+  index: number;
+  total: number;
+}
+
+export interface OffPolicySuggestion {
+  real_path: string;
+  caption: string;
+  caption_lines: string[];
+  real_size: [number, number];
+  /** Trainer bucket the photo trains in. */
+  aspect_bucket: string;
+  /** Nearest ratio the generator can actually produce ("3:2", "9:16", ...). */
+  generate_aspect: string;
+  generate_size: [number, number];
+  /** Aspect gap left between the photo and that generatable ratio. */
+  aspect_delta: number | null;
+  /** False when that gap exceeds the session's aspect tolerance. */
+  within_tolerance: boolean;
+}
+
+/** Per trainer bucket: photos still to generate for, and the one size to batch them at. */
+export type OffPolicyBuckets = Record<string, { photos: number; generate_size: [number, number] }>;
+
+export interface OffPolicyPhotoBrief {
+  real_path: string;
+  real_size: [number, number];
+  aspect_bucket: string;
+  generate_aspect: string;
+  generate_size: [number, number];
+  aspect_delta: number | null;
+  caption_lines: string[];
+  lines_needing_generation: string[];
+  paired: boolean;
+  skipped: boolean;
+  has_usable_generation: boolean;
+  too_small_for_suggested_size: boolean;
+}
+
+export const dpoOffPolicyApi = {
+  start: (
+    generatedFolder: string,
+    realFolder: string,
+    outputDir: string,
+    aspectTolerance = 0.15,
+    baseResolution = 1024,
+    maxUpscale = 1.1,
+  ) =>
+    request<{
+      ok: boolean;
+      existing_pairs?: number;
+      pruned?: number;
+      cache_imported?: number;
+      permanently_skipped?: number;
+      error?: string;
+    }>("/dpo/offpolicy/start", {
+      method: "POST",
+      body: JSON.stringify({
+        generated_folder: generatedFolder,
+        real_folder: realFolder,
+        output_dir: outputDir,
+        aspect_tolerance: aspectTolerance,
+        max_upscale: maxUpscale,
+        base_resolution: baseResolution,
+      }),
+    }),
+
+  status: () => request<OffPolicyStatus>("/dpo/offpolicy/status"),
+
+  next: () =>
+    request<{ ok: boolean; candidate?: OffPolicyCandidate; waiting?: boolean; done?: boolean; error?: string }>(
+      "/dpo/offpolicy/next",
+      { method: "POST" },
+    ),
+
+  // The candidate currently on screen (null when none), for a reloaded UI.
+  current: () =>
+    request<{ ok: boolean; candidate?: OffPolicyCandidate | null; error?: string }>("/dpo/offpolicy/current"),
+
+  confirm: () =>
+    request<{ ok: boolean; total_pairs?: number; error?: string }>("/dpo/offpolicy/confirm", { method: "POST" }),
+
+  skip: () => request<{ ok: boolean; error?: string }>("/dpo/offpolicy/skip", { method: "POST" }),
+
+  // Never offer this photo again for this output folder (saved to disk).
+  skipForever: () =>
+    request<{ ok: boolean; permanently_skipped?: number; error?: string }>("/dpo/offpolicy/skip-forever", {
+      method: "POST",
+    }),
+
+  // Swap the rejected generation for another of the same photo's.
+  reroll: () =>
+    request<{ ok: boolean; candidate?: OffPolicyCandidate; error?: string }>("/dpo/offpolicy/reroll", {
+      method: "POST",
+    }),
+
+  // Reverses the last confirm / skip / delete and returns that candidate.
+  undo: () =>
+    request<{ ok: boolean; undone?: string; candidate?: OffPolicyCandidate; error?: string }>("/dpo/offpolicy/undo", {
+      method: "POST",
+    }),
+
+  // Removes the caption line on screen from the photo's .txt (the photo and
+  // its other lines stay; an emptied .txt is deleted). Undoable in-session.
+  removeCaption: () =>
+    request<{ ok: boolean; removed_lines?: number; removed_file?: boolean; remaining_lines?: number; error?: string }>(
+      "/dpo/offpolicy/remove-caption",
+      { method: "POST" },
+    ),
+
+  // Random captions that have no usable generation yet, with the size to
+  // generate each at; optionally only photos in one trainer bucket ("3:2").
+  suggest: (aspectBucket: string | null = null, count = 1, keywords = "") =>
+    request<{
+      ok: boolean;
+      suggestions?: OffPolicySuggestion[];
+      remaining?: number;
+      aspect_bucket?: string | null;
+      buckets?: OffPolicyBuckets;
+      waiting?: boolean;
+      error?: string;
+    }>("/dpo/offpolicy/suggest", {
+      method: "POST",
+      body: JSON.stringify({ aspect_bucket: aspectBucket, count, keywords }),
+    }),
+
+  buckets: (keywords = "") =>
+    request<{ ok: boolean; buckets?: OffPolicyBuckets; remaining?: number; waiting?: boolean; error?: string }>(
+      `/dpo/offpolicy/buckets${keywords ? `?keywords=${encodeURIComponent(keywords)}` : ""}`,
+    ),
+
+  // Photos whose file name matches, with the size to generate at. Matched
+  // against the in-memory index by string only — never resolved on disk.
+  lookup: (filename: string) =>
+    request<{
+      ok: boolean;
+      matches?: OffPolicyPhotoBrief[];
+      generations_scanned?: boolean;
+      waiting?: boolean;
+      error?: string;
+    }>("/dpo/offpolicy/lookup", {
+      method: "POST",
+      body: JSON.stringify({ filename }),
+    }),
+
+  cancel: () => request<{ ok: boolean }>("/dpo/offpolicy/cancel", { method: "POST" }),
 };

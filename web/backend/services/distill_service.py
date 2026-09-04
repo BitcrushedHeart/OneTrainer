@@ -1,6 +1,7 @@
 from modules.util.distill_metadata_util import (
-    DistillBuildFilters,
     DistillBuildRequest as DistillDatasetBuildRequest,
+)
+from modules.util.distill_metadata_util import (
     build_distillation_dataset,
 )
 from web.backend.services._singleton import SingletonMixin

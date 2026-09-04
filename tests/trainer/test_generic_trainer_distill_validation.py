@@ -1,11 +1,11 @@
-import pytest
-
 from modules.trainer.GenericTrainer import GenericTrainer
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
+
+import pytest
 
 
 def test_generic_trainer_rejects_invalid_distill_startup_without_loading_model():

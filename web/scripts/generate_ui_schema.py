@@ -543,6 +543,7 @@ TAB_ORDER = [
     "embedding",
     "rlhf",
     "distill",
+    "transfer",
     "performance",
     "run",
     "help",

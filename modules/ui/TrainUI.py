@@ -15,6 +15,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import scripts.generate_debug_report
+from modules.ui.AdaptiveResolutionLadderWindow import AdaptiveResolutionLadderWindow
 from modules.ui.AdditionalEmbeddingsTab import AdditionalEmbeddingsTab
 from modules.ui.CaptionUI import CaptionUI
 from modules.ui.CloudTab import CloudTab
@@ -31,6 +32,7 @@ from modules.ui.SampleWindow import SampleWindow
 from modules.ui.SamplingTab import SamplingTab
 from modules.ui.TopBar import TopBar
 from modules.ui.TrainingTab import TrainingTab
+from modules.ui.TransferTab import TransferTab
 from modules.ui.VideoToolUI import VideoToolUI
 from modules.util import create
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
@@ -135,6 +137,7 @@ class TrainUI(ctk.CTk):
         self.training_tab = None
         self.lora_tab = None
         self.distill_tab = None
+        self.transfer_tab = None
         self.rlhf_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
@@ -508,6 +511,24 @@ class TrainUI(ctk.CTk):
         )
         components.switch(frame, 0, 1, self.ui_state, "aspect_ratio_bucketing")
 
+        components.label(
+            frame,
+            0,
+            3,
+            "Adaptive Resolution (No Upscaling)",
+            tooltip="Use the highest configured resolution tier each image supports without enlargement. The smallest active ladder tier remains an intentional fallback",
+        )
+        components.switch(frame, 0, 4, self.ui_state, "adaptive_resolution")
+
+        components.label(
+            frame,
+            1,
+            3,
+            "Resolution Snap Ladder",
+            tooltip="Configure every scalar tier Adaptive Resolution may snap an image to",
+        )
+        components.button(frame, 1, 4, "Configure…", self.__open_adaptive_resolution_ladder)
+
         # latent caching
         components.label(
             frame,
@@ -557,6 +578,15 @@ class TrainUI(ctk.CTk):
             tooltip="Remove orphaned cache files from datasets that have been edited. Shows a preview before deleting anything",
         )
         self.clean_button = components.button(frame, 3, 4, "Clean", self.__clean_cache)
+
+        components.label(
+            frame,
+            4,
+            3,
+            "Prune Upscaled Cache",
+            tooltip="Preview and selectively remove image-cache variants that enlarged their source images",
+        )
+        self.prune_upscaled_button = components.button(frame, 4, 4, "Preview / Prune", self.__prune_upscaled_cache)
 
         frame.pack(fill="both", expand=1)
         return frame
@@ -871,6 +901,7 @@ class TrainUI(ctk.CTk):
         self._update_rlhf_controls()
         self._update_rlhf_tab()
         self._update_distill_tab()
+        self._update_transfer_tab()
 
     def _rlhf_is_supported(self) -> bool:
         return self.train_config.training_method == TrainingMethod.LORA
@@ -905,6 +936,21 @@ class TrainUI(ctk.CTk):
         elif not self._distill_is_supported() and "Distill" in self.tabview._tab_dict:
             self.tabview.delete("Distill")
             self.distill_tab = None
+
+    def _transfer_is_supported(self) -> bool:
+        return self.train_config.training_method == TrainingMethod.LORA
+
+    def _update_transfer_tab(self):
+        if not self.tabview:
+            return
+
+        if self._transfer_is_supported() and "Transfer" not in self.tabview._tab_dict:
+            self.transfer_tab = TransferTab(self.tabview.add("Transfer"), self.train_config, self.ui_state)
+        elif self._transfer_is_supported() and self.transfer_tab:
+            self.transfer_tab.refresh_ui()
+        elif not self._transfer_is_supported() and "Transfer" in self.tabview._tab_dict:
+            self.tabview.delete("Transfer")
+            self.transfer_tab = None
 
     def load_preset(self):
         if not self.tabview:
@@ -1105,6 +1151,68 @@ class TrainUI(ctk.CTk):
             SmartDiskCache.gc_clean(os.path.join(cache_dir, "text"))
             SmartDiskCache.gc_clean(os.path.join(cache_dir, "image"))
             messagebox.showinfo("Clean Cache", f"Removed {total_files} orphaned files ({total_mb:.1f} MB).")
+
+    def __prune_upscaled_cache(self):
+        if self.training_thread is not None:
+            messagebox.showwarning("Prune Upscaled Cache", "Cache pruning is unavailable while training is active.")
+            return
+        if not self.train_config.adaptive_resolution:
+            messagebox.showinfo("Prune Upscaled Cache", "Enable Adaptive Resolution before pruning.")
+            return
+
+        image_cache_dir = os.path.join(self.train_config.cache_dir, "image")
+        if not os.path.isfile(os.path.join(image_cache_dir, "cache.json")):
+            image_cache_dir = self.train_config.cache_dir
+        if not os.path.isfile(os.path.join(image_cache_dir, "cache.json")):
+            messagebox.showinfo("Prune Upscaled Cache", "No image cache index was found.")
+            return
+
+        from mgds.pipelineModules.ResolutionPolicy import parse_scalar_resolutions
+        from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
+
+        additional_names = ["original_resolution_rejected"] if self.train_config.rlhf_enabled else None
+        maximum = max(parse_scalar_resolutions(self.train_config.resolution), default=None)
+        prune_kwargs = {
+            "additional_resolution_names": additional_names,
+            "adaptive_resolution_ladder": self.train_config.adaptive_resolution_ladder,
+            "adaptive_resolution_max": maximum,
+        }
+        stats = SmartDiskCache.preview_adaptive_prune(image_cache_dir, **prune_kwargs)
+        if stats["removed_variants"] == 0:
+            detail = ""
+            if stats["skipped_missing_metadata"]:
+                detail = (
+                    f"\n\n{stats['skipped_missing_metadata']} legacy entries were skipped "
+                    "because source dimensions were unavailable."
+                )
+            messagebox.showinfo("Prune Upscaled Cache", "No upscaled cache variants were found." + detail)
+            return
+
+        warning = ""
+        if stats["entries_without_usable_variant"]:
+            warning = (
+                f"\n\n{stats['entries_without_usable_variant']} entries will need sourced "
+                "recaching or will be dropped in sourceless mode."
+            )
+        skipped = ""
+        if stats["skipped_missing_metadata"]:
+            skipped = f"\n{stats['skipped_missing_metadata']} legacy entries will be skipped."
+        message = (
+            f"Remove {stats['removed_variants']} upscaled variants from "
+            f"{stats['affected_entries']} entries and delete {stats['files']} unreferenced "
+            f"tensor files ({stats['bytes'] / (1024 * 1024):.1f} MB)?"
+            f"{warning}{skipped}"
+        )
+        if messagebox.askyesno("Prune Upscaled Cache", message):
+            result = SmartDiskCache.clean_adaptive_prune(image_cache_dir, **prune_kwargs)
+            messagebox.showinfo(
+                "Prune Upscaled Cache",
+                f"Removed {result['removed_variants']} variants and {result['deleted_files']} unreferenced files.",
+            )
+
+    def __open_adaptive_resolution_ladder(self):
+        window = AdaptiveResolutionLadderWindow(self, self.ui_state)
+        window.focus()
 
     def __training_thread_function(self):
         error_caught = False

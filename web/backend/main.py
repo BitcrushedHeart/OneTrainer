@@ -10,12 +10,13 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, PROJECT_ROOT)
 
 from web.backend.routers import (
-    concepts,
     cloud,
+    concepts,
     config,
     converter,
     distill,
     dpo,
+    dpo_offpolicy,
     health,
     mask_editor,
     merge_oft,
@@ -24,6 +25,7 @@ from web.backend.routers import (
     samples,
     sampling,
     secrets,
+    swarm_generate,
     system,
     tensorboard,
     tools,
@@ -85,6 +87,8 @@ _routers = [
     validation.router,
     distill.router,
     dpo.router,
+    dpo_offpolicy.router,
+    swarm_generate.router,
     wiki.router,
     system.router,
     tools.router,

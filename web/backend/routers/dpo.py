@@ -24,6 +24,13 @@ class StartSessionRequest(BaseModel):
     output_dir: str
     pairs_per_group: int = 1
     mode: Literal["selection", "swiss", "triage"] = "selection"
+    # Presentation order of the scanned groups. The realism orders rank on
+    # cached P(AI) scores (largest_gap on the spread between a group's best
+    # and worst image) and fall back to the shuffle when scoring is off.
+    group_order: Literal["random", "least_realistic", "most_realistic", "largest_gap"] = "most_realistic"
+    # Comma-separated caption keywords; every term must appear in a group's
+    # prompt for the group to be shown. Empty means no filtering.
+    caption_filter: str = ""
 
 
 class SelectImageRequest(BaseModel):
@@ -46,10 +53,12 @@ class SwissReorderRequest(BaseModel):
 
 class SwissExportRequest(BaseModel):
     pair_count: int
+    discard_rest: bool = False
 
 
 class ConfirmPairRequest(BaseModel):
     continue_scoring: bool = False
+    discard_rest: bool = False
 
 
 class TriagePair(BaseModel):
@@ -65,6 +74,17 @@ class CommitPairsRequest(BaseModel):
 class TriageAlignRequest(BaseModel):
     good: list[str]
     bad: list[str]
+
+
+class RealismScoresRequest(BaseModel):
+    paths: list[str]
+
+
+class RealismDeviceRequest(BaseModel):
+    # "off" is not a device: it disables scoring entirely, for when the GPU is
+    # busy and even the CPU pass is not wanted. Kept on this one setting so the
+    # service has a single thing to consult before touching the model.
+    device: Literal["auto", "cpu", "off"] = "auto"
 
 
 class BucketAnalysisRequest(BaseModel):
@@ -167,7 +187,14 @@ def bucket_analysis(req: BucketAnalysisRequest):
 @router.post("/dpo/session/start")
 def start_session(req: StartSessionRequest):
     service = DPOService.get_instance()
-    return service.start_session(req.source_folder, req.output_dir, req.pairs_per_group, req.mode)
+    return service.start_session(
+        req.source_folder,
+        req.output_dir,
+        req.pairs_per_group,
+        req.mode,
+        group_order=req.group_order,
+        caption_filter=req.caption_filter,
+    )
 
 
 @router.get("/dpo/session/status")
@@ -191,7 +218,7 @@ def select_image(req: SelectImageRequest):
 @router.post("/dpo/session/confirm-pair")
 def confirm_pair(req: ConfirmPairRequest):
     service = DPOService.get_instance()
-    return service.confirm_pair(req.continue_scoring)
+    return service.confirm_pair(req.continue_scoring, discard_rest=req.discard_rest)
 
 
 @router.post("/dpo/session/cancel-pair")
@@ -216,6 +243,57 @@ def discard_group():
 def triage_align(req: TriageAlignRequest):
     service = DPOService.get_instance()
     return service.triage_align(req.good, req.bad)
+
+
+@router.post("/dpo/session/realism-scores")
+def realism_scores(req: RealismScoresRequest):
+    service = DPOService.get_instance()
+    return service.realism_scores(req.paths)
+
+
+@router.post("/dpo/session/realism-backfill")
+def start_realism_backfill():
+    """Score the whole source tree once so Selection never waits on the model.
+
+    Returns immediately; poll ``/dpo/session/realism-backfill/status``. Safe to
+    re-run — anything already cached under the current model version is a hit,
+    so a second pass only costs the images added since the first.
+    """
+    service = DPOService.get_instance()
+    return service.start_realism_backfill()
+
+
+@router.get("/dpo/session/realism-backfill/status")
+def realism_backfill_status():
+    service = DPOService.get_instance()
+    return service.realism_backfill_status()
+
+
+@router.post("/dpo/session/realism-backfill/stop")
+def stop_realism_backfill():
+    service = DPOService.get_instance()
+    return service.stop_realism_backfill()
+
+
+@router.get("/dpo/realism/device")
+def realism_device():
+    """Where the realism head currently runs: ``auto`` (CUDA when usable),
+    ``cpu``, or ``off`` when scoring is disabled."""
+    service = DPOService.get_instance()
+    return service.realism_device()
+
+
+@router.post("/dpo/realism/device")
+def set_realism_device(req: RealismDeviceRequest):
+    """Move scoring on or off the GPU, or turn it off altogether.
+
+    Applies from the next scoring call onwards, so a backfill already in flight
+    switches at its next chunk rather than having to be restarted. Not tied to a
+    curation session — it can be set before one starts, which is how the setup
+    screen's toggle keeps a whole session off the model.
+    """
+    service = DPOService.get_instance()
+    return service.set_realism_device(req.device)
 
 
 @router.post("/dpo/session/skip-group", response_model=ActionResponse)
@@ -281,4 +359,4 @@ def swiss_reorder(req: SwissReorderRequest):
 @router.post("/dpo/session/swiss-export")
 def swiss_export(req: SwissExportRequest):
     service = DPOService.get_instance()
-    return service.swiss_export(req.pair_count)
+    return service.swiss_export(req.pair_count, discard_rest=req.discard_rest)

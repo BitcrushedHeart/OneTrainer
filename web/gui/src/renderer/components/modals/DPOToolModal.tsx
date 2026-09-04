@@ -47,6 +47,8 @@ export function DPOToolModal({ open, onClose }: Props) {
     sourceFolder,
     outputDir,
     pairsPerGroup,
+    groupOrder,
+    captionFilter,
     scanCount,
     scanTotal,
     hashCount,
@@ -55,6 +57,10 @@ export function DPOToolModal({ open, onClose }: Props) {
     phase,
     bestImage,
     remainingImages,
+    realismScores,
+    realismError,
+    realismDevice,
+    backfill,
     pairsDone,
     swissMatch,
     swissRound,
@@ -103,15 +109,21 @@ export function DPOToolModal({ open, onClose }: Props) {
           sourceFolder={sourceFolder}
           outputDir={outputDir}
           pairsPerGroup={pairsPerGroup}
+          groupOrder={groupOrder}
+          captionFilter={captionFilter}
           onSourceChange={actions.setSourceFolder}
           onOutputChange={actions.setOutputDir}
           onPairsPerGroupChange={actions.setPairsPerGroup}
+          onGroupOrderChange={actions.setGroupOrder}
+          onCaptionFilterChange={actions.setCaptionFilter}
           onStart={actions.startSession}
           onReview={actions.goToReview}
           onClose={onClose}
           resume={resume}
           onSelectOutput={actions.loadOutputManifest}
           error={error}
+          realismDevice={realismDevice}
+          onSetRealismDevice={(device) => void actions.setRealismDevice(device)}
         />
       )}
 
@@ -129,9 +141,10 @@ export function DPOToolModal({ open, onClose }: Props) {
         <SelectionStep
           group={group}
           onPick={actions.pickImage}
-          onAcceptPair={(keepScoring) => void actions.confirmPair(keepScoring)}
+          onAcceptPair={(keepScoring, discardRest) => void actions.confirmPair(keepScoring, discardRest)}
           onDismissPair={() => void actions.cancelPendingPair()}
           onSkipGroup={() => void actions.skipGroup()}
+          onDiscardGroup={() => void actions.discardGroup()}
           onCancel={() => void actions.cancelSession()}
           phase={phase}
           bestImage={bestImage}
@@ -140,6 +153,13 @@ export function DPOToolModal({ open, onClose }: Props) {
           showAcceptDialog={showAcceptDialog}
           pendingBest={pendingBest}
           pendingWorst={pendingWorst}
+          realismScores={realismScores}
+          realismError={realismError}
+          backfill={backfill}
+          onStartBackfill={() => void actions.startRealismBackfill()}
+          onStopBackfill={() => void actions.stopRealismBackfill()}
+          realismDevice={realismDevice}
+          onSetRealismDevice={(device) => void actions.setRealismDevice(device)}
         />
       )}
 
@@ -154,6 +174,7 @@ export function DPOToolModal({ open, onClose }: Props) {
           onVote={actions.swissVote}
           onFinishEarly={actions.swissFinishEarly}
           onSkipGroup={() => void actions.skipGroup()}
+          onDiscardGroup={() => void actions.discardGroup()}
           onCancel={() => void actions.cancelSession()}
           pairsDone={pairsDone}
         />
@@ -170,6 +191,7 @@ export function DPOToolModal({ open, onClose }: Props) {
           onSwap={actions.swapRanked}
           onExport={actions.swissExportPairs}
           onSkipGroup={() => void actions.skipGroup()}
+          onDiscardGroup={() => void actions.discardGroup()}
           onCancel={() => void actions.cancelSession()}
           pairsDone={pairsDone}
         />

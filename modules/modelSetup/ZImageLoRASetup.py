@@ -5,12 +5,19 @@ from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.BaseZImageSetup import BaseZImageSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util import factory
+from modules.util.adapter_io import read_layer_weights_buffered
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.NamedParameterGroup import NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.TrainProgress import TrainProgress
+from modules.util.transfer_util import (
+    build_raw_late_tensors,
+    build_teacher_late_tensors,
+    is_late_family_key,
+    parse_transfer_families,
+)
 
 import torch
 
@@ -100,6 +107,46 @@ class ZImageLoRASetup(
     ) -> NamedParameterGroupCollection:
         parameter_group_collection = NamedParameterGroupCollection()
 
+        if config.transfer_enabled or config.redistill_enabled:
+            # Transfer (and redistill) train ONLY the late-family adapter
+            # modules (oft_R and, for DoRA-OFT, dora_multiplier). Everything
+            # else in the adapter -- early/mid layers and non-family late
+            # modules like attention.to_out.0 -- stays frozen.
+            # LoRAModuleWrapper is not an nn.Module, so partition by
+            # lora_modules instead of _create_model_part_parameters' freeze
+            # path (which needs named_parameters()).
+            stems = parse_transfer_families(config.transfer_families)
+            selected, frozen = [], []
+            for name, module in model.transformer_lora.lora_modules.items():
+                if is_late_family_key(name, config.transfer_late_start, stems) is not None:
+                    selected.extend(module.parameters())
+                else:
+                    frozen.extend(module.parameters())
+            if not selected:
+                raise ValueError(
+                    f"transfer mode selected no trainable modules: the adapter covers nothing in "
+                    f"families '{config.transfer_families}' at layers >= {config.transfer_late_start}"
+                )
+            self.frozen_parameters["transformer"] = frozen
+            parameter_group_collection.add_group(
+                NamedParameterGroup(
+                    unique_name="transformer",
+                    parameters=selected,
+                    learning_rate=config.transformer.learning_rate,
+                )
+            )
+            # Redistill Phase B additionally needs the fake critic; a single
+            # optimizer holds both groups from step 0 (Phase A produces no
+            # fake grads, so its moments stay zero until the boundary).
+            if config.redistill_enabled and model.transformer_fake_lora is not None:
+                self._create_model_part_parameters(
+                    parameter_group_collection,
+                    "transformer_fake",
+                    model.transformer_fake_lora,
+                    config.transformer,
+                )
+            return parameter_group_collection
+
         self._create_model_part_parameters(
             parameter_group_collection, "transformer", model.transformer_lora, config.transformer
         )
@@ -124,7 +171,7 @@ class ZImageLoRASetup(
         self._setup_model_part_requires_grad(
             "transformer", model.transformer_lora, config.transformer, model.train_progress
         )
-        if config.distill_enabled and model.transformer_fake_lora is not None:
+        if config.distill_phase_active() and model.transformer_fake_lora is not None:
             self._setup_model_part_requires_grad(
                 "transformer_fake", model.transformer_fake_lora, config.transformer, model.train_progress
             )
@@ -158,6 +205,11 @@ class ZImageLoRASetup(
         model.transformer_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
         model.transformer_lora.hook_to_module()
 
+        if config.transfer_enabled:
+            self.__setup_transfer_teacher(model, config)
+        elif config.redistill_enabled:
+            self.__setup_redistill_teacher(model, config)
+
         if model.teacher_lora_state_dict is not None:
             teacher_config = _build_teacher_config_view(config, model.teacher_lora_state_dict)
             # Use the student's layer_filter so coverage matches.
@@ -171,7 +223,7 @@ class ZImageLoRASetup(
             # Intentionally do NOT call hook_to_module(); the distillation context
             # manager toggles this per training step.
 
-        if config.distill_enabled:
+        if config.distill_phase_active():
             fake_config = _build_fake_config_view(config)
             model.transformer_fake_lora = LoRAModuleWrapper(
                 model.transformer, "transformer_fake", fake_config, config.layer_filter.split(",")
@@ -186,6 +238,64 @@ class ZImageLoRASetup(
 
         init_model_parameters(model, params, self.train_device)
 
+    def __setup_transfer_teacher(self, model: ZImageModel, config: TrainConfig):
+        """Build the in-memory teacher: Base's late tensors + the ORIGINAL
+        adapter's education, one tensor per late adapter-covered module. Built
+        in fp32 on CPU; cast/moved to each module's weight dtype/device in
+        setup_train_device so the per-step swap stays pointer-only."""
+        swap_modules = self._transfer_swap_modules(model, config)
+        if not swap_modules:
+            raise ValueError(
+                f"transfer_enabled but the adapter covers no modules at layers >= {config.transfer_late_start}"
+            )
+        for stem, module in swap_modules.items():
+            if not module.weight.dtype.is_floating_point:
+                raise ValueError(
+                    f"transfer mode does not support quantized late modules ({stem} is {module.weight.dtype})"
+                )
+        expected_shapes = {stem: module.weight.shape for stem, module in swap_modules.items()}
+        model.transfer_teacher_late_tensors = build_teacher_late_tensors(
+            config.transfer_base_model_name,
+            config.transfer_teacher_adapter_name,
+            config.transfer_late_start,
+            None,  # every late adapter-covered stem, not just the trainable families
+            expected_shapes=expected_shapes,
+        )
+
+        # Misconfiguration probe: if transfer_base_model_name points at the
+        # VARIANT, its late tensors equal the loaded model's bit-for-bit.
+        # (Comparing the RAW file tensor, not the education-baked teacher --
+        # the teacher always differs from the module weight for a real adapter.)
+        first_stem = next(iter(swap_modules))
+        raw_base = read_layer_weights_buffered(config.transfer_base_model_name, {first_stem})[first_stem]
+        module_weight = swap_modules[first_stem].weight.data.detach().cpu()
+        if raw_base.shape == module_weight.shape and torch.equal(raw_base.to(module_weight.dtype), module_weight):
+            print(
+                "WARN: the Base checkpoint's late tensors are identical to the loaded model's -- "
+                "transfer_base_model_name likely points at the variant instead of Base."
+            )
+
+    def __setup_redistill_teacher(self, model: ZImageModel, config: TrainConfig):
+        """Redistill Phase A teacher: the OLD distilled variant's RAW late
+        tensors -- no adapter education. Reuses the transfer_teacher_late_tensors
+        slot so device-follow and the per-step pointer swap work unchanged. No
+        base-points-at-variant probe here: the teacher tensors are SUPPOSED to
+        differ from the loaded Base model's."""
+        swap_modules = self._transfer_swap_modules(model, config)
+        if not swap_modules:
+            raise ValueError(
+                f"redistill_enabled but the adapter covers no modules at layers >= {config.transfer_late_start}"
+            )
+        for stem, module in swap_modules.items():
+            if not module.weight.dtype.is_floating_point:
+                raise ValueError(f"redistill does not support quantized late modules ({stem} is {module.weight.dtype})")
+        expected_shapes = {stem: module.weight.shape for stem, module in swap_modules.items()}
+        model.transfer_teacher_late_tensors = build_raw_late_tensors(
+            config.redistill_turbo_model_name,
+            set(swap_modules),
+            expected_shapes=expected_shapes,
+        )
+
     def setup_train_device(
         self,
         model: ZImageModel,
@@ -197,6 +307,19 @@ class ZImageLoRASetup(
         model.text_encoder_to(self.train_device if text_encoder_on_train_device else self.temp_device)
         model.vae_to(self.train_device if vae_on_train_device else self.temp_device)
         model.transformer_to(self.train_device)
+
+        if (config.transfer_enabled or config.redistill_enabled) and model.transfer_teacher_late_tensors is not None:
+            # Pre-cast/move once so the per-step teacher swap is a pure pointer
+            # swap. Idempotent: .to() no-ops when already matching. (The
+            # base-points-at-variant misconfiguration probe lives in
+            # __setup_transfer_teacher, where the RAW base tensors are at hand --
+            # the education-baked teacher always differs from the module weight
+            # for a real adapter, so comparing it here could never fire.)
+            swap_modules = self._transfer_swap_modules(model, config)
+            model.transfer_teacher_late_tensors = {
+                stem: tensor.to(device=swap_modules[stem].weight.device, dtype=swap_modules[stem].weight.dtype)
+                for stem, tensor in model.transfer_teacher_late_tensors.items()
+            }
 
         model.text_encoder.eval()
         model.vae.eval()

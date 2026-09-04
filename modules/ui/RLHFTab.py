@@ -13,6 +13,7 @@ from modules.util.dpo_curation_util import (
 )
 from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.ui import components
 from modules.util.ui.UIState import UIState
@@ -44,15 +45,43 @@ class RLHFTab:
         self.scroll_frame.grid_columnconfigure(3, weight=0)
         self.scroll_frame.grid_columnconfigure(4, weight=1)
 
-        training_type = "DPO (Existing Adapter)" if self.train_config.lora_model_name else "DPO (New Adapter)"
+        training_type = (
+            "DPO (Existing Adapter)"
+            if self.train_config.effective_dpo_ref_mode() == DPORefMode.EXISTING_ADAPTER
+            else "DPO (New Adapter)"
+        )
 
         mode_options = [
             ("DPO", RLHFMode.DPO),
+            ("SFT + DPO", RLHFMode.SFT_DPO),
         ]
         components.label(
-            self.scroll_frame, 0, 0, "RLHF Mode", tooltip="Preference training method. DPO is the current option."
+            self.scroll_frame,
+            0,
+            0,
+            "RLHF Mode",
+            tooltip="DPO: the chosen/rejected pairs drive the run; standard concepts become a weighted SFT anchor. "
+            "SFT + DPO: your standard concepts drive the run at full weight exactly like a normal finetune, and "
+            "a DPO pair is interleaved every N micro-batches as a weighted add-on. Set Repeats on the DPO concept "
+            "to control how much preference signal enters each epoch.",
         )
         components.options_kv(self.scroll_frame, 0, 1, mode_options, self.ui_state, "rlhf_mode")
+
+        ref_mode_options = [
+            ("New Adapter (base model)", DPORefMode.NEW_ADAPTER),
+            ("Existing Adapter (snapshot)", DPORefMode.EXISTING_ADAPTER),
+        ]
+        components.label(
+            self.scroll_frame,
+            0,
+            3,
+            "Reference",
+            tooltip="What DPO measures preferences against. New Adapter: the base model with the adapter switched "
+            "off. Existing Adapter: the adapter as it stands at the first DPO step, snapshotted once and saved "
+            "with backups - pick this when resuming a finetune from a backup so DPO refines the current weights "
+            "instead of the bare base. A loaded adapter file always acts as the reference.",
+        )
+        components.options_kv(self.scroll_frame, 0, 4, ref_mode_options, self.ui_state, "rlhf_dpo_ref_mode")
 
         components.label(
             self.scroll_frame,
@@ -197,6 +226,51 @@ class RLHFTab:
             "Useful to verify pairs are compared evenly across noise levels.",
         )
         components.switch(self.scroll_frame, 7, 4, self.ui_state, "rlhf_dpo_timestep_margin_logging")
+
+        components.label(
+            self.scroll_frame,
+            10,
+            0,
+            "DPO Add-on Weight",
+            tooltip="SFT + DPO mode only. Multiplier on the DPO loss when a pair is interleaved into the standard "
+            "run; the standard loss always stays at full weight. 1.0 adds the DPO term as-is.",
+        )
+        components.entry(self.scroll_frame, 10, 1, self.ui_state, "rlhf_dpo_addon_weight")
+
+        components.label(
+            self.scroll_frame,
+            10,
+            3,
+            "DPO Add-on Interval",
+            tooltip="SFT + DPO mode only. Interleave one DPO pair every N standard micro-batches. 0 = automatic: "
+            "derived each epoch from the dataset sizes (including the DPO concept's Repeats) so both finish an "
+            "epoch together.",
+        )
+        components.entry(self.scroll_frame, 10, 4, self.ui_state, "rlhf_dpo_addon_interval")
+
+        components.label(
+            self.scroll_frame,
+            11,
+            0,
+            "Rebase Reference on Start",
+            tooltip="Existing Adapter reference only. When resuming from a backup, discard the reference snapshot "
+            "saved with it and take a fresh one from the adapter as it stands at the first DPO step of this run. "
+            "Use this when the pairs have stopped contributing: once the policy has drifted far from the reference "
+            "the reward margins saturate and the DPO term goes flat; rebasing resets every margin to zero so the "
+            "same pairs bite again. Applies on every start while enabled - turn it off after the resume.",
+        )
+        components.switch(self.scroll_frame, 11, 1, self.ui_state, "rlhf_dpo_ref_rebase")
+
+        components.label(
+            self.scroll_frame,
+            11,
+            3,
+            "Rebase Reference Every",
+            tooltip="Existing Adapter reference only. Re-snapshot the reference from the current adapter every N "
+            "steps (global step, as shown in TensorBoard), right after an optimizer step. 0 = never. A resumed run "
+            "waits for the next multiple of N rather than rebasing immediately.",
+        )
+        components.entry(self.scroll_frame, 11, 4, self.ui_state, "rlhf_dpo_ref_rebase_interval")
 
         components.button(
             self.scroll_frame,

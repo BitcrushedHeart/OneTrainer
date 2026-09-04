@@ -2,6 +2,7 @@ import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin, text_encode_batch_size
+from modules.dataLoader.promptOnly.GenerateZeroLatent import GenerateZeroLatent
 from modules.model.BaseModel import BaseModel
 from modules.model.ZImageModel import PROMPT_MAX_LENGTH, ZImageModel, format_input
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
@@ -83,10 +84,24 @@ class ZImageBaseDataLoader(
             tokens_name="tokens", tokens_mask_name="tokens_mask", hidden_state_name="text_encoder_hidden_state"
         )
 
-        modules = [rescale_image, encode_image, image_sample]
+        if config.prompt_only_data:
+            # Distill-only data: the losses read just latent_image's
+            # shape/device/dtype, so a zeros tensor replaces the whole
+            # image-load + VAE-encode path and the VAE never loads.
+            generate_zero_latent = GenerateZeroLatent(
+                crop_resolution_in_name="crop_resolution",
+                latent_out_name="latent_image",
+                crop_offset_out_name="crop_offset",
+                channels=model.vae.config.latent_channels,
+                downscale_factor=8,
+                dtype=model.train_dtype.torch_dtype(),
+            )
+            modules = [generate_zero_latent]
+        else:
+            modules = [rescale_image, encode_image, image_sample]
 
-        if config.masked_training or config.model_type.has_mask_input():
-            modules.append(downscale_mask)
+            if config.masked_training or config.model_type.has_mask_input():
+                modules.append(downscale_mask)
 
         modules += [tokenize_prompt, encode_prompt]
 
@@ -212,6 +227,10 @@ class ZImageBaseDataLoader(
         # These modules don't really work, since they are inserted after a sorting operation that does not include this data
         # SaveImage(image_in_name='mask', original_path_in_name='image_path', path=debug_dir, in_range_min=0, in_range_max=1),
         # SaveImage(image_in_name='image', original_path_in_name='image_path', path=debug_dir, in_range_min=-1, in_range_max=1),
+
+        if config.prompt_only_data:
+            # Decoding a zero latent is pointless and would pull the VAE up.
+            return [decode_prompt, save_prompt]
 
         modules = [decode_image, save_image]
 

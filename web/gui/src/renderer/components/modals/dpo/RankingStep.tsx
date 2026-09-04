@@ -1,4 +1,4 @@
-import { Download, SkipForward, X } from "lucide-react";
+import { Download, SkipForward, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { API_BASE } from "@/api/request";
@@ -26,6 +26,7 @@ export function RankingStep({
   onSwap,
   onExport,
   onSkipGroup,
+  onDiscardGroup,
   onCancel,
   pairsDone,
 }: RankingStepProps) {
@@ -60,10 +61,10 @@ export function RankingStep({
     void onSwap(a, index);
   };
 
-  const handleExport = async () => {
+  const handleExport = async (discardRest = false) => {
     setExporting(true);
     try {
-      await onExport();
+      await onExport(discardRest);
     } finally {
       setExporting(false);
     }
@@ -96,6 +97,16 @@ export function RankingStep({
           <Button variant="ghost" size="sm" onClick={onSkipGroup} style={{ background: "#8B4513", color: "#fff" }}>
             <SkipForward className="w-4 h-4" />
             Skip Group
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDiscardGroup}
+            style={{ background: "#7f1d1d", color: "#fff" }}
+            title="Move every image in this group to a .discard subfolder so it never reappears (nothing exported)"
+          >
+            <Trash2 className="w-4 h-4" />
+            Discard Group
           </Button>
           <Button variant="ghost" size="sm" onClick={onCancel}>
             <X className="w-4 h-4" />
@@ -170,10 +181,23 @@ export function RankingStep({
           />
           <span className="tabular-nums">(max {maxPairs}; 0 skips the group)</span>
         </label>
-        <Button variant="primary" size="md" onClick={() => void handleExport()} disabled={exporting}>
-          <Download className="w-4 h-4" />
-          {exporting ? "Exporting…" : clampedPairs === 0 ? "Skip & Next Group" : `Export ${clampedPairs} Pairs`}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={() => void handleExport(true)}
+            disabled={exporting || clampedPairs === 0}
+            style={exporting || clampedPairs === 0 ? undefined : { background: "#7f1d1d", color: "#fff" }}
+            title="Export these pairs, then move the exported sources to .chosen/.rejected and every mid-ranked leftover to .discard so this group won't reappear"
+          >
+            <Trash2 className="w-4 h-4" />
+            {exporting ? "Exporting…" : "Export & Discard Rest"}
+          </Button>
+          <Button variant="primary" size="md" onClick={() => void handleExport()} disabled={exporting}>
+            <Download className="w-4 h-4" />
+            {exporting ? "Exporting…" : clampedPairs === 0 ? "Skip & Next Group" : `Export ${clampedPairs} Pairs`}
+          </Button>
+        </div>
       </div>
 
       {/* Preview overlay */}

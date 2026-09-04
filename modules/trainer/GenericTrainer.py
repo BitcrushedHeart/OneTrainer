@@ -25,6 +25,13 @@ from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dataset_fingerprint import compute_concept_fingerprint
+from modules.util.dpo_addon_util import (
+    CyclingBatchSource,
+    accumulate_dpo_metrics,
+    derive_dpo_addon_interval,
+    dpo_ref_rebase_due,
+    is_dpo_addon_step,
+)
 from modules.util.dpo_beta_controller import DPOBetaController
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
@@ -38,6 +45,7 @@ from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
+from modules.util.transfer_util import TransferStopCriterion
 
 from mgds.pipelineModules.SmartDiskCache import CachingStoppedException
 
@@ -79,6 +87,22 @@ class GenericTrainer(BaseTrainer):
         if distill_error is not None:
             raise RuntimeError(distill_error)
 
+        transfer_error = self.config.validate_transfer_startup()
+        if transfer_error is not None:
+            raise RuntimeError(transfer_error)
+
+        redistill_error = self.config.validate_redistill_startup()
+        if redistill_error is not None:
+            raise RuntimeError(redistill_error)
+
+        prompt_only_error = self.config.validate_prompt_only_startup()
+        if prompt_only_error is not None:
+            raise RuntimeError(prompt_only_error)
+
+        rlhf_error = self.config.validate_rlhf_startup()
+        if rlhf_error is not None:
+            raise RuntimeError(rlhf_error)
+
         if multi.is_master():
             # TB writer creation is deferred to start() so a backup's tensorboard_subdir
             # can be reused and logging continues in the same TB run on resume.
@@ -102,6 +126,33 @@ class GenericTrainer(BaseTrainer):
         self._loop_accumulated_loss_tensor: torch.Tensor | None = None
         self._loop_accumulated_dpo_metrics: dict | None = None
         self._loop_scaler = None
+
+        # Defaults for state start() re-initializes; __advance_redistill_phase
+        # must be safe to reach even if start() was bypassed (tests).
+        self._transfer_best_backup_path: str | None = None
+        self._transfer_val_failures = 0
+
+        # Redistill phase state: Phase A (transfer toward the old variant's
+        # late tensors) until the step budget or convergence, then Phase B
+        # (DMD2 distill). The marker json makes the boundary resume-proof.
+        self._redistill_phase_b = False
+        self._redistill_resume_start_step: int | None = None
+        self._redistill_phase_marker_path = os.path.join(self.config.workspace_dir, "backup", "redistill-phase.json")
+        if self.config.redistill_enabled:
+            if self.config.continue_last_backup and os.path.isfile(self._redistill_phase_marker_path):
+                try:
+                    with open(self._redistill_phase_marker_path) as marker_file:
+                        marker = json.load(marker_file)
+                    self._redistill_resume_start_step = int(marker["phase_b_start_step"])
+                    print(f"Resuming redistill in Phase B (started at step {self._redistill_resume_start_step}).")
+                except Exception:
+                    traceback.print_exc()
+                    print("Could not read the redistill phase marker; Phase A state will be re-derived.")
+            elif not self.config.continue_last_backup and os.path.isfile(self._redistill_phase_marker_path):
+                try:
+                    os.remove(self._redistill_phase_marker_path)
+                except OSError:
+                    traceback.print_exc()
 
     def start(self):
         # torch._dynamo.config overrides are thread-local. The web backend constructs the
@@ -179,13 +230,37 @@ class GenericTrainer(BaseTrainer):
             raise NotImplementedError("RLHF DPO is currently implemented for adapter training in the LoRA tab only.")
 
         # Resuming a DPO run: restore the frozen reference saved with the backup so
-        # it is not re-captured from the already-trained adapter weights.
+        # it is not re-captured from the already-trained adapter weights - unless
+        # the user asked for a rebase, in which case the stale reference is left
+        # behind and the adapter as it stands at the first DPO step becomes the
+        # new anchor (the same lazy capture a fresh run does).
         if self.config.rlhf_enabled and last_backup_path:
-            self.model_setup.load_dpo_reference(last_backup_path, self.model)
+            if self.config.rlhf_dpo_ref_rebase:
+                print(
+                    "DPO reference rebase: ignoring the reference saved with the backup; "
+                    "the adapter as it stands at the first DPO step becomes the new reference."
+                )
+            else:
+                self.model_setup.load_dpo_reference(last_backup_path, self.model, self.config)
+        self._dpo_ref_rebase_bucket = 0
+
+        if self.config.rlhf_sft_primary() and self.__count_sft_anchor_concepts() == 0:
+            raise RuntimeError(
+                "SFT + DPO mode needs at least one enabled STANDARD/PRIOR_PREDICTION concept without DPO "
+                "patterns to drive the main loader; use RLHF mode DPO for a pairs-only run."
+            )
 
         self.callbacks.on_update_status("creating the data loader/caching")
 
-        self.data_loader = self.create_data_loader(self.model, self.model_setup, self.model.train_progress)
+        # In SFT + DPO mode the main loader is the plain standard pipeline with
+        # the DPO pattern concepts excluded (the same construction as the
+        # SFT-anchor loader); the pairs come from a secondary loader below.
+        self.data_loader = self.create_data_loader(
+            self.model,
+            self.model_setup,
+            self.model.train_progress,
+            is_sft_anchor=self.config.rlhf_sft_primary(),
+        )
         self.data_loader.stop_check_fun = self.commands.get_stop_command
         self.model_saver = self.create_model_saver()
 
@@ -195,13 +270,16 @@ class GenericTrainer(BaseTrainer):
 
         self.parameters = self.model.parameters.parameters()
 
-        # SFT-anchored DPO: when a DPO run also contains STANDARD/PRIOR_PREDICTION
-        # concepts (without DPO patterns), run those samples through a parallel
-        # non-DPO loader and add a weighted supervised term to the DPO loss.
-        # Without this, the DPO pipeline drops non-pattern concepts.
-        self.sft_anchor_data_loader = None
-        self.sft_anchor_iter = None
-        if self.config.rlhf_enabled and self.config.rlhf_sft_anchor_weight > 0:
+        # One-shot guard for the mid-step re-cache warning (see __restore_train_device).
+        self.__warned_midstep_recache = False
+
+        # SFT-anchored DPO (RLHF mode DPO): when a DPO run also contains
+        # STANDARD/PRIOR_PREDICTION concepts (without DPO patterns), run those
+        # samples through a parallel non-DPO loader and add a weighted
+        # supervised term to the DPO loss. Without this, the DPO pipeline drops
+        # non-pattern concepts.
+        self.sft_anchor_source = None
+        if self.config.rlhf_dpo_primary() and self.config.rlhf_sft_anchor_weight > 0:
             sft_anchor_count = self.__count_sft_anchor_concepts()
             if sft_anchor_count > 0:
                 print(
@@ -210,13 +288,35 @@ class GenericTrainer(BaseTrainer):
                     f"{self.config.rlhf_sft_anchor_weight} * sft_loss."
                 )
                 self.callbacks.on_update_status("creating the SFT-anchor data loader/caching")
-                self.sft_anchor_data_loader = self.create_data_loader(
+                sft_anchor_data_loader = self.create_data_loader(
                     self.model,
                     self.model_setup,
                     self.model.train_progress,
                     is_sft_anchor=True,
                 )
-                self.sft_anchor_data_loader.stop_check_fun = self.commands.get_stop_command
+                sft_anchor_data_loader.stop_check_fun = self.commands.get_stop_command
+                self.sft_anchor_source = CyclingBatchSource(
+                    sft_anchor_data_loader, "SFT-anchor", on_epoch_restart=self.__restore_train_device
+                )
+
+        # SFT + DPO (RLHF mode SFT_DPO): the standard loss stays at full weight
+        # and a DPO pair from this secondary loader is interleaved every
+        # N standard micro-batches; loss = sft_loss + weight * dpo_loss on
+        # those micro-batches. N is derived per epoch from the loader lengths
+        # unless rlhf_dpo_addon_interval overrides it.
+        self.dpo_addon_source = None
+        self._dpo_addon_interval = 1
+        if self.config.rlhf_sft_primary():
+            print(
+                f"SFT + DPO: loss = sft_loss + {self.config.rlhf_dpo_addon_weight} * dpo_loss "
+                "on interleaved DPO micro-batches."
+            )
+            self.callbacks.on_update_status("creating the DPO add-on data loader/caching")
+            dpo_addon_data_loader = self.create_data_loader(self.model, self.model_setup, self.model.train_progress)
+            dpo_addon_data_loader.stop_check_fun = self.commands.get_stop_command
+            self.dpo_addon_source = CyclingBatchSource(
+                dpo_addon_data_loader, "DPO add-on", on_epoch_restart=self.__restore_train_device
+            )
 
         if self.config.validation or self.config.dpo_validation_active():
             self.validation_data_loader = self.create_data_loader(
@@ -240,6 +340,44 @@ class GenericTrainer(BaseTrainer):
         self._dpo_best_margin = float("-inf")
         self._dpo_best_backup_path: str | None = None
         self._dpo_beta_controller: DPOBetaController | None = None
+
+        self._transfer_stop = TransferStopCriterion(
+            patience=self.config.transfer_patience_checks if self.config.transfer_patience_enabled else 0,
+            min_relative_improvement=self.config.transfer_min_relative_improvement,
+            target_residual=self.config.transfer_target_residual,
+        )
+        self._transfer_best_backup_path: str | None = None
+        self._transfer_val_failures = 0
+
+        if self.config.transfer_enabled or self.config.redistill_enabled:
+            # The criterion state must survive resume, or the first post-resume
+            # validation "improves" on inf and clobbers a genuinely better
+            # pre-resume snapshot. A sidecar json carries the best residual.
+            best_path = os.path.join(self.config.workspace_dir, "backup", "transfer-best.pt")
+            meta_path = best_path + ".json"
+            if self.config.continue_last_backup and os.path.isfile(best_path) and os.path.isfile(meta_path):
+                try:
+                    with open(meta_path) as meta_file:
+                        best_meta = json.load(meta_file)
+                    self._transfer_stop.best_residual = float(best_meta["residual"])
+                    self._transfer_stop.best_tag = best_meta.get("step")
+                    self._transfer_best_backup_path = best_path
+                    print(
+                        f"Resuming transfer best state: residual {self._transfer_stop.best_residual:.6f} "
+                        f"from step {self._transfer_stop.best_tag}"
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    print("Could not read transfer best sidecar; starting the criterion fresh.")
+            else:
+                # Fresh run: stale best files from a previous run in this
+                # workspace must not leak into end()'s restore.
+                for stale in (best_path, meta_path, best_path + ".tmp"):
+                    if os.path.isfile(stale):
+                        try:
+                            os.remove(stale)
+                        except OSError:
+                            traceback.print_exc()
 
         if multi.is_master():
             self._init_tensorboard_writer()
@@ -274,27 +412,59 @@ class GenericTrainer(BaseTrainer):
             self.model.tensorboard_subdir = subdir
             self.tensorboard = SummaryWriter(os.path.join(tensorboard_log_dir, subdir))
 
-    def __next_sft_anchor_batch(self):
-        """Pull the next SFT-anchor batch, cycling the loader if exhausted.
+    def __restore_train_device(self):
+        """Put the model back on the train device after a secondary loader
+        restarted its epoch mid-step.
 
-        The SFT and DPO loaders generally have different lengths. When the
-        SFT-anchor iterator runs out mid-DPO-epoch, advance its dataset to the
-        next epoch and restart. A safety counter prevents an infinite loop if
-        the dataset is empty (which shouldn't happen — we gate on a non-zero
-        concept count at startup — but keeps the failure mode loud).
+        A mid-epoch restart of the SFT-anchor / DPO add-on loader re-runs that
+        loader's caching pass. If the pass actually has to encode anything, it
+        moves the whole model to the temp device and pulls the VAE (latents) or
+        the text encoder (prompts) up onto the train device instead; nothing
+        put the model back, so the next forward ran against a CPU-resident
+        transformer and died with "Expected all tensors to be on the same
+        device".
+
+        The device check makes this a strict no-op for the common case: a
+        restart served entirely from an already-complete cache never moves
+        anything, so this must not touch the model, print, or churn memory.
+        When it does fire, the run has just paid for a mid-training encode
+        pass -- worth saying out loud once, because the usual cause is a
+        secondary concept whose variations exceed what was cached up front.
         """
-        for _ in range(2):
-            if self.sft_anchor_iter is None:
-                self.sft_anchor_iter = iter(self.sft_anchor_data_loader.get_data_loader())
-            try:
-                return next(self.sft_anchor_iter)
-            except StopIteration:
-                self.sft_anchor_data_loader.get_data_set().start_next_epoch()
-                self.sft_anchor_iter = None
-        raise RuntimeError(
-            "SFT-anchor data loader produced no batches after a full epoch restart. "
-            "Check that STANDARD/PRIOR_PREDICTION concepts contain readable images."
-        )
+        # The trained parameters follow the transformer (transformer_to moves
+        # the adapters with it), so they report where the model actually is.
+        # Compare device TYPE only: config's train device may be an indexless
+        # "cuda" while a parameter reports "cuda:0".
+        if not self.parameters or self.parameters[0].device.type == self.train_device.type:
+            return
+
+        if not self.__warned_midstep_recache:
+            self.__warned_midstep_recache = True
+            print(
+                "Warning: a secondary (SFT-anchor / DPO add-on) loader re-cached mid-epoch, which moved the "
+                "model off the train device. Restoring it. This costs a full model round-trip per restart -- "
+                "cache that concept's variations up front to avoid it."
+            )
+
+        self.model_setup.setup_train_device(self.model, self.config)
+
+    def __start_secondary_epochs(self):
+        """Advance the SFT-anchor / DPO add-on loader epochs in lockstep with
+        the main loader and re-derive the add-on interval from the new lengths."""
+        if self.sft_anchor_source is not None:
+            self.sft_anchor_source.start_next_epoch()
+        if self.dpo_addon_source is not None:
+            self.dpo_addon_source.start_next_epoch()
+            sft_batches = self.data_loader.get_data_set().approximate_length()
+            dpo_batches = self.dpo_addon_source.approximate_length()
+            self._dpo_addon_interval = derive_dpo_addon_interval(
+                sft_batches, dpo_batches, self.config.rlhf_dpo_addon_interval
+            )
+            if multi.is_master():
+                print(
+                    f"SFT + DPO: one DPO pair every {self._dpo_addon_interval} standard micro-batch(es) "
+                    f"({dpo_batches} pair batches vs {sft_batches} standard batches per epoch)."
+                )
 
     def __count_sft_anchor_concepts(self) -> int:
         """Return the number of enabled STANDARD/PRIOR_PREDICTION concepts.
@@ -533,7 +703,145 @@ class GenericTrainer(BaseTrainer):
             if vae_restore_device is not None:
                 self.model.vae_to(vae_restore_device)
 
+    def __validate_transfer(self, train_progress: TrainProgress):
+        # Teacher-match residual on cached batches; must never crash a run.
+        if not multi.is_master():
+            return
+        try:
+            self.callbacks.on_update_status("Transfer validation")
+            self.model_setup.setup_train_device(self.model, self.config)
+            torch_gc()
+            metrics = self.model_setup.run_transfer_validation(self.model, self.config, train_progress)
+            if not metrics:
+                return
+            self._transfer_val_failures = 0
+            for key, value in metrics.items():
+                self.tensorboard.add_scalar(f"transfer_val/{key}", value, train_progress.global_step)
+            self.__check_transfer_convergence(metrics.get("residual"), train_progress)
+        except Exception as exception:  # noqa: BLE001 - validation must not abort training
+            self._transfer_val_failures += 1
+            print(f"Transfer validation skipped after error: {exception}")
+            if self._transfer_val_failures >= 3:
+                print(
+                    f"WARNING: transfer validation has failed {self._transfer_val_failures} times in a row -- "
+                    "auto-stop and best-checkpoint tracking are NOT operating; the run will only end at the "
+                    "epochs cap and the final save will use last-step parameters."
+                )
+
+    def __check_transfer_convergence(self, residual: float | None, train_progress: TrainProgress):
+        if residual is None:
+            return
+        # Snapshot on every numeric improvement, BEFORE the criterion folds the
+        # value into its best: the final save always uses the best-seen adapter.
+        if residual < self._transfer_stop.best_residual:
+            self._transfer_best_backup_path = self.__save_transfer_best(residual, train_progress)
+        should_stop = self._transfer_stop.update(residual, tag=train_progress.global_step)
+        self.tensorboard.add_scalar(
+            "transfer/patience_counter", self._transfer_stop.counter, train_progress.global_step
+        )
+        self.tensorboard.add_scalar(
+            "transfer/best_residual", self._transfer_stop.best_residual, train_progress.global_step
+        )
+        if should_stop:
+            print(
+                f"Transfer convergence reached at step {train_progress.global_step}. "
+                f"Best residual {self._transfer_stop.best_residual:.6f} at step {self._transfer_stop.best_tag}."
+            )
+            if self.config.redistill_enabled:
+                # Phase A converged early: advance to Phase B instead of stopping.
+                self.__advance_redistill_phase(train_progress, restore_best=True)
+            else:
+                self.commands.stop()
+
+    def __maybe_advance_redistill_phase(self, train_progress: TrainProgress):
+        if not self.config.redistill_enabled or self._redistill_phase_b:
+            return
+        if self._redistill_resume_start_step is not None:
+            # Resumed past the boundary: enter Phase B without a best-restore
+            # (the resumed backup already carries the post-boundary weights).
+            self.__advance_redistill_phase(
+                train_progress, restore_best=False, start_step=self._redistill_resume_start_step
+            )
+        elif train_progress.global_step >= self.config.redistill_transfer_steps:
+            self.__advance_redistill_phase(train_progress, restore_best=True)
+
+    def __advance_redistill_phase(
+        self, train_progress: TrainProgress, *, restore_best: bool, start_step: int | None = None
+    ):
+        if self._redistill_phase_b:
+            return
+        self._redistill_phase_b = True
+        start_step = train_progress.global_step if start_step is None else start_step
+
+        if restore_best and self._transfer_best_backup_path and os.path.isfile(self._transfer_best_backup_path):
+            try:
+                stop = getattr(self, "_transfer_stop", None)
+                detail = (
+                    f" (residual {stop.best_residual:.6f} at step {stop.best_tag})"
+                    if stop is not None and stop.best_tag is not None
+                    else ""
+                )
+                print(f"Redistill Phase A -> B at step {train_progress.global_step}: restoring transfer best{detail}.")
+                best_state = torch.load(self._transfer_best_backup_path, map_location=self.temp_device)
+                for param, saved in zip(self.parameters, best_state, strict=True):
+                    param.data.copy_(saved)
+                del best_state
+            except Exception:  # noqa: BLE001 - a corrupt snapshot must not abort the run
+                traceback.print_exc()
+                print("Could not restore the Phase A best snapshot; continuing with last-step parameters.")
+        else:
+            print(f"Redistill Phase A -> B at step {train_progress.global_step}.")
+
+        # The Phase A teacher (~2-3 GB of late tensors) is dead weight in Phase B.
+        if self.model is not None and getattr(self.model, "transfer_teacher_late_tensors", None) is not None:
+            self.model.transfer_teacher_late_tensors = None
+            torch_gc()
+
+        # Phase B's fake-critic warmup and TTUR schedule count from the boundary.
+        self.model_setup.set_redistill_phase_b_start(start_step)
+
+        if self._redistill_resume_start_step is None:
+            try:
+                os.makedirs(os.path.dirname(self._redistill_phase_marker_path), exist_ok=True)
+                with open(self._redistill_phase_marker_path, "w") as marker_file:
+                    json.dump({"phase_b_start_step": start_step}, marker_file)
+            except OSError:
+                traceback.print_exc()
+                print("Could not write the redistill phase marker; a resume would repeat Phase A.")
+
+    def __save_transfer_best(self, residual: float, train_progress: TrainProgress) -> str:
+        best_path = os.path.join(self.config.workspace_dir, "backup", "transfer-best.pt")
+        os.makedirs(os.path.dirname(best_path), exist_ok=True)
+        try:
+            # Atomic: a crash mid-save must not leave a corrupt file that makes
+            # end()'s restore fail after a whole night of training.
+            state = [p.data.clone().cpu() for p in self.parameters]
+            tmp_path = best_path + ".tmp"
+            torch.save(state, tmp_path)
+            os.replace(tmp_path, best_path)
+            with open(best_path + ".json", "w") as meta_file:
+                json.dump({"residual": residual, "step": train_progress.global_step}, meta_file)
+            print(f"Saved transfer best checkpoint (residual improved) at step {train_progress.global_step}")
+        except Exception:
+            traceback.print_exc()
+            print("Could not save transfer best checkpoint.")
+            return self._transfer_best_backup_path or ""
+        return best_path
+
     def __validate(self, train_progress: TrainProgress):
+        if self.config.redistill_enabled:
+            if not self.__needs_validate(train_progress):
+                return
+            if not self._redistill_phase_b:
+                if self.config.transfer_validation:
+                    self.__validate_transfer(train_progress)
+            elif self.config.distill_validation:
+                self.__validate_distill(train_progress)
+            return
+        if self.config.transfer_enabled:
+            if self.config.transfer_validation and self.__needs_validate(train_progress):
+                self.__validate_transfer(train_progress)
+            return
         if self.config.distill_enabled and self.config.distill_validation:
             if self.__needs_validate(train_progress):
                 self.__validate_distill(train_progress)
@@ -1160,7 +1468,12 @@ class GenericTrainer(BaseTrainer):
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
         accumulated_dpo_metrics: dict[str, float] | None = None
+        # Periodic reference rebase counts from the resume step, so a resumed
+        # run waits for the next interval boundary rather than rebasing at once.
+        if self.config.rlhf_enabled and self.config.rlhf_dpo_ref_rebase_interval > 0:
+            self._dpo_ref_rebase_bucket = train_progress.global_step // self.config.rlhf_dpo_ref_rebase_interval
         accumulated_distill_metrics: dict[str, float | str] | None = None
+        accumulated_transfer_metrics: dict[str, float] | None = None
         ema_loss = None
         ema_loss_steps = 0
         ema_reward_margin = None
@@ -1194,19 +1507,21 @@ class GenericTrainer(BaseTrainer):
 
             try:
                 for _ in multi.master_first():
+                    # The secondary loaders (SFT-anchor / DPO add-on) cache
+                    # too, and caching moves the model off the train device,
+                    # so they must advance BEFORE setup_train_device() puts it
+                    # back. Mid-epoch exhaustion (when the two sets differ in
+                    # length) is handled by CyclingBatchSource restarting it.
                     if self.config.latent_caching:
                         self.data_loader.get_data_set().start_next_epoch()
+                        self.__start_secondary_epochs()
                         self.model_setup.setup_train_device(self.model, self.config)
                     else:
                         self.model_setup.setup_train_device(self.model, self.config)
                         self.data_loader.get_data_set().start_next_epoch()
-                # Advance the SFT-anchor loader's epoch in lockstep with the
-                # main DPO loader. Mid-epoch exhaustion (when the standard set
-                # is shorter than the DPO pair set) is handled by restarting
-                # the iterator inside __train_step.
-                if self.sft_anchor_data_loader is not None:
-                    self.sft_anchor_data_loader.get_data_set().start_next_epoch()
-                    self.sft_anchor_iter = None
+                        if self.sft_anchor_source is not None or self.dpo_addon_source is not None:
+                            self.__start_secondary_epochs()
+                            self.model_setup.setup_train_device(self.model, self.config)
             except CachingStoppedException:
                 return
 
@@ -1302,23 +1617,26 @@ class GenericTrainer(BaseTrainer):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
-                    if self.config.rlhf_enabled:
+                    self.__maybe_advance_redistill_phase(train_progress)
+
+                    # Set on SFT + DPO add-on micro-steps: the standard loss is
+                    # backwarded early (see below) and its detached value is
+                    # folded into accumulated_loss alongside the DPO term.
+                    addon_sft_loss = None
+                    addon_dpo_loss = None
+                    if self.config.rlhf_dpo_primary():
                         loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
                         # Accumulate per-micro-batch DPO metrics across the grad-accum window.
                         # Without this, only the final micro-batch's metric reaches TensorBoard —
                         # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
-                        micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
-                        if accumulated_dpo_metrics is None:
-                            accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
-                            accumulated_dpo_metrics["_count"] = 0
-                            if self.sft_anchor_data_loader is not None:
-                                accumulated_dpo_metrics.setdefault("sft_anchor_loss", 0.0)
-                        for _k, _v in micro_dpo_metrics.items():
-                            accumulated_dpo_metrics[_k] += _v
-                        accumulated_dpo_metrics["_count"] += 1
+                        accumulated_dpo_metrics = accumulate_dpo_metrics(
+                            accumulated_dpo_metrics,
+                            self.model_setup.get_last_dpo_metrics(),
+                            extra_keys=("sft_anchor_loss",) if self.sft_anchor_source is not None else (),
+                        )
 
-                        if self.sft_anchor_data_loader is not None:
-                            sft_batch = self.__next_sft_anchor_batch()
+                        if self.sft_anchor_source is not None:
+                            sft_batch = self.sft_anchor_source.next()
                             sft_output = self.model_setup.predict(self.model, sft_batch, self.config, train_progress)
                             sft_loss = self.model_setup.calculate_loss(self.model, sft_batch, sft_output, self.config)
                             loss = loss + self.config.rlhf_sft_anchor_weight * sft_loss
@@ -1326,7 +1644,7 @@ class GenericTrainer(BaseTrainer):
                         # Mirror for Fix B save-side staging (after the SFT-anchor
                         # block so the mirror reflects the final dpo metrics dict).
                         self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
-                    elif self.config.distill_enabled:
+                    elif self.config.distill_enabled or (self.config.redistill_enabled and self._redistill_phase_b):
                         loss = self.model_setup.calculate_distill_loss(self.model, batch, self.config, train_progress)
                         self.model_setup.capture_distill_val_batch(batch, self.config)
                         micro_distill_metrics = self.model_setup.get_last_distill_metrics()
@@ -1343,6 +1661,26 @@ class GenericTrainer(BaseTrainer):
                             if isinstance(value, int | float):
                                 accumulated_distill_metrics[key] += value
                         accumulated_distill_metrics["_count"] += 1
+                    elif self.config.transfer_enabled or self.config.redistill_enabled:
+                        if self.config.redistill_enabled:
+                            loss = self.model_setup.calculate_redistill_transfer_loss(
+                                self.model, batch, self.config, train_progress
+                            )
+                        else:
+                            loss = self.model_setup.calculate_transfer_loss(
+                                self.model, batch, self.config, train_progress
+                            )
+                        self.model_setup.capture_transfer_val_batch(batch, self.config)
+                        micro_transfer_metrics = self.model_setup.get_last_transfer_metrics()
+                        if accumulated_transfer_metrics is None:
+                            accumulated_transfer_metrics = {"_count": 0}
+                            for key, value in micro_transfer_metrics.items():
+                                if isinstance(value, int | float):
+                                    accumulated_transfer_metrics[key] = 0.0
+                        for key, value in micro_transfer_metrics.items():
+                            if isinstance(value, int | float):
+                                accumulated_transfer_metrics[key] += value
+                        accumulated_transfer_metrics["_count"] += 1
                     else:
                         # Standard training path
                         prior_pred_indices = [
@@ -1405,14 +1743,62 @@ class GenericTrainer(BaseTrainer):
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
                             loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
-                    loss = loss / self.config.gradient_accumulation_steps
-                    if scaler:
-                        scaler.scale(loss).backward()
+                        if self.dpo_addon_source is not None and is_dpo_addon_step(
+                            train_progress.epoch_step, self._dpo_addon_interval
+                        ):
+                            # SFT + DPO: the standard loss above stays at full
+                            # weight; a DPO pair rides along on this micro-batch.
+                            # Backward the standard loss FIRST so its graph is
+                            # freed before the pair's fused policy + reference
+                            # forwards: holding both graphs for one combined
+                            # backward OOMs a 24 GB card. Gradients accumulate
+                            # identically (d(a+b) = da + db), and fused_back_pass
+                            # is not supported in this mode (two backwards per
+                            # micro-step).
+                            addon_sft_loss = loss / self.config.gradient_accumulation_steps
+                            if scaler:
+                                scaler.scale(addon_sft_loss).backward()
+                            else:
+                                addon_sft_loss.backward()
+                            addon_sft_loss = addon_sft_loss.detach()
+                            del loss, model_output_data
+
+                            # The pair itself is evaluated half by half with one
+                            # graph alive at a time (calculate_dpo_loss_light);
+                            # its gradients land through _addon_backward, so the
+                            # common backward below is skipped on this step.
+                            dpo_batch = self.dpo_addon_source.next()
+                            dpo_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
+
+                            def _addon_backward(term, _scale=dpo_scale, _scaler=scaler):
+                                term = term * _scale
+                                if _scaler:
+                                    _scaler.scale(term).backward()
+                                else:
+                                    term.backward()
+
+                            dpo_value = self.model_setup.calculate_dpo_loss_light(
+                                self.model, dpo_batch, self.config, train_progress, _addon_backward
+                            )
+                            addon_dpo_loss = dpo_value.detach() * dpo_scale
+                            accumulated_dpo_metrics = accumulate_dpo_metrics(
+                                accumulated_dpo_metrics, self.model_setup.get_last_dpo_metrics()
+                            )
+                            self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
+
+                    if addon_dpo_loss is None:
+                        loss = loss / self.config.gradient_accumulation_steps
+                        if scaler:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                        detached_loss = loss.detach()
                     else:
-                        loss.backward()
+                        # SFT + DPO add-on micro-step: both terms were already
+                        # backwarded (standard first, then the pair half by half).
+                        detached_loss = addon_sft_loss + addon_dpo_loss
 
                     has_gradient = True
-                    detached_loss = loss.detach()
                     multi.reduce_tensor_mean(detached_loss)
                     accumulated_loss += detached_loss
                     # Mirror the live accumulator tensor reference for the
@@ -1447,6 +1833,21 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
+
+                        # Periodic DPO reference rebase, applied right after the
+                        # optimizer step so the reference never changes inside a
+                        # gradient-accumulation window.
+                        if self.config.rlhf_enabled and self.config.rlhf_dpo_ref_rebase_interval > 0:
+                            rebase_due, self._dpo_ref_rebase_bucket = dpo_ref_rebase_due(
+                                train_progress.global_step,
+                                self.config.rlhf_dpo_ref_rebase_interval,
+                                self._dpo_ref_rebase_bucket,
+                            )
+                            if rebase_due:
+                                self.model_setup.rebase_dpo_reference(self.model, self.config)
+                                print(
+                                    f"DPO reference rebased to the current adapter at step {train_progress.global_step}."
+                                )
 
                         # Adaptive beta must be applied on EVERY rank and driven by
                         # the global margin: otherwise non-master ranks keep the
@@ -1554,6 +1955,14 @@ class GenericTrainer(BaseTrainer):
                                         self._dpo_beta_controller.margin_ema,
                                         train_progress.global_step,
                                     )
+                                if "beta_mean" in dpo_metrics:
+                                    # Present only when concepts set per-concept beta
+                                    # overrides. dpo/beta above tracks the global scalar;
+                                    # this is the batch-mean beta actually applied, after
+                                    # the adaptive controller's ratio.
+                                    self.tensorboard.add_scalar(
+                                        "dpo/beta_mean", dpo_metrics["beta_mean"], train_progress.global_step
+                                    )
 
                                 if self.config.rlhf_dpo_timestep_margin_logging:
                                     for quartile in range(4):
@@ -1564,7 +1973,13 @@ class GenericTrainer(BaseTrainer):
                                                 dpo_metrics[f"margin_t_q{quartile + 1}_sum"] / quartile_count,
                                                 train_progress.global_step,
                                             )
-                            if self.config.distill_enabled and accumulated_distill_metrics is not None:
+                            if self.config.redistill_enabled:
+                                self.tensorboard.add_scalar(
+                                    "redistill/phase",
+                                    1.0 if self._redistill_phase_b else 0.0,
+                                    train_progress.global_step,
+                                )
+                            if accumulated_distill_metrics is not None:
                                 count = accumulated_distill_metrics.pop("_count")
                                 mode = accumulated_distill_metrics.pop("mode", "")
                                 distill_metrics = {
@@ -1591,6 +2006,11 @@ class GenericTrainer(BaseTrainer):
                                     1.0 if mode == "student" else 0.0,
                                     train_progress.global_step,
                                 )
+                            if accumulated_transfer_metrics is not None:
+                                count = accumulated_transfer_metrics.pop("_count")
+                                for key, value in accumulated_transfer_metrics.items():
+                                    tag = "loss/transfer" if key == "loss" else f"transfer/{key}"
+                                    self.tensorboard.add_scalar(tag, value / count, train_progress.global_step)
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
@@ -1606,6 +2026,7 @@ class GenericTrainer(BaseTrainer):
                         accumulated_loss = 0.0
                         accumulated_dpo_metrics = None
                         accumulated_distill_metrics = None
+                        accumulated_transfer_metrics = None
                         # Reset Fix B mirrors at the accumulator boundary so a
                         # backup taken immediately after this point captures a
                         # clean zero state.
@@ -1628,6 +2049,7 @@ class GenericTrainer(BaseTrainer):
                     self.config.validation
                     or self.config.dpo_validation_active()
                     or (self.config.distill_enabled and self.config.distill_validation)
+                    or (self.config.transfer_enabled and self.config.transfer_validation)
                 ) and multi.is_master():
                     self.__validate(train_progress)
 
@@ -1689,6 +2111,26 @@ class GenericTrainer(BaseTrainer):
                     for param, saved in zip(self.parameters, best_state, strict=True):
                         param.data.copy_(saved)
                     del best_state
+
+                # Transfer best AFTER the EMA copy so the best-seen adapter wins.
+                if (
+                    self.config.transfer_enabled
+                    and self._transfer_best_backup_path
+                    and os.path.isfile(self._transfer_best_backup_path)
+                ):
+                    try:
+                        print(
+                            f"Restoring transfer best checkpoint from step {self._transfer_stop.best_tag} "
+                            f"(residual: {self._transfer_stop.best_residual:.6f})"
+                        )
+                        self.callbacks.on_update_status("Restoring best transfer checkpoint")
+                        best_state = torch.load(self._transfer_best_backup_path, map_location=self.temp_device)
+                        for param, saved in zip(self.parameters, best_state, strict=True):
+                            param.data.copy_(saved)
+                        del best_state
+                    except Exception:  # noqa: BLE001 - a corrupt snapshot must not lose the final save
+                        traceback.print_exc()
+                        print("Could not restore transfer best checkpoint; saving last-step parameters instead.")
                 if (
                     os.path.isdir(self.config.output_model_destination)
                     and self.config.output_model_format.is_single_file()
@@ -1734,8 +2176,8 @@ class GenericTrainer(BaseTrainer):
         self.model_sampler = None
         self.data_loader = None
         self.validation_data_loader = None
-        self.sft_anchor_data_loader = None
-        self.sft_anchor_iter = None
+        self.sft_anchor_source = None
+        self.dpo_addon_source = None
         self.parameters = None
         self.tensorboard = None
         self.sample_queue = []

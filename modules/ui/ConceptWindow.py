@@ -258,6 +258,20 @@ class ConceptWindow(ctk.CTkToplevel):
         )
         components.entry(frame, 11, 1, self.ui_state, "dpo_rejected_pattern")
 
+        components.label(
+            frame,
+            12,
+            0,
+            "DPO Beta Override",
+            tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. Use it when "
+            "one dataset needs a looser or tighter KL leash than the rest - a lower beta allows "
+            "larger moves away from the reference, a higher beta keeps the model closer to it. "
+            "0 inherits the global beta. Adaptive beta still applies: it scales every concept by "
+            "the same factor, so the overrides keep their relative proportions. Ignored by the "
+            "IPO objective, which uses tau instead of beta.",
+        )
+        components.entry(frame, 12, 1, self.ui_state, "dpo_beta_override")
+
         frame.pack(fill="both", expand=1)
         return frame
 

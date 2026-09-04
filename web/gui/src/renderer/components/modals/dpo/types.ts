@@ -1,6 +1,6 @@
-import type { GroupData, ReviewPair, SessionStatus, SwissScores } from "@/api/dpoApi";
+import type { GroupData, GroupOrder, RealismDevice, ReviewPair, SessionStatus, SwissScores } from "@/api/dpoApi";
 
-export type { GroupData, ReviewPair, SessionStatus, SwissScores };
+export type { GroupData, GroupOrder, RealismDevice, ReviewPair, SessionStatus, SwissScores };
 
 export type CurationStep = "setup" | "scanning" | "selecting" | "swiss" | "ranking" | "triage" | "review" | "export";
 
@@ -13,6 +13,9 @@ export interface SessionConfig {
   outputDir: string;
   pairsPerGroup: number;
   mode: CurationMode;
+  groupOrder: GroupOrder;
+  /** Comma-separated caption keywords; all must appear. Empty = no filter. */
+  captionFilter: string;
 }
 
 export interface ResumeInfo {
@@ -30,15 +33,24 @@ export interface SetupStepProps {
   sourceFolder: string;
   outputDir: string;
   pairsPerGroup: number;
+  groupOrder: GroupOrder;
+  captionFilter: string;
   onSourceChange: (dir: string) => void;
   onOutputChange: (dir: string) => void;
   onPairsPerGroupChange: (n: number) => void;
+  onGroupOrderChange: (order: GroupOrder) => void;
+  onCaptionFilterChange: (text: string) => void;
   onStart: (config: SessionConfig) => Promise<void>;
   onReview: () => void;
   onClose: () => void;
   resume: ResumeInfo | null;
   onSelectOutput: (dir: string) => void;
   error: string | null;
+  // Realism scoring, chosen before the session starts. "off" is the reason this
+  // lives on setup at all: the scan orders groups by score, so by the time
+  // Selection's toggle is reachable the model has already been asked.
+  realismDevice: RealismDevice;
+  onSetRealismDevice: (device: RealismDevice) => void;
 }
 
 export interface ScanningStepProps {
@@ -52,9 +64,12 @@ export interface ScanningStepProps {
 export interface SelectionStepProps {
   group: GroupData;
   onPick: (path: string) => Promise<void>;
-  onAcceptPair: (keepScoring: boolean) => void;
+  // discardRest commits the pair and then retires the whole group from the
+  // source tree (paired sources → .chosen/.rejected, leftovers → .discard).
+  onAcceptPair: (keepScoring: boolean, discardRest?: boolean) => void;
   onDismissPair: () => void;
   onSkipGroup: () => void;
+  onDiscardGroup: () => void;
   onCancel: () => void;
   phase: SelectionPhase;
   bestImage: string | null;
@@ -63,6 +78,29 @@ export interface SelectionStepProps {
   showAcceptDialog: boolean;
   pendingBest: string | null;
   pendingWorst: string | null;
+  // P(AI-generated) per path. Drives the grid order (most photorealistic
+  // first) and the per-tile badge. Empty while the group is still being scored,
+  // and empty for good if the model is unavailable — the grid falls back to
+  // source order in both cases.
+  realismScores?: Record<string, number>;
+  realismError?: string | null;
+  // Whole-tree backfill: scores every image in the source folder once so no
+  // group ever waits on the model. Optional so the step still renders in modes
+  // and tests that do not wire it.
+  backfill?: {
+    running: boolean;
+    done: number;
+    total: number;
+    cached: number;
+    error: string | null;
+  };
+  onStartBackfill?: () => void;
+  onStopBackfill?: () => void;
+  // Scoring device. "cpu" keeps the head off the GPU — slower, but it leaves
+  // the VRAM to a training or generation run sharing the machine; "off" skips
+  // scoring entirely, so no badges and no sort.
+  realismDevice?: RealismDevice;
+  onSetRealismDevice?: (device: RealismDevice) => void;
 }
 
 export interface TournamentStepProps {
@@ -75,6 +113,7 @@ export interface TournamentStepProps {
   onVote: (winner: "a" | "b" | "tie") => Promise<void>;
   onFinishEarly: () => Promise<void>;
   onSkipGroup: () => void;
+  onDiscardGroup: () => void;
   onCancel: () => void;
   pairsDone: number;
 }
@@ -87,8 +126,11 @@ export interface RankingStepProps {
   pairCount: number;
   onPairCountChange: (n: number) => void;
   onSwap: (i: number, j: number) => Promise<void>;
-  onExport: () => Promise<void>;
+  // discardRest exports the chosen pairs and then retires the group from the
+  // source tree, so the mid-ranked leftovers can't reappear in a later session.
+  onExport: (discardRest?: boolean) => Promise<void>;
   onSkipGroup: () => void;
+  onDiscardGroup: () => void;
   onCancel: () => void;
   pairsDone: number;
 }

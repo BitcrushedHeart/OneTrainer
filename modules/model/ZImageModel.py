@@ -104,6 +104,10 @@ class ZImageModel(BaseModel):
     teacher_lora_state_dict: dict | None
     transformer_fake_lora: LoRAModuleWrapper | None
 
+    # transfer mode: Base + original-adapter education per late module,
+    # swapped in for the teacher late pass (bare 'layers.N.stem' keys)
+    transfer_teacher_late_tensors: dict[str, torch.Tensor] | None
+
     def __init__(
         self,
         model_type: ModelType,
@@ -131,6 +135,8 @@ class ZImageModel(BaseModel):
         self.transformer_teacher_lora = None
         self.teacher_lora_state_dict = None
         self.transformer_fake_lora = None
+
+        self.transfer_teacher_late_tensors = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
         return [
@@ -189,6 +195,13 @@ class ZImageModel(BaseModel):
 
         if self.transformer_fake_lora is not None:
             self.transformer_fake_lora.to(device)
+
+        if self.transfer_teacher_late_tensors is not None:
+            # ~2-3 GB of teacher tensors follow the transformer so offloading
+            # the model (backup/save/sampling windows) actually frees them.
+            self.transfer_teacher_late_tensors = {
+                stem: tensor.to(device=device) for stem, tensor in self.transfer_teacher_late_tensors.items()
+            }
 
     def to(self, device: torch.device):
         self.vae_to(device)

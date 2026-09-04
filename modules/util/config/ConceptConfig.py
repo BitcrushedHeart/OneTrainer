@@ -138,6 +138,7 @@ class ConceptConfig(BaseConfig):
     concept_stats: dict
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
+    dpo_beta_override: float
 
     image: ConceptImageConfig
     text: ConceptTextConfig
@@ -240,5 +241,6 @@ class ConceptConfig(BaseConfig):
         data.append(("concept_stats", {}, dict, False))
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
+        data.append(("dpo_beta_override", 0.0, float, False))
 
         return ConceptConfig(data)

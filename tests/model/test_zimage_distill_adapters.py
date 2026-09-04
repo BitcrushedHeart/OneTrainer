@@ -1,7 +1,7 @@
-import torch
-
 from modules.model.ZImageModel import ZImageModel
 from modules.util.enum.ModelType import ModelType
+
+import torch
 
 
 class FakeAdapter:

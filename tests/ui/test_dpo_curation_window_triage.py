@@ -5,10 +5,9 @@ the commit/export/advance step) is plain Python. We construct the window via
 ``object.__new__`` to skip Tk entirely and stub the one UI-rebuild call.
 """
 
-import pytest
-
 from modules.util.dpo_curation_util import load_manifest
 
+import pytest
 from PIL import Image
 
 # Importing the window pulls in customtkinter; skip cleanly if it can't load.

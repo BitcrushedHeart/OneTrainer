@@ -96,6 +96,40 @@ class OFTRotationModule(nn.Module):
             id_mat = torch.eye(block_size).unsqueeze(0).expand(r, block_size, block_size)
             self.register_buffer("id_mat", id_mat, persistent=False)
 
+    @torch.no_grad()
+    def warm_start_spectral_state(self, steps: int = 256):
+        """Re-converge the power-iteration state (u_state/v_state) after a load.
+
+        The state is a non-persistent buffer, so resuming from a backup restarts
+        it from random vectors. At init that is harmless (Q == 0), but on a
+        trained adapter a random restart underestimates sigma, which silently
+        lifts the spectral clip until the one-step-per-forward iteration
+        re-converges — every previously clipped block snaps to a stronger
+        rotation for hundreds of steps. Called from OFTModule.load_state_dict.
+
+        Pure batched matmul on purpose: no LAPACK, so it is safe to run while
+        safetensors files may still be open (Windows MKL segfaults when mmap IO
+        interleaves with SVD/eigh).
+        """
+        if self.oft_clipped_norm is None:
+            return
+        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
+        Q = (self.weight.detach() / scaling_factor).to(torch.float32)
+        Q_skew = self._pytorch_skew_symmetric(Q, self.block_size)
+        u = self.u_state.to(torch.float32).unsqueeze(-1)
+        v = self.v_state.to(torch.float32).unsqueeze(-1)
+        for _ in range(steps):
+            # Same degeneracy guard as _spectral_norm: a (near-)zero block keeps
+            # its random unit vectors instead of collapsing the state to zero.
+            v_raw = torch.bmm(Q_skew.mT, u)
+            v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
+            v = torch.where(v_norm >= 1e-6, v_raw / v_norm.clamp_min(1e-8), v)
+            u_raw = torch.bmm(Q_skew, v)
+            u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
+            u = torch.where(u_norm >= 1e-6, u_raw / u_norm.clamp_min(1e-8), u)
+        self.v_state.copy_(v.squeeze(-1).to(self.v_state.dtype))
+        self.u_state.copy_(u.squeeze(-1).to(self.u_state.dtype))
+
     def _pytorch_skew_symmetric(self, vec, block_size):
         batch_size = vec.shape[0]
         matrix = torch.zeros(batch_size, block_size, block_size, device=vec.device, dtype=vec.dtype)

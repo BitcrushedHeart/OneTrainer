@@ -50,6 +50,9 @@ def _dora_config(rank: int = 4, alpha: float = 4.0) -> SimpleNamespace:
         oft_scaled=False,
         oft_block_size=4,
         oft_block_share=False,
+        oft_clipped_norm=None,
+        oft_cans=False,
+        lokr_dim=0,
         layer_filter_regex=False,
         dropout_probability=0.0,
     )
@@ -69,6 +72,9 @@ def _doraoft_config(block_size: int = 4) -> SimpleNamespace:
         oft_scaled=False,
         oft_block_size=block_size,
         oft_block_share=False,
+        oft_clipped_norm=None,
+        oft_cans=False,
+        lokr_dim=0,
         layer_filter_regex=False,
         dropout_probability=0.0,
     )

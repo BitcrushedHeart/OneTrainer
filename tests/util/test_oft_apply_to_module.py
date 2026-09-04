@@ -101,10 +101,10 @@ def test_dora_oft_linear_apply_matches_forward(scaled_oft):
     orig_module = nn.Linear(in_features, out_features, bias=True)
 
     module = _seeded_oft(DoRAOFTModule, orig_module, block_size=block_size, scaled_oft=scaled_oft)
-    # Perturb dora_scale away from initial_norm so the test exercises the
-    # actual scaling path rather than scale == 1.
+    # Perturb dora_multiplier away from its identity value (1.0) so the test
+    # exercises the actual scaling path rather than scale == 1.
     with torch.no_grad():
-        module.dora_scale.mul_(0.7)
+        module.dora_multiplier.mul_(0.7)
 
     x = torch.randn(4, in_features)
     y_adapter, y_baked = _adapter_then_bare(module, orig_module, x)
@@ -114,14 +114,14 @@ def test_dora_oft_linear_apply_matches_forward(scaled_oft):
 
 @pytest.mark.parametrize("scaled_oft", [True, False])
 def test_dora_oft_conv2d_apply_matches_forward(scaled_oft):
-    """DoRA-OFT on Conv2d: dora_scale must bake into per-output-channel scaling."""
+    """DoRA-OFT on Conv2d: dora_multiplier must bake into per-output-channel scaling."""
     in_ch, out_ch, block_size = 16, 32, 8
     torch.manual_seed(1)
     orig_module = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=True)
 
     module = _seeded_oft(DoRAOFTModule, orig_module, block_size=block_size, scaled_oft=scaled_oft)
     with torch.no_grad():
-        module.dora_scale.mul_(0.7)
+        module.dora_multiplier.mul_(0.7)
 
     x = torch.randn(2, in_ch, 8, 8)
     y_adapter, y_baked = _adapter_then_bare(module, orig_module, x)
@@ -150,7 +150,7 @@ def test_oft_linear_zero_oft_is_identity():
 
 
 def test_dora_oft_zero_oft_with_unit_scale_is_identity():
-    """DoRA-OFT with zero rotation params and dora_scale == initial_norm is a no-op."""
+    """DoRA-OFT with zero rotation params and dora_multiplier == 1.0 is a no-op."""
     in_features, out_features, block_size = 64, 32, 16
     torch.manual_seed(3)
     orig_module = nn.Linear(in_features, out_features, bias=True)
@@ -163,8 +163,8 @@ def test_dora_oft_zero_oft_with_unit_scale_is_identity():
         block_share=False,
         oft_scaled=True,
     )
-    # dora_scale is initialized to initial_norm in DoRAOFTModule.initialize_weights,
-    # so the per-row scale is 1.0 and apply_to_module should be a no-op.
+    # dora_multiplier is initialized to 1.0 (identity magnitude) in
+    # DoRAOFTModule.initialize_weights, so apply_to_module should be a no-op.
     module.apply_to_module()
 
     torch.testing.assert_close(orig_module.weight.data, weight_before, rtol=1e-5, atol=1e-6)
@@ -206,11 +206,12 @@ def test_apply_to_module_preserves_orig_weight_dtype():
 
 
 def test_dora_oft_linear_invariant_merged_row_norm_equals_dora_scale():
-    """For DoRA-OFT on Linear, |merged_row[i]| must equal |dora_scale[i]|.
+    """For DoRA-OFT on Linear, ||merged_row[i]|| == |dora_multiplier[i]| * ||base_row[i]||.
 
-    This is the OFT-DoRA invariant: orthogonal R preserves row norms, so
-    after scaling by dora_scale/initial_norm, each merged output row has
-    norm == |dora_scale|. Verification gates depend on this property.
+    This is the OFT-DoRA invariant in the relative-multiplier parametrization:
+    orthogonal R preserves row norms, so scaling by the multiplier makes each
+    merged output row's norm exactly |m| times the pre-merge row norm.
+    Verification gates (oft_verify) depend on this property.
     """
     in_features, out_features, block_size = 64, 32, 16
     torch.manual_seed(6)
@@ -218,9 +219,10 @@ def test_dora_oft_linear_invariant_merged_row_norm_equals_dora_scale():
 
     module = _seeded_oft(DoRAOFTModule, orig_module, block_size=block_size, scaled_oft=True)
     with torch.no_grad():
-        module.dora_scale.mul_(0.7)
+        module.dora_multiplier.mul_(0.7)
 
-    expected_norms = module.dora_scale.detach().abs().view(-1)
+    base_row_norms = orig_module.weight.data.float().norm(dim=1)
+    expected_norms = module.dora_multiplier.detach().abs().view(-1) * base_row_norms
     module.apply_to_module()
     actual_norms = orig_module.weight.data.float().norm(dim=1)
 
