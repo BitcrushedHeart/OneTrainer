@@ -91,6 +91,7 @@ class MaskRequest(BaseModel):
     folder: str
     prompt: str = ""
     mode: str = "fill"
+    variant: int = 0
     threshold: float = 0.3
     smooth: int = 5
     expand: int = 10

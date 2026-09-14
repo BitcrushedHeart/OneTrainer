@@ -7,6 +7,7 @@ import time
 import uuid
 from collections import OrderedDict
 
+from modules.util import path_util
 from web.backend.paths import CONCEPTS_DIR
 from web.backend.services.concept_service import ConceptService
 from web.backend.services.config_service import ConfigService
@@ -28,7 +29,7 @@ _thumbnail_cache_lock = threading.Lock()
 
 def _is_valid_image(name: str) -> bool:
     ext = os.path.splitext(name)[1].lower()
-    return ext in _IMAGE_EXTENSIONS and not name.endswith("-masklabel.png") and not name.endswith("-condlabel.png")
+    return ext in _IMAGE_EXTENSIONS and not path_util.is_mask_filename(name) and not name.endswith("-condlabel.png")
 
 
 def _pick_thumbnail(dir_path: str, include_subdirectories: bool = False) -> str | None:

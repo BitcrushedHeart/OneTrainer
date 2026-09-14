@@ -10,7 +10,7 @@ from pathlib import Path
 
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.enum.ConceptType import ConceptType
-from modules.util.path_util import canonical_join, is_supported_image_extension
+from modules.util.path_util import canonical_join, is_mask_filename, is_supported_image_extension
 from modules.util.torch_util import default_device, torch_gc
 
 import huggingface_hub
@@ -172,7 +172,7 @@ def _build_validation_image(
         return None
     if any(part.startswith(".") for part in path.relative_to(root_path).parent.parts):
         return None
-    if path.name.endswith("-masklabel.png") or path.name.endswith("-condlabel.png"):
+    if is_mask_filename(path.name) or path.name.endswith("-condlabel.png"):
         return None
     if not is_supported_image_extension(path.suffix):
         return None

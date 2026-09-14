@@ -53,6 +53,7 @@ class CaptionUI(ctk.CTkToplevel):
     Ctrl+M: only show the mask
     Ctrl+D: draw mask editing mode
     Ctrl+F: fill mask editing mode
+    Ctrl+1 to Ctrl+9: edit that mask variant, Ctrl+0 for the base mask
 
     When editing masks:
     Left click: add mask
@@ -75,6 +76,8 @@ class CaptionUI(ctk.CTkToplevel):
         self.image = None
         self.image_label = None
         self.mask_editing_mode = "draw"
+        # which of an image's masks is being edited, 0 for the original "-masklabel.png"
+        self.mask_variant = 0
         self.enable_mask_editing_var = ctk.BooleanVar()
         self.mask_editing_alpha = None
         self.prompt_var = None
@@ -167,7 +170,7 @@ class CaptionUI(ctk.CTkToplevel):
         right_frame = ctk.CTkFrame(master, fg_color="transparent")
         right_frame.grid(row=0, column=1, sticky="nsew")
 
-        right_frame.grid_columnconfigure(4, weight=1)
+        right_frame.grid_columnconfigure(6, weight=1)
         right_frame.grid_rowconfigure(1, weight=1)
 
         components.button(right_frame, 0, 0, "Draw", self.draw_mask_editing_mode, tooltip="draw a mask using a brush")
@@ -192,12 +195,26 @@ class CaptionUI(ctk.CTkToplevel):
         mask_editing_alpha_label = ctk.CTkLabel(right_frame, text="Brush Alpha", width=75)
         mask_editing_alpha_label.grid(row=0, column=4, padx=0, pady=5, sticky="w")
 
+        # which mask of the image is being edited
+        self.mask_variant_var = ctk.StringVar(self, "Base")
+        mask_variant_dropdown = ctk.CTkOptionMenu(
+            right_frame,
+            variable=self.mask_variant_var,
+            values=["Base"] + [str(v) for v in range(1, path_util.MAX_MASK_VARIANTS + 1)],
+            width=80,
+            command=self.select_mask_variant,
+        )
+        mask_variant_dropdown.grid(row=0, column=5, padx=5, pady=5, sticky="e")
+
+        mask_variant_label = ctk.CTkLabel(right_frame, text="Mask", width=40)
+        mask_variant_label.grid(row=0, column=6, padx=0, pady=5, sticky="w")
+
         # image
         self.image = ctk.CTkImage(light_image=image, size=(self.image_size, self.image_size))
         self.image_label = ctk.CTkLabel(
             master=right_frame, text="", image=self.image, height=self.image_size, width=self.image_size
         )
-        self.image_label.grid(row=1, column=0, columnspan=5, sticky="nsew")
+        self.image_label.grid(row=1, column=0, columnspan=7, sticky="nsew")
 
         self.image_label.bind("<Motion>", self.edit_mask)
         self.image_label.bind("<Button-1>", self.edit_mask)
@@ -207,7 +224,7 @@ class CaptionUI(ctk.CTkToplevel):
         # prompt
         self.prompt_var = ctk.StringVar()
         self.prompt_component = ctk.CTkEntry(right_frame, textvariable=self.prompt_var)
-        self.prompt_component.grid(row=2, column=0, columnspan=5, pady=5, sticky="new")
+        self.prompt_component.grid(row=2, column=0, columnspan=7, pady=5, sticky="new")
         self.bind_key_events(self.prompt_component)
         self.prompt_component.focus_set()
 
@@ -218,6 +235,11 @@ class CaptionUI(ctk.CTkToplevel):
         component.bind("<Control-m>", self.toggle_mask)
         component.bind("<Control-d>", self.draw_mask_editing_mode)
         component.bind("<Control-f>", self.fill_mask_editing_mode)
+        for variant in range(path_util.MAX_MASK_VARIANTS + 1):
+            component.bind(
+                f"<Control-Key-{variant}>",
+                lambda e, v=variant: self.select_mask_variant("Base" if v == 0 else str(v)),
+            )
 
     def load_directory(self, include_subdirectories: bool = False):
         self.scan_directory(include_subdirectories)
@@ -235,7 +257,7 @@ class CaptionUI(ctk.CTkToplevel):
             name, ext = os.path.splitext(filename)
             return (
                 path_util.is_supported_image_extension(ext)
-                and not name.endswith("-masklabel")
+                and not path_util.is_mask_filename(filename)
                 and not name.endswith("-condlabel")
             )
 
@@ -269,7 +291,7 @@ class CaptionUI(ctk.CTkToplevel):
     def load_mask(self):
         if len(self.image_rel_paths) > 0 and self.current_image_index < len(self.image_rel_paths):
             image_name = self.image_rel_paths[self.current_image_index]
-            mask_name = os.path.splitext(image_name)[0] + "-masklabel.png"
+            mask_name = path_util.mask_path_for(image_name, self.mask_variant)
             mask_name = os.path.join(self.dir, mask_name)
 
             try:
@@ -328,6 +350,14 @@ class CaptionUI(ctk.CTkToplevel):
         else:
             image = Image.new("RGB", (512, 512), (0, 0, 0))
             self.image.configure(light_image=image)
+
+    def select_mask_variant(self, variant_str):
+        # unsaved edits are dropped, the same way moving to another image drops them
+        self.mask_variant_var.set(variant_str)
+        self.mask_variant = 0 if variant_str == "Base" else int(variant_str)
+        self.pil_mask = self.load_mask()
+        self.refresh_image()
+        return "break"
 
     def refresh_image(self):
         if self.pil_mask:
@@ -468,7 +498,7 @@ class CaptionUI(ctk.CTkToplevel):
             prompt_name = os.path.splitext(image_name)[0] + ".txt"
             prompt_name = os.path.join(self.dir, prompt_name)
 
-            mask_name = os.path.splitext(image_name)[0] + "-masklabel.png"
+            mask_name = path_util.mask_path_for(image_name, self.mask_variant)
             mask_name = os.path.join(self.dir, mask_name)
 
             try:

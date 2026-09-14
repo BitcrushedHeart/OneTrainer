@@ -2,6 +2,7 @@ import contextlib
 import tkinter as tk
 from tkinter import filedialog
 
+from modules.util import path_util
 from modules.util.ui.ui_utils import set_window_icon
 
 import customtkinter as ctk
@@ -33,9 +34,12 @@ class GenerateMasksWindow(ctk.CTkToplevel):
         ]
         self.model_var = ctk.StringVar(self, "ClipSeg")
         self.models = ["ClipSeg", "Rembg", "Rembg-Human", "Hex Color"]
+        self.variant_var = ctk.StringVar(self, "Base")
+        # the mask an image trains with cycles through its variants, one per image variation
+        self.variants = ["Base"] + [str(v) for v in range(1, path_util.MAX_MASK_VARIANTS + 1)]
 
         self.title("Batch generate masks")
-        self.geometry("360x430")
+        self.geometry("360x470")
         self.resizable(True, True)
 
         self.frame = ctk.CTkFrame(self, width=600, height=300)
@@ -70,45 +74,52 @@ class GenerateMasksWindow(ctk.CTkToplevel):
         )
         self.mode_dropdown.grid(row=3, column=1, sticky="w", padx=5, pady=5)
 
+        self.variant_label = ctk.CTkLabel(self.frame, text="Variant", width=100)
+        self.variant_label.grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        self.variant_dropdown = ctk.CTkOptionMenu(
+            self.frame, variable=self.variant_var, values=self.variants, dynamic_resizing=False, width=200
+        )
+        self.variant_dropdown.grid(row=4, column=1, sticky="w", padx=5, pady=5)
+
         self.threshold_label = ctk.CTkLabel(self.frame, text="Threshold", width=100)
-        self.threshold_label.grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        self.threshold_label.grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.threshold_entry = ctk.CTkEntry(self.frame, width=200, placeholder_text="0.0 - 1.0")
         self.threshold_entry.insert(0, "0.3")
-        self.threshold_entry.grid(row=4, column=1, sticky="w", padx=5, pady=5)
+        self.threshold_entry.grid(row=5, column=1, sticky="w", padx=5, pady=5)
 
         self.smooth_label = ctk.CTkLabel(self.frame, text="Smooth", width=100)
-        self.smooth_label.grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        self.smooth_label.grid(row=6, column=0, sticky="w", padx=5, pady=5)
         self.smooth_entry = ctk.CTkEntry(self.frame, width=200, placeholder_text="5")
         self.smooth_entry.insert(0, 5)
-        self.smooth_entry.grid(row=5, column=1, sticky="w", padx=5, pady=5)
+        self.smooth_entry.grid(row=6, column=1, sticky="w", padx=5, pady=5)
 
         self.expand_label = ctk.CTkLabel(self.frame, text="Expand", width=100)
-        self.expand_label.grid(row=6, column=0, sticky="w", padx=5, pady=5)
+        self.expand_label.grid(row=7, column=0, sticky="w", padx=5, pady=5)
         self.expand_entry = ctk.CTkEntry(self.frame, width=200, placeholder_text="10")
         self.expand_entry.insert(0, 10)
-        self.expand_entry.grid(row=6, column=1, sticky="w", padx=5, pady=5)
+        self.expand_entry.grid(row=7, column=1, sticky="w", padx=5, pady=5)
 
         self.alpha_label = ctk.CTkLabel(self.frame, text="Alpha", width=100)
-        self.alpha_label.grid(row=7, column=0, sticky="w", padx=5, pady=5)
+        self.alpha_label.grid(row=8, column=0, sticky="w", padx=5, pady=5)
         self.alpha_entry = ctk.CTkEntry(self.frame, width=200, placeholder_text="1")
         self.alpha_entry.insert(0, 1)
-        self.alpha_entry.grid(row=7, column=1, sticky="w", padx=5, pady=5)
+        self.alpha_entry.grid(row=8, column=1, sticky="w", padx=5, pady=5)
 
         self.include_subdirectories_label = ctk.CTkLabel(self.frame, text="Include subfolders", width=100)
-        self.include_subdirectories_label.grid(row=8, column=0, sticky="w", padx=5, pady=5)
+        self.include_subdirectories_label.grid(row=9, column=0, sticky="w", padx=5, pady=5)
         self.include_subdirectories_var = ctk.BooleanVar(self, parent_include_subdirectories)
         self.include_subdirectories_switch = ctk.CTkSwitch(
             self.frame, text="", variable=self.include_subdirectories_var
         )
-        self.include_subdirectories_switch.grid(row=8, column=1, sticky="w", padx=5, pady=5)
+        self.include_subdirectories_switch.grid(row=9, column=1, sticky="w", padx=5, pady=5)
 
         self.progress_label = ctk.CTkLabel(self.frame, text="Progress: 0/0", width=100)
-        self.progress_label.grid(row=9, column=0, sticky="w", padx=5, pady=5)
+        self.progress_label.grid(row=10, column=0, sticky="w", padx=5, pady=5)
         self.progress = ctk.CTkProgressBar(self.frame, orientation="horizontal", mode="determinate", width=200)
-        self.progress.grid(row=9, column=1, sticky="w", padx=5, pady=5)
+        self.progress.grid(row=10, column=1, sticky="w", padx=5, pady=5)
 
         self.create_masks_button = ctk.CTkButton(self.frame, text="Create Masks", width=310, command=self.create_masks)
-        self.create_masks_button.grid(row=10, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        self.create_masks_button.grid(row=11, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
         self.frame.pack(fill="both", expand=True)
 
@@ -144,11 +155,16 @@ class GenerateMasksWindow(ctk.CTkToplevel):
             "Blend with existing": "blend",
         }[self.mode_var.get()]
 
+        # "Base" is the original -masklabel.png, the numbers are its variants
+        variant_str = self.variant_var.get()
+        variant = 0 if variant_str == "Base" else int(variant_str)
+
         self.parent.masking_model.mask_folder(
             sample_dir=self.path_entry.get(),
             prompts=[self.prompt_entry.get()],
             mode=mode,
             alpha=float(self.alpha_entry.get()),
+            variant=variant,
             threshold=float(self.threshold_entry.get()),
             smooth_pixels=int(self.smooth_entry.get()),
             expand_pixels=int(self.expand_entry.get()),

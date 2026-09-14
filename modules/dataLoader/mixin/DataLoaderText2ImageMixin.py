@@ -9,6 +9,7 @@ from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
 from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
 from modules.dataLoader.promptOnly.CollectPromptPaths import CollectPromptPaths
 from modules.dataLoader.promptOnly.SynthesizeResolution import SynthesizeResolution
+from modules.dataLoader.SelectMaskPath import SelectMaskPath
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -108,10 +109,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             concept_out_name="concept",
             extensions=supported_extensions,
             include_postfix=None,
-            exclude_postfix=["-masklabel", "-condlabel"],
+            exclude_postfix=[*path_util.MASK_POSTFIXES, "-condlabel"],
         )
 
-        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
+        mask_path = SelectMaskPath(in_name="image_path", out_name="mask_path")
         cond_path = ModifyPath(in_name="image_path", out_name="cond_path", postfix="-condlabel", extension=".png")
         sample_prompt_path = ModifyPath(
             in_name="image_path", out_name="sample_prompt_path", postfix="", extension=".txt"
@@ -128,7 +129,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 enabled_in_name="enabled",
                 path_out_name="image_path",
                 concept_out_name="concept",
-                exclude_postfix=["-masklabel", "-condlabel"],
+                exclude_postfix=[*path_util.MASK_POSTFIXES, "-condlabel"],
             )
             return [download_datasets, collect_prompt_paths, sample_prompt_path]
 
@@ -680,7 +681,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         # upstream pipeline would raise on resolution.
         image_extra_watched: list[str] = []
         if config.masked_training:
-            image_extra_watched.append("mask_path")
+            # every variant is watched, not just the one variation 0 picks, or editing
+            # a later variant would leave the bundled entry stale
+            image_extra_watched.extend(SelectMaskPath.variant_out_names("mask_path"))
         if config.custom_conditioning_image:
             image_extra_watched.append("cond_path")
 

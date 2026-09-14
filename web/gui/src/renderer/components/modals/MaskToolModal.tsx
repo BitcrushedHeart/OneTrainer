@@ -5,6 +5,12 @@ import { Button, DirPicker, FilePicker, FormEntry, ProgressBar, Select, Toggle }
 import { useToolPolling } from "@/hooks/useToolPolling";
 import { MASK_MODELS, MASK_MODES } from "@/types/generated/dropdownSources";
 
+// "Base" is the original -masklabel.png, 1..9 are its variants
+const MASK_VARIANTS = [
+  { value: "0", label: "Base" },
+  ...Array.from({ length: 9 }, (_, i) => ({ value: String(i + 1), label: String(i + 1) })),
+];
+
 import { ModalBase } from "./ModalBase";
 
 export interface MaskToolModalProps {
@@ -17,6 +23,7 @@ interface MaskState {
   folder: string;
   prompt: string;
   mode: string;
+  variant: number;
   threshold: number;
   smooth: number;
   expand: number;
@@ -30,6 +37,7 @@ const DEFAULT_STATE: MaskState = {
   folder: "",
   prompt: "",
   mode: "fill",
+  variant: 0,
   threshold: 0.3,
   smooth: 5,
   expand: 10,
@@ -77,6 +85,7 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
         folder: state.folder,
         prompt: state.prompt,
         mode: state.mode,
+        variant: state.variant,
         threshold: state.threshold,
         smooth: state.smooth,
         expand: state.expand,
@@ -161,6 +170,15 @@ export function MaskToolModal({ open, onClose }: MaskToolModalProps) {
           options={MASK_MODES}
           value={state.mode}
           onChange={(v) => update("mode", v)}
+          disabled={isRunning}
+        />
+
+        {/* which mask file the batch writes to, cycled per image variation during training */}
+        <Select
+          label="Variant"
+          options={MASK_VARIANTS}
+          value={String(state.variant)}
+          onChange={(v) => update("variant", Number(v))}
           disabled={isRunning}
         />
 

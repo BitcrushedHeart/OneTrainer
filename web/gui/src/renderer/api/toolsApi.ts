@@ -140,6 +140,7 @@ export interface MaskRequest {
   folder: string;
   prompt?: string;
   mode?: string;
+  variant?: number;
   threshold?: number;
   smooth?: number;
   expand?: number;

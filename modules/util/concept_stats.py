@@ -115,15 +115,21 @@ def folder_scan(
         basename, extension = os.path.splitext(path)
         if (
             extension.lower() in img_extensions_list
-            and not path.name.endswith("-masklabel.png")
+            and not path_util.is_mask_filename(path.name)
             and not path.name.endswith("-condlabel.png")
         ):
             stats_dict["image_count"] += 1
             stats_dict["file_size"] += path.stat().st_size
             if advanced_checks:
                 # check if image has a corresponding mask/caption in the same directory
-                if (basename + "-masklabel.png") in file_list_str:
-                    stats_dict["paired_masks"] += 1
+                # an image counts as masked when any of its mask variants exists
+                variant_masks = sum(
+                    1
+                    for variant in range(path_util.MAX_MASK_VARIANTS + 1)
+                    if (basename + path_util.mask_postfix(variant) + path_util.MASK_EXTENSION) in file_list_str
+                )
+                if variant_masks > 0:
+                    stats_dict["paired_masks"] += variant_masks
                     stats_dict["image_with_mask_count"] += 1
                 if (basename + ".txt") in file_list_str:
                     stats_dict["paired_captions"] += 1
@@ -263,7 +269,7 @@ def folder_scan(
                     stats_dict["min_fps"] = [fps, os.path.relpath(path, conceptconfig.path)]
                 stats_dict["avg_fps"] += (fps - stats_dict["avg_fps"]) / stats_dict["video_count"]
 
-        elif path.name.endswith("-masklabel.png"):
+        elif path_util.is_mask_filename(path.name):
             stats_dict["mask_count"] += 1
             stats_dict["file_size"] += path.stat().st_size
         elif extension == ".txt":

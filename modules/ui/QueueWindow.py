@@ -503,7 +503,7 @@ def _get_concept_preview(concept_dict: dict) -> Image.Image:
             if (
                 p.is_file()
                 and path_util.is_supported_image_extension(ext)
-                and not p.name.endswith("-masklabel.png")
+                and not path_util.is_mask_filename(p.name)
                 and not p.name.endswith("-condlabel.png")
             ):
                 preview_path = str(p)

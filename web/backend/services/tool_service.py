@@ -15,6 +15,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
+from modules.util import path_util
 from web.backend.services._singleton import SingletonMixin
 
 import requests
@@ -321,6 +322,7 @@ class ToolService(SingletonMixin):
                 sample_dir=request.folder,
                 prompts=prompts,
                 mode=mode,
+                variant=request.variant,
                 threshold=request.threshold,
                 smooth_pixels=request.smooth,
                 expand_pixels=request.expand,
@@ -788,6 +790,7 @@ class YOLOMaskAdapter:
         sample_dir: str,
         prompts: list[str] | None = None,
         mode: str = "replace",
+        variant: int = 0,
         threshold: float = 0.3,
         smooth_pixels: int = 5,
         expand_pixels: int = 10,
@@ -804,7 +807,7 @@ class YOLOMaskAdapter:
 
         for idx, img_path in enumerate(images):
             try:
-                mask_path = img_path.parent / f"{img_path.stem}-masklabel.png"
+                mask_path = img_path.parent / Path(path_util.mask_path_for(img_path.name, variant)).name
                 if mode == "fill" and mask_path.exists():
                     if progress_callback:
                         progress_callback(idx + 1, total)

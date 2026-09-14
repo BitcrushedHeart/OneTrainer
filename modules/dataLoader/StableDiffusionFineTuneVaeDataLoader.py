@@ -2,6 +2,7 @@ import os
 import re
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.SelectMaskPath import SelectMaskPath
 from modules.model.StableDiffusionModel import StableDiffusionModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory, path_util
@@ -21,7 +22,6 @@ from mgds.pipelineModules.DecodeVAE import DecodeVAE
 from mgds.pipelineModules.EncodeVAE import EncodeVAE
 from mgds.pipelineModules.InlineAspectBatchSorting import InlineAspectBatchSorting
 from mgds.pipelineModules.LoadImage import LoadImage
-from mgds.pipelineModules.ModifyPath import ModifyPath
 from mgds.pipelineModules.RandomBrightness import RandomBrightness
 from mgds.pipelineModules.RandomContrast import RandomContrast
 from mgds.pipelineModules.RandomFlip import RandomFlip
@@ -68,10 +68,10 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
             concept_out_name="concept",
             extensions=supported_extensions,
             include_postfix=None,
-            exclude_postfix=["-masklabel"],
+            exclude_postfix=list(path_util.MASK_POSTFIXES),
         )
 
-        mask_path = ModifyPath(in_name="image_path", out_name="mask_path", postfix="-masklabel", extension=".png")
+        mask_path = SelectMaskPath(in_name="image_path", out_name="mask_path")
 
         modules = [collect_paths]
 

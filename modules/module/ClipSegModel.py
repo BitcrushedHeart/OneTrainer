@@ -68,8 +68,9 @@ class ClipSegModel(BaseImageMaskModel):
         threshold: float = 0.3,
         smooth_pixels: int = 5,
         expand_pixels: int = 10,
+        variant: int = 0,
     ):
-        mask_sample = MaskSample(filename, self.device)
+        mask_sample = MaskSample(filename, self.device, variant)
 
         if mode == "fill" and mask_sample.get_mask_tensor() is not None:
             return

@@ -2,6 +2,8 @@ import hashlib
 import os
 from pathlib import Path
 
+from modules.util import path_util
+
 # Both WSL's drvfs view of a Windows drive (which exposes names as UTF-8) and RunPod's MooseFS
 # /workspace volume cap a single path component at 255 *bytes*. NTFS instead counts 255 UTF-16
 # units, so a caption-as-filename full of multi-byte characters (smart quotes, em-dashes, emoji)
@@ -14,7 +16,7 @@ _MAX_NAME_BYTES = 240
 # OneTrainer pairs an image with its caption (<base>.txt) and masks (<base>-masklabel.png /
 # <base>-condlabel.png) by shared base name, so a whole group has to be renamed together or the
 # pairing silently breaks. See modules/dataLoader/mixin/DataLoaderText2ImageMixin.py.
-_GROUP_POSTFIXES = ("-masklabel", "-condlabel")
+_GROUP_POSTFIXES = (*path_util.MASK_POSTFIXES, "-condlabel")
 
 
 def _utf8_len(text: str) -> int:
