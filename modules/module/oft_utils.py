@@ -12,6 +12,13 @@ import torch.nn as nn
 # reads attributes, so no dict lookup ever happens inside a compiled region.
 _TRIU_INDEX_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 
+# Power-iteration steps applied to the spectral-clip state (u_state/v_state) once
+# per optimizer update, by OFTRotationModule.advance_spectral_state. Forwards only
+# read the state, so every forward of one update window (checkpoint recompute, DPO
+# reference passes, validation) sees the same clip. See
+# tests/util/test_oft_spectral_state.py for the drift-tracking evidence.
+SPECTRAL_STEPS_PER_UPDATE = 2
+
 
 def shared_triu_indices(block_size: int, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
     """(rows, cols) of the strict upper triangle of a block_size square, shared per device."""
@@ -147,32 +154,58 @@ class OFTRotationModule(nn.Module):
         The state is a non-persistent buffer, so resuming from a backup restarts
         it from random vectors. At init that is harmless (Q == 0), but on a
         trained adapter a random restart underestimates sigma, which silently
-        lifts the spectral clip until the one-step-per-forward iteration
-        re-converges — every previously clipped block snaps to a stronger
-        rotation for hundreds of steps. Called from OFTModule.load_state_dict.
+        lifts the spectral clip until the per-update iteration re-converges —
+        every previously clipped block snaps to a stronger rotation for hundreds
+        of steps. Called from OFTModule.load_state_dict.
 
         Pure batched matmul on purpose: no LAPACK, so it is safe to run while
         safetensors files may still be open (Windows MKL segfaults when mmap IO
         interleaves with SVD/eigh).
         """
+        self._iterate_spectral_state(steps)
+
+    @torch.no_grad()
+    def advance_spectral_state(self, steps: int = SPECTRAL_STEPS_PER_UPDATE):
+        """Advance the power-iteration state against the current weight.
+
+        The forward only reads u_state/v_state, so the trainer calls this once per
+        optimizer update (BaseModelSetup.after_optimizer_step_adapters) to track
+        the weight as it trains. No-op when the spectral clip is disabled.
+        """
+        self._iterate_spectral_state(steps)
+
+    def _iterate_spectral_state(self, steps: int):
         if self.oft_clipped_norm is None:
             return
+        # Same scaled Q as the forward, iterated in float32 whatever the weight dtype.
         scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
         Q = (self.weight.detach() / scaling_factor).to(torch.float32)
         Q_skew = self._pytorch_skew_symmetric(Q, self.block_size)
-        u = self.u_state.to(torch.float32).unsqueeze(-1)
-        v = self.v_state.to(torch.float32).unsqueeze(-1)
+        u = self.u_state.to(device=Q_skew.device, dtype=torch.float32).unsqueeze(-1)
+        v = self.v_state.to(device=Q_skew.device, dtype=torch.float32).unsqueeze(-1)
         for _ in range(steps):
-            # Same degeneracy guard as _spectral_norm: a (near-)zero block keeps
-            # its random unit vectors instead of collapsing the state to zero.
-            v_raw = torch.bmm(Q_skew.mT, u)
-            v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
-            v = torch.where(v_norm >= 1e-6, v_raw / v_norm.clamp_min(1e-8), v)
-            u_raw = torch.bmm(Q_skew, v)
-            u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
-            u = torch.where(u_norm >= 1e-6, u_raw / u_norm.clamp_min(1e-8), u)
+            v, u = self._power_iteration_step(Q_skew, u, v)
         self.v_state.copy_(v.squeeze(-1).to(self.v_state.dtype))
         self.u_state.copy_(u.squeeze(-1).to(self.u_state.dtype))
+
+    @staticmethod
+    def _power_iteration_step(
+        Q_skew: torch.Tensor, u: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One power-iteration step on (B, n, 1) vectors; returns (next_v, next_u).
+
+        Degeneracy guard: a (near-)zero block keeps its current unit vectors
+        instead of collapsing the state to zero.
+        """
+        # Update v (right singular vector)
+        v_raw = torch.bmm(Q_skew.mT, u)
+        v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
+        next_v = torch.where(v_norm >= 1e-6, v_raw / v_norm.clamp_min(1e-8), v)
+        # Update u (left singular vector)
+        u_raw = torch.bmm(Q_skew, next_v)
+        u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
+        next_u = torch.where(u_norm >= 1e-6, u_raw / u_norm.clamp_min(1e-8), u)
+        return next_v, next_u
 
     def _pytorch_skew_symmetric(self, vec, block_size):
         batch_size = vec.shape[0]
@@ -195,23 +228,15 @@ class OFTRotationModule(nn.Module):
 
     @torch.no_grad()
     def _spectral_norm(self, Q_skew):
-        """One power-iteration step; returns the (right, left) singular vectors per block."""
+        """One read-only power-iteration step; returns the (right, left) singular vectors per block.
+
+        Never writes u_state/v_state, in any mode, so a forward and its checkpoint
+        recompute, DPO reference passes and validation all see the same clip. The
+        state advances once per optimizer update (advance_spectral_state).
+        """
         u = self.u_state.unsqueeze(-1).to(Q_skew.dtype)
         v = self.v_state.unsqueeze(-1).to(Q_skew.dtype)
-        # Update v (right singular vector)
-        v_raw = torch.bmm(Q_skew.mT, u)
-        v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
-        candidate_v = v_raw / v_norm.clamp_min(1e-8)
-        next_v = torch.where(v_norm >= 1e-6, candidate_v, v)
-        # Update u (left singular vector)
-        u_raw = torch.bmm(Q_skew, next_v)
-        u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
-        candidate_u = u_raw / u_norm.clamp_min(1e-8)
-        next_u = torch.where(u_norm >= 1e-6, candidate_u, u)
-        if self.training:
-            self.v_state.copy_(next_v.squeeze(-1))
-            self.u_state.copy_(next_u.squeeze(-1))
-        return next_v, next_u
+        return self._power_iteration_step(Q_skew, u, v)
 
     def _cans_newton_schulz_iteration(
         self,
@@ -283,7 +308,7 @@ class OFTRotationModule(nn.Module):
 
         if self.oft_clipped_norm is not None:
             # The Neumann series only converges if the spectral norm ||Q||_2 < 1.
-            # Estimate it with one power-iteration step and clip Q to the
+            # Estimate it with one read-only power-iteration step and clip Q to the
             # configured max norm; this also bounds the learned rotation angle
             # (angle ~= 2*arctan(sigma)) regardless of orthogonalization method.
             v_vec, u_vec = self._spectral_norm(Q_skew)

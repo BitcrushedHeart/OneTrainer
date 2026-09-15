@@ -7,8 +7,10 @@ trained adapter:
 
   1. how wrong the clip is immediately after a simulated resume
      (estimated sigma vs true sigma, applied scale vs correct scale),
-  2. how many forward passes the one-step-per-forward power iteration
-     needs to bring the effective rotation back to the pre-resume one,
+  2. how many optimizer updates the per-update power iteration
+     (advance_spectral_state, SPECTRAL_STEPS_PER_UPDATE steps each; forwards
+     only read the state) needs to bring the effective rotation back to the
+     pre-resume one,
   3. that warm_start_spectral_state() closes the gap before the first step.
 
 Run: venv/Scripts/python.exe scripts/util/_oft_spectral_resume_demo.py
@@ -28,7 +30,7 @@ torch.manual_seed(0)
 R_BLOCKS = 12
 BLOCK_SIZE = 320
 CLIP = 0.95
-CONVERGE_STEPS = 400  # forward passes used to reach the "trained" reference state
+CONVERGE_STEPS = 400  # optimizer updates used to reach the "trained" reference state
 RESUME_TRACK_STEPS = [0, 1, 5, 10, 25, 50, 100, 200, 400]
 
 
@@ -74,15 +76,13 @@ def estimated_sigma(m: OFTRotationModule) -> torch.Tensor:
 
 
 def rotation(m: OFTRotationModule) -> torch.Tensor:
-    m.eval()  # eval: use the stored u/v without advancing them
-    with torch.no_grad():
+    with torch.no_grad():  # forwards only read the stored u/v, in any mode
         return m._cayley_batch(m.weight, BLOCK_SIZE, m.use_cayley_neumann, m.num_cayley_neumann_terms)
 
 
-def advance_one_forward(m: OFTRotationModule):
-    m.train()  # train: _spectral_norm writes the updated u/v back
-    with torch.no_grad():
-        m._cayley_batch(m.weight, BLOCK_SIZE, m.use_cayley_neumann, m.num_cayley_neumann_terms)
+def advance_one_update(m: OFTRotationModule):
+    """What the trainer does once per optimizer update (after_optimizer_step_adapters)."""
+    m.advance_spectral_state()
 
 
 def randomize_state(m: OFTRotationModule):
@@ -120,18 +120,18 @@ def main():
 
     # Converge u/v as a long training run would, then freeze the reference rotation.
     for _ in range(CONVERGE_STEPS):
-        advance_one_forward(m)
+        advance_one_update(m)
     r_ref = rotation(m)
 
     print("Pre-resume (converged training state):")
     report(m, sig_true, r_ref, "reference")
 
-    print("\nSimulated resume-from-backup (random u/v), tracking forward passes:")
+    print("\nSimulated resume-from-backup (random u/v), tracking optimizer updates:")
     randomize_state(m)
     step = 0
     for target in RESUME_TRACK_STEPS:
         while step < target:
-            advance_one_forward(m)
+            advance_one_update(m)
             step += 1
         report(m, sig_true, r_ref, f"step {step}")
 

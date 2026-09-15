@@ -1992,6 +1992,9 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
+                        # Once per update, on every step path (plain, scaler, fused back
+                        # pass): OFT forwards only read the spectral-clip state.
+                        self.model_setup.after_optimizer_step_adapters(self.model, self.config)
 
                         # Periodic DPO reference rebase, applied right after the
                         # optimizer step so the reference never changes inside a

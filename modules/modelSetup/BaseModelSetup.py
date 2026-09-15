@@ -5,6 +5,7 @@ from contextlib import contextmanager, suppress
 
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.mixin.ModelSetupTextRewardMixin import ModelSetupTextRewardMixin
+from modules.module.oft_utils import OFTRotationModule
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.distill_dmd2_util import (
     build_distill_sigma_matrix,
@@ -259,6 +260,19 @@ class BaseModelSetup(
         train_progress: TrainProgress,
     ):
         pass
+
+    def after_optimizer_step_adapters(self, model: BaseModel, config: TrainConfig):
+        """Shared adapter upkeep, called by the trainer exactly once per optimizer update.
+
+        OFT spectral clip: forwards only read the power-iteration state, so it is
+        advanced here against the freshly stepped weights. Covers the trainable
+        adapters (policy and DMD2 fake-score); frozen teachers keep the state
+        converged by their load-time warm start. Models without adapters no-op.
+        """
+        for wrapper in (*model.adapters(), *model.fake_adapters()):
+            for module in wrapper.modules():
+                if isinstance(module, OFTRotationModule):
+                    module.advance_spectral_state()
 
     def report_to_tensorboard(
         self,
