@@ -40,6 +40,7 @@ class LoRASaverMixin(
         model: BaseModel,
         destination: str,
         dtype: torch.dtype | None,
+        internal_format: bool = False,
     ):
         state_dict = self._get_state_dict(model)
         save_state_dict = self._convert_state_dict_dtype(state_dict, dtype)
@@ -49,7 +50,8 @@ class LoRASaverMixin(
             save_state_dict = convert_to_omi(save_state_dict, key_sets)
 
         os.makedirs(Path(destination).parent.absolute(), exist_ok=True)
-        save_file(save_state_dict, destination, self._create_safetensors_header(model, save_state_dict))
+        header = self._create_safetensors_header(model, save_state_dict, internal_format=internal_format)
+        save_file(save_state_dict, destination, header)
 
     def __save_legacy_safetensors(
         self,
@@ -74,7 +76,9 @@ class LoRASaverMixin(
     ):
         os.makedirs(destination, exist_ok=True)
 
-        self.__save_safetensors(model, os.path.join(destination, "lora", "lora.safetensors"), None)
+        self.__save_safetensors(
+            model, os.path.join(destination, "lora", "lora.safetensors"), None, internal_format=True
+        )
 
     def _save(
         self,

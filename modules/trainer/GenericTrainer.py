@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import gc
 import json
 import math
 import os
@@ -1153,6 +1154,18 @@ class GenericTrainer(BaseTrainer):
             return self._dpo_best_backup_path or ""
         return best_path
 
+    def _collect_garbage_and_freeze(self):
+        """Epoch-start full collection, then freeze the survivors.
+
+        The data loaders' parsed cache indices (large dicts, alive for the whole
+        epoch) move into the permanent generation, so the periodic torch_gc()
+        calls stop re-traversing them. Unfreezing first keeps one full
+        collection per epoch; end() unfreezes for later runs in this process.
+        """
+        gc.unfreeze()
+        torch_gc()
+        gc.freeze()
+
     def __save_backup_config(self, backup_path):
         config_path = os.path.join(backup_path, "onetrainer_config")
         args_path = path_util.canonical_join(config_path, "args.json")
@@ -1645,7 +1658,7 @@ class GenericTrainer(BaseTrainer):
                 torch.clear_autocast_cache()
                 self.model.optimizer.train()
 
-            torch_gc()
+            self._collect_garbage_and_freeze()
 
             if lr_scheduler is None:
                 lr_scheduler = create.create_lr_scheduler(
@@ -1711,7 +1724,12 @@ class GenericTrainer(BaseTrainer):
                     backup = self.commands.get_and_reset_backup_command()
                     save = self.commands.get_and_reset_save_command()
                     if multi.is_master() and (backup or save):
-                        self.model.to(self.temp_device)
+                        # LoRA savers write only adapter/embedding tensors (copied to CPU one
+                        # at a time), never base weights, so offloading the whole base model
+                        # before a backup is pure stall. A save without a backup keeps the move;
+                        # with both, __backup restores the train device before __save runs anyway.
+                        if not (backup and self.config.training_method == TrainingMethod.LORA):
+                            self.model.to(self.temp_device)
                         if backup:
                             self.__backup(train_progress, True, step_tqdm.write)
                         if save:
@@ -2234,6 +2252,10 @@ class GenericTrainer(BaseTrainer):
                 return
 
     def end(self):
+        # Thaw the heap frozen at epoch start first, so it stays collectable for
+        # later runs in this process (UI, queue worker) even if the final save raises.
+        gc.unfreeze()
+
         if self.one_step_trained:
             self.model.to(self.temp_device)
 

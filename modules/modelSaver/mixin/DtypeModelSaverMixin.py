@@ -62,7 +62,15 @@ class DtypeModelSaverMixin:
         self,
         model: BaseModel,
         state_dict: dict[str, Tensor] | None = None,
+        internal_format: bool = False,
     ) -> dict[str, str]:
+        """Build the safetensors metadata header.
+
+        ``internal_format`` marks a ModelFormat.INTERNAL backup: it is only read back by
+        OneTrainer's resume path, which ignores provenance, so the SHA-256 over every tensor
+        byte and the git subprocess calls are skipped (no ``modelspec.hash_sha256``,
+        ``ot_branch`` or ``ot_revision``). Exported formats keep them.
+        """
         model_spec = copy.deepcopy(model.model_spec) if model.model_spec is not None else ModelSpec()
 
         if model.train_config is not None and model.train_config.include_train_config == ConfigPart.SETTINGS:
@@ -74,14 +82,15 @@ class DtypeModelSaverMixin:
 
         # update calculated fields
         model_spec.date = datetime.now().strftime("%Y-%m-%d")
-        model_spec.hash_sha256 = self.__calculate_safetensors_hash(state_dict)
+        # None drops the key, including any hash inherited from the loaded model spec
+        model_spec.hash_sha256 = None if internal_format else self.__calculate_safetensors_hash(state_dict)
 
         # assemble the header
         model_spec_dict = model_spec.to_dict()
-        one_trainer_header = {
-            "ot_branch": git_util.get_git_branch(),
-            "ot_revision": git_util.get_git_revision(),
-        }
+        one_trainer_header = {}
+        if not internal_format:
+            one_trainer_header["ot_branch"] = git_util.get_git_branch()
+            one_trainer_header["ot_revision"] = git_util.get_git_revision()
         if config is not None:
             one_trainer_header["ot_config"] = config
 

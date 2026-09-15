@@ -1,6 +1,7 @@
 import os
+import warnings
 from abc import ABCMeta, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.mixin.ModelSetupTextRewardMixin import ModelSetupTextRewardMixin
@@ -37,6 +38,107 @@ def _dpo_reference_storage_dtype(config: TrainConfig, policy_dtype: torch.dtype)
     return train_dtype if train_dtype in {torch.float16, torch.bfloat16, torch.float32} else policy_dtype
 
 
+def _pin_if_cuda(tensor: Tensor, like: Tensor) -> Tensor:
+    # Page-lock a host copy of the DPO reference when its live parameter trains
+    # on CUDA, so every reference pass can upload it asynchronously. Anything
+    # else (CPU params, CPU-only tests) gets the tensor back untouched without
+    # ever touching the CUDA runtime. If the driver refuses to pin (WDDM caps
+    # page-locked memory) the snapshot stays pageable: uploads still work, just
+    # synchronously.
+    if like.device.type != "cuda" or tensor.device.type != "cpu" or tensor.is_pinned():
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except RuntimeError as e:
+        warnings.warn(f"Could not pin the DPO reference in host memory, using pageable memory: {e}", stacklevel=2)
+        return tensor
+
+
+def _capture_dpo_reference(policy: list[list[Tensor]], config: TrainConfig) -> list[list[Tensor]]:
+    # Clone the live adapter params into host RAM in the forward-pass dtype. The
+    # frozen reference never occupies VRAM between reference passes.
+    return [
+        [
+            _pin_if_cuda(
+                p.data.to(device="cpu", dtype=_dpo_reference_storage_dtype(config, p.data.dtype), copy=True),
+                p.data,
+            )
+            for p in params
+        ]
+        for params in policy
+    ]
+
+
+def _pin_dpo_reference(policy: list[list[Tensor]], ref_snapshot: list[list[Tensor]]) -> bool:
+    # Pin every host snapshot tensor whose parameter trains on CUDA, replacing
+    # the pageable tensor in the snapshot. Returns whether any parameter lives
+    # off the CPU: only then is the pass final for this snapshot version. With
+    # every param still on the CPU it is retried on the next reference pass, in
+    # case the model moves to the GPU afterwards.
+    off_cpu = False
+    for params, ref_params in zip(policy, ref_snapshot, strict=True):
+        for i, (param, ref_data) in enumerate(zip(params, ref_params, strict=True)):
+            off_cpu = off_cpu or param.data.device.type != "cpu"
+            ref_params[i] = _pin_if_cuda(ref_data, param.data)
+    return off_cpu
+
+
+def _swap_in_dpo_reference(
+    policy: list[list[Tensor]],
+    ref_snapshot: list[list[Tensor]],
+    config: TrainConfig,
+) -> None:
+    # Point every adapter param at its frozen reference. A snapshot tensor that
+    # already sits on the param's device in the forward-pass dtype is used as is.
+    # Otherwise it is uploaded into a temporary that only param.data holds, so
+    # restoring the policy data frees it and the snapshot never leaves the host.
+    # From pinned memory the upload is an async copy queued on the current
+    # stream, ahead of the reference forward that reads it.
+    for params, ref_params in zip(policy, ref_snapshot, strict=True):
+        for param, ref_data in zip(params, ref_params, strict=True):
+            device = param.data.device
+            dtype = _dpo_reference_storage_dtype(config, param.data.dtype)
+            if ref_data.device != device or ref_data.dtype != dtype:
+                ref_data = ref_data.to(device=device, dtype=dtype, non_blocking=True)
+            param.data = ref_data
+
+
+def _bump_dpo_reference_version(setup: "BaseModelSetup") -> None:
+    # Every capture, rebase and load yields a reference that may differ from the
+    # last saved file. save_dpo_reference hard-links the previous backup's file
+    # only while the version it recorded is still current.
+    setup._dpo_ref_version = getattr(setup, "_dpo_ref_version", 0) + 1
+
+
+def _link_dpo_reference_file(src_path: str, dst_path: str) -> bool:
+    # Hard-link an already written reference file into another backup. False
+    # whenever that is not possible (source pruned, cross-volume, no hard-link
+    # support, an unrelated file already at dst), so the caller writes instead.
+    try:
+        if os.path.lexists(dst_path):
+            return os.path.samefile(src_path, dst_path)
+        os.link(src_path, dst_path)
+    except OSError:
+        return False
+    return True
+
+
+def _write_dpo_reference_file(ref_snapshot: list[list[Tensor]], path: str) -> None:
+    # torch.save opens its target with "wb", truncating in place. The target may
+    # be a hard link shared with an older backup, so write a temp file and rename
+    # it over the target: the older name keeps its intact bytes, and an
+    # interrupted write never leaves a truncated reference behind.
+    payload = [[t.detach().cpu() for t in adapter] for adapter in ref_snapshot]
+    tmp_path = path + ".tmp"
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        with suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
 def _dpo_reference_matches(
     ref_snapshot: list[list[Tensor]] | None,
     policy: list[list[Tensor]],
@@ -44,8 +146,10 @@ def _dpo_reference_matches(
 ) -> bool:
     # Whether a frozen DPO reference lines up tensor for tensor with the live
     # params, which is what makes an in-place rebase safe. A first capture has
-    # no snapshot at all, and one restored from a backup still sits on the CPU
-    # until the first reference pass moves it onto the policy's device.
+    # no snapshot at all. The snapshot lives in host RAM whatever device the
+    # adapter trains on (reference passes upload temporaries), so a CPU tensor
+    # matches a param on any device; a tensor on the param's own device matches
+    # too. Shape and forward-pass dtype must agree either way.
     if ref_snapshot is None or len(ref_snapshot) != len(policy):
         return False
     for ref_params, params in zip(ref_snapshot, policy, strict=True):
@@ -54,7 +158,7 @@ def _dpo_reference_matches(
         for ref_data, param in zip(ref_params, params, strict=True):
             if (
                 ref_data.shape != param.data.shape
-                or ref_data.device != param.data.device
+                or (ref_data.device != param.data.device and ref_data.device.type != "cpu")
                 or ref_data.dtype != _dpo_reference_storage_dtype(config, param.data.dtype)
             ):
                 return False
@@ -79,6 +183,9 @@ class BaseModelSetup(
         self.debug_mode = debug_mode
         self.frozen_parameters = {}
         self._dpo_ref_params = None
+        self._dpo_ref_version = 0  # bumped on every capture, rebase and load of the reference
+        self._dpo_ref_saved = None  # (version, path) of the last dpo_reference.pt written or loaded
+        self._dpo_ref_pinned_version = None  # snapshot version already pinned for CUDA uploads
         self._last_dpo_metrics = None
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
@@ -1402,19 +1509,22 @@ class BaseModelSetup(
         elif ref_mode == DPORefMode.EXISTING_ADAPTER:
             # Reference params are captured once at first call and frozen for the
             # entire training run. This is intentional: DPO requires a fixed
-            # reference policy from the start of training.
+            # reference policy from the start of training. The snapshot lives in
+            # host RAM (pinned for CUDA); each pass uploads temporaries instead of
+            # holding a second copy of the adapter in VRAM for the whole run.
             policy_params = [list(adapter.parameters()) for adapter in adapters]
             if self._dpo_ref_params is None:
-                self._dpo_ref_params = [
-                    [
-                        p.data.to(
-                            dtype=_dpo_reference_storage_dtype(config, p.data.dtype),
-                            copy=True,
-                        )
-                        for p in params
-                    ]
-                    for params in policy_params
-                ]
+                self._dpo_ref_params = _capture_dpo_reference(policy_params, config)
+                _bump_dpo_reference_version(self)
+
+            # A reference restored from a backup was loaded while the model sat on
+            # the temp device, so it is still pageable. Pin it once per snapshot
+            # version, on the first pass that sees the params on the GPU.
+            ref_version = getattr(self, "_dpo_ref_version", 0)
+            if getattr(self, "_dpo_ref_pinned_version", None) != ref_version and _pin_dpo_reference(
+                policy_params, self._dpo_ref_params
+            ):
+                self._dpo_ref_pinned_version = ref_version
 
             policy_data = [[p.data for p in params] for params in policy_params]
             policy_grads = [[p.grad for p in params] for params in policy_params]
@@ -1427,16 +1537,7 @@ class BaseModelSetup(
                     for param in params:
                         param.grad = None
 
-                for params, ref_params in zip(policy_params, self._dpo_ref_params, strict=True):
-                    for i, (param, ref_data) in enumerate(zip(params, ref_params, strict=True)):
-                        # Reference params restored from a backup live on CPU; move
-                        # them onto the live param's device in the forward-pass dtype
-                        # once and cache that tensor.
-                        reference_dtype = _dpo_reference_storage_dtype(config, param.data.dtype)
-                        if ref_data.device != param.data.device or ref_data.dtype != reference_dtype:
-                            ref_data = ref_data.to(device=param.data.device, dtype=reference_dtype)
-                            ref_params[i] = ref_data
-                        param.data = ref_data
+                _swap_in_dpo_reference(policy_params, self._dpo_ref_params, config)
                 yield
             finally:
                 for params, policy_ptrs, grad_ptrs in zip(policy_params, policy_data, policy_grads, strict=True):
@@ -1456,30 +1557,21 @@ class BaseModelSetup(
         if len(adapters) == 0:
             return
 
-        # Overwrite the snapshot in place wherever it already mirrors the live
-        # params. Building the replacement first and rebinding would hold both
-        # snapshots at once: allocation peaks at twice the reference, and the
-        # caching allocator keeps that extra block reserved for the rest of the
-        # run even though it is free again. Anything that does not line up
-        # falls back to fresh clones, so the snapshot always ends up on the
-        # policy's device in the configured forward-pass dtype.
+        # Overwrite the host snapshot in place wherever it already mirrors the
+        # live params. Building the replacement first and rebinding would hold
+        # both snapshots at once, and the caching host allocator keeps pinned
+        # blocks it has handed out. copy_ from a CUDA param into a CPU tensor is
+        # a blocking copy, so the snapshot is complete when this returns, before
+        # any later upload reads it. Anything that does not line up is captured
+        # afresh into host RAM.
         policy = [list(adapter.parameters()) for adapter in adapters]
         if _dpo_reference_matches(self._dpo_ref_params, policy, config):
             for ref_params, params in zip(self._dpo_ref_params, policy, strict=True):
                 for ref_data, param in zip(ref_params, params, strict=True):
                     ref_data.copy_(param.data)
-            return
-
-        self._dpo_ref_params = [
-            [
-                p.data.to(
-                    dtype=_dpo_reference_storage_dtype(config, p.data.dtype),
-                    copy=True,
-                )
-                for p in params
-            ]
-            for params in policy
-        ]
+        else:
+            self._dpo_ref_params = _capture_dpo_reference(policy, config)
+        _bump_dpo_reference_version(self)
 
     _DPO_REFERENCE_FILENAME = "dpo_reference.pt"
 
@@ -1488,13 +1580,28 @@ class BaseModelSetup(
         # survives resume. Without this the reference is re-captured from the
         # resumed (already DPO-trained) adapter weights, silently moving the KL
         # anchor. NEW_ADAPTER mode never captures params, so nothing is written.
+        #
+        # Resume reads only the newest backup and rolling pruning deletes older
+        # ones, so every backup needs its own file. The reference only changes
+        # on capture, rebase or load, so while the last saved file is still the
+        # current version it is hard-linked into the new backup instead of being
+        # written again; a link survives deleting the other name.
         if self._dpo_ref_params is None:
             return
+        path = os.path.join(backup_path, self._DPO_REFERENCE_FILENAME)
+        ref_version = getattr(self, "_dpo_ref_version", 0)
+        last_saved = getattr(self, "_dpo_ref_saved", None)
         try:
-            payload = [[t.detach().to("cpu", copy=True) for t in adapter] for adapter in self._dpo_ref_params]
-            torch.save(payload, os.path.join(backup_path, self._DPO_REFERENCE_FILENAME))
-        except OSError:
-            pass
+            linked = (
+                last_saved is not None
+                and last_saved[0] == ref_version
+                and _link_dpo_reference_file(last_saved[1], path)
+            )
+            if not linked:
+                _write_dpo_reference_file(self._dpo_ref_params, path)
+            self._dpo_ref_saved = (ref_version, path)
+        except OSError as e:
+            print(f"Could not save the DPO reference to {path}: {e}")
 
     def load_dpo_reference(self, backup_path: str, model: BaseModel, config: TrainConfig) -> bool:
         # Restore the frozen reference saved next to the backup we are resuming
@@ -1509,19 +1616,26 @@ class BaseModelSetup(
         if not isinstance(saved, list) or len(saved) != len(adapters):
             return False
         restored: list[list[Tensor]] = []
+        file_matches_snapshot = True
         for adapter, adapter_saved in zip(adapters, saved, strict=True):
             params = list(adapter.parameters())
             if len(adapter_saved) != len(params):
                 return False
             if any(tuple(t.shape) != tuple(p.shape) for t, p in zip(adapter_saved, params, strict=True)):
                 return False
-            restored.append(
-                [
-                    tensor.to(dtype=_dpo_reference_storage_dtype(config, param.data.dtype))
-                    for tensor, param in zip(adapter_saved, params, strict=True)
-                ]
-            )
+            adapter_restored = []
+            for tensor, param in zip(adapter_saved, params, strict=True):
+                reference_dtype = _dpo_reference_storage_dtype(config, param.data.dtype)
+                file_matches_snapshot = file_matches_snapshot and tensor.dtype == reference_dtype
+                # Stays in host RAM. Pinned now only if the params already sit
+                # on CUDA; otherwise on the first reference pass that sees them there.
+                adapter_restored.append(_pin_if_cuda(tensor.to(dtype=reference_dtype), param.data))
+            restored.append(adapter_restored)
         self._dpo_ref_params = restored
+        _bump_dpo_reference_version(self)
+        # A file holding exactly the restored tensors can be hard-linked into the
+        # first backup after resume; one that needed a dtype cast is rewritten.
+        self._dpo_ref_saved = (self._dpo_ref_version, path) if file_matches_snapshot else None
         return True
 
     def _create_model_part_parameters(

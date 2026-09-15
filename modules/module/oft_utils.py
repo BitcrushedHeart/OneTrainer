@@ -1,7 +1,40 @@
+import contextlib
 import math
 
 import torch
 import torch.nn as nn
+
+# Shared upper-triangle index tables, keyed by (block_size, device). Every
+# adapted Linear of a given block size reads the same two int64 tensors instead
+# of registering its own copy: on Z-Image (210 adapted Linears, blocks 768/1024)
+# per-module buffers cost ~1 GiB of VRAM for data that only has 2 distinct values.
+# Modules hold plain attribute references (not buffers), filled eagerly in
+# __init__ and re-bound in _apply after .to()/.cuda(); the forward path only
+# reads attributes, so no dict lookup ever happens inside a compiled region.
+_TRIU_INDEX_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+
+# Device types torch.autocast accepts; anything else (e.g. "meta") has no
+# autocast state to disable.
+_AUTOCAST_DEVICE_TYPES = ("cuda", "cpu", "xpu", "mps", "hpu", "mtia", "xla", "privateuseone")
+
+
+def shared_triu_indices(block_size: int, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
+    """(rows, cols) of the strict upper triangle of a block_size square, shared per device."""
+    device = torch.device(device)
+    key = (block_size, device)
+    cached = _TRIU_INDEX_CACHE.get(key)
+    if cached is None:
+        rows, cols = torch.triu_indices(block_size, block_size, 1, device=device)
+        cached = (rows, cols)
+        _TRIU_INDEX_CACHE[key] = cached
+    return cached
+
+
+def _autocast_disabled(device_type: str):
+    """An autocast-off region for ``device_type`` (no-op for types autocast does not know)."""
+    if device_type in _AUTOCAST_DEVICE_TYPES:
+        return torch.autocast(device_type=device_type, enabled=False)
+    return contextlib.nullcontext()
 
 
 class MultiplicativeDropoutLayer(nn.Module):
@@ -37,6 +70,9 @@ class MultiplicativeDropoutLayer(nn.Module):
 
 
 class OFTRotationModule(nn.Module):
+    rows: torch.Tensor  # shared triu row indices, see _TRIU_INDEX_CACHE
+    cols: torch.Tensor
+
     def __init__(
         self,
         r,
@@ -69,10 +105,11 @@ class OFTRotationModule(nn.Module):
         self.oft_cans = oft_cans
         if oft_cans:
             self.register_buffer("cans_oft", torch.tensor(True))
-        # Create indices for upper triangle (excluding diagonal)
-        rows, cols = torch.triu_indices(block_size, block_size, 1)
-        self.register_buffer("rows", rows, persistent=False)
-        self.register_buffer("cols", cols, persistent=False)
+        # Indices for the upper triangle (excluding diagonal). Plain attributes
+        # referencing the shared per-(block_size, device) table, NOT buffers:
+        # nn.Module.to() would otherwise materialize a private copy per module.
+        # Re-bound to the weight's device by _apply.
+        self._bind_triu_indices(torch.device("cpu"))
         self.dropout = MultiplicativeDropoutLayer(p=dropout_probability)
         # Spectral clipping is a Cayley-Neumann convergence safeguard only: it
         # exists because the Neumann series diverges once ||Q||_2 >= 1. CANS
@@ -95,6 +132,25 @@ class OFTRotationModule(nn.Module):
         if not self.use_cayley_neumann:
             id_mat = torch.eye(block_size).unsqueeze(0).expand(r, block_size, block_size)
             self.register_buffer("id_mat", id_mat, persistent=False)
+
+    def _bind_triu_indices(self, device: torch.device) -> None:
+        self.rows, self.cols = shared_triu_indices(self.block_size, device)
+
+    def _apply(self, fn, recurse=True):
+        # .to()/.cuda()/.cpu()/.to_empty() all funnel through _apply. The index
+        # tables are integer attributes outside the buffer registry, so they are
+        # never dtype-cast; only their device follows the weight.
+        result = super()._apply(fn, recurse)
+        self._bind_triu_indices(self.weight.device)
+        return result
+
+    def _triu_indices_on(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fast path (always taken after a normal .to()): the bound attributes.
+        # The fallback covers a weight moved without _apply (e.g. load_state_dict
+        # with assign=True onto another device).
+        if self.rows.device == device:
+            return self.rows, self.cols
+        return shared_triu_indices(self.block_size, device)
 
     @torch.no_grad()
     def warm_start_spectral_state(self, steps: int = 256):
@@ -134,17 +190,19 @@ class OFTRotationModule(nn.Module):
         batch_size = vec.shape[0]
         matrix = torch.zeros(batch_size, block_size, block_size, device=vec.device, dtype=vec.dtype)
 
-        # the following two lines are equivalent to "matrix[:, self.rows, self.cols] = vec",
+        # the following lines are equivalent to "matrix[:, rows, cols] = vec",
         # but they work around a pytorch issue: https://github.com/pytorch/pytorch/issues/169179
+        rows, cols = self._triu_indices_on(vec.device)
         batch_idx = torch.arange(batch_size, device=vec.device)[:, None]
-        matrix = matrix.index_put((batch_idx, self.rows, self.cols), vec)
+        matrix = matrix.index_put((batch_idx, rows, cols), vec)
 
         matrix = matrix - matrix.transpose(-2, -1)
         return matrix
 
     def _pytorch_skew_symmetric_inv(self, matrix, block_size):
         # Extract the upper triangular elements
-        vec = matrix[:, self.rows, self.cols]
+        rows, cols = self._triu_indices_on(matrix.device)
+        vec = matrix[:, rows, cols]
         return vec
 
     @torch.no_grad()
@@ -226,9 +284,14 @@ class OFTRotationModule(nn.Module):
         use_cayley_neumann: bool = True,
         num_neumann_terms: int = 5,
         oft_cans: bool = False,
+        cans_step_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """
         Perform the Cayley parametrization on a batch of skew-symmetric matrices.
+
+        cans_step_dtype: dtype of the stored rotation weight when ``Q`` was upcast
+        for a full-precision Cayley. CANS picks its Newton-Schulz step count from
+        the precision the weight lives in, not from the upcast. None -> ``Q.dtype``.
         """
         b, _ = Q.shape
         previous_dtype = Q.dtype
@@ -246,7 +309,15 @@ class OFTRotationModule(nn.Module):
             max_norm = self.oft_clipped_norm
             Q_skew = Q_skew * (max_norm / torch.clamp(sigma, min=max_norm))
 
-        if use_cayley_neumann:
+        if use_cayley_neumann and num_neumann_terms == 5:
+            # R = I + 2Q + 2Q^2 + 2Q^3 + Q^4, Horner-factored as
+            # R = I + 2Q + Q^2 (2I + 2Q + Q^2): two batched matmuls instead of three.
+            Q_squared = torch.bmm(Q_skew, Q_skew)
+            inner = torch.add(Q_squared, Q_skew, alpha=2.0)
+            inner.diagonal(dim1=-2, dim2=-1).add_(2.0)
+            R = torch.baddbmm(Q_skew, Q_squared, inner, beta=2.0, alpha=1.0)
+            R.diagonal(dim1=-2, dim2=-1).add_(1.0)
+        elif use_cayley_neumann:
             R = torch.eye(block_size, device=Q.device, dtype=Q.dtype).repeat(b, 1, 1)
             if num_neumann_terms > 1:
                 R.add_(Q_skew, alpha=2.0)
@@ -264,7 +335,10 @@ class OFTRotationModule(nn.Module):
             G = self.id_mat + Q_skew
             # Empirically, BF16 requires 5 steps to converge to ortho error ~1e-2 (its limit)
             # While FP32 takes 7 steps to converge to ortho error ~1e-6
-            steps = 5 if G.dtype == torch.bfloat16 else 7
+            # Under a full-precision upcast the count follows the dtype G would have
+            # had without it (id_mat + Q in the stored weight dtype).
+            step_dtype = G.dtype if cans_step_dtype is None else torch.promote_types(self.id_mat.dtype, cans_step_dtype)
+            steps = 5 if step_dtype == torch.bfloat16 else 7
             R_half = self._cans_newton_schulz_iteration(G=G, steps=steps)
             # Squaring the matrix doubles the rotation range from (-90°, 90°) to (-180°, 180°) and
             # matches Cayley (I + 2Q).
@@ -274,20 +348,38 @@ class OFTRotationModule(nn.Module):
 
         return R.to(previous_dtype)
 
+    def cayley_rotation_full_precision(self) -> torch.Tensor:
+        """The (undropped) rotation R, computed in at least float32 with autocast off.
+
+        Under mixed-precision training (fp32 adapter weights, bf16 autocast) every
+        matmul of the Neumann series and of the spectral-norm power iteration would
+        otherwise run in bf16, leaving R measurably non-orthogonal and diverging from
+        the fp32 bake in OFTModule.apply_to_module. Only this small (r, b, b)
+        computation is lifted; the activation path stays in the caller's dtype.
+        Returns float32 (float64 for a float64 weight).
+        """
+        weight = self.weight
+        compute_dtype = torch.promote_types(weight.dtype, torch.float32)
+        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
+        with _autocast_disabled(weight.device.type):
+            effective_weight = weight.to(compute_dtype) / scaling_factor
+            return self._cayley_batch(
+                effective_weight,
+                self.block_size,
+                self.use_cayley_neumann,
+                self.num_cayley_neumann_terms,
+                self.oft_cans,
+                cans_step_dtype=weight.dtype,
+            )
+
     def forward(self, x):
         required_dtype = x.dtype
-        if required_dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
-
         orig_shape = x.shape
 
-        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
-        effective_weight = self.weight / scaling_factor
-
-        orth_rotate = self._cayley_batch(
-            effective_weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms, self.oft_cans
-        )
+        orth_rotate = self.cayley_rotation_full_precision()
         orth_rotate = self.dropout(orth_rotate)
+        # Cast once; the einsum runs in the activation dtype (x is no longer upcast).
+        orth_rotate = orth_rotate.to(required_dtype)
 
         rank = self.in_features // self.block_size if self.block_share else self.r
         batch_dims = x.shape[:-1]

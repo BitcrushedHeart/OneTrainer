@@ -173,6 +173,7 @@ class TextRewardModel:
         from doctr.models import detection, recognition
 
         self.device = device
+        self.detector_arch = detector_arch
         self.recognizer_arch = recognizer_arch
         self.is_trocr = recognizer_arch.startswith("trocr")
         self.detector = getattr(detection, detector_arch)(pretrained=True).eval().to(device)

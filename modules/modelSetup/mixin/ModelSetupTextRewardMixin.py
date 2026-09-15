@@ -14,6 +14,14 @@ One reward step, for one synthetic prompt:
    recognizer's CTC loss back through pixels, VAE and the one transformer
    forward into the adapter.
 
+With ``OFFLINE_IMAGES`` there is no prefix and no step 3 on the policy: the
+pre-generated image is re-noised to ``sigma_k``, and its VAE latent plus the
+detector's boxes and readings on the *clean* source are computed once per
+image and cached under ``<cache_dir>/text_reward``. A sample is then exactly
+one transformer forward (the grad one) and one grad-bearing crop decode; the
+metric readings come from a no-grad read of that crop, and the preview's full
+decode runs only on save steps, after the backward.
+
 Conditioning is pre-encoded per epoch (:meth:`build_text_reward_bank`)
 because the text encoder is offloaded while training.
 """
@@ -35,6 +43,7 @@ from modules.util.text_reward_util import (
     generate_text_specs,
     load_text_reward_dataset,
     load_word_list,
+    policy_read_metrics,
     text_reward_metrics,
 )
 from modules.util.torch_util import torch_gc
@@ -61,6 +70,7 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
         self._last_text_reward_metrics: dict[str, float] = {}
         self._text_reward_sample_count = 0
         self._text_reward_recognizer_arch: str | None = None
+        self._text_reward_cache = None
 
     # -- reward model ---------------------------------------------------------
 
@@ -84,6 +94,7 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
         self._text_reward_recognizer_arch = config.text_reward_recognizer
         vocab = self.text_reward_model().vocab
         image_paths: list[str] | None = None
+        image_sha256s: list[str | None] | None = None
         if config.text_reward_source == TextRewardSource.OFFLINE_IMAGES:
             rows = load_text_reward_dataset(config.text_reward_dataset_dir, vocab)
             if not rows:
@@ -93,6 +104,7 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             specs = [r[0] for r in rows]
             prompts = [r[1] for r in rows]
             image_paths = [r[2] for r in rows]
+            image_sha256s = [getattr(r, "sha256", None) for r in rows]
         else:
             specs = generate_text_specs(
                 max(1, config.text_reward_samples_per_epoch),
@@ -129,7 +141,7 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             if config.latent_caching:
                 model.text_encoder_to(self.temp_device)
             torch_gc()
-        return TextRewardBank(specs, embeddings, negative, image_paths)
+        return TextRewardBank(specs, embeddings, negative, image_paths, image_sha256s)
 
     # -- one reward step ---------------------------------------------------------
 
@@ -141,28 +153,112 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             "text_encoder_hidden_state": embedding.unsqueeze(0),
         }
 
-    def _text_reward_encode_image(self, model: BaseModel, image_path: str, config: TrainConfig) -> Tensor:
-        """Load an offline sample and VAE-encode it to a *scaled* latent
-        ``(1, C, H/8, W/8)``. The image is resized so its longer edge matches
+    @staticmethod
+    def _text_reward_target_resolution(config: TrainConfig) -> int:
+        """Effective longer-edge target of the offline encode: a multiple of 16, at least 64."""
+        return max(64, int(config.text_reward_resolution) // 16 * 16)
+
+    def _text_reward_load_pixels(self, image_path: str, config: TrainConfig) -> Tensor:
+        """Load an offline sample as ``(1, 3, H, W)`` float pixels in ``[0, 1]``
+        on the CPU, resized so its longer edge matches the effective
         ``text_reward_resolution`` and both edges are multiples of 16."""
+        import numpy as np
         from PIL import Image
 
         image = Image.open(image_path).convert("RGB")
-        target = max(64, int(config.text_reward_resolution) // 16 * 16)
+        target = self._text_reward_target_resolution(config)
         w, h = image.size
         scale = target / max(w, h)
         nw = max(16, int(round(w * scale / 16)) * 16)
         nh = max(16, int(round(h * scale / 16)) * 16)
         if (nw, nh) != (w, h):
             image = image.resize((nw, nh), Image.LANCZOS)
-        import numpy as np
+        return torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).float().unsqueeze(0) / 255.0
 
-        pixels = torch.from_numpy(np.asarray(image).copy()).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        pixels = (pixels * 2.0 - 1.0).to(device=self.train_device)
+    def _text_reward_encode_pixels(self, model: BaseModel, pixels01: Tensor) -> Tensor:
+        """VAE-encode ``[0, 1]`` pixels to a *scaled* latent ``(1, C, H/8, W/8)``."""
+        pixels = (pixels01 * 2.0 - 1.0).to(device=self.train_device)
         vae_dtype = next(model.vae.parameters()).dtype
         posterior = model.vae.encode(pixels.to(dtype=vae_dtype), return_dict=False)[0]
         latent = posterior.mode() if hasattr(posterior, "mode") else posterior
         return model.scale_latents(latent.float())
+
+    def _text_reward_encode_image(self, model: BaseModel, image_path: str, config: TrainConfig) -> Tensor:
+        """Load an offline sample and VAE-encode it to a *scaled* latent
+        ``(1, C, H/8, W/8)``. The image is resized so its longer edge matches
+        ``text_reward_resolution`` and both edges are multiples of 16."""
+        return self._text_reward_encode_pixels(model, self._text_reward_load_pixels(image_path, config))
+
+    def _text_reward_vae_to_train_device(self, model: BaseModel) -> None:
+        if next(model.vae.parameters()).device.type != self.train_device.type:
+            model.vae_to(self.train_device)
+
+    @staticmethod
+    def _text_reward_vae_identity(model: BaseModel, config: TrainConfig) -> str:
+        """What the cached latent depends on from the VAE side: which VAE (its
+        own model name, else the base model's), its configured and actual
+        weight dtype, and the latent scaling."""
+        vae_part = getattr(config, "vae", None)
+        name = getattr(vae_part, "model_name", "") or getattr(config, "base_model_name", "") or ""
+        weight_dtype = getattr(vae_part, "weight_dtype", None)
+        runtime_dtype = next(model.vae.parameters()).dtype
+        vae_config = getattr(model.vae, "config", None)
+        scaling = getattr(vae_config, "scaling_factor", None)
+        shift = getattr(vae_config, "shift_factor", None)
+        return f"{name}|{weight_dtype}|{runtime_dtype}|scale={scaling}|shift={shift}"
+
+    def _text_reward_source_cache(self, config: TrainConfig):
+        from modules.util.text_reward_cache import TEXT_REWARD_CACHE_SUBDIR, TextRewardSourceCache
+
+        if not config.cache_dir:
+            return None
+        folder = os.path.join(config.cache_dir, TEXT_REWARD_CACHE_SUBDIR)
+        cache = getattr(self, "_text_reward_cache", None)
+        if cache is None or cache.folder != folder:
+            cache = TextRewardSourceCache(folder)
+            self._text_reward_cache = cache
+        return cache
+
+    def _text_reward_offline_source(self, model: BaseModel, sample: TextRewardSample, config: TrainConfig, reward):
+        """``(scaled source latent on CPU, DetectedWords)`` for an offline
+        sample: from ``<cache_dir>/text_reward`` when a matching entry exists,
+        otherwise encoded and detected on the clean resized source (no decode)
+        and written back. Only a miss touches the VAE; it is paged onto the
+        train device for the encode and returned to the temp device afterwards
+        if it was not there already."""
+        from modules.util.text_reward_cache import text_reward_cache_key, text_reward_image_identity
+        from modules.util.text_reward_model import DetectedWords
+
+        cache = self._text_reward_source_cache(config)
+        key = text_reward_cache_key(
+            image_identity=text_reward_image_identity(sample.image_path, sample.image_sha256),
+            resolution=self._text_reward_target_resolution(config),
+            vae_identity=self._text_reward_vae_identity(model, config),
+            detector_arch=getattr(reward, "detector_arch", ""),
+            recognizer_arch=getattr(reward, "recognizer_arch", ""),
+            min_box_confidence=reward.min_box_confidence,
+            min_box_height=reward.min_box_height,
+        )
+        if cache is not None:
+            hit = cache.load(key)
+            if hit is not None:
+                return hit.latent, DetectedWords(boxes=hit.boxes, readings=hit.readings)
+
+        pixels01 = self._text_reward_load_pixels(sample.image_path, config)
+        was_on_train_device = next(model.vae.parameters()).device.type == self.train_device.type
+        if not was_on_train_device:
+            model.vae_to(self.train_device)
+        try:
+            with torch.no_grad():
+                latent = self._text_reward_encode_pixels(model, pixels01).detach().to(device="cpu", dtype=torch.float32)
+        finally:
+            if not was_on_train_device:
+                model.vae_to(self.temp_device)
+        detected = reward.detect(pixels01.to(device=reward.device))[0]
+        del pixels01
+        if cache is not None:
+            cache.save(key, latent, detected.boxes, detected.readings)
+        return latent, detected
 
     def _text_reward_decode(self, model: BaseModel, scaled_latent: Tensor, *, tiled: bool = False) -> Tensor:
         """VAE decode of a scaled latent to ``[0, 1]`` float pixels. ``tiled``
@@ -178,7 +274,6 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             model.vae.tile_sample_min_size = 256
             model.vae.tile_latent_min_size = 32
             model.vae.enable_tiling()
-            torch.cuda.empty_cache()
         try:
             image = model.vae.decode(model.unscale_latents(scaled_latent.to(dtype=vae_dtype)), return_dict=False)[0]
         finally:
@@ -198,23 +293,26 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
         """Run one reward sample; gradients land through ``backward_fn``.
         Returns the detached CTC value (zero when no word was found)."""
         reward = self.text_reward_model()
-        vae_device = next(model.vae.parameters()).device
-        if vae_device.type != self.train_device.type:
-            model.vae_to(self.train_device)
+        offline = sample.image_path is not None
+        if not offline:
+            self._text_reward_vae_to_train_device(model)
         if not self._text_reward_vae_ckpt_enabled and hasattr(model.vae, "enable_gradient_checkpointing"):
             model.vae.enable_gradient_checkpointing()
             self._text_reward_vae_ckpt_enabled = True
 
         channels = model.vae.config.latent_channels
         source_latent = None
-        if sample.image_path is not None:
+        detected = None
+        if offline:
             # OFFLINE_IMAGES: the clean latent comes from the pre-generated
-            # image; its own size (padded to 16 px) sets the latent shape.
-            with torch.no_grad():
-                source_latent = self._text_reward_encode_image(model, sample.image_path, config)
+            # image; its own size (padded to 16 px) sets the latent shape. The
+            # latent and the detector's boxes/readings on the clean source are
+            # cached on disk per image (see modules/util/text_reward_cache.py).
+            source_latent, detected = self._text_reward_offline_source(model, sample, config, reward)
+            source_latent = source_latent.to(device=self.train_device)
             lh, lw = int(source_latent.shape[-2]), int(source_latent.shape[-1])
         else:
-            res = max(64, int(config.text_reward_resolution) // 16 * 16)
+            res = self._text_reward_target_resolution(config)
             lh = lw = res // 8
         latent_shape = (1, channels, lh, lw)
         cond_batch = self._text_reward_cond_batch(sample.embedding, latent_shape, model)
@@ -254,17 +352,26 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             x_k = latent.detach()
         sigma_b = sigma_k.view(1, 1, 1, 1).to(dtype=x_k.dtype)
 
-        # Detect BEFORE the grad-bearing forward so the full-image decode never
-        # coexists with the transformer's autograd graph (that pairing OOMs a
-        # 24 GB card). The grad forward below sees the same x_k and sigma, so
-        # its x0 matches this one bit-for-bit and the boxes stay valid.
-        with torch.no_grad():
-            v_probe = self.predict_distill_velocity(model, cond_batch, config, train_progress, x_k, sigma_k)
-            x0_probe = x_k - sigma_b * v_probe.to(dtype=x_k.dtype)
-            del v_probe
-            full01 = self._text_reward_decode(model, x0_probe, tiled=True)
-            del x0_probe
-            detected = reward.detect(full01)[0]
+        # Where the boxes come from, and why nothing full-frame coexists with
+        # the transformer's autograd graph (that pairing OOMs a 24 GB card):
+        # * OFFLINE_IMAGES: boxes and readings come from the clean source image
+        #   (the cached detection above), not from the policy's x0, so there is
+        #   no no-grad probe forward and no full-frame decode. Boxes are
+        #   relative and the latent grid is derived from the same resized
+        #   source, so they land on the grad forward's x0 unchanged. The only
+        #   full decode left is the preview, which runs after backward_fn.
+        # * ONLINE_ROLLOUT: detect BEFORE the grad-bearing forward. The grad
+        #   forward below sees the same x_k and sigma, so its x0 matches the
+        #   probe's bit-for-bit and the boxes stay valid.
+        full01 = None
+        if not offline:
+            with torch.no_grad():
+                v_probe = self.predict_distill_velocity(model, cond_batch, config, train_progress, x_k, sigma_k)
+                x0_probe = x_k - sigma_b * v_probe.to(dtype=x_k.dtype)
+                del v_probe
+                full01 = self._text_reward_decode(model, x0_probe, tiled=True)
+                del x0_probe
+                detected = reward.detect(full01)[0]
         alignment = reward.align(detected, sample.spec.words)
 
         v_k = self.predict_distill_velocity(model, cond_batch, config, train_progress, x_k, sigma_k)
@@ -272,15 +379,22 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
 
         from modules.util.text_reward_model import boxes_inside_region, latent_crop_region
 
+        save_due = (
+            config.text_reward_save_interval > 0
+            and self._text_reward_sample_count % config.text_reward_save_interval == 0
+        )
         matched = [(detected.boxes[bi], sample.spec.words[ti]) for bi, ti in alignment.pairs]
         loss_value = torch.zeros((), device=self.train_device)
         ctc_words = 0
+        policy_readings: dict[int, str] = {}  # offline: box index -> no-grad reading of the policy crop
         if matched:
             max_edge = max(64, int(config.text_reward_max_decode_pixels)) // 8
             region = latent_crop_region([b for b, _ in matched], lh, lw, max_area=max_edge * max_edge)
             keep = boxes_inside_region([b for b, _ in matched], region, lh, lw)
             if keep:
                 y0, y1, x0_, x1 = region
+                if offline:
+                    self._text_reward_vae_to_train_device(model)
                 crop01 = self._text_reward_decode(model, x0[:, :, y0:y1, x0_:x1])
                 ch, cw = (y1 - y0) * 8, (x1 - x0_) * 8
                 rel_boxes = []
@@ -301,9 +415,24 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
                 backward_fn(loss)
                 loss_value = loss.detach()
                 ctc_words = len(targets)
+                del loss
+                if offline:
+                    # Policy reading for the metrics: the recognizer on the
+                    # (already decoded) crop, after the backward freed the graph.
+                    with torch.no_grad(), torch.autocast(device_type=self.train_device.type, enabled=False):
+                        crop_readings = reward.read(crop01.detach(), rel_boxes)
+                    for i, reading in zip(keep, crop_readings, strict=True):
+                        policy_readings[alignment.pairs[i][0]] = reading
+                del crop01
+        x0_preview = x0.detach() if offline and save_due else None
         del x0, v_k
 
-        metrics = text_reward_metrics([detected.readings], [list(sample.spec.words)], [alignment])
+        if offline:
+            metrics = policy_read_metrics(policy_readings, list(sample.spec.words), alignment)
+            readings = [policy_readings[bi] for bi in sorted(policy_readings)]  # boxes are in reading order
+        else:
+            metrics = text_reward_metrics([detected.readings], [list(sample.spec.words)], [alignment])
+            readings = detected.readings
         self._last_text_reward_metrics = {
             "ctc": float(loss_value),
             "word_ratio": metrics.word_ratio,
@@ -314,11 +443,15 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             f"family_count/{sample.spec.family}": 1.0,
         }
         self._text_reward_sample_count += 1
-        if (
-            config.text_reward_save_interval > 0
-            and (self._text_reward_sample_count - 1) % config.text_reward_save_interval == 0
-        ):
-            self._save_text_reward_sample(config, train_progress, full01, sample, detected.readings)
+        if save_due:
+            if x0_preview is not None:
+                # Preview only: a detached tiled decode, after backward_fn and
+                # after the grad forward's graph was dropped.
+                self._text_reward_vae_to_train_device(model)
+                with torch.no_grad():
+                    full01 = self._text_reward_decode(model, x0_preview, tiled=True)
+                del x0_preview
+            self._save_text_reward_sample(config, train_progress, full01, sample, readings)
         del full01
         return loss_value
 

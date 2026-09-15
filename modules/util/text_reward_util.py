@@ -618,6 +618,38 @@ def text_reward_metrics(
     )
 
 
+def policy_read_metrics(
+    policy_readings: dict[int, str],
+    targets: Sequence[str],
+    alignment: WordAlignment,
+) -> TextRewardMetrics:
+    """Metrics for one offline-source sample, where the boxes and the
+    alignment come from the clean source image and only the words inside the
+    grad-decoded crop get a policy reading (``policy_readings``: box index ->
+    reading).
+
+    * ``missing``: fraction of *all* target words the source alignment left
+      unboxed, as in :func:`text_reward_metrics`.
+    * ``word_ratio`` / ``exact``: over the target words that were either read
+      from the policy crop or are missing (scored as 0). Words aligned on the
+      source but lying outside the decoded crop have no policy reading and
+      are left out rather than counted as 0."""
+    read_pairs = [(bi, ti) for bi, ti in alignment.pairs if bi in policy_readings]
+    counted = sorted({ti for _, ti in read_pairs} | set(alignment.missing))
+    remap = {ti: k for k, ti in enumerate(counted)}
+    sub = WordAlignment(
+        pairs=[(k, remap[ti]) for k, (_, ti) in enumerate(read_pairs)],
+        missing=[remap[t] for t in alignment.missing],
+    )
+    inner = text_reward_metrics([[policy_readings[bi] for bi, _ in read_pairs]], [[targets[t] for t in counted]], [sub])
+    return TextRewardMetrics(
+        word_ratio=inner.word_ratio,
+        exact=inner.exact,
+        missing=len(alignment.missing) / len(targets) if targets else 0.0,
+        count=1,
+    )
+
+
 # -- scheduling and the per-epoch prompt bank ---------------------------------
 
 
@@ -663,6 +695,7 @@ class TextRewardSample:
     embedding: object  #: per-prompt conditioning, as the model's encode_text returns it
     negative_embedding: object | None
     image_path: str | None = None  #: offline source image (OFFLINE_IMAGES), else None
+    image_sha256: str | None = None  #: dataset tool's content hash of ``image_path``, when known
 
 
 class TextRewardBank:
@@ -676,15 +709,19 @@ class TextRewardBank:
         embeddings: Sequence[object],
         negative_embedding: object | None,
         image_paths: Sequence[str] | None = None,
+        image_sha256s: Sequence[str | None] | None = None,
     ):
         if len(specs) != len(embeddings):
             raise ValueError("one embedding per spec")
         if image_paths is not None and len(image_paths) != len(specs):
             raise ValueError("one image per spec")
+        if image_sha256s is not None and (image_paths is None or len(image_sha256s) != len(image_paths)):
+            raise ValueError("one sha256 (or None) per image")
         self.specs = list(specs)
         self.embeddings = list(embeddings)
         self.negative_embedding = negative_embedding
         self.image_paths = list(image_paths) if image_paths is not None else None
+        self.image_sha256s = list(image_sha256s) if image_sha256s is not None else None
         self.cursor = 0
 
     def __len__(self) -> int:
@@ -700,6 +737,7 @@ class TextRewardBank:
             self.embeddings[i],
             self.negative_embedding,
             self.image_paths[i] if self.image_paths is not None else None,
+            self.image_sha256s[i] if self.image_sha256s is not None else None,
         )
 
 
@@ -750,12 +788,40 @@ def spec_from_prompt(prompt: str, vocab: str, *, family: str = "offline") -> Tex
     return TextSpec(surface=surface, text=" ".join(words), words=tuple(words), family=family)
 
 
-def load_text_reward_dataset(folder: str, vocab: str) -> list[tuple[TextSpec, str, str]]:
+class TextRewardDatasetEntry(tuple):
+    """One offline sample: unpacks, indexes and compares exactly like the
+    ``(spec, prompt, image_path)`` 3-tuple, and additionally carries
+    ``sha256`` — the dataset tool's content hash of the image from
+    ``<stem>.json`` (``None`` when there is no JSON or it has no hash)."""
+
+    def __new__(cls, spec: TextSpec, prompt: str, image_path: str, sha256: str | None = None):
+        entry = super().__new__(cls, (spec, prompt, image_path))
+        entry.sha256 = sha256
+        return entry
+
+    def __getnewargs__(self):
+        return (*self, self.sha256)
+
+    @property
+    def spec(self) -> TextSpec:
+        return self[0]
+
+    @property
+    def prompt(self) -> str:
+        return self[1]
+
+    @property
+    def image_path(self) -> str:
+        return self[2]
+
+
+def load_text_reward_dataset(folder: str, vocab: str) -> list[TextRewardDatasetEntry]:
     """``[(spec, prompt, image_path), ...]`` for every image in ``folder``
     (recursive) with a ``<stem>.txt`` prompt beside it. A ``<stem>.json`` from
-    the dataset tool supplies ``prompt``/``text`` when present. Sorted by path
-    so the order is stable across epochs."""
-    out: list[tuple[TextSpec, str, str]] = []
+    the dataset tool supplies ``prompt``/``text`` when present, and its
+    ``sha256`` rides along as ``entry.sha256``. Sorted by path so the order is
+    stable across epochs."""
+    out: list[TextRewardDatasetEntry] = []
     if not folder or not os.path.isdir(folder):
         return out
     for root, _dirs, files in os.walk(folder):
@@ -766,6 +832,7 @@ def load_text_reward_dataset(folder: str, vocab: str) -> list[tuple[TextSpec, st
             image_path = os.path.join(root, name)
             prompt = None
             explicit_text = None
+            sha256 = None
             json_path = os.path.join(root, stem + ".json")
             if os.path.isfile(json_path):
                 try:
@@ -773,6 +840,9 @@ def load_text_reward_dataset(folder: str, vocab: str) -> list[tuple[TextSpec, st
                         meta = json.load(f)
                     prompt = meta.get("prompt") or None
                     explicit_text = meta.get("text") or None
+                    digest = meta.get("sha256")
+                    if isinstance(digest, str) and digest.strip():
+                        sha256 = digest.strip().lower()
                 except (OSError, ValueError):
                     prompt = None
             if prompt is None:
@@ -789,7 +859,7 @@ def load_text_reward_dataset(folder: str, vocab: str) -> list[tuple[TextSpec, st
                 spec = spec_from_prompt(prompt, vocab)
             if spec is None:
                 continue
-            out.append((spec, prompt, image_path))
+            out.append(TextRewardDatasetEntry(spec, prompt, image_path, sha256))
     return out
 
 
