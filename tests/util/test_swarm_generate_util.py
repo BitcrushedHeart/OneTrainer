@@ -1,10 +1,12 @@
 """Sizing and batch planning for SwarmUI-generated off-policy negatives."""
 
+from modules.util.dpo_offpolicy_util import RealPhoto
 from modules.util.swarm_client import SwarmClient, SwarmError, normalize_base_url
 from modules.util.swarm_generate_util import (
     DEFAULT_TARGET_RESOLUTION,
     bucket_size_for_photo,
     bucket_sizes,
+    filter_pool_lines,
     plan_generations,
 )
 
@@ -89,6 +91,36 @@ def test_plan_drops_short_captions_when_a_minimum_is_set():
     jobs, stats = plan_generations(entries, min_caption_words=5)
     assert [job["real_path"] for job in jobs] == ["ok.jpg"]
     assert stats["too_short"] == 1
+
+
+def _photo(*lines: str, path: str = "p.jpg") -> RealPhoto:
+    return RealPhoto(path, path + ".txt", list(lines), 2400, 1600)
+
+
+def test_pool_filter_judges_each_caption_line_not_the_whole_sidecar():
+    long_line = "A woman stands in a sunlit garden holding a watering can."
+    pool = [
+        (_photo("A woman.", long_line, path="mixed.jpg"), ["A woman.", long_line]),
+        (_photo("A woman.", "A man.", path="short.jpg"), ["A woman.", "A man."]),
+        (_photo("blonde hair, blue eyes, 1girl", path="tags.jpg"), ["blonde hair, blue eyes, 1girl"]),
+    ]
+    narrowed, stats = filter_pool_lines(pool, exclude_tag_style=True, min_caption_words=5)
+    # The mixed sidecar keeps only its long line, so a draw can never land on
+    # the short one and drop the photo.
+    assert [(p.path, lines) for p, lines in narrowed] == [("mixed.jpg", [long_line])]
+    assert stats == {"tag_style": 1, "too_short": 1}
+
+
+def test_pool_filter_is_a_no_op_when_both_filters_are_off():
+    pool = [(_photo("A woman.", "blonde hair, blue eyes, 1girl"), ["A woman.", "blonde hair, blue eyes, 1girl"])]
+    narrowed, stats = filter_pool_lines(pool)
+    assert narrowed == pool and stats == {"tag_style": 0, "too_short": 0}
+
+
+def test_pool_filter_reports_a_short_tag_list_as_tag_style():
+    pool = [(_photo("1girl, smile"), ["1girl, smile"])]
+    _narrowed, stats = filter_pool_lines(pool, exclude_tag_style=True, min_caption_words=5)
+    assert stats == {"tag_style": 1, "too_short": 0}
 
 
 def test_plan_skips_entries_it_cannot_size_or_prompt():

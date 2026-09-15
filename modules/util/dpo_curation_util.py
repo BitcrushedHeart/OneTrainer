@@ -89,6 +89,11 @@ _TRAINER_BUCKET_RATIOS: tuple[tuple[int, int], ...] = (
     (3, 1),
     (7, 2),
     (4, 1),
+    # Native generator buckets (AspectBucketing.all_possible_input_resolutions)
+    # reduced to lowest terms: 1216x832, 1216x768, 1536x640.
+    (19, 13),
+    (19, 12),
+    (12, 5),
 )
 
 
@@ -295,6 +300,10 @@ class DpoScanCache:
         self._cache_path = cache_path
         self._lock = threading.Lock()
         self._entries: dict[str, dict] = {}
+        # Values that belong to no file: per-model text embeddings and
+        # calibration for the adherence scorer. ``{field: {key: {"value",
+        # "model"}}}``, validated by model version only.
+        self._globals: dict[str, dict] = {}
         self._dirty = False
         # Rough counters for UI feedback ("N served from cache"). Updated from
         # worker threads without atomics — close enough for a progress display.
@@ -309,6 +318,8 @@ class DpoScanCache:
                 and isinstance(data.get("entries"), dict)
             ):
                 self._entries = data["entries"]
+                if isinstance(data.get("globals"), dict):
+                    self._globals = data["globals"]
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -380,9 +391,38 @@ class DpoScanCache:
                 if key not in self._entries and isinstance(entry, dict):
                     self._entries[key] = entry
                     imported += 1
+            other_globals = data.get("globals")
+            if isinstance(other_globals, dict):
+                for field, slots in other_globals.items():
+                    if not isinstance(slots, dict):
+                        continue
+                    mine = self._globals.setdefault(field, {})
+                    for slot_key, slot in slots.items():
+                        if slot_key not in mine and isinstance(slot, dict):
+                            mine[slot_key] = slot
+                            imported += 1
             if imported:
                 self._dirty = True
         return imported
+
+    def peek_global(self, field: str, key: str, model_version: str | None = None):
+        """Cached JSON-able value under ``field``/``key`` if stamped with
+        ``model_version``, else None. For values that belong to a model rather
+        than to a file (a prompt's text embeddings, the model's calibration),
+        so a group whose images are all cached needs no model at all."""
+        with self._lock:
+            slot = self._globals.get(field, {}).get(key)
+            if isinstance(slot, dict) and slot.get("model") == model_version:
+                self.hits += 1
+                return slot.get("value")
+        self.misses += 1
+        return None
+
+    def store_global(self, field: str, key: str, value, model_version: str | None = None) -> None:
+        """Write a JSON-able value under ``field``/``key`` stamped with ``model_version``."""
+        with self._lock:
+            self._globals.setdefault(field, {})[key] = {"value": value, "model": model_version}
+            self._dirty = True
 
     def get_image_size(self, path: str, compute) -> tuple[int, int] | None:
         """Cached (width, height). ``compute(path)`` returns that pair or None.
@@ -497,6 +537,101 @@ class DpoScanCache:
             entry["realism_model"] = model_version
             self._dirty = True
 
+    def peek_versioned(self, path: str, field: str, model_version: str | None = None):
+        """Cached JSON-able ``field`` for ``path`` if present, valid and stamped
+        with ``model_version`` (stored beside it as ``f"{field}_model"``), else
+        None. The generic form of :meth:`peek_realism` for further per-model
+        scores (age estimates, ...) so each one does not grow its own pair of
+        methods."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            valid = (
+                entry is not None
+                and entry.get("size") == st.st_size
+                and entry.get("mtime_ns") == st.st_mtime_ns
+                and field in entry
+                and entry.get(f"{field}_model") == model_version
+            )
+            value = entry[field] if valid else None
+        if value is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return value
+
+    def store_versioned(self, path: str, field: str, value, model_version: str | None = None) -> None:
+        """Write a JSON-able ``field`` for ``path`` stamped with ``model_version``."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.get("size") != st.st_size or entry.get("mtime_ns") != st.st_mtime_ns:
+                entry = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+                self._entries[key] = entry
+            entry[field] = value
+            entry[f"{field}_model"] = model_version
+            self._dirty = True
+
+    def peek_adherence_embedding(self, path: str, model_version: str | None = None):
+        """Cached prompt-adherence image embedding for ``path`` (a float32
+        numpy vector) if present, valid and produced by ``model_version``, else
+        None. Same additive, model-keyed contract as :meth:`peek_realism`; the
+        vector is stored compactly (see ``adherence_score_util.encode_embedding``)
+        because one is ~1k floats, not one float."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            valid = (
+                entry is not None
+                and entry.get("size") == st.st_size
+                and entry.get("mtime_ns") == st.st_mtime_ns
+                and "adherence_embedding" in entry
+                and entry.get("adherence_model") == model_version
+            )
+            blob = entry["adherence_embedding"] if valid else None
+        if blob is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        from modules.util.adherence_score_util import decode_embedding
+
+        try:
+            return decode_embedding(blob)
+        except Exception:
+            return None
+
+    def store_adherence_embedding(self, path: str, vector, model_version: str | None = None) -> None:
+        """Write a prompt-adherence image embedding for ``path``, validated by
+        the file's current (size, mtime) and stamped with the model."""
+        from modules.util.adherence_score_util import encode_embedding
+
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        blob = encode_embedding(vector)
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.get("size") != st.st_size or entry.get("mtime_ns") != st.st_mtime_ns:
+                entry = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+                self._entries[key] = entry
+            entry["adherence_embedding"] = blob
+            entry["adherence_model"] = model_version
+            self._dirty = True
+
     def save(self) -> None:
         """Persist to disk (atomic replace). Entries whose file no longer exists
         are pruned so renames/finalize moves don't grow the cache forever. No-op
@@ -511,7 +646,7 @@ class DpoScanCache:
             tmp_path = self._cache_path + ".tmp"
             try:
                 with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump({"version": self._VERSION, "entries": self._entries}, f)
+                    json.dump({"version": self._VERSION, "entries": self._entries, "globals": self._globals}, f)
                 os.replace(tmp_path, self._cache_path)
             except OSError:
                 pass

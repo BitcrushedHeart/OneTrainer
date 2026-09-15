@@ -31,6 +31,9 @@ class StartSessionRequest(BaseModel):
     # Comma-separated caption keywords; every term must appear in a group's
     # prompt for the group to be shown. Empty means no filtering.
     caption_filter: str = ""
+    # Smallest group to present. 2 (the floor a pair needs) shows everything;
+    # raise it to skip prompts with only a handful of generations.
+    min_images_per_group: int = 2
 
 
 class SelectImageRequest(BaseModel):
@@ -77,6 +80,10 @@ class TriageAlignRequest(BaseModel):
 
 
 class RealismScoresRequest(BaseModel):
+    paths: list[str]
+
+
+class ScoreBreakdownRequest(BaseModel):
     paths: list[str]
 
 
@@ -194,6 +201,7 @@ def start_session(req: StartSessionRequest):
         req.mode,
         group_order=req.group_order,
         caption_filter=req.caption_filter,
+        min_images_per_group=req.min_images_per_group,
     )
 
 
@@ -251,28 +259,38 @@ def realism_scores(req: RealismScoresRequest):
     return service.realism_scores(req.paths)
 
 
-@router.post("/dpo/session/realism-backfill")
-def start_realism_backfill():
-    """Score the whole source tree once so Selection never waits on the model.
+@router.post("/dpo/session/score-breakdown")
+def score_breakdown(req: ScoreBreakdownRequest):
+    """Every scorer's verdict per image of the current group: realism,
+    prompt adherence (with its propositions), age agreement, scalar quality
+    and the combined score. Feeds the per-tile panel in Selection mode."""
+    service = DPOService.get_instance()
+    return service.score_breakdown(req.paths)
 
-    Returns immediately; poll ``/dpo/session/realism-backfill/status``. Safe to
-    re-run — anything already cached under the current model version is a hit,
-    so a second pass only costs the images added since the first.
+
+@router.post("/dpo/session/score-backfill")
+def start_score_backfill():
+    """Score the whole source tree on every axis once so Selection never
+    loads a model.
+
+    Returns immediately; poll ``/dpo/session/score-backfill/status``. Safe to
+    re-run — anything already cached under the current model versions is a
+    hit, so a second pass only costs the images added since the first.
     """
     service = DPOService.get_instance()
-    return service.start_realism_backfill()
+    return service.start_score_backfill()
 
 
-@router.get("/dpo/session/realism-backfill/status")
-def realism_backfill_status():
+@router.get("/dpo/session/score-backfill/status")
+def score_backfill_status():
     service = DPOService.get_instance()
-    return service.realism_backfill_status()
+    return service.score_backfill_status()
 
 
-@router.post("/dpo/session/realism-backfill/stop")
-def stop_realism_backfill():
+@router.post("/dpo/session/score-backfill/stop")
+def stop_score_backfill():
     service = DPOService.get_instance()
-    return service.stop_realism_backfill()
+    return service.stop_score_backfill()
 
 
 @router.get("/dpo/realism/device")

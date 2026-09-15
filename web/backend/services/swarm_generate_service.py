@@ -24,6 +24,7 @@ from modules.util.swarm_client import DEFAULT_BASE_URL, SwarmClient, SwarmError
 from modules.util.swarm_generate_util import (
     DEFAULT_QUANTIZATION,
     DEFAULT_TARGET_RESOLUTION,
+    filter_pool_lines,
     merge_params,
     plan_generations,
     read_last_generation_params,
@@ -415,14 +416,16 @@ class SwarmGenerateService(SingletonMixin):
             self._state["phase"] = "cancelled"
             return
         pool = filter_pool_by_keywords(pool, parse_caption_keywords(options["keywords"]))
+        # Tag-style and word-minimum filters narrow each photo's eligible
+        # *lines* before the draw, so a photo is never judged by whichever of
+        # its caption lines the random pick landed on.
+        pool, stats = filter_pool_lines(
+            pool, exclude_tag_style=options["exclude_tag_style"], min_caption_words=options["min_caption_words"]
+        )
         self._state["pool"] = len(pool)
 
-        # Draw more than asked when tag-style captions are being dropped, so a
-        # tag-heavy dataset still fills the batch.
-        filtering = options["exclude_tag_style"] or options["min_caption_words"] > 0
-        draw = options["captions"] * (4 if filtering else 1)
-        entries = suggest_captions(pool, self._rng, draw, base_resolution=options["target_resolution"])
-        jobs, stats = plan_generations(
+        entries = suggest_captions(pool, self._rng, options["captions"], base_resolution=options["target_resolution"])
+        jobs, plan_stats = plan_generations(
             entries,
             images_per_caption=options["images_per_caption"],
             exclude_tag_style=options["exclude_tag_style"],
@@ -431,8 +434,8 @@ class SwarmGenerateService(SingletonMixin):
             quantization=options["quantization"],
         )
         jobs = jobs[: options["captions"]]
-        self._state["skipped_tag_style"] = stats.get("tag_style", 0)
-        self._state["skipped_short"] = stats.get("too_short", 0)
+        self._state["skipped_tag_style"] = stats["tag_style"] + plan_stats.get("tag_style", 0)
+        self._state["skipped_short"] = stats["too_short"] + plan_stats.get("too_short", 0)
         self._state["planned"] = len(jobs)
 
         if options["dry_run"]:

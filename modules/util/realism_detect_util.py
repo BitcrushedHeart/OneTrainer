@@ -326,11 +326,12 @@ def score_images_realism(
     skipped rather than raising — one bad file in a group should not cost the
     whole group its scores.
 
-    Note the model *is* loaded even when everything is cached, because its
-    version is what decides whether those cached scores are still valid. That
-    costs one session creation (~100ms) on an otherwise free call, which is a
-    fair price for never serving a score from a superseded model. An empty
-    ``paths`` still short-circuits before any load.
+    The cache is consulted before the model is loaded: the model version that
+    decides whether a cached score is still valid is read from the sidecar
+    (:func:`realism_model_version`), so a group that is fully cached — after a
+    backfill — never creates a session. That is the point of the backfill: no
+    weights on a GPU that is busy with something else. Only a miss loads the
+    model, and an empty ``paths`` short-circuits before anything.
 
     ``workers`` overrides the preprocessing pool size; the default scales with
     the machine (see :func:`_preprocess_worker_count`). It changes throughput
@@ -351,13 +352,25 @@ def score_images_realism(
 
     # The model has to be identified before the cache can be consulted: a score
     # cached by a previous model is stale, and version-keying is how a retrained
-    # head invalidates every session cache without hunting for the files.
-    session, spec = loader() if loader is not None else load_realism_model(device=device)
-    if session is None or spec is None:
-        raise RuntimeError(
-            f"Realism scoring needs onnxruntime and the model at {model_paths()[0]} (export it from Bitcrush Engine)."
-        )
-    model_version = spec.get("model_version")
+    # head invalidates every session cache without hunting for the files. With
+    # the default loader the version comes from the sidecar, so a fully cached
+    # call never builds a session; an explicit loader owns its version.
+    missing = RuntimeError(
+        f"Realism scoring needs onnxruntime and the model at {model_paths()[0]} (export it from Bitcrush Engine)."
+    )
+    session = spec = None
+    if loader is not None:
+        session, spec = loader()
+        if session is None or spec is None:
+            raise missing
+        model_version = spec.get("model_version")
+    else:
+        model_version = realism_model_version() if cache is not None else None
+        if model_version is None:
+            session, spec = load_realism_model(device=device)
+            if session is None or spec is None:
+                raise missing
+            model_version = spec.get("model_version")
 
     scores: dict[str, float] = {}
     misses: list[str] = []
@@ -373,6 +386,11 @@ def score_images_realism(
         progress(done, total)
     if not misses:
         return scores
+    if session is None:
+        session, spec = load_realism_model(device=device)
+        if session is None or spec is None:
+            raise missing
+        model_version = spec.get("model_version")
     draws = max(1, int(spec.get("tta", {}).get("draws", 1)))
     positive_index = int(spec.get("positive_class_index", 1))
 

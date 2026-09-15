@@ -49,6 +49,7 @@ export function DPOToolModal({ open, onClose }: Props) {
     pairsPerGroup,
     groupOrder,
     captionFilter,
+    minImagesPerGroup,
     scanCount,
     scanTotal,
     hashCount,
@@ -58,6 +59,10 @@ export function DPOToolModal({ open, onClose }: Props) {
     bestImage,
     remainingImages,
     realismScores,
+    scoreBreakdown,
+    scoreBreakdownErrors,
+    scoreWeights,
+    scoreSortMode,
     realismError,
     realismDevice,
     backfill,
@@ -111,11 +116,13 @@ export function DPOToolModal({ open, onClose }: Props) {
           pairsPerGroup={pairsPerGroup}
           groupOrder={groupOrder}
           captionFilter={captionFilter}
+          minImagesPerGroup={minImagesPerGroup}
           onSourceChange={actions.setSourceFolder}
           onOutputChange={actions.setOutputDir}
           onPairsPerGroupChange={actions.setPairsPerGroup}
           onGroupOrderChange={actions.setGroupOrder}
           onCaptionFilterChange={actions.setCaptionFilter}
+          onMinImagesPerGroupChange={actions.setMinImagesPerGroup}
           onStart={actions.startSession}
           onReview={actions.goToReview}
           onClose={onClose}
@@ -156,10 +163,16 @@ export function DPOToolModal({ open, onClose }: Props) {
           realismScores={realismScores}
           realismError={realismError}
           backfill={backfill}
-          onStartBackfill={() => void actions.startRealismBackfill()}
-          onStopBackfill={() => void actions.stopRealismBackfill()}
+          onStartBackfill={() => void actions.startScoreBackfill()}
+          onStopBackfill={() => void actions.stopScoreBackfill()}
           realismDevice={realismDevice}
           onSetRealismDevice={(device) => void actions.setRealismDevice(device)}
+          scoreBreakdown={scoreBreakdown}
+          scoreBreakdownErrors={scoreBreakdownErrors}
+          scoreWeights={scoreWeights}
+          onSetScoreWeights={actions.setScoreWeights}
+          scoreSortMode={scoreSortMode}
+          onSetScoreSortMode={actions.setScoreSortMode}
         />
       )}
 

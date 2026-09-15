@@ -2,14 +2,17 @@ import {
   Activity,
   Camera,
   Database,
+  Gauge,
   Grid3x3,
   Heart,
   Image,
   Layers,
   ListOrdered,
+  ListRestart,
   RefreshCw,
   Shuffle,
   Sparkles,
+  Type,
   Video,
   Wand2,
 } from "lucide-react";
@@ -20,14 +23,17 @@ import { BucketAnalysisModal } from "@/components/modals/BucketAnalysisModal";
 import { CaptionToolModal } from "@/components/modals/CaptionToolModal";
 import { ConvertModelModal } from "@/components/modals/ConvertModelModal";
 import { DistillDatasetModal } from "@/components/modals/DistillDatasetModal";
+import { DPOSaturationModal } from "@/components/modals/DPOSaturationModal";
 import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { MergeOFTModal } from "@/components/modals/MergeOFTModal";
 import { OffPolicyDpoModal } from "@/components/modals/OffPolicyDpoModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
 import { RepairRejectedModal } from "@/components/modals/RepairRejectedModal";
+import { ReplacePairsModal } from "@/components/modals/ReplacePairsModal";
 import { StandaloneSamplingModal } from "@/components/modals/StandaloneSamplingModal";
 import { SwarmGenerateModal } from "@/components/modals/SwarmGenerateModal";
+import { TextAlignmentDatasetModal } from "@/components/modals/TextAlignmentDatasetModal";
 import { VideoToolModal } from "@/components/modals/VideoToolModal";
 import { Button, Card } from "@/components/shared";
 import { useUiStore } from "@/store/uiStore";
@@ -68,6 +74,9 @@ export default function ToolsPage() {
   const [mergeOftOpen, setMergeOftOpen] = useState(false);
   const [offPolicyOpen, setOffPolicyOpen] = useState(false);
   const [swarmOpen, setSwarmOpen] = useState(false);
+  const [replaceOpen, setReplaceOpen] = useState(false);
+  const [saturationOpen, setSaturationOpen] = useState(false);
+  const [textAlignOpen, setTextAlignOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   return (
@@ -128,10 +137,28 @@ export default function ToolsPage() {
           onLaunch={() => setSwarmOpen(true)}
         />
         <ToolCard
+          icon={<Type className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Text Alignment Dataset"
+          description="Keep SwarmUI generations whose on-image text is rendered but wrong, for the offline text reward; write reward prompts as a wildcard"
+          onLaunch={() => setTextAlignOpen(true)}
+        />
+        <ToolCard
           icon={<Camera className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="Off-policy DPO Builder"
           description="Pair real photos (chosen) against the model's own generations of their captions (rejected), with a caption check"
           onLaunch={() => setOffPolicyOpen(true)}
+        />
+        <ToolCard
+          icon={<ListRestart className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Replace Pairs"
+          description="Regenerate existing DPO pairs with the checkpoint you last used in SwarmUI and swap in harder negatives or stronger positives"
+          onLaunch={() => setReplaceOpen(true)}
+        />
+        <ToolCard
+          icon={<Gauge className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="DPO Saturation"
+          description="Score how much preference each DPO pair has already absorbed since the lineage's pre-DPO base and retire the pairs that no longer pull"
+          onLaunch={() => setSaturationOpen(true)}
         />
         <ToolCard
           icon={<Sparkles className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
@@ -172,6 +199,9 @@ export default function ToolsPage() {
       <MergeOFTModal open={mergeOftOpen} onClose={() => setMergeOftOpen(false)} />
       <OffPolicyDpoModal open={offPolicyOpen} onClose={() => setOffPolicyOpen(false)} />
       <SwarmGenerateModal open={swarmOpen} onClose={() => setSwarmOpen(false)} />
+      <ReplacePairsModal open={replaceOpen} onClose={() => setReplaceOpen(false)} />
+      <DPOSaturationModal open={saturationOpen} onClose={() => setSaturationOpen(false)} />
+      <TextAlignmentDatasetModal open={textAlignOpen} onClose={() => setTextAlignOpen(false)} />
     </>
   );
 }

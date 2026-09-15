@@ -25,6 +25,10 @@ class DPOService(SingletonMixin):
         self._output_dir: str | None = None
         self._manifest: dict = {"pairs": []}
         self._pairs_per_group = 1
+        # Smallest group the session will present. 2 is the floor a pair
+        # needs; raising it filters out prompts that were only generated a
+        # couple of times (e.g. the off-policy builder's two-image groups).
+        self._min_images_per_group = 2
         self._group_order = "most_realistic"
         self._caption_keywords: list[str] = []
         self._ready_queue: Queue = Queue(maxsize=10)
@@ -71,12 +75,17 @@ class DPOService(SingletonMixin):
         self._repair_thread: threading.Thread | None = None
         self._repair_state: dict = {"running": False}
 
-        # Realism backfill: score the whole source tree once, ahead of curation,
-        # so Selection never waits on the model. Its own thread and state, kept
-        # apart from the scan worker because it outlives any single group.
+        # Score backfill: score the whole source tree on every axis once, ahead
+        # of curation, so Selection never loads a model. Its own thread and
+        # state, kept apart from the scan worker because it outlives any
+        # single group.
         self._backfill_thread: threading.Thread | None = None
         self._backfill_stop = threading.Event()
         self._backfill_state: dict = {"running": False}
+        # Serialises use of the resident OCR reader between the backfill
+        # thread and the Selection panel: two threads loading the same weights
+        # is twice the VRAM.
+        self._models_lock = threading.RLock()
         # Where the realism head runs: "auto" (CUDA when usable), "cpu", or
         # "off" for no scoring at all. Deliberately not persisted to the config
         # — it answers "what else is using this box right now", which is true of
@@ -369,6 +378,7 @@ class DPOService(SingletonMixin):
         mode: str = "selection",
         group_order: str = "most_realistic",
         caption_filter: str = "",
+        min_images_per_group: int = 2,
     ) -> dict:
         from modules.util.dpo_curation_util import (
             GROUP_ORDERS,
@@ -394,6 +404,8 @@ class DPOService(SingletonMixin):
         # pairs per group, so pairs_per_group must never pre-skip groups —
         # the sentinel disables the cap in next_group and the scan worker.
         self._pairs_per_group = 10**9 if mode == "triage" else max(1, pairs_per_group)
+        # 2 is a hard floor, not a default: a pair needs two images.
+        self._min_images_per_group = max(2, min_images_per_group)
         self._mode = mode
         self._group_order = group_order
         self._caption_keywords = parse_caption_keywords(caption_filter)
@@ -471,7 +483,7 @@ class DPOService(SingletonMixin):
             available_images = [
                 i for i in group["images"] if not is_source_used(used_sources, i) and not self._is_pixel_hash_used(i)
             ]
-            if len(available_images) < 2:
+            if len(available_images) < self._min_images_per_group:
                 continue
 
             self._current_group = group
@@ -769,11 +781,184 @@ class DPOService(SingletonMixin):
         return {"ok": True, "scores": scores}
 
     # ------------------------------------------------------------------ #
-    # Realism backfill
+    # Score breakdown (Selection side panel)
     # ------------------------------------------------------------------ #
 
-    #: Images per `score_images_realism` call. This is a correctness bound, not
-    #: a tuning knob: that function preprocesses its ENTIRE argument list before
+    def _heavy_models_lock(self) -> threading.RLock:
+        lock = getattr(self, "_models_lock", None)
+        if lock is None:
+            lock = self._models_lock = threading.RLock()
+        return lock
+
+    # SigLIP prompt adherence is switched off: too slow for curation and not
+    # discriminative enough to earn the wait. The ``adherence`` axis is still
+    # reported (always ``None``) so the panel, the weights and the scan cache
+    # keep their shape; the cached image vectors are left in place untouched.
+    # ``_release_adherence_embedder`` stays so the shared release paths need no
+    # change and any handle from an older session is still dropped.
+    def _release_adherence_embedder(self) -> None:
+        current = getattr(self, "_adherence_embedder_obj", None)
+        self._adherence_embedder_obj = None
+        self._adherence_embedder_device = None
+        unload = getattr(current, "unload_model", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception:
+                logger.warning("could not unload the adherence embedder", exc_info=True)
+
+    def _ocr_backend(self, device: str):
+        """The Text Tool OCR reader handle, kept resident across groups (it
+        is ~1.8 GB of weights and seconds to load). Rebuilt when the device
+        setting changes; released when scoring is turned off. Only ever built
+        for a caption that mentions on-image text, and lazy: the weights load
+        on the first reading the cache cannot supply."""
+        from modules.util.text_adherence_util import load_ocr_backend
+
+        current = getattr(self, "_ocr_backend_obj", None)
+        current_device = getattr(self, "_ocr_backend_device", None)
+        if current is not None and current_device == device:
+            return current
+        self._release_ocr_backend()
+        reader = load_ocr_backend(device=device)
+        self._ocr_backend_obj = reader
+        self._ocr_backend_device = device
+        return reader
+
+    def _release_ocr_backend(self) -> None:
+        current = getattr(self, "_ocr_backend_obj", None)
+        self._ocr_backend_obj = None
+        self._ocr_backend_device = None
+        if current is not None:
+            try:
+                current.unload_model()
+            except Exception:
+                logger.warning("could not unload the OCR reader", exc_info=True)
+
+    def score_breakdown(self, paths: list[str]) -> dict:
+        """Every scorer's verdict on each image of the current group, for the
+        per-tile breakdown in Selection mode.
+
+        Per path: ``realism`` (P(AI)), ``adherence`` (always ``None`` — the
+        SigLIP scorer is switched off, the key is kept for the panel),
+        ``age`` (Engine age head agreement with the caption's claimed age —
+        ``None`` when the caption claims no age),
+        ``estimated_age``, ``text`` (OCR match against the on-image text the
+        caption asks for — ``None`` when it asks for none), ``ocr_text``,
+        ``quality`` (Studio's scalar 0–100), ``combined``
+        (weighted z with the default weights; the UI recomputes it with the
+        user's sliders), ``gate_rank`` (position under gate-then-rank) and the
+        per-proposition ``propositions`` list.
+
+        Each scorer fails on its own: a missing model reports under
+        ``errors[<scorer>]`` and the others still come back, so the panel
+        degrades a column at a time rather than going blank. Scoring off
+        skips every model, same as :meth:`realism_scores`.
+
+        Every scorer consults the session's scan cache before touching a
+        model, so a group the backfill has covered costs no model load —
+        which is what "Backfill Scores" promises when the GPU is busy.
+        """
+        from modules.util import dpo_combined_score as combined
+        from modules.util.adherence_score_util import claimed_age_range, score_images_age_agreement
+        from modules.util.age_estimate_util import estimate_ages
+        from modules.util.realism_detect_util import score_images_realism
+        from modules.util.scalar_quality_util import score_images_quality
+        from modules.util.text_adherence_util import caption_text_spans, score_images_text
+
+        if self._scoring_disabled():
+            with self._heavy_models_lock():
+                self._release_adherence_embedder()
+                self._release_ocr_backend()
+            return {"ok": True, "scores": {}, "disabled": True}
+
+        with self._lock:
+            if not self._current_group:
+                return {"ok": False, "error": "No active group"}
+            valid = set(self._current_group.get("images", []))
+            prompt = self._current_group.get("prompt", "")
+            cache = self._hash_cache
+            device = self._realism_device
+
+        paths = list(paths)
+        for path in paths:
+            if path not in valid:
+                return {"ok": False, "error": "Image is not part of the current group"}
+        if not paths:
+            return {"ok": True, "scores": {}}
+
+        errors: dict[str, str] = {}
+        realism: dict[str, float] = {}
+        try:
+            realism = score_images_realism(paths, cache=cache, device=device)
+        except RuntimeError as ex:
+            errors["realism"] = str(ex)
+
+        quality = score_images_quality(paths, cache=cache)
+
+        ages: dict[str, dict] = {}
+        if claimed_age_range(prompt) is not None:
+            try:
+                ages = estimate_ages(paths, cache=cache, device=device)
+            except RuntimeError as ex:
+                errors["age"] = str(ex)
+
+        # The age axis used to ride along with the SigLIP propositions; with
+        # SigLIP off it is scored on its own from the estimates above.
+        adherence: dict[str, dict] = score_images_age_agreement(paths, prompt, age_estimates=ages or None)
+
+        # The resident OCR reader is shared with a backfill in flight, which
+        # holds this lock one small batch at a time.
+        text: dict[str, dict] = {}
+        with self._heavy_models_lock():
+            # On-image text: the OCR reader is consulted only when the caption
+            # mentions text, and its verdict gates ahead of every other axis.
+            if caption_text_spans(prompt):
+                try:
+                    reader = self._ocr_backend(device)
+                    text = score_images_text(paths, prompt, backend=reader, cache=cache)
+                except RuntimeError as ex:
+                    errors["text"] = str(ex)
+        if cache is not None:
+            cache.save()
+
+        axes = {
+            path: {
+                "text": text.get(path, {}).get("text"),
+                "adherence": adherence.get(path, {}).get("adherence"),
+                "age": adherence.get(path, {}).get("age_agreement"),
+                "realism": realism.get(path),
+                "quality": quality.get(path),
+            }
+            for path in paths
+        }
+        z = combined.weighted_z(axes)
+        order = combined.gate_then_rank(axes)
+        scores = {}
+        for path in paths:
+            detail = adherence.get(path, {})
+            text_detail = text.get(path, {})
+            scores[path] = {
+                **axes[path],
+                "estimated_age": detail.get("estimated_age"),
+                "axis_mean": detail.get("axis_mean"),
+                "phrase_mean": detail.get("phrase_mean"),
+                "text_min": text_detail.get("text_min"),
+                "ocr_text": text_detail.get("ocr_text"),
+                "combined": z.get(path),
+                "gate_rank": order.index(path) + 1,
+                # Text spans lead the list: they are the propositions a
+                # curator most needs to see when they fail.
+                "propositions": [*text_detail.get("propositions", []), *detail.get("propositions", [])],
+            }
+        return {"ok": True, "scores": scores, "errors": errors, "default_weights": dict(combined.DEFAULT_WEIGHTS)}
+
+    # ------------------------------------------------------------------ #
+    # Score backfill
+    # ------------------------------------------------------------------ #
+
+    #: Images per chunk. A correctness bound, not a tuning knob:
+    #: `score_images_realism` preprocesses its ENTIRE argument list before
     #: running a batch, holding one ~3 MB tensor per image. Handing it a whole
     #: source tree asks for tens of gigabytes — 11.9k images reached a 39 GB
     #: working set on a 64 GB machine before being killed. Chunking caps peak
@@ -781,17 +966,50 @@ class DPOService(SingletonMixin):
     #: TTA draw is keyed on the file path, so nothing depends on which images
     #: share a call.
     _BACKFILL_CHUNK = 200
+    #: Images per OCR call inside a chunk. The reader is shared with the
+    #: Selection panel under the models lock, so the lock is held one small
+    #: batch at a time and a group the user opens mid-backfill waits for a
+    #: batch, not for a chunk.
+    _BACKFILL_HEAVY_BATCH = 8
 
-    def start_realism_backfill(self) -> dict:
-        """Score every image in the session's source tree, in the background.
+    @staticmethod
+    def _extract_group_key(path: str) -> tuple[str, str]:
+        """(normalised prompt, trainer bucket label) for one image — the scan's
+        grouping key and the backfill's way of knowing what each image's
+        caption asks for."""
+        from modules.util.dpo_curation_util import normalize_prompt_for_grouping, resolve_aspect_ratio
+        from modules.util.image_metadata_util import extract_metadata
 
-        Selection sorts a group most-photorealistic-first, so the first view of
-        each group otherwise pays for the model. Doing the whole tree once up
-        front means every group is a cache hit from then on.
+        meta = extract_metadata(path)
+        # The aspect component is the trainer bucket label ("7:4", "4:7",
+        # ...) derived from actual pixel dimensions, so images that crop
+        # to the same AspectBucketing bucket group together even when
+        # their exact ratios differ (1344x768 vs 1680x960, metadata
+        # "16:9" vs derived). Metadata is only a fallback for undecodable
+        # files.
+        ar = resolve_aspect_ratio(meta.get("aspectratio", ""), path)
+        prompt = normalize_prompt_for_grouping(meta.get("prompt", ""))
+        return prompt, ar
 
-        Idempotent by construction: scores already cached under the current
-        model version are served from the cache, so re-running after adding new
-        images only pays for the new ones.
+    def start_score_backfill(self) -> dict:
+        """Score every image in the session's source tree on every axis, in
+        the background.
+
+        Selection's breakdown otherwise pays for the models on the first view
+        of each group. Doing the whole tree once up front means every group is
+        a cache hit from then on — and, because each scorer consults the cache
+        before loading anything, no model is loaded at all while curating.
+        That is what the button is for: the GPU is busy with something else.
+
+        Per image: realism and scalar quality always; the age head when the
+        caption claims an age; the OCR reading when the caption mentions
+        on-image text. The SigLIP adherence axis is switched off and is
+        counted as covered without any work.
+
+        Idempotent by construction: anything already cached under the current
+        model versions is served from the cache, so re-running after adding new
+        images only pays for the new ones. A scorer whose model is missing is
+        reported under ``errors`` and skipped; the others still run.
         """
         from modules.util.dpo_curation_util import walk_skipping_dotted
         from modules.util.path_util import supported_image_extensions
@@ -803,7 +1021,7 @@ class DPOService(SingletonMixin):
             if not self._session_active or not self._source_folder:
                 return {"ok": False, "error": "No active session"}
             if self._backfill_thread is not None and self._backfill_thread.is_alive():
-                return {"ok": False, "error": "A realism backfill is already running"}
+                return {"ok": False, "error": "A score backfill is already running"}
             source = self._source_folder
             cache = self._hash_cache
 
@@ -824,53 +1042,123 @@ class DPOService(SingletonMixin):
             "running": True,
             "done": 0,
             "total": len(paths),
-            "scored": 0,
-            "cached": 0,
+            # Images each axis has covered (cache hits included) — the caption
+            # decides whether the age, adherence and text axes apply at all.
+            "axes": {"realism": 0, "quality": 0, "age": 0, "adherence": 0, "text": 0},
+            # Per-axis load failures: a missing model disables that axis for
+            # the rest of the run and leaves the others alone.
+            "errors": {},
             "error": None,
             "finished": False,
         }
-        self._backfill_thread = threading.Thread(target=self._realism_backfill_worker, args=(paths, cache), daemon=True)
+        self._backfill_thread = threading.Thread(target=self._score_backfill_worker, args=(paths, cache), daemon=True)
         self._backfill_thread.start()
         return {"ok": True, "total": len(paths)}
 
-    def _realism_backfill_worker(self, paths: list[str], cache) -> None:
+    def _backfill_prompt_for(self, path: str, cache) -> str:
+        """The normalised caption of one image, through the scan cache."""
+        try:
+            if cache is not None:
+                key = cache.get_group_key(path, self._extract_group_key)
+            else:
+                key = self._extract_group_key(path)
+        except Exception:  # noqa: BLE001 — an unreadable file simply has no caption
+            key = None
+        return key[0] if key else ""
+
+    def _score_backfill_worker(self, paths: list[str], cache) -> None:
+        from modules.util.adherence_score_util import claimed_age_range
+        from modules.util.age_estimate_util import estimate_ages
         from modules.util.realism_detect_util import score_images_realism
+        from modules.util.scalar_quality_util import score_images_quality
+        from modules.util.text_adherence_util import caption_text_spans, read_image_text
 
         state = self._backfill_state
+        errors: dict[str, str] = state["errors"]
+        axes: dict[str, int] = state["axes"]
+        lock = self._heavy_models_lock()
+
+        def stopping() -> bool:
+            # Same boundary the device switch is honoured at, for the same
+            # reason: turning scoring off mid-run has to stop the work, not
+            # just stop displaying it.
+            return self._backfill_stop.is_set() or self._scoring_disabled()
+
+        def run_axis(axis: str, count: int, fn, *args, **kwargs) -> None:
+            """One scorer over its share of the chunk; a load failure retires
+            the axis rather than the backfill."""
+            if axis in errors or count == 0:
+                return
+            try:
+                fn(*args, **kwargs)
+                axes[axis] += count
+            except RuntimeError as ex:
+                errors[axis] = str(ex)
+
+        def batches(items: list[str]):
+            for start in range(0, len(items), self._BACKFILL_HEAVY_BATCH):
+                if stopping():
+                    return
+                yield items[start : start + self._BACKFILL_HEAVY_BATCH]
+
         try:
             for start in range(0, len(paths), self._BACKFILL_CHUNK):
-                # Same chunk boundary the device switch is honoured at, for the
-                # same reason: turning scoring off mid-run has to stop the work,
-                # not just stop displaying it.
-                if self._backfill_stop.is_set() or self._scoring_disabled():
+                if stopping():
                     break
                 chunk = paths[start : start + self._BACKFILL_CHUNK]
-                before_hits = cache.hits if cache is not None else 0
-                # Read per chunk, not once up front: the session is created per
-                # call, so flipping the device mid-run takes effect at the next
-                # chunk boundary instead of needing the backfill restarted.
-                score_images_realism(chunk, cache=cache, device=self._realism_device)
-                if cache is not None:
-                    state["cached"] += cache.hits - before_hits
+                device = self._realism_device
+                prompts = {path: self._backfill_prompt_for(path, cache) for path in chunk}
+                # What each caption asks for, decided once per distinct prompt:
+                # a chunk is mostly a handful of prompts repeated.
+                distinct = set(prompts.values())
+                claims_age = {p: claimed_age_range(p) is not None for p in distinct}
+                has_text = {p: bool(caption_text_spans(p)) for p in distinct}
+
+                # The ONNX heads build a session per call, so the device
+                # setting takes effect at the next chunk without a restart.
+                run_axis("realism", len(chunk), score_images_realism, chunk, cache=cache, device=device)
+                run_axis("quality", len(chunk), score_images_quality, chunk, cache=cache)
+
+                age_paths = [p for p in chunk if claims_age[prompts[p]]]
+                run_axis("age", len(age_paths), estimate_ages, age_paths, cache=cache, device=device)
+
+                # SigLIP adherence is switched off: nothing to compute, but the
+                # axis is counted so the progress read keeps its shape.
+                axes["adherence"] += len(chunk)
+
+                ocr_paths = [p for p in chunk if has_text[prompts[p]]]
+                if ocr_paths and "text" not in errors:
+                    try:
+                        with lock:
+                            reader = self._ocr_backend(device)
+                        for batch in batches(ocr_paths):
+                            with lock:
+                                read_image_text(batch, backend=reader, cache=cache)
+                            axes["text"] += len(batch)
+                    except RuntimeError as ex:
+                        errors["text"] = str(ex)
+
                 state["done"] = start + len(chunk)
-                state["scored"] = state["done"] - state["cached"]
                 # Persist as we go: a tree this size is minutes of work and a
                 # late failure should not throw all of it away. `save()` is a
                 # no-op when nothing changed.
                 if cache is not None:
                     cache.save()
-        except RuntimeError as ex:
-            # The model is missing — reported, not raised, same as realism_scores.
-            state["error"] = str(ex)
         except Exception as ex:  # noqa: BLE001 — a backfill must never kill the session
             state["error"] = f"{type(ex).__name__}: {ex}"
         finally:
+            # The point of the run is a free GPU afterwards: drop the resident
+            # OCR weights. Selection rebuilds them lazily, and with the cache
+            # full that rebuild never actually loads anything.
+            with lock:
+                self._release_adherence_embedder()
+                self._release_ocr_backend()
             if cache is not None:
                 cache.save()
             state["running"] = False
             state["finished"] = True
 
-    def realism_backfill_status(self) -> dict:
+    def score_backfill_status(self) -> dict:
         state = dict(self._backfill_state)
         state["ok"] = True
         state["device"] = self._realism_device
@@ -900,7 +1188,7 @@ class DPOService(SingletonMixin):
             self._backfill_stop.set()
         return {"ok": True, "device": device}
 
-    def stop_realism_backfill(self) -> dict:
+    def stop_score_backfill(self) -> dict:
         """Ask the backfill to stop after the current chunk. Work already
         written to the cache is kept, so a later run resumes from it."""
         self._backfill_stop.set()
@@ -1263,11 +1551,8 @@ class DPOService(SingletonMixin):
             is_source_used,
             manifest_pair_counts,
             manifest_used_sources,
-            normalize_prompt_for_grouping,
-            resolve_aspect_ratio,
             walk_skipping_dotted,
         )
-        from modules.util.image_metadata_util import extract_metadata
 
         supported = path_util.supported_image_extensions()
 
@@ -1285,18 +1570,7 @@ class DPOService(SingletonMixin):
                 if ext in supported:
                     candidate_paths.append(os.path.join(root, filename))
         self._scan_total = len(candidate_paths)
-
-        def extract_group_key(path: str) -> tuple[str, str]:
-            meta = extract_metadata(path)
-            # The aspect component is the trainer bucket label ("7:4", "4:7",
-            # ...) derived from actual pixel dimensions, so images that crop
-            # to the same AspectBucketing bucket group together even when
-            # their exact ratios differ (1344x768 vs 1680x960, metadata
-            # "16:9" vs derived). Metadata is only a fallback for undecodable
-            # files.
-            ar = resolve_aspect_ratio(meta.get("aspectratio", ""), path)
-            prompt = normalize_prompt_for_grouping(meta.get("prompt", ""))
-            return prompt, ar
+        extract_group_key = self._extract_group_key
 
         # Pass 2: parallel metadata extraction, served from the persistent
         # cache for unchanged files — extraction reads (and for unmarked files,
@@ -1321,12 +1595,13 @@ class DPOService(SingletonMixin):
                     if group_key is not None:
                         groups_dict[group_key].append(future_to_path[future])
 
+        min_images = self._min_images_per_group
         # as_completed scrambles arrival order; re-sort so group contents (and
         # therefore dedup keep-order and UI display) stay deterministic.
         raw_groups = [
             {"prompt": prompt, "aspectratio": ar, "images": sorted(images)}
             for (prompt, ar), images in groups_dict.items()
-            if len(images) >= 2
+            if len(images) >= min_images
         ]
         # A caption filter narrows the session to groups whose prompt carries
         # every keyword; it runs before the ordering so the order applies to
@@ -1369,11 +1644,11 @@ class DPOService(SingletonMixin):
                 # Drop images already committed in any prior pair before dedup so
                 # the content-hash pass doesn't waste work on sources we'll discard.
                 fresh = [i for i in group["images"] if not is_source_used(used_sources, i)]
-                if len(fresh) < 2:
+                if len(fresh) < min_images:
                     continue
 
                 deduped = self._dedup_by_content_hash(fresh, hash_pool)
-                if len(deduped) >= 2:
+                if len(deduped) >= min_images:
                     group["images"] = deduped
                     self._groups_queued += 1
                     while not self._worker_stop.is_set():

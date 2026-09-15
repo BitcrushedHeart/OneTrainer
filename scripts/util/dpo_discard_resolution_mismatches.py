@@ -56,6 +56,17 @@ ALL_POSSIBLE_INPUT_ASPECTS = [
     (1.0, 4.0),
 ]
 
+# Mirror of AspectBucketing.all_possible_input_resolutions (1024 reference).
+REFERENCE_TARGET_RESOLUTION = 1024
+ALL_POSSIBLE_INPUT_RESOLUTIONS = [
+    (1024, 1024),
+    (1152, 896),
+    (1216, 832),
+    (1216, 768),
+    (1344, 768),
+    (1536, 640),
+]
+
 
 def quantize_resolution(resolution, quantization):
     return (
@@ -77,8 +88,11 @@ def build_buckets(target_resolution, quantization):
         )
         for (h, w) in ALL_POSSIBLE_INPUT_ASPECTS
     ]
+    scale = target_resolution / REFERENCE_TARGET_RESOLUTION
+    res = res + [(h * scale, w * scale) for (h, w) in ALL_POSSIBLE_INPUT_RESOLUTIONS]
     res = res + [(w, h) for (h, w) in res]
     res = [quantize_resolution(r, quantization) for r in res]
+    res = [(h, w) for h, w in res if h > 0 and w > 0]
     res = list(set(res))
     aspects = [h / w for (h, w) in res]
     return res, aspects

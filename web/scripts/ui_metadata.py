@@ -52,6 +52,10 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "LOHA": "LoHa",
         "OFT_2": "OFT v2",
     },
+    "PatienceMode": {
+        "STOP_TRAINING": "Stop Training",
+        "SAVE_ALTERNATIVE_AT_END": "Save Alternative At End",
+    },
     "EMAMode": {
         "OFF": "Off",
         "GPU": "GPU",

@@ -34,6 +34,12 @@ _WORKER_SCRIPT = _PROJECT_ROOT / "scripts" / "train_queue_worker.py"
 _ACCEPT_TIMEOUT_S = 120.0
 # Grace period after a stop request before we forcibly terminate the child.
 _STOP_GRACE_S = 60.0
+# After the child has reported its result and closed the IPC socket, the only
+# thing left is its interpreter shutdown. If that hangs (a stuck tqdm lock, a
+# native teardown wedge) the child would otherwise sit forever holding the whole
+# run's RAM, the queue thread would block with it, and a backend restart would
+# leave it orphaned. Bound the wait and kill the straggler.
+_EXIT_GRACE_S = 60.0
 
 
 class SubprocessResult:
@@ -112,7 +118,7 @@ class QueueSubprocessRunner:
                     self._send_stop_locked()
 
             result = self._event_loop(conn)
-            self._process.wait()
+            self._wait_for_exit()
             output_thread.join(timeout=5.0)
             return self._finalize(result)
         finally:
@@ -203,6 +209,19 @@ class QueueSubprocessRunner:
                 error_category=str(event.get("category", "other")),
             )
         return None
+
+    def _wait_for_exit(self) -> None:
+        assert self._process is not None
+        try:
+            self._process.wait(timeout=_EXIT_GRACE_S)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self._on_status(f"Training subprocess did not exit within {_EXIT_GRACE_S:.0f}s of finishing; terminating it.")
+        with contextlib.suppress(OSError):
+            self._process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            self._process.wait(timeout=_STOP_GRACE_S)
 
     def _handle_no_connection(self) -> SubprocessResult:
         # Child never connected within the timeout — kill it and report failure.

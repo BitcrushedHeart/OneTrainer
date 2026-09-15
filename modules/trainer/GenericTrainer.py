@@ -39,9 +39,11 @@ from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.PatienceMode import PatienceMode
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
+from modules.util.text_reward_util import TextRewardScheduler, derive_text_reward_interval
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -103,6 +105,10 @@ class GenericTrainer(BaseTrainer):
         if rlhf_error is not None:
             raise RuntimeError(rlhf_error)
 
+        text_reward_error = self.config.validate_text_reward_startup()
+        if text_reward_error is not None:
+            raise RuntimeError(text_reward_error)
+
         if multi.is_master():
             # TB writer creation is deferred to start() so a backup's tensorboard_subdir
             # can be reused and logging continues in the same TB run on resume.
@@ -125,6 +131,10 @@ class GenericTrainer(BaseTrainer):
         # .item() it at save time (rare event, one host sync each).
         self._loop_accumulated_loss_tensor: torch.Tensor | None = None
         self._loop_accumulated_dpo_metrics: dict | None = None
+        # On-image text reward add-on: this epoch's pre-encoded prompt bank
+        # and the micro-batch scheduler that spreads its budget over the epoch.
+        self._text_reward_bank = None
+        self._text_reward_scheduler = TextRewardScheduler(0)
         self._loop_scaler = None
 
         # Defaults for state start() re-initializes; __advance_redistill_phase
@@ -318,6 +328,12 @@ class GenericTrainer(BaseTrainer):
                 dpo_addon_data_loader, "DPO add-on", on_epoch_restart=self.__restore_train_device
             )
 
+        if self.config.text_reward_enabled:
+            print(
+                f"Text reward: {self.config.text_reward_samples_per_epoch} OCR-rewarded rollouts per epoch, "
+                f"loss += {self.config.text_reward_weight} * ctc (never on a DPO add-on micro-batch)."
+            )
+
         if self.config.validation or self.config.dpo_validation_active():
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
@@ -334,6 +350,8 @@ class GenericTrainer(BaseTrainer):
         self._patience_best_loss = float("inf")
         self._patience_best_step = -1
         self._patience_best_backup_path: str | None = None
+        self._patience_alt_backup_path: str | None = None
+        self._patience_alt_step = -1
 
         self._dpo_patience_counter = 0
         self._dpo_best_accuracy = float("-inf")
@@ -448,11 +466,34 @@ class GenericTrainer(BaseTrainer):
 
         self.model_setup.setup_train_device(self.model, self.config)
 
+    def __start_text_reward_epoch(self):
+        """Draw and encode this epoch's reward prompts, and size the interval
+        so ``text_reward_samples_per_epoch`` rollouts fit the primary epoch."""
+        epoch = self.model.train_progress.epoch
+        self.callbacks.on_update_status("encoding text reward prompts")
+        self._text_reward_bank = self.model_setup.build_text_reward_bank(self.model, self.config, epoch)
+        primary_batches = self.data_loader.get_data_set().approximate_length()
+        # Offline images: every dataset image once per epoch; online: the configured budget.
+        samples = (
+            len(self._text_reward_bank) * max(1, self.config.text_reward_dataset_repeats)
+            if self._text_reward_bank.image_paths is not None
+            else self.config.text_reward_samples_per_epoch
+        )
+        interval = derive_text_reward_interval(primary_batches, samples)
+        self._text_reward_scheduler.start_epoch(interval)
+        if multi.is_master():
+            print(
+                f"Text reward: one rollout every {interval} standard micro-batch(es) "
+                f"({len(self._text_reward_bank)} prompts vs {primary_batches} standard batches per epoch)."
+            )
+
     def __start_secondary_epochs(self):
         """Advance the SFT-anchor / DPO add-on loader epochs in lockstep with
         the main loader and re-derive the add-on interval from the new lengths."""
         if self.sft_anchor_source is not None:
             self.sft_anchor_source.start_next_epoch()
+        if self.config.text_reward_enabled:
+            self.__start_text_reward_epoch()
         if self.dpo_addon_source is not None:
             self.dpo_addon_source.start_next_epoch()
             sft_batches = self.data_loader.get_data_set().approximate_length()
@@ -967,6 +1008,7 @@ class GenericTrainer(BaseTrainer):
 
     def __check_patience(self, val_loss: float, train_progress: TrainProgress):
         is_new_best = val_loss < self._patience_best_loss
+        stop_mode = self.config.patience_mode == PatienceMode.STOP_TRAINING
 
         if is_new_best:
             self._patience_best_backup_path = self.__save_patience_best(train_progress)
@@ -979,13 +1021,76 @@ class GenericTrainer(BaseTrainer):
         self.tensorboard.add_scalar("patience/counter", self._patience_counter, train_progress.global_step)
         self.tensorboard.add_scalar("patience/best_val_loss", self._patience_best_loss, train_progress.global_step)
 
-        if self._patience_counter >= self.config.patience_epochs:
+        if stop_mode:
+            if self._patience_counter >= self.config.patience_epochs:
+                print(
+                    f"Patience triggered at step {train_progress.global_step}. "
+                    f"Best checkpoint from step {self._patience_best_step} "
+                    f"(val_loss: {self._patience_best_loss:.6f})"
+                )
+                self.commands.stop()
+        elif self._patience_counter == self.config.patience_epochs:
+            # Preserve the threshold weights before end() restores the best checkpoint.
+            # Both modes stop here; this mode also writes an alternative output.
             print(
-                f"Patience triggered at step {train_progress.global_step}. "
-                f"Best checkpoint from step {self._patience_best_step} "
-                f"(val_loss: {self._patience_best_loss:.6f})"
+                f"Patience threshold reached at step {train_progress.global_step} "
+                f"(best val_loss {self._patience_best_loss:.6f} at step {self._patience_best_step}). "
+                "Snapshotting alternative model and stopping training."
             )
+            self._patience_alt_backup_path = self.__save_patience_alternative(train_progress)
+            self._patience_alt_step = train_progress.global_step
             self.commands.stop()
+
+    def __save_patience_alternative_output(self, final_save_path: str):
+        if (
+            not self.config.patience
+            or self.config.patience_mode != PatienceMode.SAVE_ALTERNATIVE_AT_END
+            or not self._patience_alt_backup_path
+            or not os.path.isfile(self._patience_alt_backup_path)
+        ):
+            return
+
+        if self.config.output_model_format.is_single_file():
+            root, ext = os.path.splitext(final_save_path)
+            alt_save_path = f"{root}-patience-alt{ext}"
+        else:
+            alt_save_path = final_save_path.rstrip("/\\") + "-patience-alt"
+
+        try:
+            print(
+                f"Restoring patience alternative snapshot from step {self._patience_alt_step} "
+                f"(best val_loss {self._patience_best_loss:.6f} at step {self._patience_best_step})"
+            )
+            self.callbacks.on_update_status("Saving the patience alternative model")
+            alt_state = torch.load(self._patience_alt_backup_path, map_location=self.temp_device)
+            for param, saved in zip(self.parameters, alt_state, strict=True):
+                param.data.copy_(saved)
+            del alt_state
+
+            print("Saving " + alt_save_path)
+            self.model_saver.save(
+                model=self.model,
+                model_type=self.config.model_type,
+                output_model_format=self.config.output_model_format,
+                output_model_destination=alt_save_path,
+                dtype=self.config.output_dtype.torch_dtype(),
+            )
+        except Exception:  # noqa: BLE001 - the alternative must never take the final save down with it
+            traceback.print_exc()
+            print("Could not save the patience alternative model; the final model was saved normally.")
+
+    def __save_patience_alternative(self, train_progress: TrainProgress) -> str:
+        alt_path = os.path.join(self.config.workspace_dir, "backup", "patience-alternative.pt")
+        os.makedirs(os.path.dirname(alt_path), exist_ok=True)
+        try:
+            state = [p.data.clone().cpu() for p in self.parameters]
+            torch.save(state, alt_path)
+            print(f"Saved patience alternative snapshot at step {train_progress.global_step}")
+        except Exception:
+            traceback.print_exc()
+            print("Could not save patience alternative snapshot.")
+            return self._patience_alt_backup_path or ""
+        return alt_path
 
     def __save_patience_best(self, train_progress: TrainProgress) -> str:
         best_path = os.path.join(self.config.workspace_dir, "backup", "patience-best.pt")
@@ -1468,6 +1573,7 @@ class GenericTrainer(BaseTrainer):
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
         accumulated_dpo_metrics: dict[str, float] | None = None
+        accumulated_text_metrics: dict[str, float] | None = None
         # Periodic reference rebase counts from the resume step, so a resumed
         # run waits for the next interval boundary rather than rebasing at once.
         if self.config.rlhf_enabled and self.config.rlhf_dpo_ref_rebase_interval > 0:
@@ -1519,7 +1625,11 @@ class GenericTrainer(BaseTrainer):
                     else:
                         self.model_setup.setup_train_device(self.model, self.config)
                         self.data_loader.get_data_set().start_next_epoch()
-                        if self.sft_anchor_source is not None or self.dpo_addon_source is not None:
+                        if (
+                            self.sft_anchor_source is not None
+                            or self.dpo_addon_source is not None
+                            or self.config.text_reward_enabled
+                        ):
                             self.__start_secondary_epochs()
                             self.model_setup.setup_train_device(self.model, self.config)
             except CachingStoppedException:
@@ -1624,6 +1734,7 @@ class GenericTrainer(BaseTrainer):
                     # folded into accumulated_loss alongside the DPO term.
                     addon_sft_loss = None
                     addon_dpo_loss = None
+                    addon_text_loss = None
                     if self.config.rlhf_dpo_primary():
                         loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
                         # Accumulate per-micro-batch DPO metrics across the grad-accum window.
@@ -1743,13 +1854,19 @@ class GenericTrainer(BaseTrainer):
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
                             loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
-                        if self.dpo_addon_source is not None and is_dpo_addon_step(
+                        dpo_step = self.dpo_addon_source is not None and is_dpo_addon_step(
                             train_progress.epoch_step, self._dpo_addon_interval
-                        ):
-                            # SFT + DPO: the standard loss above stays at full
-                            # weight; a DPO pair rides along on this micro-batch.
-                            # Backward the standard loss FIRST so its graph is
-                            # freed before the pair's fused policy + reference
+                        )
+                        # The text reward never shares a micro-batch with a DPO
+                        # pair (peak memory); a blocked firing carries over.
+                        text_step = self._text_reward_bank is not None and self._text_reward_scheduler.due(
+                            train_progress.epoch_step, blocked=dpo_step
+                        )
+                        if dpo_step or text_step:
+                            # Add-on micro-batch: the standard loss above stays
+                            # at full weight; a DPO pair or a text-reward
+                            # rollout rides along. Backward the standard loss
+                            # FIRST so its graph is freed before the add-on's
                             # forwards: holding both graphs for one combined
                             # backward OOMs a 24 GB card. Gradients accumulate
                             # identically (d(a+b) = da + db), and fused_back_pass
@@ -1763,6 +1880,25 @@ class GenericTrainer(BaseTrainer):
                             addon_sft_loss = addon_sft_loss.detach()
                             del loss, model_output_data
 
+                        if text_step:
+                            text_scale = self.config.text_reward_weight / self.config.gradient_accumulation_steps
+
+                            def _text_backward(term, _scale=text_scale, _scaler=scaler):
+                                term = term * _scale
+                                if _scaler:
+                                    _scaler.scale(term).backward()
+                                else:
+                                    term.backward()
+
+                            text_value = self.model_setup.calculate_text_reward_loss(
+                                self.model, self._text_reward_bank.next(), self.config, train_progress, _text_backward
+                            )
+                            addon_text_loss = text_value.detach() * text_scale
+                            accumulated_text_metrics = accumulate_dpo_metrics(
+                                accumulated_text_metrics, self.model_setup.get_last_text_reward_metrics()
+                            )
+
+                        if dpo_step:
                             # The pair itself is evaluated half by half with one
                             # graph alive at a time (calculate_dpo_loss_light);
                             # its gradients land through _addon_backward, so the
@@ -1786,7 +1922,7 @@ class GenericTrainer(BaseTrainer):
                             )
                             self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
 
-                    if addon_dpo_loss is None:
+                    if addon_sft_loss is None:
                         loss = loss / self.config.gradient_accumulation_steps
                         if scaler:
                             scaler.scale(loss).backward()
@@ -1794,9 +1930,14 @@ class GenericTrainer(BaseTrainer):
                             loss.backward()
                         detached_loss = loss.detach()
                     else:
-                        # SFT + DPO add-on micro-step: both terms were already
-                        # backwarded (standard first, then the pair half by half).
-                        detached_loss = addon_sft_loss + addon_dpo_loss
+                        # Add-on micro-step: every term was already backwarded
+                        # (standard first, then the DPO pair and/or the text
+                        # reward rollout).
+                        detached_loss = addon_sft_loss
+                        if addon_dpo_loss is not None:
+                            detached_loss = detached_loss + addon_dpo_loss
+                        if addon_text_loss is not None:
+                            detached_loss = detached_loss + addon_text_loss
 
                     has_gradient = True
                     multi.reduce_tensor_mean(detached_loss)
@@ -1973,6 +2114,32 @@ class GenericTrainer(BaseTrainer):
                                                 dpo_metrics[f"margin_t_q{quartile + 1}_sum"] / quartile_count,
                                                 train_progress.global_step,
                                             )
+                            if accumulated_text_metrics is not None:
+                                text_count = accumulated_text_metrics.pop("_count")
+                                self.tensorboard.add_scalar(
+                                    "loss/text_reward",
+                                    accumulated_text_metrics.pop("ctc") / text_count * self.config.text_reward_weight,
+                                    train_progress.global_step,
+                                )
+                                for key, value in accumulated_text_metrics.items():
+                                    if key.startswith("family_ratio/"):
+                                        # Summed only over the samples that drew
+                                        # this family; the per-family count
+                                        # rides along as its own key.
+                                        continue
+                                    if key.startswith("family_count/"):
+                                        family = key.removeprefix("family_count/")
+                                        if value > 0:
+                                            self.tensorboard.add_scalar(
+                                                f"text_reward/family/{family}",
+                                                accumulated_text_metrics.get(f"family_ratio/{family}", 0.0) / value,
+                                                train_progress.global_step,
+                                            )
+                                        continue
+                                    self.tensorboard.add_scalar(
+                                        f"text_reward/{key}", value / text_count, train_progress.global_step
+                                    )
+                                accumulated_text_metrics = None
                             if self.config.redistill_enabled:
                                 self.tensorboard.add_scalar(
                                     "redistill/phase",
@@ -2025,6 +2192,7 @@ class GenericTrainer(BaseTrainer):
 
                         accumulated_loss = 0.0
                         accumulated_dpo_metrics = None
+                        accumulated_text_metrics = None
                         accumulated_distill_metrics = None
                         accumulated_transfer_metrics = None
                         # Reset Fix B mirrors at the accumulator boundary so a
@@ -2150,6 +2318,8 @@ class GenericTrainer(BaseTrainer):
                     output_model_destination=save_path,
                     dtype=self.config.output_dtype.torch_dtype(),
                 )
+
+                self.__save_patience_alternative_output(save_path)
 
         if self.model is not None:
             self.model.to(self.temp_device)

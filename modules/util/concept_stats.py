@@ -74,6 +74,9 @@ def init_concept_stats(advanced_checks: bool):
         for aspect in AspectBucketing.all_possible_input_aspects:  # input parameters don't matter but can't be blank
             aspect_ratio_list.append(round(aspect[0] / aspect[1], 6))  # get both wide and tall ratios
             aspect_ratio_list.append(round(aspect[1] / aspect[0], 6))
+        for h, w in AspectBucketing.all_possible_input_resolutions:
+            aspect_ratio_list.append(round(h / w, 6))
+            aspect_ratio_list.append(round(w / h, 6))
         aspect_ratio_list = list(set(aspect_ratio_list))
         aspect_ratio_list.sort()
 

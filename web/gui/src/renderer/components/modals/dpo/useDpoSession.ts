@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import type { GroupOrder, RealismDevice, SwissStateResponse } from "@/api/dpoApi";
+import type { GroupOrder, RealismDevice, ScoreBreakdown, SwissStateResponse } from "@/api/dpoApi";
 import { dpoApi } from "@/api/dpoApi";
 
+import { DEFAULT_SCORE_WEIGHTS, type ScoreSortMode, type ScoreWeights } from "./scoreCombine";
 import type {
   CurationMode,
   CurationStep,
@@ -40,6 +41,7 @@ export interface UseDpoSessionResult {
   pairsPerGroup: number;
   groupOrder: GroupOrder;
   captionFilter: string;
+  minImagesPerGroup: number;
   mode: CurationMode;
   scanCount: number;
   scanTotal: number;
@@ -53,15 +55,26 @@ export interface UseDpoSessionResult {
   /** P(AI-generated) per image path for the current group; empty until scored. */
   realismScores: Record<string, number>;
   realismError: string | null;
+  /** Every scorer's verdict per image path for the current group (Selection panel). */
+  scoreBreakdown: Record<string, ScoreBreakdown>;
+  /** Scorer name -> why it produced nothing, for the current group. */
+  scoreBreakdownErrors: Record<string, string>;
+  /**
+   * Weights over the five scorers for the current prompt. Stored per prompt so
+   * revisiting a group restores them; a new prompt starts from the last edit.
+   */
+  scoreWeights: ScoreWeights;
+  scoreSortMode: ScoreSortMode;
   /**
    * Where the realism head runs. Server-owned — this mirrors it so the toggle
    * can render the truth rather than an optimistic guess.
    */
   realismDevice: RealismDevice;
   /**
-   * Whole-tree realism backfill. Scoring a group on first view is the default,
-   * so this only exists to pay that cost once up front instead of a group at a
-   * time — after it runs, every group is a cache hit.
+   * Whole-tree score backfill, every axis. Scoring a group on first view is
+   * the default, so this only exists to pay that cost once up front instead
+   * of a group at a time — after it runs, every group is a cache hit and no
+   * model is loaded while curating.
    */
   backfill: BackfillState;
   swissMatch: [string, string] | null;
@@ -87,6 +100,7 @@ export interface UseDpoSessionResult {
     setPairsPerGroup: (n: number) => void;
     setGroupOrder: (order: GroupOrder) => void;
     setCaptionFilter: (text: string) => void;
+    setMinImagesPerGroup: (n: number) => void;
     startSession: (config: SessionConfig) => Promise<void>;
     pickImage: (path: string) => Promise<void>;
     confirmPair: (keepScoring: boolean, discardRest?: boolean) => Promise<void>;
@@ -113,9 +127,11 @@ export interface UseDpoSessionResult {
     setToast: (msg: string | null) => void;
     loadOutputManifest: (outputDir: string) => void;
     goToReview: () => void;
-    startRealismBackfill: () => Promise<void>;
-    stopRealismBackfill: () => Promise<void>;
+    startScoreBackfill: () => Promise<void>;
+    stopScoreBackfill: () => Promise<void>;
     setRealismDevice: (device: RealismDevice) => Promise<void>;
+    setScoreWeights: (weights: ScoreWeights) => void;
+    setScoreSortMode: (mode: ScoreSortMode) => void;
   };
 }
 
@@ -123,8 +139,8 @@ export interface BackfillState {
   running: boolean;
   done: number;
   total: number;
-  /** Served from the scan cache rather than recomputed. */
-  cached: number;
+  /** Scorers whose model could not load; the run continued without them. */
+  errors: Record<string, string>;
   error: string | null;
 }
 
@@ -135,6 +151,7 @@ export function useDpoSession(): UseDpoSessionResult {
   const [pairsPerGroup, setPairsPerGroup] = useState(1);
   const [groupOrder, setGroupOrder] = useState<GroupOrder>("most_realistic");
   const [captionFilter, setCaptionFilter] = useState("");
+  const [minImagesPerGroup, setMinImagesPerGroup] = useState(2);
   const [mode, setMode] = useState<CurationMode>("selection");
   const [scanCount, setScanCount] = useState(0);
   const [scanTotal, setScanTotal] = useState(0);
@@ -156,25 +173,40 @@ export function useDpoSession(): UseDpoSessionResult {
   // moved on, which would decorate the wrong group.
   const realismRequestRef = useRef(0);
 
+  // The full breakdown (realism + age + text + quality; adherence is always
+  // null with SigLIP off) for the same group. Separate from realismScores
+  // because it is a heavier call — the OCR reader loads on first use — and the
+  // realism badge must not wait on it.
+  const [scoreBreakdown, setScoreBreakdown] = useState<Record<string, ScoreBreakdown>>({});
+  const [scoreBreakdownErrors, setScoreBreakdownErrors] = useState<Record<string, string>>({});
+  const breakdownRequestRef = useRef(0);
+
+  // Per-prompt scorer weights. The last edit is the starting point for any
+  // prompt not seen before, so a user tuning for "age + prompt" keeps that
+  // across groups until they change it again.
+  const [scoreWeightsByPrompt, setScoreWeightsByPrompt] = useState<Record<string, ScoreWeights>>({});
+  const lastWeightsRef = useRef<ScoreWeights>({ ...DEFAULT_SCORE_WEIGHTS });
+  const [scoreSortMode, setScoreSortMode] = useState<ScoreSortMode>("combined");
+
   // Whole-tree backfill. Polled rather than pushed: it is minutes of work on a
   // background thread and a coarse progress read is all the UI needs.
   const [backfill, setBackfill] = useState<BackfillState>({
     running: false,
     done: 0,
     total: 0,
-    cached: 0,
+    errors: {},
     error: null,
   });
   const backfillTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const pollBackfill = useCallback(async () => {
-    const res = await dpoApi.realismBackfillStatus().catch(() => null);
+    const res = await dpoApi.scoreBackfillStatus().catch(() => null);
     if (!res) return;
     setBackfill({
       running: res.running,
       done: res.done ?? 0,
       total: res.total ?? 0,
-      cached: res.cached ?? 0,
+      errors: res.errors ?? {},
       error: res.error ?? null,
     });
     if (!res.running && backfillTimerRef.current) {
@@ -183,19 +215,19 @@ export function useDpoSession(): UseDpoSessionResult {
     }
   }, []);
 
-  const startRealismBackfill = useCallback(async () => {
-    const res = await dpoApi.startRealismBackfill().catch(() => null);
+  const startScoreBackfill = useCallback(async () => {
+    const res = await dpoApi.startScoreBackfill().catch(() => null);
     if (!res?.ok) {
       setBackfill((b) => ({ ...b, error: res?.error ?? "Could not start the backfill" }));
       return;
     }
-    setBackfill({ running: true, done: 0, total: res.total ?? 0, cached: 0, error: null });
+    setBackfill({ running: true, done: 0, total: res.total ?? 0, errors: {}, error: null });
     if (backfillTimerRef.current) clearInterval(backfillTimerRef.current);
     backfillTimerRef.current = setInterval(() => void pollBackfill(), 1000);
   }, [pollBackfill]);
 
-  const stopRealismBackfill = useCallback(async () => {
-    await dpoApi.stopRealismBackfill().catch(() => null);
+  const stopScoreBackfill = useCallback(async () => {
+    await dpoApi.stopScoreBackfill().catch(() => null);
     await pollBackfill();
   }, [pollBackfill]);
 
@@ -231,6 +263,9 @@ export function useDpoSession(): UseDpoSessionResult {
         realismRequestRef.current += 1;
         setRealismScores({});
         setRealismError(null);
+        breakdownRequestRef.current += 1;
+        setScoreBreakdown({});
+        setScoreBreakdownErrors({});
       }
     },
     [adoptRealismDevice],
@@ -312,6 +347,28 @@ export function useDpoSession(): UseDpoSessionResult {
     await applySwissState(await dpoApi.swissState());
   }, [applySwissState]);
 
+  const loadScoreBreakdown = useCallback(async (images: string[]) => {
+    const token = ++breakdownRequestRef.current;
+    setScoreBreakdown({});
+    setScoreBreakdownErrors({});
+    if (images.length === 0) return;
+    if (realismDeviceRef.current === "off") return;
+    try {
+      const res = await dpoApi.scoreBreakdown(images);
+      if (token !== breakdownRequestRef.current) return; // user already moved on
+      if (res.ok && res.scores) {
+        setScoreBreakdown(res.scores);
+        setScoreBreakdownErrors(res.errors ?? {});
+      } else if (res.error) {
+        setScoreBreakdownErrors({ breakdown: res.error });
+      }
+    } catch {
+      if (token === breakdownRequestRef.current) {
+        setScoreBreakdownErrors({ breakdown: "Score breakdown is unavailable." });
+      }
+    }
+  }, []);
+
   // Fire-and-forget on purpose: group advance must not wait on a model call.
   // Scores arrive a moment later and the grid re-sorts, which is far better
   // than stalling every group behind inference.
@@ -364,6 +421,7 @@ export function useDpoSession(): UseDpoSessionResult {
         setGroup(res.group);
         setRemainingImages(res.group.images);
         void loadRealismScores(res.group.images);
+        void loadScoreBreakdown(res.group.images);
         setPhase("best");
         setBestImage(null);
         setPendingBest(null);
@@ -387,7 +445,7 @@ export function useDpoSession(): UseDpoSessionResult {
       }
       return;
     }
-  }, [refreshSwissState, loadRealismScores]);
+  }, [refreshSwissState, loadRealismScores, loadScoreBreakdown]);
 
   const pollScan = useCallback(
     async (signal: AbortSignal) => {
@@ -425,6 +483,7 @@ export function useDpoSession(): UseDpoSessionResult {
       setPairsPerGroup(config.pairsPerGroup);
       setGroupOrder(config.groupOrder);
       setCaptionFilter(config.captionFilter);
+      setMinImagesPerGroup(config.minImagesPerGroup);
       setScanCount(0);
       setScanTotal(0);
       setHashCount(0);
@@ -437,6 +496,7 @@ export function useDpoSession(): UseDpoSessionResult {
         config.mode,
         config.groupOrder,
         config.captionFilter,
+        config.minImagesPerGroup,
       );
       if (!res.ok) {
         setError(res.error ?? "Failed to start session");
@@ -687,6 +747,16 @@ export function useDpoSession(): UseDpoSessionResult {
     };
   }, []);
 
+  const scoreWeights = (group && scoreWeightsByPrompt[group.prompt]) ?? lastWeightsRef.current;
+  const setScoreWeights = useCallback(
+    (weights: ScoreWeights) => {
+      lastWeightsRef.current = weights;
+      const prompt = group?.prompt;
+      if (prompt !== undefined) setScoreWeightsByPrompt((m) => ({ ...m, [prompt]: weights }));
+    },
+    [group?.prompt],
+  );
+
   return {
     step,
     setStep,
@@ -695,6 +765,7 @@ export function useDpoSession(): UseDpoSessionResult {
     pairsPerGroup,
     groupOrder,
     captionFilter,
+    minImagesPerGroup,
     mode,
     scanCount,
     scanTotal,
@@ -708,6 +779,10 @@ export function useDpoSession(): UseDpoSessionResult {
     realismScores,
     realismError,
     realismDevice,
+    scoreBreakdown,
+    scoreBreakdownErrors,
+    scoreWeights,
+    scoreSortMode,
     backfill,
     swissMatch,
     swissRound,
@@ -732,6 +807,7 @@ export function useDpoSession(): UseDpoSessionResult {
       setPairsPerGroup,
       setGroupOrder,
       setCaptionFilter,
+      setMinImagesPerGroup,
       startSession,
       pickImage,
       confirmPair,
@@ -751,9 +827,11 @@ export function useDpoSession(): UseDpoSessionResult {
       setToast,
       loadOutputManifest,
       goToReview,
-      startRealismBackfill,
-      stopRealismBackfill,
+      startScoreBackfill,
+      stopScoreBackfill,
       setRealismDevice,
+      setScoreWeights,
+      setScoreSortMode,
     },
   };
 }

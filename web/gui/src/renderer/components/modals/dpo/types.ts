@@ -1,6 +1,16 @@
-import type { GroupData, GroupOrder, RealismDevice, ReviewPair, SessionStatus, SwissScores } from "@/api/dpoApi";
+import type {
+  GroupData,
+  GroupOrder,
+  RealismDevice,
+  ReviewPair,
+  ScoreBreakdown,
+  SessionStatus,
+  SwissScores,
+} from "@/api/dpoApi";
 
-export type { GroupData, GroupOrder, RealismDevice, ReviewPair, SessionStatus, SwissScores };
+import type { ScoreSortMode, ScoreWeights } from "./scoreCombine";
+
+export type { GroupData, GroupOrder, RealismDevice, ReviewPair, ScoreBreakdown, SessionStatus, SwissScores };
 
 export type CurationStep = "setup" | "scanning" | "selecting" | "swiss" | "ranking" | "triage" | "review" | "export";
 
@@ -16,6 +26,8 @@ export interface SessionConfig {
   groupOrder: GroupOrder;
   /** Comma-separated caption keywords; all must appear. Empty = no filter. */
   captionFilter: string;
+  /** Skip prompts with fewer images than this. 2 (the pair floor) = no filter. */
+  minImagesPerGroup: number;
 }
 
 export interface ResumeInfo {
@@ -35,11 +47,13 @@ export interface SetupStepProps {
   pairsPerGroup: number;
   groupOrder: GroupOrder;
   captionFilter: string;
+  minImagesPerGroup: number;
   onSourceChange: (dir: string) => void;
   onOutputChange: (dir: string) => void;
   onPairsPerGroupChange: (n: number) => void;
   onGroupOrderChange: (order: GroupOrder) => void;
   onCaptionFilterChange: (text: string) => void;
+  onMinImagesPerGroupChange: (n: number) => void;
   onStart: (config: SessionConfig) => Promise<void>;
   onReview: () => void;
   onClose: () => void;
@@ -84,14 +98,14 @@ export interface SelectionStepProps {
   // source order in both cases.
   realismScores?: Record<string, number>;
   realismError?: string | null;
-  // Whole-tree backfill: scores every image in the source folder once so no
-  // group ever waits on the model. Optional so the step still renders in modes
-  // and tests that do not wire it.
+  // Whole-tree backfill: scores every image in the source folder on every
+  // axis once so no group ever loads a model. Optional so the step still
+  // renders in modes and tests that do not wire it.
   backfill?: {
     running: boolean;
     done: number;
     total: number;
-    cached: number;
+    errors: Record<string, string>;
     error: string | null;
   };
   onStartBackfill?: () => void;
@@ -101,6 +115,18 @@ export interface SelectionStepProps {
   // scoring entirely, so no badges and no sort.
   realismDevice?: RealismDevice;
   onSetRealismDevice?: (device: RealismDevice) => void;
+  // Every scorer's verdict per path (realism, prompt adherence, age, on-image
+  // text, quality) for the per-tile breakdown panel and the combined sort. Empty until the
+  // group has been scored; per-scorer failures arrive in the errors map so
+  // the panel degrades a row at a time.
+  scoreBreakdown?: Record<string, ScoreBreakdown>;
+  scoreBreakdownErrors?: Record<string, string>;
+  // Per-prompt weights over the five scorers. Changing them re-sorts the grid
+  // client-side; nothing is re-scored.
+  scoreWeights?: ScoreWeights;
+  onSetScoreWeights?: (weights: ScoreWeights) => void;
+  scoreSortMode?: ScoreSortMode;
+  onSetScoreSortMode?: (mode: ScoreSortMode) => void;
 }
 
 export interface TournamentStepProps {

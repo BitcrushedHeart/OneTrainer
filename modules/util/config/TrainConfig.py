@@ -29,7 +29,9 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
+from modules.util.enum.PatienceMode import PatienceMode
 from modules.util.enum.RLHFMode import RLHFMode
+from modules.util.enum.TextRewardSource import TextRewardSource
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -403,6 +405,27 @@ class QuantizationConfig(BaseConfig):
         return QuantizationConfig(data)
 
 
+_TEXT_REWARD_DEFAULTS = (
+    ("text_reward_enabled", False),
+    ("text_reward_weight", 1.0),
+    ("text_reward_samples_per_epoch", 1000),
+    ("text_reward_rollout_steps", 8),
+    ("text_reward_random_grad_step", True),
+    ("text_reward_cfg_scale", 1.0),
+    ("text_reward_negative_prompt", ""),
+    ("text_reward_resolution", 1024),
+    ("text_reward_max_decode_pixels", 384),
+    ("text_reward_word_list", ""),
+    ("text_reward_min_words", 1),
+    ("text_reward_max_words", 8),
+    ("text_reward_save_interval", 50),
+    ("text_reward_recognizer", "parseq"),
+    ("text_reward_source", TextRewardSource.ONLINE_ROLLOUT),
+    ("text_reward_dataset_dir", ""),
+    ("text_reward_dataset_repeats", 1),
+)
+
+
 class TrainConfig(BaseConfig):
     training_method: TrainingMethod
     model_type: ModelType
@@ -419,6 +442,7 @@ class TrainConfig(BaseConfig):
     validate_after_unit: TimeUnit
     patience: bool
     patience_epochs: int
+    patience_mode: PatienceMode
     continue_last_backup: bool
     prevent_overwrites: bool
     include_train_config: ConfigPart
@@ -677,6 +701,25 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_patience_value: int
     rlhf_dpo_save_best: bool
 
+    # on-image text reward (DRaFT-1 style differentiable OCR add-on)
+    text_reward_enabled: bool
+    text_reward_weight: float
+    text_reward_samples_per_epoch: int
+    text_reward_rollout_steps: int
+    text_reward_random_grad_step: bool
+    text_reward_cfg_scale: float
+    text_reward_negative_prompt: str
+    text_reward_resolution: int
+    text_reward_max_decode_pixels: int
+    text_reward_word_list: str
+    text_reward_min_words: int
+    text_reward_max_words: int
+    text_reward_save_interval: int
+    text_reward_recognizer: str
+    text_reward_source: TextRewardSource
+    text_reward_dataset_dir: str
+    text_reward_dataset_repeats: int
+
     # optimizer
     optimizer: TrainOptimizerConfig
     optimizer_defaults: dict[str, TrainOptimizerConfig]
@@ -743,6 +786,7 @@ class TrainConfig(BaseConfig):
                 25: self.__migration_25,
                 26: self.__migration_26,
                 27: self.__migration_27,
+                28: self.__migration_28,
             },
         )
 
@@ -962,6 +1006,7 @@ class TrainConfig(BaseConfig):
         migrated_data = data.copy()
         migrated_data.setdefault("patience", False)
         migrated_data.setdefault("patience_epochs", 5)
+        migrated_data.setdefault("patience_mode", "STOP_TRAINING")
         migrated_data.setdefault("rlhf_enabled", False)
         migrated_data.setdefault("rlhf_dpo_beta", 300.0)
         migrated_data.setdefault("rlhf_dpo_label_smoothing", 0.0)
@@ -1117,6 +1162,13 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("rlhf_dpo_ref_rebase_interval", 0)
         return migrated_data
 
+    def __migration_28(self, data: dict) -> dict:
+        # On-image text reward add-on (frozen OCR, CTC through the VAE).
+        migrated_data = data.copy()
+        for name, default in _TEXT_REWARD_DEFAULTS:
+            migrated_data.setdefault(name, default)
+        return migrated_data
+
     def from_dict(self, data: dict) -> "TrainConfig":
         # oft_clipped_norm was briefly a bool on this branch (clip on/off at a
         # hard-coded 0.999) before upstream PR #1492 settled on float | None
@@ -1169,6 +1221,50 @@ class TrainConfig(BaseConfig):
                 # to keep peak memory at one graph; a fused back pass would
                 # apply the optimizer inside the first of them.
                 return "SFT + DPO mode does not support the optimizer's fused back pass; disable it."
+        return None
+
+    def validate_text_reward_startup(self) -> str | None:
+        if not self.text_reward_enabled:
+            return None
+        if self.model_type != ModelType.Z_IMAGE:
+            return "The on-image text reward is currently implemented for Z-Image only."
+        if self.text_reward_weight <= 0:
+            return "The text reward needs a positive weight."
+        if self.text_reward_samples_per_epoch <= 0:
+            return "The text reward needs a positive number of samples per epoch."
+        if self.text_reward_rollout_steps < 1:
+            return "The text reward rollout needs at least one step."
+        if self.text_reward_recognizer not in (
+            "parseq",
+            "crnn_vgg16_bn",
+            "vitstr_base",
+            "sar_resnet31",
+            "master",
+            "trocr-base-str",
+            "trocr-base-printed",
+            "trocr-large-str",
+            "trocr-large-printed",
+        ):
+            return "Unknown text reward recognizer; use trocr-base-str, parseq or crnn_vgg16_bn."
+        if self.text_reward_source == TextRewardSource.OFFLINE_IMAGES:
+            from modules.util.text_reward_util import DEFAULT_VOCAB, load_text_reward_dataset
+
+            if not self.text_reward_dataset_dir or not os.path.isdir(self.text_reward_dataset_dir):
+                return "Offline text reward needs an existing dataset folder (Text Alignment Dataset Tool output)."
+            if self.text_reward_dataset_repeats < 1:
+                return "Text dataset repeats must be at least 1."
+            if not load_text_reward_dataset(self.text_reward_dataset_dir, DEFAULT_VOCAB):
+                return "The text reward dataset folder holds no image with a prompt (.txt / .json) beside it."
+        if self.text_reward_min_words < 1 or self.text_reward_max_words < self.text_reward_min_words:
+            return "The text reward word range must satisfy 1 <= min <= max."
+        if self.distill_phase_active() or self.transfer_enabled or self.rlhf_dpo_primary():
+            return "The text reward rides on the standard finetune loss (plain or SFT + DPO), not on distill, transfer or DPO-primary runs."
+        if self.optimizer is not None and getattr(self.optimizer, "fused_back_pass", False):
+            return "The text reward runs a second backward per micro-step and does not support the optimizer's fused back pass."
+        try:
+            import doctr  # noqa: F401
+        except ImportError:
+            return "The text reward needs the 'python-doctr' package (venv/Scripts/pip.exe install python-doctr)."
         return None
 
     def dpo_validation_active(self) -> bool:
@@ -1513,6 +1609,7 @@ class TrainConfig(BaseConfig):
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
         data.append(("patience", False, bool, False))
         data.append(("patience_epochs", 5, int, False))
+        data.append(("patience_mode", PatienceMode.STOP_TRAINING, PatienceMode, False))
         data.append(("continue_last_backup", False, bool, False))
         data.append(("prevent_overwrites", False, bool, False))
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
@@ -1814,6 +1911,10 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_patience_enabled", False, bool, False))
         data.append(("rlhf_dpo_patience_value", 5, int, False))
         data.append(("rlhf_dpo_save_best", True, bool, False))
+
+        # on-image text reward
+        for name, default in _TEXT_REWARD_DEFAULTS:
+            data.append((name, default, type(default), False))
 
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))

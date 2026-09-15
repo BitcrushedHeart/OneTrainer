@@ -3,10 +3,13 @@ from util.import_util import script_imports
 script_imports()
 
 import argparse
+import atexit
 import contextlib
 import json
+import logging
 import os
 import socket
+import sys
 import threading
 import traceback
 
@@ -14,6 +17,19 @@ from modules.util import create
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
+
+from tqdm import tqdm
+
+# tqdm's monitor thread is joined during interpreter teardown. If its write lock is
+# ever left held (a bar closed from another thread, a worker killed mid-write) that
+# join never returns and this process outlives its parent as a zombie that still
+# owns every byte of RAM the run allocated. Disable the monitor outright; we also
+# hard-exit below so no other teardown hang can keep the process alive.
+tqdm.monitor_interval = 0
+
+# How long the orderly exit path (atexit handlers, log/stream flush) gets before
+# the process is terminated regardless.
+_EXIT_GRACE_S = 30.0
 
 
 def _categorize(error: BaseException) -> str:
@@ -47,8 +63,21 @@ class _EventChannel:
             self._sock.sendall(data)
 
 
-def _start_control_reader(sock: socket.socket, commands: TrainCommands, stop_flag: threading.Event) -> None:
-    """Read control frames ({"cmd": "stop"}) from the parent on a daemon thread."""
+def _start_control_reader(
+    sock: socket.socket,
+    commands: TrainCommands,
+    stop_flag: threading.Event,
+    parent_gone: threading.Event,
+    run_finished: threading.Event,
+) -> None:
+    """Read control frames ({"cmd": "stop"}) from the parent on a daemon thread.
+
+    EOF on this socket before ``run_finished`` is set means the parent is gone
+    (the backend was restarted or crashed). An orphan that keeps training has no
+    UI, no stop button, and fights the next run for RAM and VRAM, so we treat it
+    as a stop request: the trainer finishes the current step, saves / backs up
+    as configured, and the process exits.
+    """
 
     def _run() -> None:
         buffer = b""
@@ -71,11 +100,41 @@ def _start_control_reader(sock: socket.socket, commands: TrainCommands, stop_fla
                         commands.stop()
         except OSError:
             pass
+        finally:
+            if not run_finished.is_set() and not stop_flag.is_set():
+                parent_gone.set()
+                stop_flag.set()
+                commands.stop()
+                print("Queue parent disconnected; stopping this run gracefully.", flush=True)
 
     threading.Thread(target=_run, daemon=True, name="queue-ipc-control").start()
 
 
-def main() -> None:
+def _exit_now(code: int) -> None:
+    """Leave the process without relying on interpreter teardown finishing.
+
+    The run is already reported to the parent by the time this is called; the only
+    remaining work is best-effort flushing. A watchdog guarantees the exit even if
+    an atexit handler or a stuck lock would otherwise hang finalization.
+    """
+
+    def _force() -> None:
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os._exit(code)
+
+    watchdog = threading.Timer(_EXIT_GRACE_S, _force)
+    watchdog.daemon = True
+    watchdog.start()
+    with contextlib.suppress(Exception):
+        atexit._run_exitfuncs()
+    with contextlib.suppress(Exception):
+        logging.shutdown()
+    _force()
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Run a single OneTrainer queue entry in an isolated process.")
     parser.add_argument("--config-path", required=True, help="Path to the merged TrainConfig JSON for this entry.")
     parser.add_argument("--ipc-port", type=int, required=True, help="Localhost TCP port the parent is listening on.")
@@ -86,7 +145,9 @@ def main() -> None:
 
     commands = TrainCommands()
     stop_flag = threading.Event()
-    _start_control_reader(sock, commands, stop_flag)
+    parent_gone = threading.Event()
+    run_finished = threading.Event()
+    _start_control_reader(sock, commands, stop_flag, parent_gone, run_finished)
 
     train_config = TrainConfig.default_values()
     with open(args.config_path, "r", encoding="utf-8") as fh:
@@ -142,10 +203,12 @@ def main() -> None:
             )
         else:
             channel.send({"type": "result", "status": "completed", "stopped": stop_flag.is_set()})
+        run_finished.set()
         with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
         sock.close()
+    return 0 if error is None else 1
 
 
 if __name__ == "__main__":
-    main()
+    _exit_now(main())

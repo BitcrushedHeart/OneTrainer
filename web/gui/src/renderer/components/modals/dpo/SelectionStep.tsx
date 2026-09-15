@@ -1,5 +1,5 @@
 import { Ban, Cpu, Loader2, SkipForward, Sparkles, Trash2, X, Zap } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { API_BASE } from "@/api/request";
@@ -7,6 +7,9 @@ import { Button } from "@/components/shared";
 
 import { PreviewOverlay } from "./PreviewOverlay";
 import { PromptExpander } from "./PromptExpander";
+import { ScoreBreakdownPanel } from "./ScoreBreakdownPanel";
+import { DEFAULT_SCORE_WEIGHTS, type ScoreAxes, sortByCombined, weightedZ } from "./scoreCombine";
+import { ScoreWeightSliders } from "./ScoreWeightSliders";
 import type { RealismDevice, SelectionStepProps } from "./types";
 
 // The scoring control cycles rather than opening a menu: three positions is
@@ -86,6 +89,12 @@ export function SelectionStep({
   // render; "auto" is what the server starts on.
   realismDevice = "auto",
   onSetRealismDevice,
+  scoreBreakdown,
+  scoreBreakdownErrors,
+  scoreWeights = DEFAULT_SCORE_WEIGHTS,
+  onSetScoreWeights,
+  scoreSortMode = "combined",
+  onSetScoreSortMode,
 }: SelectionStepProps) {
   const [previewPath, setPreviewPath] = useState<string | null>(null);
 
@@ -141,13 +150,32 @@ export function SelectionStep({
   const minRemaining = phase === "worst" ? 1 : 2;
   const hasEnoughImages = remainingImages.length >= minRemaining;
 
-  // Most photorealistic first — the lowest P(AI) is the strongest DPO winner
-  // candidate. Unscored images keep their source position relative to each
-  // other (Array.sort is stable), so a partially-scored or unavailable model
-  // degrades to the original order rather than to a scrambled one.
   const scored = realismScores ?? {};
-  const displayImages =
-    Object.keys(scored).length > 0
+  const breakdown = useMemo(() => scoreBreakdown ?? {}, [scoreBreakdown]);
+  const hasBreakdown = Object.keys(breakdown).length > 0;
+
+  // The combined score under the user's weights, recomputed on every slider
+  // move from the breakdown the server sent — no round trip. Only the images
+  // still in the group take part, so the z-scores describe what is on screen.
+  const axesByPath = useMemo(() => {
+    const out: Record<string, ScoreAxes> = {};
+    for (const path of remainingImages) {
+      const b = breakdown[path];
+      if (b) out[path] = { text: b.text, adherence: b.adherence, age: b.age, realism: b.realism, quality: b.quality };
+    }
+    return out;
+  }, [breakdown, remainingImages]);
+  const combinedByPath = useMemo(() => weightedZ(axesByPath, scoreWeights), [axesByPath, scoreWeights]);
+
+  // Grid order. Combined (default) ranks on the weighted breakdown; realism
+  // keeps the pre-breakdown behaviour — most photorealistic first. Unscored
+  // images keep their source position relative to each other (Array.sort is
+  // stable), so a partially-scored or unavailable model degrades to the
+  // original order rather than to a scrambled one.
+  const useCombinedSort = scoreSortMode === "combined" && hasBreakdown;
+  const displayImages = useCombinedSort
+    ? sortByCombined(remainingImages, axesByPath, scoreWeights)
+    : Object.keys(scored).length > 0
       ? [...remainingImages].sort((a, b) => {
           const sa = scored[a];
           const sb = scored[b];
@@ -160,6 +188,24 @@ export function SelectionStep({
   const ar = parseAspectRatio(group.aspectratio);
   const arStyle: React.CSSProperties | undefined = ar ? { aspectRatio: ar.css } : undefined;
   const gridCols = columnsForRatio(ar?.ratio ?? null, displayImages.length);
+  // A portrait image leaves room beside itself in its grid cell; a landscape
+  // one does not, so its breakdown goes underneath.
+  const panelLayout: "side" | "below" = ar && ar.ratio < 1.15 ? "side" : "below";
+
+  const scoringOn = realismDevice !== "off";
+  const breakdownErrors = scoreBreakdownErrors ?? {};
+  const anyBreakdownError = Object.keys(breakdownErrors).length > 0;
+  // Scorers the last backfill had to skip (model missing), one line each.
+  const backfillSkipped = Object.entries(backfill?.errors ?? {}).map(([axis, why]) => `${axis}: ${why}`);
+  const allNull = (pick: (b: (typeof breakdown)[string]) => number | null) =>
+    hasBreakdown && Object.values(breakdown).every((b) => pick(b) === null);
+  const unavailableAxes = {
+    text: !!breakdownErrors.text || allNull((b) => b.text),
+    adherence: !!breakdownErrors.adherence || allNull((b) => b.adherence),
+    age: allNull((b) => b.age),
+    realism: !!breakdownErrors.realism || !!realismError,
+    quality: allNull((b) => b.quality),
+  };
 
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
@@ -187,17 +233,35 @@ export function SelectionStep({
                 realism scoring unavailable
               </span>
             </>
+          ) : useCombinedSort ? (
+            <>
+              <span className="text-[var(--color-border-subtle)]">·</span>
+              <span style={{ color: "#22c55e" }}>sorted by combined score</span>
+            </>
           ) : Object.keys(scored).length > 0 ? (
             <>
               <span className="text-[var(--color-border-subtle)]">·</span>
               <span style={{ color: "#22c55e" }}>sorted most photorealistic first</span>
             </>
           ) : null}
+          {scoringOn && anyBreakdownError ? (
+            <>
+              <span className="text-[var(--color-border-subtle)]">·</span>
+              <span
+                title={Object.entries(breakdownErrors)
+                  .map(([k, v]) => `${k}: ${v}`)
+                  .join("\n")}
+                style={{ color: "#f97316" }}
+              >
+                some scorers unavailable
+              </span>
+            </>
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
-          {/* Score the whole source tree once so no group ever waits on the
-              model. Hidden when scoring is unavailable — there would be nothing
-              to backfill. */}
+          {/* Score the whole source tree on every axis once so no group ever
+              loads a model. Hidden when scoring is unavailable — there would be
+              nothing to backfill. */}
           {/* Move scoring off the GPU when something else needs the VRAM. The
               server applies it from the next call on, so a backfill in flight
               switches at its next chunk instead of restarting. */}
@@ -241,12 +305,19 @@ export function SelectionStep({
                 onClick={onStartBackfill}
                 title={
                   backfill?.error ??
-                  "Score every image in the source folder once, so each group is instant from then on"
+                  (backfillSkipped.length > 0
+                    ? `Some scorers could not load and were skipped:\n${backfillSkipped.join("\n")}`
+                    : "Score every image in the source folder on every axis (realism, quality, age, " +
+                      "on-image text) once, so no group loads a model from then on")
                 }
-                style={backfill?.error ? { color: "#f97316" } : undefined}
+                style={backfill?.error || backfillSkipped.length > 0 ? { color: "#f97316" } : undefined}
               >
                 <Sparkles className="w-4 h-4" />
-                {backfill?.error ? "Backfill failed" : "Backfill Scores"}
+                {backfill?.error
+                  ? "Backfill failed"
+                  : backfillSkipped.length > 0
+                    ? "Backfill Scores (partial)"
+                    : "Backfill Scores"}
               </Button>
             )
           ) : null}
@@ -274,6 +345,17 @@ export function SelectionStep({
       {/* Prompt expander */}
       <PromptExpander prompt={group.prompt} />
 
+      {/* Per-prompt scorer weights — only meaningful while something is scored. */}
+      {scoringOn && onSetScoreWeights && onSetScoreSortMode ? (
+        <ScoreWeightSliders
+          weights={scoreWeights}
+          onChange={onSetScoreWeights}
+          sortMode={scoreSortMode}
+          onSortModeChange={onSetScoreSortMode}
+          unavailable={unavailableAxes}
+        />
+      ) : null}
+
       {/* Phase banner */}
       <div
         className="w-full text-center font-bold text-sm py-2 px-3 rounded"
@@ -296,10 +378,9 @@ export function SelectionStep({
                 type="button"
                 onClick={() => handleThumbClick(imgPath)}
                 onContextMenu={(e) => handleThumbContextMenu(e, imgPath)}
-                className="group relative rounded border-2 overflow-hidden transition-all hover:shadow-lg hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] bg-black/30"
+                className={`group relative rounded border-2 overflow-hidden transition-all hover:shadow-lg hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] bg-black/30 flex ${panelLayout === "side" ? "flex-row" : "flex-col"}`}
                 style={{
                   borderColor: isBest ? "#22c55e" : "var(--color-border-subtle)",
-                  ...arStyle,
                 }}
                 onMouseEnter={(e) => {
                   if (!isBest) e.currentTarget.style.borderColor = "var(--color-cobalt-600)";
@@ -308,36 +389,45 @@ export function SelectionStep({
                   if (!isBest) e.currentTarget.style.borderColor = "var(--color-border-subtle)";
                 }}
               >
-                <img
-                  src={imageUrl(imgPath)}
-                  alt={basename(imgPath)}
-                  loading="lazy"
-                  draggable={false}
-                  className={`${arStyle ? "object-contain w-full h-full" : "object-contain w-full h-40"} transition-[filter] group-hover:brightness-110`}
-                />
-                {isBest && (
+                <div className="relative flex-1 min-w-0" style={arStyle}>
+                  <img
+                    src={imageUrl(imgPath)}
+                    alt={basename(imgPath)}
+                    loading="lazy"
+                    draggable={false}
+                    className={`${arStyle ? "object-contain w-full h-full" : "object-contain w-full h-40"} transition-[filter] group-hover:brightness-110`}
+                  />
+                  {isBest && (
+                    <div
+                      className="absolute top-1 left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                      style={{ background: "#22c55e", color: "#0b2c13" }}
+                    >
+                      BEST
+                    </div>
+                  )}
+                  {scored[imgPath] !== undefined && (
+                    <div
+                      className="absolute top-1 right-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                      style={{ background: realismColor(scored[imgPath]), color: "#0b0b0b" }}
+                      title={`Model thinks this is ${(scored[imgPath] * 100).toFixed(1)}% AI-generated`}
+                    >
+                      {(scored[imgPath] * 100).toFixed(0)}% AI
+                    </div>
+                  )}
                   <div
-                    className="absolute top-1 left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
-                    style={{ background: "#22c55e", color: "#0b2c13" }}
+                    className="absolute bottom-0 left-0 right-0 text-[10px] text-white/90 bg-black/60 px-1 py-0.5 truncate text-left font-mono"
+                    title={basename(imgPath)}
                   >
-                    BEST
+                    {basename(imgPath)}
                   </div>
-                )}
-                {scored[imgPath] !== undefined && (
-                  <div
-                    className="absolute top-1 right-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
-                    style={{ background: realismColor(scored[imgPath]), color: "#0b0b0b" }}
-                    title={`Model thinks this is ${(scored[imgPath] * 100).toFixed(1)}% AI-generated`}
-                  >
-                    {(scored[imgPath] * 100).toFixed(0)}% AI
-                  </div>
-                )}
-                <div
-                  className="absolute bottom-0 left-0 right-0 text-[10px] text-white/90 bg-black/60 px-1 py-0.5 truncate text-left font-mono"
-                  title={basename(imgPath)}
-                >
-                  {basename(imgPath)}
                 </div>
+                {scoringOn ? (
+                  <ScoreBreakdownPanel
+                    breakdown={breakdown[imgPath]}
+                    combined={combinedByPath[imgPath]}
+                    layout={panelLayout}
+                  />
+                ) : null}
               </button>
             );
           })}

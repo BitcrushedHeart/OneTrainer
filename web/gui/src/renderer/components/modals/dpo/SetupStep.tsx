@@ -94,11 +94,13 @@ export function SetupStep({
   pairsPerGroup,
   groupOrder,
   captionFilter,
+  minImagesPerGroup,
   onSourceChange,
   onOutputChange,
   onPairsPerGroupChange,
   onGroupOrderChange,
   onCaptionFilterChange,
+  onMinImagesPerGroupChange,
   onStart,
   onReview,
   onClose,
@@ -269,6 +271,21 @@ export function SetupStep({
             </p>
           </div>
           <div className="flex items-end gap-3">
+            <div className="w-32">
+              <FormEntry
+                label="Min images per prompt"
+                type="number"
+                value={minImagesPerGroup}
+                onChange={(v) => onMinImagesPerGroupChange(Math.max(2, Number(v)))}
+              />
+            </div>
+            <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
+              Skip any prompt with fewer usable images than this, counted after duplicates and already-exported images
+              are dropped. 2 is the floor a pair needs, so 2 shows everything; raise it to filter out prompts that were
+              only generated a couple of times.
+            </p>
+          </div>
+          <div className="flex items-end gap-3">
             <div className="w-56">
               <Select
                 label="Image scoring"
@@ -323,7 +340,15 @@ export function SetupStep({
           variant="primary"
           disabled={!canStart}
           onClick={() =>
-            void onStart({ sourceFolder, outputDir, pairsPerGroup, groupOrder, captionFilter, mode: "selection" })
+            void onStart({
+              sourceFolder,
+              outputDir,
+              pairsPerGroup,
+              groupOrder,
+              captionFilter,
+              minImagesPerGroup,
+              mode: "selection",
+            })
           }
         >
           <MousePointer2 className="w-4 h-4" />
@@ -333,7 +358,15 @@ export function SetupStep({
           variant="primary"
           disabled={!canStart}
           onClick={() =>
-            void onStart({ sourceFolder, outputDir, pairsPerGroup, groupOrder, captionFilter, mode: "swiss" })
+            void onStart({
+              sourceFolder,
+              outputDir,
+              pairsPerGroup,
+              groupOrder,
+              captionFilter,
+              minImagesPerGroup,
+              mode: "swiss",
+            })
           }
         >
           <MousePointer2 className="w-4 h-4" />
@@ -343,7 +376,15 @@ export function SetupStep({
           variant="primary"
           disabled={!canStart}
           onClick={() =>
-            void onStart({ sourceFolder, outputDir, pairsPerGroup, groupOrder, captionFilter, mode: "triage" })
+            void onStart({
+              sourceFolder,
+              outputDir,
+              pairsPerGroup,
+              groupOrder,
+              captionFilter,
+              minImagesPerGroup,
+              mode: "triage",
+            })
           }
         >
           <Zap className="w-4 h-4" />

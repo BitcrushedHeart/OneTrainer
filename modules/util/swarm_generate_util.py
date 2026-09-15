@@ -10,7 +10,7 @@ import os
 import threading
 
 from modules.util.caption_style import is_tag_line
-from modules.util.dpo_offpolicy_util import exact_size_for_small_photo
+from modules.util.dpo_offpolicy_util import RealPhoto, exact_size_for_small_photo
 
 #: Trainer target resolution and bucket quantization these sizes are built
 #: for. 64 is what every current OneTrainer image loader passes to
@@ -99,6 +99,55 @@ def bucket_size_for_photo(
 # ---------------------------------------------------------------------------
 
 
+def line_is_usable(line: str, exclude_tag_style: bool = False, min_caption_words: int = 0) -> str | None:
+    """Why one caption line should not be generated for — ``"tag_style"`` or
+    ``"too_short"`` — or ``None`` when it is fine. Tag style is checked first
+    so a short tag list is reported as tag style, the more specific reason."""
+    if exclude_tag_style and is_tag_line(line):
+        return "tag_style"
+    if min_caption_words > 0 and len(line.split()) < min_caption_words:
+        return "too_short"
+    return None
+
+
+def filter_pool_lines(
+    pool: list[tuple[RealPhoto, list[str]]],
+    exclude_tag_style: bool = False,
+    min_caption_words: int = 0,
+) -> tuple[list[tuple[RealPhoto, list[str]]], dict[str, int]]:
+    """Narrow a suggestion pool to the caption *lines* worth generating for,
+    the way :func:`~modules.util.dpo_offpolicy_util.filter_pool_by_keywords`
+    narrows by keyword.
+
+    A multi-line sidecar is several captions, and the trainer draws one at
+    random per step, so the filters apply per line, not per file: a photo
+    whose sidecar mixes a short line with a long one keeps the long line
+    rather than being judged by whichever line a draw happens to pick. A
+    photo stays while at least one of its eligible lines survives.
+
+    ``stats`` counts the photos dropped entirely, once each: under
+    ``too_short`` when any of its lines fell to the word minimum, otherwise
+    under ``tag_style``."""
+    stats = {"tag_style": 0, "too_short": 0}
+    if not exclude_tag_style and min_caption_words <= 0:
+        return pool, stats
+    narrowed: list[tuple[RealPhoto, list[str]]] = []
+    for photo, lines in pool:
+        kept: list[str] = []
+        reasons: set[str] = set()
+        for line in lines:
+            reason = line_is_usable(line, exclude_tag_style, min_caption_words)
+            if reason is None:
+                kept.append(line)
+            else:
+                reasons.add(reason)
+        if kept:
+            narrowed.append((photo, kept))
+        elif reasons:
+            stats["too_short" if "too_short" in reasons else "tag_style"] += 1
+    return narrowed, stats
+
+
 def plan_generations(
     entries: list[dict],
     images_per_caption: int = 1,
@@ -131,11 +180,9 @@ def plan_generations(
         if not caption or width <= 0 or height <= 0:
             stats["unusable"] += 1
             continue
-        if exclude_tag_style and is_tag_line(caption):
-            stats["tag_style"] += 1
-            continue
-        if min_caption_words > 0 and len(caption.split()) < min_caption_words:
-            stats["too_short"] += 1
+        reason = line_is_usable(caption, exclude_tag_style, min_caption_words)
+        if reason is not None:
+            stats[reason] += 1
             continue
         gen_w, gen_h = bucket_size_for_photo(width, height, target_resolution, quantization)
         jobs.append(

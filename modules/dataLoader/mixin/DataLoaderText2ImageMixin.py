@@ -688,11 +688,13 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # The rejected latent is a new split tensor inside the chosen
             # row's .pt: SmartDiskCache's schema-drift augmentation encodes it
             # in place without invalidating the existing chosen latents.
-            # In adaptive mode the rejected source constrains tier eligibility,
-            # so edits and re-pairing must invalidate the bundled image entry.
+            # The rejected file is watched as a sidecar of the chosen row: the
+            # cache entry is keyed on the chosen path, so a rejected image
+            # swapped in place (Replace Pairs, re-pairing) would otherwise
+            # train on the stale cached latent forever. In adaptive mode it
+            # also constrains tier eligibility.
             image_split_names = image_split_names + ["latent_image_rejected"]
-            if config.adaptive_resolution:
-                image_extra_watched.append("image_path_rejected")
+            image_extra_watched.append("image_path_rejected")
 
         # The DPO patterns change which rows a concept produces, so they join
         # the variation group keys. Group keys only organize balancing and

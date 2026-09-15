@@ -181,6 +181,25 @@ def test_short_captions_can_be_excluded(service, dirs):
     assert state["skipped_short"] == 1 and state["planned"] == 0
 
 
+def test_word_minimum_applies_per_caption_line_not_per_sidecar(service, dirs):
+    real, _gen, _out = dirs
+    long_line = "A woman in a red coat waits under a streetlight while rain drips from the awning behind her."
+    _jpg(str(real / "mixed.jpg"), (2400, 1600))
+    (real / "mixed.txt").write_text("A woman.\n" + long_line + "\n", encoding="utf-8")
+    # Several runs: the line is chosen at random per photo, so a filter that
+    # judged the draw instead of the pool would drop the photo some of the time.
+    for _ in range(6):
+        FakeClient.calls = []
+        assert _start(service, dirs, min_caption_words=15)["ok"]
+        state = _wait(service)
+        assert [call["prompt"] for call in FakeClient.calls] == [long_line]
+        assert state["planned"] == 1
+        # prose.jpg's only line is too short; mixed.jpg is not counted.
+        assert state["skipped_short"] == 1
+        for path in (_gen / "2026-08-30").iterdir():
+            path.unlink()
+
+
 def test_keyword_filter_narrows_the_pool(service, dirs):
     assert _start(service, dirs, keywords="watering can", exclude_tag_style=False)["ok"]
     _wait(service)

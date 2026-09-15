@@ -46,7 +46,7 @@ def test_scoring_off_refuses_to_start_a_backfill(service, monkeypatch):
     monkeypatch.setattr(rdu, "load_realism_model", _explode)
     service._realism_device = REALISM_DEVICE_OFF
 
-    result = service.start_realism_backfill()
+    result = service.start_score_backfill()
 
     assert result["ok"] is False
     assert "off" in result["error"].lower()

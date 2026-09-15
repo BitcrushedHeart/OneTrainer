@@ -8,6 +8,49 @@ import { API_BASE, request } from "./request";
  */
 export type RealismDevice = "auto" | "cpu" | "off";
 
+/** One proposition of the caption, and how strongly the image supports it. */
+export interface ScoreProposition {
+  text: string;
+  /** Vocabulary axis ("shot_type", "vertical_angle", ..., "age_model", "text_ocr") or null for a free phrase. */
+  axis: string | null;
+  label: string | null;
+  prob: number;
+  estimated_age?: number;
+  p_none?: number;
+  /** For "text_ocr": what the OCR reader saw for this span, null when nothing resembled it. */
+  read?: string | null;
+  /** For "text_ocr": "verbatim", "wrong" or "absent". `prob` is the policy score (absent sits above wrong). */
+  verdict?: "verbatim" | "wrong" | "absent";
+  /** For "text_ocr": the raw similarity of the reading, for display. */
+  ratio?: number;
+}
+
+/**
+ * Every scorer's verdict on one image of the current group. `null` where a
+ * scorer had nothing to say (no model, or — for age and text — a caption that
+ * claims no age / mentions no on-image text). `realism` is P(AI-generated),
+ * lower is better; the rest are higher-is-better.
+ */
+export interface ScoreBreakdown {
+  realism: number | null;
+  adherence: number | null;
+  age: number | null;
+  estimated_age: number | null;
+  /** OCR match (0–1) against the text the caption asks for; the worst span is `text_min`. */
+  text: number | null;
+  text_min?: number | null;
+  /** The reader's full transcription of the image, for the tooltip. */
+  ocr_text?: string | null;
+  quality: number | null;
+  axis_mean: number | null;
+  phrase_mean: number | null;
+  /** Weighted z under the server's default weights; the UI recomputes it from the sliders. */
+  combined: number | null;
+  /** 1-based position under the gate-then-rank rule. */
+  gate_rank: number;
+  propositions: ScoreProposition[];
+}
+
 /** Presentation order of scanned groups; the realism orders rank on P(AI). */
 export type GroupOrder = "random" | "least_realistic" | "most_realistic" | "largest_gap";
 
@@ -221,6 +264,7 @@ export const dpoApi = {
     mode: "selection" | "swiss" | "triage" = "selection",
     groupOrder: GroupOrder = "most_realistic",
     captionFilter = "",
+    minImagesPerGroup = 2,
   ) =>
     request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
       method: "POST",
@@ -231,6 +275,7 @@ export const dpoApi = {
         mode,
         group_order: groupOrder,
         caption_filter: captionFilter,
+        min_images_per_group: minImagesPerGroup,
       }),
     }),
 
@@ -299,29 +344,50 @@ export const dpoApi = {
       body: JSON.stringify({ paths }),
     }),
 
-  // Score the whole source tree once, ahead of curation, so Selection never
-  // waits on the model. Returns immediately — poll realismBackfillStatus.
-  // Re-running is cheap: anything already cached under the current model
-  // version is a hit, so a second pass only costs newly added images.
-  startRealismBackfill: () =>
-    request<{ ok: boolean; total?: number; error?: string }>("/dpo/session/realism-backfill", {
+  // Every scorer's verdict per image of the current group — realism, prompt
+  // adherence with its propositions, age agreement, on-image text (OCR),
+  // scalar quality — for the per-tile breakdown. Scorers fail one at a time
+  // (see `errors`).
+  scoreBreakdown: (paths: string[]) =>
+    request<{
+      ok: boolean;
+      scores?: Record<string, ScoreBreakdown>;
+      errors?: Record<string, string>;
+      default_weights?: Record<string, number>;
+      disabled?: boolean;
+      error?: string;
+    }>("/dpo/session/score-breakdown", {
+      method: "POST",
+      body: JSON.stringify({ paths }),
+    }),
+
+  // Score the whole source tree on every axis once, ahead of curation, so
+  // Selection never loads a model. Returns immediately — poll
+  // scoreBackfillStatus. Re-running is cheap: anything already cached under
+  // the current model versions is a hit, so a second pass only costs newly
+  // added images.
+  startScoreBackfill: () =>
+    request<{ ok: boolean; total?: number; error?: string }>("/dpo/session/score-backfill", {
       method: "POST",
     }),
 
-  realismBackfillStatus: () =>
+  scoreBackfillStatus: () =>
     request<{
       ok: boolean;
       running: boolean;
       done: number;
       total: number;
-      scored: number;
-      cached: number;
+      // Images each axis has covered; the caption decides whether the age,
+      // adherence and text axes apply to an image at all.
+      axes?: Record<string, number>;
+      // Per-axis load failures — that axis is skipped, the others still run.
+      errors?: Record<string, string>;
       finished: boolean;
       device?: RealismDevice;
       error?: string | null;
-    }>("/dpo/session/realism-backfill/status"),
+    }>("/dpo/session/score-backfill/status"),
 
-  stopRealismBackfill: () => request<{ ok: boolean }>("/dpo/session/realism-backfill/stop", { method: "POST" }),
+  stopScoreBackfill: () => request<{ ok: boolean }>("/dpo/session/score-backfill/stop", { method: "POST" }),
 
   // Where the realism head runs. "cpu" keeps it off the GPU entirely, for when
   // training or generation is using the VRAM; "auto" takes CUDA when it can.

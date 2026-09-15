@@ -43,6 +43,7 @@ from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.PathIOType import PathIOType
+from modules.util.enum.PatienceMode import PatienceMode
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -397,9 +398,9 @@ class TrainUI(ctk.CTk):
             10,
             2,
             "Patience",
-            tooltip="Enable early stopping based on validation loss. "
-            "Training stops when validation loss has not improved "
+            tooltip="Track validation loss and act when it has not improved "
             "for a set number of consecutive validation checks. "
+            "What happens then is chosen by 'Patience Mode' below. "
             "Automatically enables Validation when turned on.",
         )
         components.switch(frame, 10, 3, self.ui_state, "patience", command=self._on_patience_toggle)
@@ -417,12 +418,14 @@ class TrainUI(ctk.CTk):
             frame,
             11,
             2,
-            "Early Stop After",
+            "Patience Checks",
             tooltip="Number of consecutive validation checks without improvement "
-            "before training stops. You control how often validation runs "
-            "with the 'Validate after' setting above. The best checkpoint "
-            "(lowest validation loss) is automatically saved and restored "
-            "as the final output model.",
+            "before patience triggers. You control how often validation runs "
+            "with the 'Validate after' setting above. "
+            "Stop Training: training stops and the best checkpoint "
+            "(lowest validation loss) is restored as the final output model. "
+            "Save Alternative At End: training stops at the patience threshold and saves "
+            "the best checkpoint plus the threshold weights as a second output.",
         )
         components.entry(frame, 11, 3, self.ui_state, "patience_epochs")
 
@@ -486,6 +489,21 @@ class TrainUI(ctk.CTk):
             tooltip='The device used to temporarily offload models while they are not used. Default:"cpu"',
         )
         components.entry(frame, 15, 1, self.ui_state, "temp_device")
+
+        components.label(
+            frame,
+            15,
+            2,
+            "Patience Mode",
+            tooltip="STOP_TRAINING: Classic early stopping. Training stops once patience triggers "
+            "and the lowest-validation-loss checkpoint becomes the final output model.\n"
+            "SAVE_ALTERNATIVE_AT_END: Training stops once patience triggers and saves the "
+            "lowest-validation-loss checkpoint as the final output model. The weights at "
+            "the patience threshold ('Patience Checks' consecutive validations without "
+            "improvement) are also saved with a '-patience-alt' suffix.",
+            wide_tooltip=True,
+        )
+        components.options(frame, 15, 3, [str(x) for x in list(PatienceMode)], self.ui_state, "patience_mode")
 
         frame.pack(fill="both", expand=1)
         return frame

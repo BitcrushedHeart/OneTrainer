@@ -1,0 +1,134 @@
+import random
+
+from modules.util.text_reward_util import (
+    BUILTIN_WORDS,
+    DEFAULT_VOCAB,
+    TextRewardBank,
+    TextRewardScheduler,
+    TextSpec,
+    align_words,
+    derive_text_reward_interval,
+    filter_to_vocab,
+    generate_text_spec,
+    generate_text_specs,
+    reading_order,
+    text_reward_metrics,
+)
+
+import pytest
+
+
+def test_generated_specs_stay_inside_vocab_and_cover_families():
+    rng = random.Random(0)
+    families = set()
+    for _ in range(400):
+        spec = generate_text_spec(rng, DEFAULT_VOCAB)
+        families.add(spec.family)
+        assert spec.text == " ".join(spec.words)
+        assert spec.words
+        for word in spec.words:
+            assert word
+            assert all(ch in DEFAULT_VOCAB for ch in word), word
+        assert spec.prompt == f'{spec.surface} text reading "{spec.text}"'
+    assert families == {"words", "price", "date", "time", "url", "abbrev", "number", "nonword"}
+
+
+def test_vocab_filter_drops_unreadable_characters_but_keeps_prices():
+    ascii_only = DEFAULT_VOCAB.replace("£", "").replace("€", "")
+    assert filter_to_vocab("The Woollen Mill — £11.50", ascii_only) == "The Woollen Mill  11.50"
+    assert filter_to_vocab("£11.50", DEFAULT_VOCAB) == "£11.50"
+    rng = random.Random(4)
+    for _ in range(200):
+        spec = generate_text_spec(rng, ascii_only, family_weights={"price": 1.0, "words": 0.0})
+        assert "£" not in spec.text and "€" not in spec.text
+
+
+def test_generation_is_deterministic_per_seed():
+    a = generate_text_specs(20, seed=7, vocab=DEFAULT_VOCAB)
+    b = generate_text_specs(20, seed=7, vocab=DEFAULT_VOCAB)
+    c = generate_text_specs(20, seed=8, vocab=DEFAULT_VOCAB)
+    assert a == b
+    assert a != c
+
+
+def test_word_bounds_respected_for_plain_words():
+    rng = random.Random(1)
+    for _ in range(100):
+        spec = generate_text_spec(
+            rng,
+            DEFAULT_VOCAB,
+            family_weights={
+                "words": 1.0,
+                **dict.fromkeys(("price", "date", "time", "url", "abbrev", "number", "nonword"), 0.0),
+            },
+            min_words=2,
+            max_words=3,
+        )
+        assert 2 <= len(spec.words) <= 3
+        assert all(w.lower() in BUILTIN_WORDS for w in spec.words)
+
+
+def test_align_words_skips_spurious_boxes_and_reports_missing():
+    al = align_words(["The", "Woollen", "Mill", "-", "-", "£11.50"], ["The", "Woollen", "Mill", "-", "£11.50"])
+    assert al.pairs == [(0, 0), (1, 1), (2, 2), (4, 3), (5, 4)] or al.pairs == [(0, 0), (1, 1), (2, 2), (3, 3), (5, 4)]
+    assert al.missing == []
+
+    al = align_words(["Tne", "Wollen", "MiII"], ["The", "Woollen", "Mill", "-", "£11.50"])
+    assert al.pairs == [(0, 0), (1, 1), (2, 2)]
+    assert al.missing == [3, 4]
+
+    al = align_words(["zzzzzz"], ["Bakery"])
+    assert al.pairs == []
+    assert al.missing == [0]
+
+    assert align_words([], ["a", "b"]).missing == [0, 1]
+    assert align_words(["a"], []).pairs == []
+
+
+def test_metrics_penalise_missing_and_reward_verbatim():
+    targets = [["Open", "24h"]]
+    exact = text_reward_metrics([["Open", "24h"]], targets, [align_words(["Open", "24h"], targets[0])])
+    assert exact.exact == 1.0 and exact.word_ratio == 1.0 and exact.missing == 0.0
+
+    partial = text_reward_metrics([["Opem"]], targets, [align_words(["Opem"], targets[0])])
+    assert partial.exact == 0.0
+    assert 0.0 < partial.word_ratio < 1.0
+    assert partial.missing == 0.5
+
+
+def test_reading_order_is_line_then_left_to_right():
+    boxes = [[0.6, 0.1, 0.9, 0.2], [0.1, 0.12, 0.5, 0.22], [0.1, 0.5, 0.9, 0.6]]
+    assert reading_order(boxes) == [1, 0, 2]
+
+
+@pytest.mark.parametrize(
+    ("primary", "samples", "expected"),
+    [(96000, 1000, 96), (5000, 1000, 5), (500, 1000, 1), (0, 1000, 0), (1000, 0, 0)],
+)
+def test_interval_matches_budget(primary, samples, expected):
+    assert derive_text_reward_interval(primary, samples) == expected
+
+
+def test_scheduler_never_fires_on_a_blocked_step_but_keeps_the_budget():
+    sched = TextRewardScheduler(5)
+    fired = []
+    for step in range(30):
+        blocked = step % 10 == 0  # a DPO pair rides on every 10th step
+        if sched.due(step, blocked):
+            fired.append(step)
+    # every 5th step is due; the blocked ones (0, 10, 20) carry over to the next free step
+    assert fired == [1, 5, 11, 15, 21, 25]
+    assert sched.pending == 0
+
+    sched.start_epoch(0)
+    assert not any(sched.due(step, False) for step in range(10))
+
+
+def test_bank_cycles():
+    specs = [TextSpec("Sign", f"w{i}", (f"w{i}",), "words") for i in range(3)]
+    bank = TextRewardBank(specs, ["e0", "e1", "e2"], None)
+    seen = [bank.next().spec.text for _ in range(5)]
+    assert seen == ["w0", "w1", "w2", "w0", "w1"]
+    assert bank.next().embedding == "e2"
+    with pytest.raises(ValueError):
+        TextRewardBank(specs, ["e0"], None)

@@ -19,6 +19,18 @@ ALL_POSSIBLE_INPUT_ASPECTS = [
     (1.0, 4.0),
 ]
 
+# Mirrors AspectBucketing.all_possible_input_resolutions: native generator
+# buckets at a 1024 reference target, scaled linearly (not pixel-normalized).
+REFERENCE_TARGET_RESOLUTION = 1024
+ALL_POSSIBLE_INPUT_RESOLUTIONS = [
+    (1024, 1024),
+    (1152, 896),
+    (1216, 832),
+    (1216, 768),
+    (1344, 768),
+    (1536, 640),
+]
+
 
 # Quantization per model, cross-checked against modules/dataLoader/*BaseDataLoader.py
 MODEL_QUANTIZATION = {
@@ -71,8 +83,11 @@ def build_buckets(target_resolution: int, q: int):
         )
         for (h, w) in ALL_POSSIBLE_INPUT_ASPECTS
     ]
+    scale = target_resolution / REFERENCE_TARGET_RESOLUTION
+    new = new + [(h * scale, w * scale) for (h, w) in ALL_POSSIBLE_INPUT_RESOLUTIONS]
     new = new + [(w, h) for (h, w) in new]
     new = [_quantize_res(r, q) for r in new]
+    new = [(h, w) for h, w in new if h > 0 and w > 0]
     new = list(set(new))
     aspects = np.array([h / w for (h, w) in new])
     return new, aspects

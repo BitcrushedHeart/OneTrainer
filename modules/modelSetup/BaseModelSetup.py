@@ -3,6 +3,7 @@ from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 
 from modules.model.BaseModel import BaseModel
+from modules.modelSetup.mixin.ModelSetupTextRewardMixin import ModelSetupTextRewardMixin
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.distill_dmd2_util import (
     build_distill_sigma_matrix,
@@ -62,6 +63,7 @@ def _dpo_reference_matches(
 
 class BaseModelSetup(
     TimedActionMixin,
+    ModelSetupTextRewardMixin,
     metaclass=ABCMeta,
 ):
     def __init__(

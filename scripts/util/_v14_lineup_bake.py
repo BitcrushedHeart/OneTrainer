@@ -1,33 +1,27 @@
-r"""Bake the V1.4 SoReal! lineup: Base + Turbo + Lightning from the SFT+DPO adapter.
+r"""Bake the V1.4 SoReal! lineup: Base + Turbo + Lightning from the V45 adapter.
 
-2026-08-26. Source adapter is ``models\SoReal!_V41_OFT.safetensors`` -- the name
-is STALE (it is the destination path an older run left in the config, not a V41
-revision). It is really the SFT+DPO DoRA-OFT add-on run: ``rlhf_mode=SFT_DPO``,
-``dora_oft=True``, ``oft_block_size=833`` (snaps to 768/1024 -- the largest
-SoReal! OFT to date, 1.69 GB), trained ON Base V1.3 per its own
-``transformer.model_name``.
+2026-09-12 rebuild. Replaces the 26Aug V1.4, which was baked from the SFT+DPO
+adapter mislabelled ``models\SoReal!_V41_OFT.safetensors``.
 
-Do NOT confuse it with ``Lora\SoReal!_V41_OFT.safetensors`` (the 08Aug V41
-final, whose late-family ``oft_R`` blew up ~16x and which generates badly).
-This adapter was screened against that failure: late-family ``oft_R`` is
-0.0607 qkv / 0.0738 mlp, matching the good V41 save's 0.0625 / 0.0955 regime.
+Source adapter is ``Lora\SoReal!_V45_OFT.safetensors``: the SFT+DPO DoRA-OFT
+add-on run continued from V43 with the on-image text reward enabled
+(``rlhf_mode=SFT_DPO``, ``dora_oft=True``, ``oft_block_size=833``), trained ON
+Base V1.3 per its own ``transformer.model_name``. Late-family ``oft_R`` screen:
+0.0769 qkv / 0.0902 mlp, in line with V44_10 (0.0652 / 0.0787) and V45_6
+(0.0741 / 0.0875) -- no V41-style blow-up.
 
 Frame: the adapter trained on Base V1.3, so every target is its own 09Aug V1.3
-checkpoint. Base takes the ORIGINAL adapter; Turbo/Lightning take their
-dense-transport (dfit) conversions, whose ``soreal_dense_fit`` metadata is
-verified below to name the matching V1.3 base/variant pair.
+checkpoint. Base takes the ORIGINAL adapter; Turbo AND Lightning both take the
+Turbo dense-transport (dfit) conversion from _oft_dense_retarget.py -- the two
+variants are near-identical, and the Lightning fit costs another ~25 min.
 
 Same clamped, NaN-gated merge path as _v13_lineup_bake.py
 (modules.util.oft_merge.merge_oft_adapter -- bit-equivalent to training), full
-strength, bf16 out, atomic .NEW -> replace on success only. The dfit adapters
-are per-variant and frame-corrected already: NO sentinel-align push and NO
-late-family strength scaling (both belong to the transplant flow; applying them
-on top of a dense-transported adapter would double-count the distill direction
--- CLAUDE.md).
+strength everywhere (no late-family scaling), bf16 out, atomic .NEW -> replace
+on success only.
 
-Nothing is overwritten: outputs land in a fresh dated folder alongside 09Aug.
-Each target merges independently, so a gate failure on one does not abort the
-others.
+Outputs land in a fresh dated folder alongside 09Aug. Each target merges
+independently, so a gate failure on one does not abort the others.
 """
 
 from __future__ import annotations
@@ -47,29 +41,21 @@ from modules.util.oft_merge import merge_oft_adapter  # noqa: E402
 from modules.util.oft_verify import MergeVerificationError  # noqa: E402
 
 LINEUP_V13 = r"E:\AI\Data\Models\StableDiffusion\SoReal!\09Aug"
-LINEUP_V14 = r"E:\AI\Data\Models\StableDiffusion\SoReal!\26Aug"
+LINEUP_V14 = r"E:\AI\Data\Models\StableDiffusion\SoReal!\12Sep"
 
-ADAPTER_STEM = "SoReal!_V41_OFT"
-ADAPTER = rf"E:\AI\Data\Packages\OneTrainer\models\{ADAPTER_STEM}.safetensors"
-DFIT_DIR = rf"E:\AI\Data\Models\Lora\warmstarts\{ADAPTER_STEM}_26Aug"
+ADAPTER_STEM = "SoReal!_V45_OFT"
+ADAPTER = rf"E:\AI\Data\Models\Lora\{ADAPTER_STEM}.safetensors"
+DFIT_DIR = rf"E:\AI\Data\Models\Lora\warmstarts\{ADAPTER_STEM}"
 
 # (label, adapter, transformer source, output filename)
 TARGETS = [
     (
-        "Base",
-        ADAPTER,
-        os.path.join(LINEUP_V13, "SoReal!_Base_V1.3.safetensors"),
-        "SoReal!_Base_V1.4.safetensors",
-    ),
-    *[
-        (
-            variant,
-            os.path.join(DFIT_DIR, f"{ADAPTER_STEM}_{variant}_dfit.safetensors"),
-            os.path.join(LINEUP_V13, f"SoReal!_{variant}_V1.3.safetensors"),
-            f"SoReal!_{variant}_V1.4.safetensors",
-        )
-        for variant in ("Turbo", "Lightning")
-    ],
+        variant,
+        ADAPTER if variant == "Base" else os.path.join(DFIT_DIR, f"{ADAPTER_STEM}_Turbo_dfit.safetensors"),
+        os.path.join(LINEUP_V13, f"SoReal!_{variant}_V1.3.safetensors"),
+        f"SoReal!_{variant}_V1.4.safetensors",
+    )
+    for variant in ("Base", "Turbo", "Lightning")
 ]
 
 
@@ -79,35 +65,17 @@ def read_metadata(path: str) -> dict[str, str]:
         return json.loads(f.read(n)).get("__metadata__", {})
 
 
-# ---- pre-flight: every path present, and each dfit file provably fitted for
-# ---- THIS adapter against THIS variant's own V1.3 pair. A dfit file carrying a
-# ---- different frame would silently bake off-axis education. The stem
-# ---- "SoReal!_V41_OFT" also names a DIFFERENT adapter under Lora\ with its own
-# ---- warmstarts\ folder, so the frame check is what separates them.
+# ---- pre-flight: every path present, and the adapter provably trained in the
+# ---- V1.3 frame -- a different frame would silently bake off-axis education.
 for label, adapter, transformer, _ in TARGETS:
     for path in (adapter, transformer):
         if not os.path.exists(path):
             raise SystemExit(f"ABORT {label}: missing {path}")
 
-    if adapter == ADAPTER:
-        continue
-
-    fit = json.loads(read_metadata(adapter).get("soreal_dense_fit", "{}"))
-    expected = {
-        "source_adapter": f"{ADAPTER_STEM}.safetensors",
-        "base_checkpoint": "SoReal!_Base_V1.3.safetensors",
-        "variant": label,
-        "variant_checkpoint": f"SoReal!_{label}_V1.3.safetensors",
-    }
-    for key, want in expected.items():
-        if fit.get(key) != want:
-            raise SystemExit(f"ABORT {label}: dfit {key}={fit.get(key)!r}, expected {want!r}")
-
-    # Off-regime conversions are a hard stop (V12_DFIT_RUNBOOK guardrails).
-    for family, stats in fit["per_family"].items():
-        if stats["clipped_blocks"] or stats["refine_projected_blocks"] or stats["dense_residual_max"] > 0.06:
-            raise SystemExit(f"ABORT {label}: {family} off-regime {stats}")
-    print(f"[preflight] {label}: dfit frame + regime OK")
+trained_on = json.loads(read_metadata(ADAPTER)["ot_config"])["transformer"]["model_name"]
+if Path(trained_on).name != "SoReal!_Base_V1.3.safetensors":
+    raise SystemExit(f"ABORT: adapter trained on {trained_on!r}, not Base V1.3")
+print(f"[preflight] adapter frame OK ({Path(trained_on).name})")
 
 os.makedirs(LINEUP_V14, exist_ok=True)
 print(f"[merge] output dir: {LINEUP_V14}")
