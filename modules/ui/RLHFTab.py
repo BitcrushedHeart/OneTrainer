@@ -252,6 +252,19 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
+            9,
+            3,
+            "DPO Add-on Graph Reuse",
+            tooltip="SFT + DPO mode only. Run the rejected image's forward with gradients first and keep its graph "
+            "until the chosen image has been backwarded, instead of an extra no-grad forward just to read its loss. "
+            "Same gradients, one model forward fewer per DPO step, about 1 GB more VRAM at 1024px while both graphs "
+            "are held. Ignored (the extra forward is kept) when gradient checkpointing is off or CPU offloaded with "
+            "activation or layer offloading.",
+        )
+        components.switch(self.scroll_frame, 9, 4, self.ui_state, "rlhf_dpo_light_reuse_rejected_graph")
+
+        components.label(
+            self.scroll_frame,
             11,
             0,
             "Rebase Reference on Start",
