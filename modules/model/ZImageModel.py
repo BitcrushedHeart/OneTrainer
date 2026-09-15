@@ -233,7 +233,15 @@ class ZImageModel(BaseModel):
         tokens_mask: Tensor = None,
         text_encoder_dropout_probability: float | None = None,
         text_encoder_output: Tensor = None,
+        pad_to_longest: bool = False,
     ) -> tuple[Tensor, Tensor]:
+        """Per-prompt hidden states of the second-to-last text-encoder layer,
+        with padding stripped. ``text`` is templated in place.
+
+        ``pad_to_longest`` pads a text batch to its longest prompt instead of
+        ``PROMPT_MAX_LENGTH`` (still truncated to it). The kept real-token
+        states are mathematically unchanged: padding is on the right and the
+        attention is causal, so pads never reach earlier positions."""
         if tokens is None and text is not None:
             if isinstance(text, str):
                 text = [text]
@@ -249,18 +257,27 @@ class ZImageModel(BaseModel):
                 text[i] = prompt_item
 
             tokenizer_output = self.tokenizer(
-                text, max_length=PROMPT_MAX_LENGTH, padding="max_length", truncation=True, return_tensors="pt"
+                text,
+                max_length=PROMPT_MAX_LENGTH,
+                padding="longest" if pad_to_longest else "max_length",
+                truncation=True,
+                return_tensors="pt",
             )
             tokens = tokenizer_output.input_ids.to(self.text_encoder.device)
             tokens_mask = tokenizer_output.attention_mask.to(self.text_encoder.device)
 
         if text_encoder_output is None and self.text_encoder is not None:
             with self.text_encoder_autocast_context:
+                # Only hidden_states[-2] is used: skip the KV cache and keep a
+                # single position of lm_head logits (the full-vocab logits are
+                # ~2.5 GB at 16x512). Neither changes the hidden states.
                 text_encoder_output = self.text_encoder(
                     tokens,
                     attention_mask=tokens_mask.float(),
                     output_hidden_states=True,
                     return_dict=True,
+                    use_cache=False,
+                    logits_to_keep=1,
                 )
                 text_encoder_output = text_encoder_output.hidden_states[-2]
 
