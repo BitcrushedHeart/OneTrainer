@@ -23,7 +23,8 @@ metric readings come from a no-grad read of that crop, and the preview's full
 decode runs only on save steps, after the backward.
 
 Conditioning is pre-encoded per epoch (:meth:`build_text_reward_bank`)
-because the text encoder is offloaded while training.
+because the text encoder is offloaded while training; embeddings are cached
+by prompt across epochs, so an offline dataset is encoded once per process.
 """
 
 from __future__ import annotations
@@ -52,6 +53,8 @@ from modules.util.TrainProgress import TrainProgress
 import torch
 from torch import Tensor
 
+TEXT_REWARD_ENCODE_CHUNK = 16
+
 
 def text_reward_sigmas(steps: int, shift: float, device: torch.device) -> Tensor:
     """``(1, steps + 1)`` sigma grid from 1 to 0 with the flow-matching time
@@ -71,6 +74,8 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
         self._text_reward_sample_count = 0
         self._text_reward_recognizer_arch: str | None = None
         self._text_reward_cache = None
+        self._text_reward_prompt_embeddings: dict[str, Tensor] | None = None
+        self._text_reward_prompt_embeddings_identity: str | None = None
 
     # -- reward model ---------------------------------------------------------
 
@@ -88,14 +93,77 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
 
     # -- per-epoch prompt bank -------------------------------------------------
 
+    @staticmethod
+    def _text_reward_text_encoder_identity(model: BaseModel, config: TrainConfig) -> str:
+        """What a cached prompt embedding depends on from the text-encoder
+        side: the model class, which encoder (its own model name, else the base
+        model's) and the loaded object, its configured and runtime weight
+        dtype, the autocast dtype, and the prompt token limit."""
+        from modules.model.ZImageModel import PROMPT_MAX_LENGTH
+
+        te_part = getattr(config, "text_encoder", None)
+        name = getattr(te_part, "model_name", "") or getattr(config, "base_model_name", "") or ""
+        weight_dtype = getattr(te_part, "weight_dtype", None)
+        text_encoder = getattr(model, "text_encoder", None)
+        try:
+            runtime_dtype = next(text_encoder.parameters()).dtype
+        except (AttributeError, StopIteration):
+            runtime_dtype = None
+        train_dtype = getattr(model, "text_encoder_train_dtype", None)
+        return (
+            f"{type(model).__name__}|{name}|{id(text_encoder)}|{weight_dtype}|{runtime_dtype}"
+            f"|autocast={train_dtype}|max_len={PROMPT_MAX_LENGTH}"
+        )
+
+    def _text_reward_prompt_cache(self, model: BaseModel, config: TrainConfig) -> dict[str, Tensor]:
+        """The per-process ``raw prompt -> CPU embedding`` cache, emptied
+        whenever the text-encoder identity changes."""
+        identity = self._text_reward_text_encoder_identity(model, config)
+        cache = getattr(self, "_text_reward_prompt_embeddings", None)
+        if cache is None or getattr(self, "_text_reward_prompt_embeddings_identity", None) != identity:
+            cache = {}
+            self._text_reward_prompt_embeddings = cache
+            self._text_reward_prompt_embeddings_identity = identity
+        return cache
+
+    def _text_reward_encode_prompts(
+        self, model: BaseModel, config: TrainConfig, prompts: list[str], cache: dict[str, Tensor]
+    ) -> None:
+        """Encode ``prompts`` (unique, all cache misses) in chunks of
+        :data:`TEXT_REWARD_ENCODE_CHUNK` with the text encoder paged onto the
+        train device once, storing each CPU embedding under its raw prompt."""
+        model.text_encoder_to(self.train_device)
+        try:
+            with torch.no_grad():
+                for start in range(0, len(prompts), TEXT_REWARD_ENCODE_CHUNK):
+                    chunk_prompts = prompts[start : start + TEXT_REWARD_ENCODE_CHUNK]
+                    # encode_text templates the list it is given in place: hand
+                    # it a copy so the cache keys stay the raw prompts.
+                    encoded = model.encode_text(
+                        train_device=self.train_device,
+                        batch_size=len(chunk_prompts),
+                        text=list(chunk_prompts),
+                        pad_to_longest=True,
+                    )
+                    for prompt, embedding in zip(chunk_prompts, encoded, strict=True):
+                        cache[prompt] = embedding.detach().to("cpu")
+        finally:
+            if config.latent_caching:
+                model.text_encoder_to(self.temp_device)
+            torch_gc()
+
     def build_text_reward_bank(self, model: BaseModel, config: TrainConfig, epoch: int) -> TextRewardBank:
-        """Draw this epoch's prompts and encode them with the text encoder
-        paged onto the train device once. Embeddings live on the CPU."""
+        """Draw this epoch's prompts and look their embeddings up in the
+        per-process prompt cache; only misses are encoded, with the text
+        encoder paged onto the train device once (and not at all when every
+        prompt hits). Entries this epoch does not use are evicted. Embeddings
+        live on the CPU."""
         self._text_reward_recognizer_arch = config.text_reward_recognizer
         vocab = self.text_reward_model().vocab
         image_paths: list[str] | None = None
         image_sha256s: list[str | None] | None = None
-        if config.text_reward_source == TextRewardSource.OFFLINE_IMAGES:
+        offline = config.text_reward_source == TextRewardSource.OFFLINE_IMAGES
+        if offline:
             rows = load_text_reward_dataset(config.text_reward_dataset_dir, vocab)
             if not rows:
                 raise RuntimeError(f"text reward dataset is empty: {config.text_reward_dataset_dir}")
@@ -115,32 +183,24 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
                 max_words=config.text_reward_max_words,
             )
             prompts = [s.prompt for s in specs]
-        model.text_encoder_to(self.train_device)
-        try:
-            embeddings: list[Tensor] = []
-            chunk = 16
-            with torch.no_grad():
-                for start in range(0, len(specs), chunk):
-                    chunk_prompts = list(prompts[start : start + chunk])
-                    encoded = model.encode_text(
-                        train_device=self.train_device, batch_size=len(chunk_prompts), text=chunk_prompts
-                    )
-                    embeddings.extend(e.detach().to("cpu") for e in encoded)
-                negative = None
-                if config.text_reward_cfg_scale > 1.0:
-                    negative = (
-                        model.encode_text(
-                            train_device=self.train_device,
-                            batch_size=1,
-                            text=[config.text_reward_negative_prompt or ""],
-                        )[0]
-                        .detach()
-                        .to("cpu")
-                    )
-        finally:
-            if config.latent_caching:
-                model.text_encoder_to(self.temp_device)
-            torch_gc()
+
+        # The unconditional branch only runs in the online rollout prefix; the
+        # offline step re-noises the source image and never reads it.
+        negative_prompt = None
+        if not offline and config.text_reward_cfg_scale > 1.0:
+            negative_prompt = config.text_reward_negative_prompt or ""
+
+        cache = self._text_reward_prompt_cache(model, config)
+        wanted = list(prompts) if negative_prompt is None else [*prompts, negative_prompt]
+        wanted_set = set(wanted)
+        for stale in [p for p in cache if p not in wanted_set]:
+            del cache[stale]
+        misses = [p for p in dict.fromkeys(wanted) if p not in cache]
+        if misses:
+            self._text_reward_encode_prompts(model, config, misses, cache)
+
+        embeddings = [cache[p] for p in prompts]
+        negative = cache[negative_prompt] if negative_prompt is not None else None
         return TextRewardBank(specs, embeddings, negative, image_paths, image_sha256s)
 
     # -- one reward step ---------------------------------------------------------
