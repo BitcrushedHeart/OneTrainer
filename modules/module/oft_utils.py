@@ -1,4 +1,3 @@
-import contextlib
 import math
 
 import torch
@@ -13,10 +12,6 @@ import torch.nn as nn
 # reads attributes, so no dict lookup ever happens inside a compiled region.
 _TRIU_INDEX_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 
-# Device types torch.autocast accepts; anything else (e.g. "meta") has no
-# autocast state to disable.
-_AUTOCAST_DEVICE_TYPES = ("cuda", "cpu", "xpu", "mps", "hpu", "mtia", "xla", "privateuseone")
-
 
 def shared_triu_indices(block_size: int, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
     """(rows, cols) of the strict upper triangle of a block_size square, shared per device."""
@@ -28,13 +23,6 @@ def shared_triu_indices(block_size: int, device: torch.device | str) -> tuple[to
         cached = (rows, cols)
         _TRIU_INDEX_CACHE[key] = cached
     return cached
-
-
-def _autocast_disabled(device_type: str):
-    """An autocast-off region for ``device_type`` (no-op for types autocast does not know)."""
-    if device_type in _AUTOCAST_DEVICE_TYPES:
-        return torch.autocast(device_type=device_type, enabled=False)
-    return contextlib.nullcontext()
 
 
 class MultiplicativeDropoutLayer(nn.Module):
@@ -284,14 +272,9 @@ class OFTRotationModule(nn.Module):
         use_cayley_neumann: bool = True,
         num_neumann_terms: int = 5,
         oft_cans: bool = False,
-        cans_step_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """
         Perform the Cayley parametrization on a batch of skew-symmetric matrices.
-
-        cans_step_dtype: dtype of the stored rotation weight when ``Q`` was upcast
-        for a full-precision Cayley. CANS picks its Newton-Schulz step count from
-        the precision the weight lives in, not from the upcast. None -> ``Q.dtype``.
         """
         b, _ = Q.shape
         previous_dtype = Q.dtype
@@ -335,10 +318,7 @@ class OFTRotationModule(nn.Module):
             G = self.id_mat + Q_skew
             # Empirically, BF16 requires 5 steps to converge to ortho error ~1e-2 (its limit)
             # While FP32 takes 7 steps to converge to ortho error ~1e-6
-            # Under a full-precision upcast the count follows the dtype G would have
-            # had without it (id_mat + Q in the stored weight dtype).
-            step_dtype = G.dtype if cans_step_dtype is None else torch.promote_types(self.id_mat.dtype, cans_step_dtype)
-            steps = 5 if step_dtype == torch.bfloat16 else 7
+            steps = 5 if G.dtype == torch.bfloat16 else 7
             R_half = self._cans_newton_schulz_iteration(G=G, steps=steps)
             # Squaring the matrix doubles the rotation range from (-90°, 90°) to (-180°, 180°) and
             # matches Cayley (I + 2Q).
@@ -348,37 +328,24 @@ class OFTRotationModule(nn.Module):
 
         return R.to(previous_dtype)
 
-    def cayley_rotation_full_precision(self) -> torch.Tensor:
-        """The (undropped) rotation R, computed in at least float32 with autocast off.
-
-        Under mixed-precision training (fp32 adapter weights, bf16 autocast) every
-        matmul of the Neumann series and of the spectral-norm power iteration would
-        otherwise run in bf16, leaving R measurably non-orthogonal and diverging from
-        the fp32 bake in OFTModule.apply_to_module. Only this small (r, b, b)
-        computation is lifted; the activation path stays in the caller's dtype.
-        Returns float32 (float64 for a float64 weight).
-        """
-        weight = self.weight
-        compute_dtype = torch.promote_types(weight.dtype, torch.float32)
-        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
-        with _autocast_disabled(weight.device.type):
-            effective_weight = weight.to(compute_dtype) / scaling_factor
-            return self._cayley_batch(
-                effective_weight,
-                self.block_size,
-                self.use_cayley_neumann,
-                self.num_cayley_neumann_terms,
-                self.oft_cans,
-                cans_step_dtype=weight.dtype,
-            )
-
     def forward(self, x):
         required_dtype = x.dtype
         orig_shape = x.shape
 
-        orth_rotate = self.cayley_rotation_full_precision()
+        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
+        effective_weight = self.weight / scaling_factor
+
+        # The rotation runs under the caller's autocast (bf16 in mixed-precision
+        # training). A float32 Cayley was tried and reverted: the applied rotation
+        # is cast back to the activation dtype anyway, so it bought no output
+        # precision while giving up the bf16 matmul speed.
+        orth_rotate = self._cayley_batch(
+            effective_weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms, self.oft_cans
+        )
         orth_rotate = self.dropout(orth_rotate)
-        # Cast once; the einsum runs in the activation dtype (x is no longer upcast).
+        # Cast the rotation once instead of upcasting the activation: under autocast
+        # the einsum runs in the autocast dtype either way, so this is numerically
+        # identical and skips an activation-sized copy.
         orth_rotate = orth_rotate.to(required_dtype)
 
         rank = self.in_features // self.block_size if self.block_share else self.r

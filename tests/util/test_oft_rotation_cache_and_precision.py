@@ -1,4 +1,4 @@
-"""OFTRotationModule: shared triu index tables, two-matmul Neumann, fp32 Cayley.
+"""OFTRotationModule: shared triu index tables, two-matmul Neumann, autocast dtypes.
 
 CPU-only. Covers:
 - the per-(block_size, device) index table is shared (not a buffer per module),
@@ -6,8 +6,9 @@ CPU-only. Covers:
   state_dict surface of OFT and DoRA-OFT adapters unchanged;
 - the Horner-factored 5-term Neumann series equals the three-matmul series and
   oft_align.reconstruct_oft_rotation;
-- the rotation is computed in float32 with autocast off even inside a bf16
-  autocast region, while output dtypes and the apply_to_module bake still agree;
+- the rotation runs under the caller's autocast (an fp32 Cayley was tried and
+  reverted); casting it once to the activation dtype is bitwise identical to the
+  old activation-upcast path, and output dtypes and the apply_to_module bake agree;
 - the forward compiles fullgraph (also under autocast) without recompiling.
 
 CUDA cannot be exercised here; the device re-bind is tested with "meta" as the
@@ -296,54 +297,31 @@ def test_cayley_batch_matches_oft_align_reconstruct_with_engaged_clip():
 
 
 # --------------------------------------------------------------------------- #
-# fp32 Cayley under autocast
+# Dtypes under autocast
 # --------------------------------------------------------------------------- #
 
 
-def _spy_cayley(monkeypatch, module: OFTRotationModule) -> list[dict]:
-    calls = []
-    original = module._cayley_batch
-
-    def spy(Q, *args, **kwargs):
-        R = original(Q, *args, **kwargs)
-        calls.append(
-            {
-                "Q_dtype": Q.dtype,
-                "R_dtype": R.dtype,
-                "R": R.detach().clone(),
-                "autocast": torch.is_autocast_enabled("cpu"),
-            }
-        )
-        return R
-
-    monkeypatch.setattr(module, "_cayley_batch", spy)
-    return calls
-
-
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
-def test_rotation_is_fp32_and_orthogonal_under_bf16_autocast(monkeypatch, input_dtype):
+def test_cast_once_matches_activation_upcast_bitwise_under_bf16_autocast(input_dtype):
+    """The forward casts R to the activation dtype instead of upcasting x to the
+    weight dtype. Under autocast the einsum runs in bf16 either way, so the
+    output must be bitwise identical to the pre-change upcast path."""
     torch.manual_seed(5)
     block = 64
-    module = _rotation(block, r=4, clip=0.99)
+    module = _rotation(block, r=4, clip=None)
     with torch.no_grad():
         module.weight.normal_(0, 2e-3)
-    calls = _spy_cayley(monkeypatch, module)
-
+    module.eval()
     x = torch.randn(2, 5, 4 * block, dtype=input_dtype)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        assert torch.is_autocast_enabled("cpu")
-        y = module(x)
 
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["autocast"] is False
-    assert call["Q_dtype"] == torch.float32
-    assert call["R_dtype"] == torch.float32
-    assert _ortho_error(call["R"]) <= 1e-5
-    assert (call["R"].double().norm(dim=-1) - 1).abs().max().item() <= 1e-6
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        y = module(x)
+        R = module._cayley_batch(module.weight, block, True, 5, False)
+        legacy = torch.einsum("...rk,rkc->...rc", x.to(module.weight.dtype).reshape(2, 5, 4, block), R)
+        legacy = legacy.reshape(x.shape).to(input_dtype)
 
     assert y.dtype == input_dtype
-    assert y.shape == x.shape
+    assert torch.equal(y, legacy)
 
 
 def test_rotation_output_dtype_without_autocast():
@@ -401,32 +379,9 @@ def test_dora_oft_linear_forward_matches_bake(scaled):
     torch.testing.assert_close(y_adapter, y_baked, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("cls", [OFTModule, DoRAOFTModule])
-def test_oft_conv2d_rotation_fp32_under_autocast(monkeypatch, cls):
-    torch.manual_seed(7)
-    # bias=False: DoRA-OFT strips/re-adds an fp32 bias, which promotes its output
-    # to fp32 under autocast (unchanged behavior, unrelated to the rotation).
-    orig = nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False)
-    module = _seeded(cls, orig, 8)
-    calls = _spy_cayley(monkeypatch, module.oft_R)
-    x = torch.randn(2, 16, 8, 8)
-
-    module.hook_to_module()
-    try:
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            y = orig(x)
-        y_fp32 = orig(x)
-    finally:
-        module.remove_hook_from_module()
-
-    assert [c["R_dtype"] for c in calls] == [torch.float32, torch.float32]
-    assert calls[0]["autocast"] is False
-    assert y.dtype == torch.bfloat16  # conv under autocast, as before
-    assert y_fp32.dtype == torch.float32
-
-
-def test_bf16_param_swap_matches_bf16_reference_semantics():
-    """DPO EXISTING_ADAPTER swaps param.data to bf16: R is now built from its fp32 upcast."""
+def test_bf16_param_swap_forward_under_autocast():
+    """DPO EXISTING_ADAPTER swaps param.data to bf16; the forward still runs and
+    returns the autocast dtype."""
     torch.manual_seed(8)
     linear = nn.Linear(32, 32, bias=False)
     module = _seeded(OFTModule, linear, 8, clip=None)
@@ -438,12 +393,9 @@ def test_bf16_param_swap_matches_bf16_reference_semantics():
     finally:
         module.remove_hook_from_module()
     assert y.dtype == torch.bfloat16
-    R = module.oft_R.cayley_rotation_full_precision()
-    assert R.dtype == torch.float32
-    assert _ortho_error(R) <= 1e-5
 
 
-def test_cans_step_count_follows_original_weight_dtype(monkeypatch):
+def test_cans_step_count_follows_rotation_dtype(monkeypatch):
     steps_seen = []
     module = _rotation(8, clip=None, oft_cans=True)
     original = module._cans_newton_schulz_iteration
@@ -462,7 +414,7 @@ def test_cans_step_count_follows_original_weight_dtype(monkeypatch):
     module.weight.data = module.weight.data.to(torch.bfloat16)  # param-only swap: id_mat fp32 + Q bf16 -> fp32
     module(x)
 
-    assert steps_seen == [(torch.float32, 7), (torch.float32, 5), (torch.float32, 7)]
+    assert steps_seen == [(torch.float32, 7), (torch.bfloat16, 5), (torch.float32, 7)]
 
 
 # --------------------------------------------------------------------------- #
@@ -533,8 +485,8 @@ def test_hooked_oft_linears_compile_fullgraph_under_autocast():
 
 @pytest.mark.parametrize("backward_pass_autocast", ["same_as_forward", "off"])
 def test_rotation_aot_eager_matches_eager_under_autocast(backward_pass_autocast):
-    """aot_eager runs AOTAutograd functionalization over the in-place diagonal adds
-    and the autocast-disabled region; the forward must match eager exactly.
+    """aot_eager runs AOTAutograd functionalization over the in-place diagonal adds;
+    the forward must match eager exactly.
 
     Gradients: AOTAutograd traces the backward under the ambient autocast
     ("same_as_forward", the default), which is eager's ``backward()`` called

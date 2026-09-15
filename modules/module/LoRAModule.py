@@ -752,10 +752,17 @@ class OFTModule(PeftBase):
             rotated_x = self.oft_R(x)
             return self.orig_forward(rotated_x, *args, **kwargs)
 
+        scaling_factor = 2 * math.sqrt(self.oft_R.block_size - 1) if self.oft_scaled else 1
+        effective_weight = self.oft_R.weight / scaling_factor
+
         # For Conv2d, we must rotate the weights, not the input, to preserve spatial information.
-        # R is computed in full precision with autocast off (as in the Linear path and the
-        # apply_to_module bake), then cast to the rotation weight's dtype as before.
-        orth_rotate = self.oft_R.cayley_rotation_full_precision().to(self.oft_R.weight.dtype)
+        orth_rotate = self.oft_R._cayley_batch(
+            effective_weight,
+            self.oft_R.block_size,
+            self.oft_R.use_cayley_neumann,
+            self.oft_R.num_cayley_neumann_terms,
+            self.oft_R.oft_cans,
+        )
         orth_rotate = self.oft_R.dropout(orth_rotate)
 
         if self.block_share:

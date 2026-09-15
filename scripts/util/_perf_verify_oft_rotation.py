@@ -1,4 +1,4 @@
-"""GPU verification for the OFT rotation memory / precision change (not run in CI).
+"""GPU verification for the OFT rotation memory / speed change (not run in CI).
 
 Measures, at Z-Image sizes (per transformer block: 6 x Linear(in 3840, block 768)
 + 1 x Linear(in 10240, block 1024), oft_clipped_norm 0.99, weights ~ N(0, 2e-4),
@@ -8,15 +8,11 @@ S = 4209 tokens):
     OFTRotationModules on CPU and moving them to CUDA (as LoRAModuleWrapper.to
     does), with the shared triu index table (NEW) vs the old per-module
     non-persistent ``rows``/``cols`` buffers (OLD, re-registered inline here).
-(b) Speed: compiled Cayley forward / backward per block for OLD (bf16 autocast,
-    three-bmm Neumann, re-implemented inline) vs NEW (fp32 with autocast off,
-    two-matmul Horner; the module code), plus the full rotation forward+backward
-    on activations, and an estimate per micro-step:
-    blocks x (forward + checkpoint recompute + backward).
-
-The compiled backward is traced under the ambient autocast by default
-(torch._functorch.config.backward_pass_autocast = "same_as_forward"), so NEW's
-backward matmuls run in bf16 unless that is set to "off"; both are timed.
+(b) Speed: compiled Cayley forward / backward per block for OLD (three-bmm
+    Neumann, re-implemented inline) vs NEW (two-matmul Horner; the module code),
+    both under bf16 autocast as in training, plus the full rotation
+    forward+backward on activations (OLD upcasts x, NEW casts R once), and an
+    estimate per micro-step: blocks x (forward + checkpoint recompute + backward).
 
 Refuses to run while another process holds more than 4 GiB of VRAM (a live
 training run) unless --force is given.
@@ -45,7 +41,6 @@ from modules.module.oft_utils import OFTRotationModule
 
 import torch
 import torch._dynamo
-import torch._functorch.config
 
 GIB = 1024**3
 MIB = 1024**2
@@ -176,7 +171,7 @@ def old_rotate(m: OFTRotationModule, x: torch.Tensor) -> torch.Tensor:
 
 
 def new_cayley(m: OFTRotationModule) -> torch.Tensor:
-    return m.cayley_rotation_full_precision()
+    return m._cayley_batch(m.weight, m.block_size, m.use_cayley_neumann, m.num_cayley_neumann_terms, m.oft_cans)
 
 
 def new_rotate(m: OFTRotationModule, x: torch.Tensor) -> torch.Tensor:
@@ -247,37 +242,34 @@ def time_variant(
     leaves: list[torch.Tensor],
     args,
     device: torch.device,
-    *,
-    backward_pass_autocast: str = "same_as_forward",
 ) -> dict:
     torch._dynamo.reset()
     run = fn if args.no_compile else torch.compile(fn, backend=args.backend, fullgraph=True)
     fwd_ms, bwd_ms = [], []
     peak = 0
-    with torch._functorch.config.patch(backward_pass_autocast=backward_pass_autocast):
-        for i in range(args.warmup + args.iters):
-            for m in modules:
-                m.weight.grad = None
-            for leaf in leaves:
-                leaf.grad = None
-            measured = i >= args.warmup
-            if measured:
-                _sync(device)
-                torch.cuda.reset_peak_memory_stats(device)
-                base_alloc = torch.cuda.memory_allocated(device)
-            t0 = time.perf_counter()
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                outputs = run()
+    for i in range(args.warmup + args.iters):
+        for m in modules:
+            m.weight.grad = None
+        for leaf in leaves:
+            leaf.grad = None
+        measured = i >= args.warmup
+        if measured:
             _sync(device)
-            t1 = time.perf_counter()
-            torch.autograd.backward(outputs, upstream)
-            _sync(device)
-            t2 = time.perf_counter()
-            if measured:
-                fwd_ms.append((t1 - t0) * 1e3)
-                bwd_ms.append((t2 - t1) * 1e3)
-                peak = max(peak, torch.cuda.max_memory_allocated(device) - base_alloc)
-            del outputs
+            torch.cuda.reset_peak_memory_stats(device)
+            base_alloc = torch.cuda.memory_allocated(device)
+        t0 = time.perf_counter()
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            outputs = run()
+        _sync(device)
+        t1 = time.perf_counter()
+        torch.autograd.backward(outputs, upstream)
+        _sync(device)
+        t2 = time.perf_counter()
+        if measured:
+            fwd_ms.append((t1 - t0) * 1e3)
+            bwd_ms.append((t2 - t1) * 1e3)
+            peak = max(peak, torch.cuda.max_memory_allocated(device) - base_alloc)
+        del outputs
     return {
         "label": label,
         "fwd": statistics.median(fwd_ms),
@@ -314,30 +306,10 @@ def run_speed(args, device: torch.device) -> list[dict]:
         return [new_rotate(m, x) for m, x in zip(modules, xs, strict=True)]
 
     results = [
-        time_variant("cayley OLD  bf16-autocast 3bmm", cayley_old, modules, r_upstream, [], args, device),
-        time_variant("cayley NEW  fp32 Horner", cayley_new, modules, r_upstream, [], args, device),
-        time_variant(
-            "cayley NEW  fp32 Horner, fp32 bwd",
-            cayley_new,
-            modules,
-            r_upstream,
-            [],
-            args,
-            device,
-            backward_pass_autocast="off",
-        ),
+        time_variant("cayley OLD  3bmm", cayley_old, modules, r_upstream, [], args, device),
+        time_variant("cayley NEW  Horner", cayley_new, modules, r_upstream, [], args, device),
         time_variant("rotate OLD  (x upcast)", rotate_old, modules, y_upstream, xs, args, device),
-        time_variant("rotate NEW", rotate_new, modules, y_upstream, xs, args, device),
-        time_variant(
-            "rotate NEW  fp32 bwd",
-            rotate_new,
-            modules,
-            y_upstream,
-            xs,
-            args,
-            device,
-            backward_pass_autocast="off",
-        ),
+        time_variant("rotate NEW  (R cast once)", rotate_new, modules, y_upstream, xs, args, device),
     ]
     return results
 
