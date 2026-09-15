@@ -693,6 +693,8 @@ class OFTModule(PeftBase):
             # clip on a trained adapter. Re-converge them against the loaded
             # weights so the effective rotation is continuous across a resume.
             self.oft_R.warm_start_spectral_state()
+            # A cached rotation (oft_rotation_cache) belongs to the old Q and clip state.
+            self.oft_R.refresh_rotation_cache()
         return result
 
     def initialize_weights(self):
