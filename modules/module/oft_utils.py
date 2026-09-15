@@ -1,5 +1,7 @@
 import math
 
+from modules.util.bf16_stochastic_rounding import add_stochastic_
+
 import torch
 import torch.nn as nn
 
@@ -11,6 +13,56 @@ import torch.nn as nn
 # __init__ and re-bound in _apply after .to()/.cuda(); the forward path only
 # reads attributes, so no dict lookup ever happens inside a compiled region.
 _TRIU_INDEX_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+
+# Power-iteration steps applied to the spectral-clip state (u_state/v_state) once
+# per optimizer update, by OFTRotationModule.advance_spectral_state. Forwards only
+# read the state, so every forward of one update window (checkpoint recompute, DPO
+# reference passes, validation) sees the same clip. See
+# tests/util/test_oft_spectral_state.py for the drift-tracking evidence.
+SPECTRAL_STEPS_PER_UPDATE = 2
+
+# Rotation cache (config oft_rotation_cache): the Linear rotation R(Q) is computed once
+# per optimizer update into a bf16 leaf that the forward reads instead of running the
+# Cayley per micro-step; dL/dR accumulates (stochastically rounded) until the update,
+# where it is pulled back to dL/dQ through one fp32 R(Q). See OFTRotationModule.
+ROTATION_CACHE_SR_SEED_SALT = 0x5EED0F7
+# Stochastic-rounding adds are sliced along the block dim to at most this many
+# elements, bounding the float32 + int32 transients of the largest modules.
+ROTATION_CACHE_SR_CHUNK_NUMEL = 1 << 22
+# Stale-cache guard threshold, in units of the leaf dtype's half-ulp at each entry
+# of the freshly computed R (see OFTRotationModule.rotation_cache_staleness).
+ROTATION_CACHE_STALE_RATIO = 1.5
+_SIGNIFICAND_BITS = {torch.bfloat16: 8, torch.float16: 11, torch.float32: 24, torch.float64: 53}
+
+# Dedicated generator for the accumulator's stochastic rounding, separate from the
+# optimizer's (bf16_stochastic_rounding.generator) so enabling the cache leaves the
+# optimizer's rounding stream untouched.
+_rotation_cache_generator: torch.Generator | None = None
+
+
+def _normalized_device(device: torch.device | str) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def set_rotation_cache_seed(seed: int, device: torch.device | str) -> None:
+    """Reseed the accumulator's rounding generator; the trainer calls this once per micro-step."""
+    global _rotation_cache_generator
+    device = _normalized_device(device)
+    if _rotation_cache_generator is None or _rotation_cache_generator.device != device:
+        _rotation_cache_generator = torch.Generator(device=device)
+    _rotation_cache_generator.manual_seed(seed ^ ROTATION_CACHE_SR_SEED_SALT)
+
+
+def rotation_cache_generator(device: torch.device | str) -> torch.Generator:
+    global _rotation_cache_generator
+    device = _normalized_device(device)
+    if _rotation_cache_generator is None or _rotation_cache_generator.device != device:
+        _rotation_cache_generator = torch.Generator(device=device)
+        _rotation_cache_generator.manual_seed(ROTATION_CACHE_SR_SEED_SALT)
+    return _rotation_cache_generator
 
 
 def shared_triu_indices(block_size: int, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -120,6 +172,21 @@ class OFTRotationModule(nn.Module):
         if not self.use_cayley_neumann:
             id_mat = torch.eye(block_size).unsqueeze(0).expand(r, block_size, block_size)
             self.register_buffer("id_mat", id_mat, persistent=False)
+        # Bumped whenever u_state/v_state change; the rotation cache records the value
+        # it was refreshed against, so a clip-state change without a refresh is caught.
+        self._spectral_state_version = 0
+        # Rotation cache, off unless enable_rotation_cache() is called. Plain attributes,
+        # not a Parameter or buffer: a Parameter would leak into state_dict, the optimizer,
+        # clipping, EMA and the DPO reference snapshot; a buffer stops being a leaf when
+        # .to() moves it. _apply moves them instead, keeping the leaf's identity and hook.
+        self.rotation_leaf: torch.Tensor | None = None
+        self.rotation_grad_acc: torch.Tensor | None = None
+        # True while the forward reads the leaf. Per-module Python bool: flipping it
+        # (reference passes) specializes the compiled graph, exactly like the weight
+        # dtype swap those passes already cause, so the graph count is unchanged.
+        self.rotation_cache_active = False
+        self._rotation_leaf_hook = None
+        self._rotation_cache_state_version = -1
 
     def _bind_triu_indices(self, device: torch.device) -> None:
         self.rows, self.cols = shared_triu_indices(self.block_size, device)
@@ -127,10 +194,25 @@ class OFTRotationModule(nn.Module):
     def _apply(self, fn, recurse=True):
         # .to()/.cuda()/.cpu()/.to_empty() all funnel through _apply. The index
         # tables are integer attributes outside the buffer registry, so they are
-        # never dtype-cast; only their device follows the weight.
+        # never dtype-cast; only their device follows the weight. The rotation
+        # cache likewise follows the device only (its dtype is the train dtype).
         result = super()._apply(fn, recurse)
         self._bind_triu_indices(self.weight.device)
+        self._move_rotation_cache(self.weight.device)
         return result
+
+    def _move_rotation_cache(self, device: torch.device) -> None:
+        leaf = self.rotation_leaf
+        if leaf is not None and leaf.device != device:
+            moved = leaf.detach().to(device)
+            if torch._has_compatible_shallow_copy_type(leaf, moved):
+                # Same Python object: the grad hook stays registered and compiled
+                # graphs (which lift the attribute as an input) see the new storage.
+                leaf.data = moved
+            else:
+                self._set_rotation_leaf(moved.requires_grad_(leaf.requires_grad))
+        if self.rotation_grad_acc is not None and self.rotation_grad_acc.device != device:
+            self.rotation_grad_acc = self.rotation_grad_acc.to(device)
 
     def _triu_indices_on(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         # Fast path (always taken after a normal .to()): the bound attributes.
@@ -147,32 +229,59 @@ class OFTRotationModule(nn.Module):
         The state is a non-persistent buffer, so resuming from a backup restarts
         it from random vectors. At init that is harmless (Q == 0), but on a
         trained adapter a random restart underestimates sigma, which silently
-        lifts the spectral clip until the one-step-per-forward iteration
-        re-converges — every previously clipped block snaps to a stronger
-        rotation for hundreds of steps. Called from OFTModule.load_state_dict.
+        lifts the spectral clip until the per-update iteration re-converges —
+        every previously clipped block snaps to a stronger rotation for hundreds
+        of steps. Called from OFTModule.load_state_dict.
 
         Pure batched matmul on purpose: no LAPACK, so it is safe to run while
         safetensors files may still be open (Windows MKL segfaults when mmap IO
         interleaves with SVD/eigh).
         """
+        self._iterate_spectral_state(steps)
+
+    @torch.no_grad()
+    def advance_spectral_state(self, steps: int = SPECTRAL_STEPS_PER_UPDATE):
+        """Advance the power-iteration state against the current weight.
+
+        The forward only reads u_state/v_state, so the trainer calls this once per
+        optimizer update (BaseModelSetup.after_optimizer_step_adapters) to track
+        the weight as it trains. No-op when the spectral clip is disabled.
+        """
+        self._iterate_spectral_state(steps)
+
+    def _iterate_spectral_state(self, steps: int):
         if self.oft_clipped_norm is None:
             return
+        self._spectral_state_version += 1
+        # Same scaled Q as the forward, iterated in float32 whatever the weight dtype.
         scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
         Q = (self.weight.detach() / scaling_factor).to(torch.float32)
         Q_skew = self._pytorch_skew_symmetric(Q, self.block_size)
-        u = self.u_state.to(torch.float32).unsqueeze(-1)
-        v = self.v_state.to(torch.float32).unsqueeze(-1)
+        u = self.u_state.to(device=Q_skew.device, dtype=torch.float32).unsqueeze(-1)
+        v = self.v_state.to(device=Q_skew.device, dtype=torch.float32).unsqueeze(-1)
         for _ in range(steps):
-            # Same degeneracy guard as _spectral_norm: a (near-)zero block keeps
-            # its random unit vectors instead of collapsing the state to zero.
-            v_raw = torch.bmm(Q_skew.mT, u)
-            v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
-            v = torch.where(v_norm >= 1e-6, v_raw / v_norm.clamp_min(1e-8), v)
-            u_raw = torch.bmm(Q_skew, v)
-            u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
-            u = torch.where(u_norm >= 1e-6, u_raw / u_norm.clamp_min(1e-8), u)
+            v, u = self._power_iteration_step(Q_skew, u, v)
         self.v_state.copy_(v.squeeze(-1).to(self.v_state.dtype))
         self.u_state.copy_(u.squeeze(-1).to(self.u_state.dtype))
+
+    @staticmethod
+    def _power_iteration_step(
+        Q_skew: torch.Tensor, u: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One power-iteration step on (B, n, 1) vectors; returns (next_v, next_u).
+
+        Degeneracy guard: a (near-)zero block keeps its current unit vectors
+        instead of collapsing the state to zero.
+        """
+        # Update v (right singular vector)
+        v_raw = torch.bmm(Q_skew.mT, u)
+        v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
+        next_v = torch.where(v_norm >= 1e-6, v_raw / v_norm.clamp_min(1e-8), v)
+        # Update u (left singular vector)
+        u_raw = torch.bmm(Q_skew, next_v)
+        u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
+        next_u = torch.where(u_norm >= 1e-6, u_raw / u_norm.clamp_min(1e-8), u)
+        return next_v, next_u
 
     def _pytorch_skew_symmetric(self, vec, block_size):
         batch_size = vec.shape[0]
@@ -195,23 +304,15 @@ class OFTRotationModule(nn.Module):
 
     @torch.no_grad()
     def _spectral_norm(self, Q_skew):
-        """One power-iteration step; returns the (right, left) singular vectors per block."""
+        """One read-only power-iteration step; returns the (right, left) singular vectors per block.
+
+        Never writes u_state/v_state, in any mode, so a forward and its checkpoint
+        recompute, DPO reference passes and validation all see the same clip. The
+        state advances once per optimizer update (advance_spectral_state).
+        """
         u = self.u_state.unsqueeze(-1).to(Q_skew.dtype)
         v = self.v_state.unsqueeze(-1).to(Q_skew.dtype)
-        # Update v (right singular vector)
-        v_raw = torch.bmm(Q_skew.mT, u)
-        v_norm = torch.linalg.vector_norm(v_raw, dim=1, keepdim=True)
-        candidate_v = v_raw / v_norm.clamp_min(1e-8)
-        next_v = torch.where(v_norm >= 1e-6, candidate_v, v)
-        # Update u (left singular vector)
-        u_raw = torch.bmm(Q_skew, next_v)
-        u_norm = torch.linalg.vector_norm(u_raw, dim=1, keepdim=True)
-        candidate_u = u_raw / u_norm.clamp_min(1e-8)
-        next_u = torch.where(u_norm >= 1e-6, candidate_u, u)
-        if self.training:
-            self.v_state.copy_(next_v.squeeze(-1))
-            self.u_state.copy_(next_u.squeeze(-1))
-        return next_v, next_u
+        return self._power_iteration_step(Q_skew, u, v)
 
     def _cans_newton_schulz_iteration(
         self,
@@ -283,7 +384,7 @@ class OFTRotationModule(nn.Module):
 
         if self.oft_clipped_norm is not None:
             # The Neumann series only converges if the spectral norm ||Q||_2 < 1.
-            # Estimate it with one power-iteration step and clip Q to the
+            # Estimate it with one read-only power-iteration step and clip Q to the
             # configured max norm; this also bounds the learned rotation angle
             # (angle ~= 2*arctan(sigma)) regardless of orthogonalization method.
             v_vec, u_vec = self._spectral_norm(Q_skew)
@@ -328,20 +429,160 @@ class OFTRotationModule(nn.Module):
 
         return R.to(previous_dtype)
 
+    # ------------------------------------------------------------------ #
+    # Rotation cache
+    # ------------------------------------------------------------------ #
+
+    @property
+    def rotation_cache_enabled(self) -> bool:
+        return self.rotation_leaf is not None
+
+    def _set_rotation_leaf(self, leaf: torch.Tensor | None) -> None:
+        if self._rotation_leaf_hook is not None:
+            self._rotation_leaf_hook.remove()
+            self._rotation_leaf_hook = None
+        self.rotation_leaf = leaf
+        if leaf is not None:
+            self._sync_rotation_leaf_requires_grad()
+
+    def _sync_rotation_leaf_requires_grad(self) -> None:
+        # The leaf trains exactly when Q does. Hooks live on the tensor object and
+        # survive requires_grad toggles, but can only be registered while it requires grad.
+        leaf = self.rotation_leaf
+        if leaf.requires_grad != self.weight.requires_grad:
+            leaf.requires_grad_(self.weight.requires_grad)
+        if leaf.requires_grad and self._rotation_leaf_hook is None:
+            self._rotation_leaf_hook = leaf.register_post_accumulate_grad_hook(self._accumulate_rotation_grad)
+
+    def enable_rotation_cache(self, dtype: torch.dtype) -> None:
+        """Allocate the cached rotation in ``dtype`` (the train dtype) and fill it from Q."""
+        if self.rotation_leaf is None or self.rotation_leaf.dtype != dtype:
+            shape = (self.weight.shape[0], self.block_size, self.block_size)
+            self._set_rotation_leaf(torch.empty(shape, dtype=dtype, device=self.weight.device))
+            self.rotation_grad_acc = None
+        self.rotation_cache_active = True
+        self.refresh_rotation_cache()
+
+    def disable_rotation_cache(self) -> None:
+        self._set_rotation_leaf(None)
+        self.rotation_grad_acc = None
+        self.rotation_cache_active = False
+        self._rotation_cache_state_version = -1
+
+    def _fp32_rotation(self, weight: torch.Tensor) -> torch.Tensor:
+        """R(Q) in float32 outside autocast; differentiable when ``weight`` requires grad."""
+        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
+        with torch.autocast(device_type=weight.device.type, enabled=False):
+            Q = weight.to(torch.float32) / scaling_factor
+            return self._cayley_batch(
+                Q, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms, self.oft_cans
+            )
+
+    @torch.no_grad()
+    def refresh_rotation_cache(self) -> None:
+        """Recompute the cached rotation from the current Q and clip state.
+
+        Must not run with dL/dR still pending: the accumulator belongs to the
+        rotation it was computed against, so materialize it first.
+        """
+        leaf = self.rotation_leaf
+        if leaf is None:
+            return
+        if self.rotation_grad_acc is not None:
+            raise RuntimeError(
+                "OFT rotation cache refreshed with un-materialized rotation gradients; "
+                "call materialize_rotation_grad() before changing Q or the clip state."
+            )
+        self._sync_rotation_leaf_requires_grad()
+        leaf.copy_(self._fp32_rotation(self.weight.detach()))
+        self._rotation_cache_state_version = self._spectral_state_version
+
+    def _accumulate_rotation_grad(self, leaf: torch.Tensor) -> None:
+        # Post-accumulate-grad hook: fires once per backward that reaches the leaf.
+        grad = leaf.grad
+        leaf.grad = None
+        if grad is None:
+            return
+        with torch.no_grad():
+            if self.rotation_grad_acc is None:
+                self.rotation_grad_acc = torch.zeros(leaf.shape, dtype=leaf.dtype, device=leaf.device)
+            if self.rotation_grad_acc.dtype == torch.bfloat16:
+                add_stochastic_(
+                    self.rotation_grad_acc,
+                    grad,
+                    generator=rotation_cache_generator(leaf.device),
+                    chunk_numel=ROTATION_CACHE_SR_CHUNK_NUMEL,
+                )
+            else:
+                self.rotation_grad_acc.add_(grad)
+
+    @staticmethod
+    def rotation_cache_staleness(leaf: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+        """max |leaf - R| in units of the leaf dtype's half-ulp at each entry of R.
+
+        A leaf filled from this same R by copy_ differs from it by at most half an
+        ulp of its dtype (round to nearest), so a fresh cache scores <= 1 (0 for a
+        float32 leaf). Entries where R is exactly 0 get a bound of float32 tiny: they
+        round exactly. Any Q or clip change since the refresh shows up as entries
+        many half-ulps off. Returns a 0-dim tensor (no host sync).
+        """
+        rotation = rotation.detach().to(torch.float32)
+        bits = _SIGNIFICAND_BITS.get(leaf.dtype, 24)
+        magnitude = rotation.abs()
+        # half-ulp(x) = 2 ** (floor(log2 |x|) - bits); small slack for exp() and for
+        # float32 kernel noise between the refresh and this recomputation.
+        bound = magnitude.log2().floor_().sub_(bits).mul_(math.log(2.0)).exp_()
+        bound.mul_(1.0 + 1e-3).add_(magnitude, alpha=1e-6).add_(torch.finfo(torch.float32).tiny)
+        del magnitude
+        # copy=True: a float32 leaf must never be modified in place here.
+        diff = leaf.detach().to(dtype=torch.float32, copy=True).sub_(rotation).abs_()
+        return diff.div_(bound).amax()
+
+    def materialize_rotation_grad(self) -> torch.Tensor | None:
+        """Pull the accumulated dL/dR back into weight.grad through one fp32 R(Q).
+
+        Releases the accumulator. Returns the stale-cache score of this module
+        (rotation_cache_staleness; a 0-dim tensor, no sync), or None when there was
+        nothing to materialize. A clip-state change since the last refresh scores inf.
+        """
+        acc = self.rotation_grad_acc
+        self.rotation_grad_acc = None
+        if acc is None or self.rotation_leaf is None or not self.weight.requires_grad:
+            return None
+        with torch.enable_grad():
+            rotation = self._fp32_rotation(self.weight)
+            if self._rotation_cache_state_version != self._spectral_state_version:
+                staleness = torch.full((), float("inf"), device=rotation.device)
+            else:
+                staleness = self.rotation_cache_staleness(self.rotation_leaf, rotation)
+            upstream = acc.to(torch.float32)
+            del acc
+            rotation.backward(upstream)
+        return staleness
+
     def forward(self, x):
         required_dtype = x.dtype
         orig_shape = x.shape
 
-        scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
-        effective_weight = self.weight / scaling_factor
+        if self.rotation_cache_active:
+            # Refreshed once per optimizer update; dL/dR reaches the accumulator
+            # through the leaf's post-accumulate-grad hook.
+            orth_rotate = self.rotation_leaf
+        else:
+            scaling_factor = 2 * math.sqrt(self.block_size - 1) if self.oft_scaled else 1
+            effective_weight = self.weight / scaling_factor
 
-        # The rotation runs under the caller's autocast (bf16 in mixed-precision
-        # training). A float32 Cayley was tried and reverted: the applied rotation
-        # is cast back to the activation dtype anyway, so it bought no output
-        # precision while giving up the bf16 matmul speed.
-        orth_rotate = self._cayley_batch(
-            effective_weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms, self.oft_cans
-        )
+            # The rotation runs under the caller's autocast (bf16 in mixed-precision
+            # training). A float32 Cayley was tried and reverted: the applied rotation
+            # is cast back to the activation dtype anyway, so it bought no output
+            # precision while giving up the bf16 matmul speed.
+            orth_rotate = self._cayley_batch(
+                effective_weight,
+                self.block_size,
+                self.use_cayley_neumann,
+                self.num_cayley_neumann_terms,
+                self.oft_cans,
+            )
         orth_rotate = self.dropout(orth_rotate)
         # Cast the rotation once instead of upcasting the activation: under autocast
         # the einsum runs in the autocast dtype either way, so this is numerically

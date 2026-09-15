@@ -195,6 +195,16 @@ class LoraTab:
             )
             components.switch(master, 2, 4, self.ui_state, "oft_scaled")
 
+            # Rotation cache
+            components.label(
+                master,
+                3,
+                3,
+                "Rotation Cache",
+                tooltip="Computes each OFT rotation once per optimizer step and reuses it for every micro-step, instead of rebuilding it in every forward and checkpoint recompute. Faster steps, at roughly +1.6 GiB VRAM on a Z-Image-sized DoRA-OFT (scales with the sum of r x block_size^2 over the adapted Linear layers). The accumulated rotation gradient is stored in bfloat16 with stochastic rounding, which adds a small unbiased gradient noise. Requires the bfloat16 train data type and a single GPU; not compatible with the fused back pass.",
+            )
+            components.switch(master, 3, 4, self.ui_state, "oft_rotation_cache")
+
             # DoRA-OFT
             components.label(
                 master,

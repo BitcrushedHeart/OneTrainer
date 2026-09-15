@@ -20,9 +20,13 @@ from safetensors.torch import save_file
 class _FakeSetup:
     def __init__(self):
         self.phase_b_start = None
+        self.restore_refreshes = []
 
     def set_redistill_phase_b_start(self, step):
         self.phase_b_start = step
+
+    def refresh_adapters_after_param_restore(self, model, config, *, warm):
+        self.restore_refreshes.append(warm)
 
 
 class _FakeModel:
@@ -94,6 +98,8 @@ def test_advance_restores_transfer_best(tmp_path):
 
     _advance(trainer, 100)
     assert float(trainer.parameters[0].data.sum()) == pytest.approx(14.0)
+    # The restored adapter re-warms the OFT spectral state (and refreshes any rotation cache).
+    assert trainer.model_setup.restore_refreshes == [True]
 
 
 def test_resume_past_boundary_enters_phase_b_without_restore(tmp_path):

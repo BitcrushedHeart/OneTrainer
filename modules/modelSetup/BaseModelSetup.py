@@ -1,10 +1,12 @@
 import os
 import warnings
 from abc import ABCMeta, abstractmethod
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.mixin.ModelSetupTextRewardMixin import ModelSetupTextRewardMixin
+from modules.module.LoRAModule import OFTModule
+from modules.module.oft_utils import ROTATION_CACHE_STALE_RATIO, OFTRotationModule
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.distill_dmd2_util import (
     build_distill_sigma_matrix,
@@ -27,7 +29,7 @@ from modules.util.TrainProgress import TrainProgress
 from modules.util.transfer_util import transfer_activation_loss
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
@@ -259,6 +261,122 @@ class BaseModelSetup(
         train_progress: TrainProgress,
     ):
         pass
+
+    def after_optimizer_step_adapters(self, model: BaseModel, config: TrainConfig):
+        """Shared adapter upkeep, called by the trainer exactly once per optimizer update.
+
+        OFT spectral clip: forwards only read the power-iteration state, so it is
+        advanced here against the freshly stepped weights. Covers the trainable
+        adapters (policy and DMD2 fake-score); frozen teachers keep the state
+        converged by their load-time warm start. Models without adapters no-op.
+        """
+        for wrapper in (*model.adapters(), *model.fake_adapters()):
+            for module in wrapper.modules():
+                if isinstance(module, OFTRotationModule):
+                    module.advance_spectral_state()
+                    # No-op without a rotation cache; otherwise the leaf now matches
+                    # the stepped Q and the advanced clip state for the next window.
+                    module.refresh_rotation_cache()
+
+    # ------------------------------------------------------------------ #
+    # OFT rotation cache (config.oft_rotation_cache)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _rotation_cache_modules(model: BaseModel) -> list[tuple[str, OFTRotationModule]]:
+        """(name, rotation) for every cached OFT rotation of the trainable policy adapters."""
+        modules = []
+        for wrapper in model.adapters():
+            for name, module in wrapper.lora_modules.items():
+                rotation = getattr(module, "oft_R", None)
+                if isinstance(rotation, OFTRotationModule) and rotation.rotation_cache_enabled:
+                    modules.append((name, rotation))
+        return modules
+
+    def setup_adapter_rotation_cache(self, model: BaseModel, config: TrainConfig):
+        """Enable the rotation cache on the Linear OFT modules of ``model.adapters()``.
+
+        DMD2 fake-score and teacher adapters, and Conv2d OFT (which rotates weights,
+        not inputs), keep computing their rotation per forward.
+        """
+        if not config.oft_rotation_cache_applies():
+            return
+        dtype = config.train_dtype.torch_dtype()
+        count, numel = 0, 0
+        for wrapper in model.adapters():
+            for module in wrapper.lora_modules.values():
+                if not isinstance(module, OFTModule) or module.oft_R is None:
+                    continue
+                if not isinstance(module.orig_module, nn.Linear):
+                    continue
+                module.oft_R.enable_rotation_cache(dtype)
+                count += 1
+                numel += module.oft_R.rotation_leaf.numel()
+        element_size = torch.empty((), dtype=dtype).element_size()
+        print(
+            f"OFT rotation cache: {count} modules, {numel * element_size / 2**30:.2f} GiB cached rotations "
+            f"(+ the same again for accumulated rotation gradients during a window)"
+        )
+
+    def before_clip_adapters(self, model: BaseModel, config: TrainConfig):
+        """Turn the rotation cache's accumulated dL/dR into Q.grad, module by module.
+
+        The trainer calls this at the update step after gradient reduction and before
+        unscale/clip/step, and wherever in-flight gradients must land in Q.grad first
+        (accumulator staging for a backup, end(), a parameter restore). Each module's
+        accumulator is released as its gradient is materialized. Also runs the
+        stale-cache guard: a leaf that no longer matches R(Q) means an invalidation
+        point was missed; raise in debug mode, otherwise warn once per run.
+        """
+        scores = []
+        for name, rotation in self._rotation_cache_modules(model):
+            score = rotation.materialize_rotation_grad()
+            if score is not None:
+                scores.append((name, score))
+        if not scores:
+            return
+        # One host sync per update: every score lives on the train device.
+        if torch.stack([score for _, score in scores]).max().item() <= ROTATION_CACHE_STALE_RATIO:
+            return
+        stale = [f"{name} ({score.item():.3g})" for name, score in scores if score.item() > ROTATION_CACHE_STALE_RATIO]
+        message = (
+            f"OFT rotation cache is stale for {len(stale)} module(s): {', '.join(stale[:5])}"
+            f"{' ...' if len(stale) > 5 else ''}. The weights or clip state changed without a cache refresh "
+            f"(score in half-ulps of the cache dtype; a fresh cache scores <= 1)."
+        )
+        if config.debug_mode or self.debug_mode:
+            raise RuntimeError(message)
+        if not getattr(self, "_rotation_cache_stale_warned", False):
+            self._rotation_cache_stale_warned = True
+            warnings.warn(message, stacklevel=2)
+
+    def refresh_adapters_after_param_restore(self, model: BaseModel, config: TrainConfig, *, warm: bool):
+        """Resynchronize OFT state after adapter parameters were overwritten in place.
+
+        ``warm`` re-converges the spectral-clip state against the new weights (for
+        restores that can move Q far, e.g. a best-snapshot restore); swaps that only
+        visit and return (EMA, schedule-free eval/train around sampling) pass False so
+        the tracked state carries on. Any rotation cache is then refreshed. Callers
+        materialize pending rotation gradients (before_clip_adapters) before the copy.
+        """
+        for wrapper in (*model.adapters(), *model.fake_adapters()):
+            for module in wrapper.modules():
+                if isinstance(module, OFTRotationModule):
+                    if warm:
+                        module.warm_start_spectral_state()
+                    module.refresh_rotation_cache()
+
+    @contextmanager
+    def rotation_cache_bypass(self, model: BaseModel):
+        """Compute rotations from Q (not the cache) inside, e.g. while Q holds a DPO reference."""
+        active = [rotation for _, rotation in self._rotation_cache_modules(model) if rotation.rotation_cache_active]
+        for rotation in active:
+            rotation.rotation_cache_active = False
+        try:
+            yield
+        finally:
+            for rotation in active:
+                rotation.rotation_cache_active = True
 
     def report_to_tensorboard(
         self,
@@ -1575,7 +1693,9 @@ class BaseModelSetup(
                         param.grad = None
 
                 _swap_in_dpo_reference(policy_params, self._dpo_ref_params, config)
-                yield
+                # The rotation cache holds the policy's rotation: bypass it while Q is the reference.
+                with self.rotation_cache_bypass(model) if config.oft_rotation_cache_applies() else nullcontext():
+                    yield
             finally:
                 for params, policy_ptrs, grad_ptrs in zip(policy_params, policy_data, policy_grads, strict=True):
                     for param, policy_ptr, grad_ptr in zip(params, policy_ptrs, grad_ptrs, strict=True):

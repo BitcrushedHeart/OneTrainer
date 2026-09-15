@@ -623,6 +623,7 @@ class TrainConfig(BaseConfig):
     oft_scaled: bool
     oft_clipped_norm: float | None
     oft_cans: bool
+    oft_rotation_cache: bool
 
     # lokr
     lokr_dim: int
@@ -1377,6 +1378,25 @@ class TrainConfig(BaseConfig):
             return "Distill sigma shift must be greater than 0 (1.0 = uniform grid, no shift)."
         return None
 
+    def oft_rotation_cache_applies(self) -> bool:
+        """The OFT rotation cache is requested and this run has OFT adapters to cache."""
+        return (
+            self.oft_rotation_cache and self.training_method == TrainingMethod.LORA and self.peft_type == PeftType.OFT_2
+        )
+
+    def validate_oft_rotation_cache_startup(self) -> str | None:
+        # Only hard errors for a cache that would actually be active: a shared preset
+        # with the flag on must not break LoRA or fine-tune runs (the trainer warns).
+        if not self.oft_rotation_cache_applies():
+            return None
+        if self.optimizer is not None and getattr(self.optimizer, "fused_back_pass", False):
+            return "The OFT rotation cache does not support the optimizer's fused back pass; disable one of them."
+        if self.multi_gpu:
+            return "The OFT rotation cache supports single-GPU training only; disable it for multi-GPU runs."
+        if self.train_dtype != DataType.BFLOAT_16:
+            return "The OFT rotation cache requires the bfloat16 train data type."
+        return None
+
     def validate_transfer_startup(self) -> str | None:
         if not self.transfer_enabled:
             return None
@@ -1836,6 +1856,7 @@ class TrainConfig(BaseConfig):
         data.append(("oft_scaled", False, bool, False))
         data.append(("oft_clipped_norm", 0.95, float, True))
         data.append(("oft_cans", False, bool, False))
+        data.append(("oft_rotation_cache", False, bool, False))
 
         # lokr
         data.append(("lokr_dim", 16, int, False))

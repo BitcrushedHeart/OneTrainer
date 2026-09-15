@@ -339,7 +339,11 @@ def test_spectral_state_stays_in_module_dtype_under_autocast():
     with torch.autocast("cpu", dtype=torch.bfloat16):
         module(torch.randn(2, 48, dtype=torch.bfloat16))
     assert module.u_state.dtype == torch.float32 and module.v_state.dtype == torch.float32
-    assert not torch.equal(module.u_state, before)  # training mode advanced the iteration
+    assert torch.equal(module.u_state, before)  # forwards only read the state, even in training mode
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        module.advance_spectral_state()  # the once-per-optimizer-update advance
+    assert module.u_state.dtype == torch.float32 and module.v_state.dtype == torch.float32
+    assert not torch.equal(module.u_state, before)
 
 
 def _seeded(cls, orig_module, block_size, *, clip=0.99, scaled=True, seed=42):
@@ -532,7 +536,9 @@ def test_rotation_aot_eager_matches_eager_under_autocast(backward_pass_autocast)
 def test_checkpointed_hooked_oft_block_compiles_fullgraph_like_training():
     """Mirror of the live path: a non-reentrant checkpoint around a block whose
     Linears are hooked by DoRA-OFT, compiled fullgraph under bf16 autocast
-    (CheckpointLayer.compile(fullgraph=True) in checkpointing_util)."""
+    (CheckpointLayer.compile(fullgraph=True) in checkpointing_util). Train mode:
+    the forward only reads the spectral-clip state, so eager and compiled see the
+    same clip and the state is unchanged after two iterations."""
     torch._dynamo.reset()
 
     def build():
@@ -540,8 +546,8 @@ def test_checkpointed_hooked_oft_block_compiles_fullgraph_like_training():
         block = nn.Sequential(nn.Linear(24, 32, bias=False), nn.Linear(32, 24, bias=False))
         adapters = [_seeded(DoRAOFTModule, layer, 8) for layer in block]
         for adapter in adapters:
-            adapter.oft_R.eval()  # fixed power-iteration state: eager and compiled see the same clip
             adapter.hook_to_module()
+        block.train()
         return block, adapters
 
     def run(block, x):
@@ -549,6 +555,8 @@ def test_checkpointed_hooked_oft_block_compiles_fullgraph_like_training():
 
     eager_block, eager_adapters = build()
     compiled_block, compiled_adapters = build()
+    assert all(adapter.oft_R.training for adapter in (*eager_adapters, *compiled_adapters))
+    states = [(a.oft_R.u_state.clone(), a.oft_R.v_state.clone()) for a in (*eager_adapters, *compiled_adapters)]
     counter = torch._dynamo.testing.CompileCounterWithBackend("aot_eager")
     compiled = torch.compile(run, backend=counter, fullgraph=True)
     x = torch.randn(3, 24)
@@ -573,4 +581,6 @@ def test_checkpointed_hooked_oft_block_compiles_fullgraph_like_training():
     torch.testing.assert_close(out_c, out_e, rtol=0, atol=0)
     for ac, ae in zip(compiled_adapters, eager_adapters, strict=True):
         torch.testing.assert_close(ac.oft_R.weight.grad, ae.oft_R.weight.grad, rtol=0, atol=1e-6)
+    for adapter, (u, v) in zip((*eager_adapters, *compiled_adapters), states, strict=True):
+        assert torch.equal(adapter.oft_R.u_state, u) and torch.equal(adapter.oft_R.v_state, v)
     torch._dynamo.reset()

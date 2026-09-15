@@ -11,16 +11,18 @@ def set_seed(seed: int, device: torch.device):
     generator.manual_seed(seed)
 
 
-def copy_stochastic_(target: Tensor, source: Tensor):
+def copy_stochastic_(target: Tensor, source: Tensor, generator: torch.Generator | None = None):
     """
     copies source into target using stochastic rounding
 
     Args:
         target: the target tensor with dtype=bfloat16
         source: the target tensor with dtype=float32
+        generator: the random generator; None uses the module-level generator set by set_seed
     """
 
-    global generator
+    if generator is None:
+        generator = globals()["generator"]
 
     # create a random 16 bit integer
     result = torch.randint(
@@ -44,19 +46,36 @@ def copy_stochastic_(target: Tensor, source: Tensor):
     del result
 
 
-def add_stochastic_(input: Tensor, other: Tensor, alpha: float = 1.0):
+def add_stochastic_(
+    input: Tensor,
+    other: Tensor,
+    alpha: float = 1.0,
+    generator: torch.Generator | None = None,
+    chunk_numel: int | None = None,
+):
     """
-    adds other to input using stochastic rounding
+    adds alpha * other to input using stochastic rounding
 
     Args:
         input: the input tensor with dtype=bfloat16
         other: the other tensor
         alpha: a multiplier for other
+        generator: the random generator; None uses the module-level generator set by set_seed
+        chunk_numel: if set, process input in slices along dim 0 of at most this many elements
+            (at least one row), bounding the float32 + int32 transients of large tensors
     """
-    result = other.clone() if other.dtype == torch.float32 else other.to(dtype=torch.float32)
+    if chunk_numel is not None and input.dim() > 0 and input.shape[0] > 1 and input.numel() > chunk_numel:
+        rows = max(1, chunk_numel // (input.numel() // input.shape[0]))
+        for start in range(0, input.shape[0], rows):
+            add_stochastic_(input[start : start + rows], other[start : start + rows], alpha, generator)
+        return
 
-    result.add_(input, alpha=alpha)
-    copy_stochastic_(input, result)
+    # input + alpha * other. (Before this was fixed it computed other + alpha * input,
+    # which only coincided for alpha == 1 or other is input -- the two ways CAME calls it.)
+    result = input.to(dtype=torch.float32, copy=True)
+
+    result.add_(other, alpha=alpha)
+    copy_stochastic_(input, result, generator)
 
 
 def addcdiv_stochastic_(input: Tensor, tensor1: Tensor, tensor2: Tensor, value: float = 1.0):
