@@ -443,14 +443,22 @@ class OFTRotationModule(nn.Module):
             self._rotation_leaf_hook = None
         self.rotation_leaf = leaf
         if leaf is not None:
+            self._sync_rotation_leaf_requires_grad()
+
+    def _sync_rotation_leaf_requires_grad(self) -> None:
+        # The leaf trains exactly when Q does. Hooks live on the tensor object and
+        # survive requires_grad toggles, but can only be registered while it requires grad.
+        leaf = self.rotation_leaf
+        if leaf.requires_grad != self.weight.requires_grad:
+            leaf.requires_grad_(self.weight.requires_grad)
+        if leaf.requires_grad and self._rotation_leaf_hook is None:
             self._rotation_leaf_hook = leaf.register_post_accumulate_grad_hook(self._accumulate_rotation_grad)
 
     def enable_rotation_cache(self, dtype: torch.dtype) -> None:
         """Allocate the cached rotation in ``dtype`` (the train dtype) and fill it from Q."""
         if self.rotation_leaf is None or self.rotation_leaf.dtype != dtype:
             shape = (self.weight.shape[0], self.block_size, self.block_size)
-            leaf = torch.empty(shape, dtype=dtype, device=self.weight.device)
-            self._set_rotation_leaf(leaf.requires_grad_(self.weight.requires_grad))
+            self._set_rotation_leaf(torch.empty(shape, dtype=dtype, device=self.weight.device))
             self.rotation_grad_acc = None
         self.rotation_cache_active = True
         self.refresh_rotation_cache()
@@ -485,8 +493,7 @@ class OFTRotationModule(nn.Module):
                 "OFT rotation cache refreshed with un-materialized rotation gradients; "
                 "call materialize_rotation_grad() before changing Q or the clip state."
             )
-        if leaf.requires_grad != self.weight.requires_grad:
-            leaf.requires_grad_(self.weight.requires_grad)
+        self._sync_rotation_leaf_requires_grad()
         leaf.copy_(self._fp32_rotation(self.weight.detach()))
         self._rotation_cache_state_version = self._spectral_state_version
 
