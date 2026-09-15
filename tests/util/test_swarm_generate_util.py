@@ -1,8 +1,9 @@
 """Sizing and batch planning for SwarmUI-generated off-policy negatives."""
 
-from modules.util.dpo_offpolicy_util import RealPhoto
+from modules.util.dpo_offpolicy_util import GENERATION_SIZE_MULTIPLE, RealPhoto
 from modules.util.swarm_client import SwarmClient, SwarmError, normalize_base_url
 from modules.util.swarm_generate_util import (
+    DEFAULT_QUANTIZATION,
     DEFAULT_TARGET_RESOLUTION,
     bucket_size_for_photo,
     bucket_sizes,
@@ -10,20 +11,74 @@ from modules.util.swarm_generate_util import (
     plan_generations,
 )
 
+from mgds.pipelineModules.AspectBucketing import AspectBucketing
+
 import pytest
 
 # --- generation size = the photo's own trainer bucket ------------------------
 
 
-def test_bucket_sizes_are_the_trainers_own_grid():
+class _TrainerBuckets(AspectBucketing):
+    """mgds' ``AspectBucketing`` driven through its real ``start()`` for a
+    config whose only target resolution is ``DEFAULT_TARGET_RESOLUTION`` —
+    wired like the trainer's loader, not through the tool's own lookup.
+
+    The expected grid comes from here rather than from pinned numbers: the
+    tool follows mgds' bucketing by design, so a change to the trainer's grid
+    must move these tests with it instead of failing on a stale count."""
+
+    _TARGET_NAME = "settings.target_resolution"
+
+    def __init__(self):
+        super().__init__(
+            quantization=DEFAULT_QUANTIZATION,
+            resolution_in_name="original_resolution",
+            target_resolution_in_name=self._TARGET_NAME,
+            enable_target_resolutions_override_in_name="concept.image.enable_resolution_override",
+            target_resolutions_override_in_name="concept.image.resolution_override",
+            target_frames_in_name="settings.target_frames",
+            frame_dim_enabled=False,
+            scale_resolution_out_name="scale_resolution",
+            crop_resolution_out_name="crop_resolution",
+            possible_resolutions_out_name="possible_resolutions",
+        )
+        self.start(0)
+
+    def _get_previous_length(self, name):
+        return 1 if name == self._TARGET_NAME else 0
+
+    def _get_previous_item(self, variation, name, index):
+        assert name == self._TARGET_NAME
+        return str(DEFAULT_TARGET_RESOLUTION)
+
+    def grid(self) -> set[tuple[int, int]]:
+        """Every bucket as ``(width, height)``."""
+        return {(int(w), int(h)) for h, w in self.bucket_resolutions[DEFAULT_TARGET_RESOLUTION]}
+
+    def size_for(self, width: int, height: int) -> tuple[int, int]:
+        """The ``(width, height)`` bucket the trainer puts this photo in."""
+        bucket_h, bucket_w = self.bucket_for_aspect(height / width, DEFAULT_TARGET_RESOLUTION)
+        return int(bucket_w), int(bucket_h)
+
+
+@pytest.fixture(scope="module")
+def trainer_buckets():
+    return _TrainerBuckets()
+
+
+def test_bucket_sizes_are_the_trainers_own_grid(trainer_buckets):
     sizes = bucket_sizes()
-    assert len(sizes) == 17
+    assert len(sizes) == len(set(sizes))
+    assert set(sizes) == trainer_buckets.grid()
+    assert sizes == sorted(sizes, key=lambda size: -size[0] / size[1])  # widest first
     assert (1024, 1024) in sizes
     assert (1344, 768) in sizes and (768, 1344) in sizes
     for width, height in sizes:
-        assert width % 64 == 0 and height % 64 == 0
-        # Every bucket carries roughly the target pixel budget.
-        assert 0.95 <= (width * height) / (DEFAULT_TARGET_RESOLUTION**2) <= 1.15
+        assert width % DEFAULT_QUANTIZATION == 0 and height % DEFAULT_QUANTIZATION == 0
+        # Every bucket carries roughly the target pixel budget. The floor
+        # leaves room for native generator presets, which mgds does not
+        # normalize to the budget (1216x768 is 0.89 of 1024^2).
+        assert 0.85 <= (width * height) / (DEFAULT_TARGET_RESOLUTION**2) <= 1.15
     # The grid is symmetric: every landscape bucket has a portrait twin.
     assert {(w, h) for w, h in sizes} == {(h, w) for w, h in sizes}
 
@@ -31,7 +86,7 @@ def test_bucket_sizes_are_the_trainers_own_grid():
 @pytest.mark.parametrize(
     ("photo", "expected"),
     [
-        ((1000, 1000), (1024, 1024)),
+        ((2000, 2000), (1024, 1024)),
         ((2400, 1600), (1280, 832)),  # 3:2
         ((1600, 2400), (832, 1280)),  # 2:3
         ((1920, 1080), (1344, 768)),  # 16:9
@@ -43,18 +98,43 @@ def test_bucket_size_for_photo(photo, expected):
     assert bucket_size_for_photo(*photo) == expected
 
 
+@pytest.mark.parametrize(
+    ("photo", "expected"),
+    [
+        ((1000, 1000), (992, 992)),
+        ((1000, 667), (992, 656)),
+        ((600, 1500), (592, 1488)),
+    ],
+)
+def test_photo_below_the_budget_generates_at_its_own_size(photo, expected):
+    """A photo under ``DEFAULT_TARGET_RESOLUTION``^2 is never upscaled to meet
+    a bucket: it generates at its own dimensions, snapped down to a renderable
+    multiple, and the trainer's scale-crop handles the pair."""
+    assert bucket_size_for_photo(*photo) == expected
+
+
 def test_bucket_size_falls_back_for_unreadable_dimensions():
     assert bucket_size_for_photo(0, 0) == (1024, 1024)
     assert bucket_size_for_photo(-5, 100) == (1024, 1024)
 
 
-def test_generation_size_is_always_a_real_bucket():
-    """Whatever the photo, the size handed to SwarmUI is one the trainer
-    buckets to — that is what removes cropping from the rejected side."""
-    grid = set(bucket_sizes())
-    for width in (600, 1000, 1500, 2400, 4000):
-        for height in (600, 1000, 1500, 2400, 4000):
-            assert bucket_size_for_photo(width, height) in grid
+def test_generation_size_is_the_trainers_bucket_or_the_photos_own_size(trainer_buckets):
+    """At or above the pixel budget the size handed to SwarmUI is exactly the
+    bucket the trainer puts the photo in — that is what removes cropping from
+    the rejected side. Below it, the photo's own size snapped down to a
+    renderable multiple, so the photo is never upscaled to meet its pair."""
+    grid = trainer_buckets.grid()
+    budget = DEFAULT_TARGET_RESOLUTION**2
+    step = GENERATION_SIZE_MULTIPLE
+    for width in (600, 1000, 1024, 1500, 2400, 4000):
+        for height in (600, 1000, 1024, 1500, 2400, 4000):
+            gen_w, gen_h = bucket_size_for_photo(width, height)
+            if width * height >= budget:
+                assert (gen_w, gen_h) == trainer_buckets.size_for(width, height)
+                assert (gen_w, gen_h) in grid
+            else:
+                assert gen_w % step == 0 and gen_h % step == 0
+                assert 0 <= width - gen_w < step and 0 <= height - gen_h < step
 
 
 # --- planning ----------------------------------------------------------------
