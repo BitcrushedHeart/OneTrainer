@@ -674,6 +674,13 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " shared across all blocks within a layer, drastically cutting the number"
         " of trainable parameters and yielding very compact adapter files."
     ),
+    "oft_rotation_cache": (
+        "Computes each OFT rotation once per optimizer step and reuses it for every micro-step."
+        " Faster steps, at roughly +1.6 GiB VRAM on a Z-Image-sized DoRA-OFT (scales with the sum of"
+        " r x block_size^2 over the adapted Linear layers). The accumulated rotation gradient is stored"
+        " in bfloat16 with stochastic rounding, adding a small unbiased gradient noise."
+        " Requires the bfloat16 train data type and a single GPU; not compatible with the fused back pass."
+    ),
     "embedding.model_name": "The base embedding to train on. Leave empty to create a new embedding",
     "embedding.placeholder": "The placeholder used when using the embedding in a prompt",
     "embedding.token_count": (

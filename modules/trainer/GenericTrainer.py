@@ -17,6 +17,7 @@ from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.modelSaver.BaseModelSaver import BaseModelSaver
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.module.oft_utils import set_rotation_cache_seed
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util import create, path_util
 from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_rounding_set_seed
@@ -109,6 +110,15 @@ class GenericTrainer(BaseTrainer):
         text_reward_error = self.config.validate_text_reward_startup()
         if text_reward_error is not None:
             raise RuntimeError(text_reward_error)
+
+        rotation_cache_error = self.config.validate_oft_rotation_cache_startup()
+        if rotation_cache_error is not None:
+            raise RuntimeError(rotation_cache_error)
+        if self.config.oft_rotation_cache and not self.config.oft_rotation_cache_applies():
+            print(
+                "Warning: the OFT rotation cache is enabled, but this run does not train OFT v2 adapters "
+                "(LoRA tab, PEFT type OFT v2); ignoring it."
+            )
 
         if multi.is_master():
             # TB writer creation is deferred to start() so a backup's tensorboard_subdir
@@ -233,6 +243,9 @@ class GenericTrainer(BaseTrainer):
         self.model_setup.setup_optimizations(self.model, self.config)
         self.model_setup.setup_train_device(self.model, self.config)
         self.model_setup.setup_model(self.model, self.config)
+        # Adapters are loaded, dtype-cast and on the train device here; the cache is
+        # filled once now and follows later device moves through _apply.
+        self.model_setup.setup_adapter_rotation_cache(self.model, self.config)
         self.model.to(self.temp_device)
         self.model.eval()
         torch_gc()
@@ -687,6 +700,8 @@ class GenericTrainer(BaseTrainer):
             # non-EMA sampling is done on all GPUs
             assert multi.is_master() and self.config.ema != EMAMode.OFF
             self.model.ema.copy_ema_to(self.parameters, store_temp=True)
+        if self.model.ema or self.config.optimizer.optimizer.is_schedule_free:
+            self.__refresh_rotation_cache_after_param_swap()
 
         self.__sample_loop(
             train_progress=train_progress,
@@ -698,6 +713,7 @@ class GenericTrainer(BaseTrainer):
 
         if self.model.ema:
             self.model.ema.copy_temp_to(self.parameters)
+            self.__refresh_rotation_cache_after_param_swap()
 
         # ema-less sampling, if ema is enabled:
         if self.config.ema != EMAMode.OFF and not is_custom_sample and self.config.non_ema_sampling:
@@ -714,8 +730,17 @@ class GenericTrainer(BaseTrainer):
         if self.config.optimizer.optimizer.is_schedule_free:
             torch.clear_autocast_cache()
             self.model.optimizer.train()
+            self.__refresh_rotation_cache_after_param_swap()
 
         torch_gc()
+
+    def __refresh_rotation_cache_after_param_swap(self):
+        # EMA and schedule-free eval/train overwrite Q in place (param.data), which the
+        # OFT rotation cache cannot see. Sampling only runs between optimizer updates,
+        # so there are no pending rotation gradients; the spectral state keeps
+        # tracking the training weights (warm=False).
+        if self.config.oft_rotation_cache_applies():
+            self.model_setup.refresh_adapters_after_param_restore(self.model, self.config, warm=False)
 
     def __validate_distill(self, train_progress: TrainProgress):
         # Teacher-match validation is self-contained (frozen teacher generates
@@ -825,12 +850,18 @@ class GenericTrainer(BaseTrainer):
                 )
                 print(f"Redistill Phase A -> B at step {train_progress.global_step}: restoring transfer best{detail}.")
                 best_state = torch.load(self._transfer_best_backup_path, map_location=self.temp_device)
+                if self.config.oft_rotation_cache_applies():
+                    # In-flight rotation gradients belong to the rotation being replaced.
+                    self.model_setup.before_clip_adapters(self.model, self.config)
                 for param, saved in zip(self.parameters, best_state, strict=True):
                     param.data.copy_(saved)
                 del best_state
             except Exception:  # noqa: BLE001 - a corrupt snapshot must not abort the run
                 traceback.print_exc()
                 print("Could not restore the Phase A best snapshot; continuing with last-step parameters.")
+            # The restored Q can be far from the tracked spectral state: re-warm it, and
+            # refresh any rotation cache (also after a partial restore).
+            self.model_setup.refresh_adapters_after_param_restore(self.model, self.config, warm=True)
         else:
             print(f"Redistill Phase A -> B at step {train_progress.global_step}.")
 
@@ -1335,6 +1366,11 @@ class GenericTrainer(BaseTrainer):
         is an empty-by-construction snapshot -- correct to write and
         cheap to load.
         """
+        if self.config.oft_rotation_cache_applies() and self.model is not None:
+            # Accumulated rotation gradients are not persisted: land them in Q.grad,
+            # which the snapshot below captures (a no-op between optimizer updates).
+            self.model_setup.before_clip_adapters(self.model, self.config)
+
         if not multi.is_master():
             # The saver is master-only; non-master ranks have nothing to stage.
             self.model.accumulator_state = None
@@ -1744,6 +1780,8 @@ class GenericTrainer(BaseTrainer):
                 ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
+                    if self.config.oft_rotation_cache_applies():
+                        set_rotation_cache_seed(step_seed, train_device)
 
                     self.__maybe_advance_redistill_phase(train_progress)
 
@@ -1971,6 +2009,11 @@ class GenericTrainer(BaseTrainer):
                         else:
                             multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
 
+                        if self.config.oft_rotation_cache_applies():
+                            # The rotation cache's accumulated dL/dR becomes Q.grad here, so
+                            # unscale, clipping and the step all see the full gradient.
+                            self.model_setup.before_clip_adapters(self.model, self.config)
+
                         if (
                             scaler
                             and self.config.optimizer.optimizer.supports_fused_back_pass()
@@ -1992,9 +2035,6 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
-                        # Once per update, on every step path (plain, scaler, fused back
-                        # pass): OFT forwards only read the spectral-clip state.
-                        self.model_setup.after_optimizer_step_adapters(self.model, self.config)
 
                         # Periodic DPO reference rebase, applied right after the
                         # optimizer step so the reference never changes inside a
@@ -2223,6 +2263,14 @@ class GenericTrainer(BaseTrainer):
                         self._loop_accumulated_loss_tensor = None
                         self._loop_accumulated_dpo_metrics = None
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        # Once per update, on every step path (plain, scaler, fused back pass):
+                        # advance the OFT spectral-clip state and refresh any rotation cache.
+                        # After after_optimizer_step, which may change requires_grad (the cache
+                        # syncs it); nothing between the optimizer step and here runs a model
+                        # forward (DPO rebase copies params, adaptive beta and reporting are
+                        # host-side; sampling/backup commands run at the next batch), and the
+                        # EMA update and validation below come after.
+                        self.model_setup.after_optimizer_step_adapters(self.model, self.config)
 
                         if self.model.ema:
                             assert multi.is_master()
@@ -2260,6 +2308,10 @@ class GenericTrainer(BaseTrainer):
         gc.unfreeze()
 
         if self.one_step_trained:
+            if self.config.oft_rotation_cache_applies():
+                # A mid-window stop leaves rotation gradients in the cache: land them in
+                # Q.grad on the train device, before the offload and the backup below.
+                self.model_setup.before_clip_adapters(self.model, self.config)
             self.model.to(self.temp_device)
 
             if self.config.backup_before_save and multi.is_master():

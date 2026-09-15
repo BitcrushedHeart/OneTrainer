@@ -1,6 +1,6 @@
 """GenericTrainer calls BaseModelSetup.after_optimizer_step_adapters exactly once per
-optimizer update (not per micro-step), after the step and before after_optimizer_step,
-on every step path: plain, grad scaler, fused back pass (with and without scaler).
+optimizer update (not per micro-step), after the step and after the model-specific
+after_optimizer_step (which may change requires_grad), on every step path: plain, grad scaler, fused back pass (with and without scaler).
 
 CPU-only. A real GenericTrainer.train() runs over mocked model/setup/loader with one
 real parameter, so backward and the fused-back-pass grad hooks actually fire.
@@ -110,13 +110,13 @@ def test_adapter_hook_runs_once_per_optimizer_update(tmp_path, monkeypatch, use_
     for call in setup.after_optimizer_step_adapters.call_args_list:
         assert call.args == (trainer.model, trainer.config)
 
-    # Each update window: 3 predicts, the parameter step(s), zero_grad, then the
-    # adapter hook, then the model-specific after_optimizer_step.
+    # Each update window: 3 predicts, the parameter step(s), zero_grad, the
+    # model-specific after_optimizer_step, then the adapter hook.
     windows = []
     current: list[str] = []
     for event in events:
         current.append(event)
-        if event == "after_optimizer_step":
+        if event == "adapters":
             windows.append(current)
             current = []
     assert current == []
@@ -126,5 +126,5 @@ def test_adapter_hook_runs_once_per_optimizer_update(tmp_path, monkeypatch, use_
         assert window.count("adapters") == 1
         assert step_event in window
         last_step = max(i for i, e in enumerate(window) if e == step_event)
-        assert last_step < window.index("zero_grad") < window.index("adapters") < window.index("after_optimizer_step")
+        assert last_step < window.index("zero_grad") < window.index("after_optimizer_step") < window.index("adapters")
         assert window.index("adapters") > max(i for i, e in enumerate(window) if e == "predict")
