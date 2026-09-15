@@ -695,6 +695,7 @@ class TrainConfig(BaseConfig):
     rlhf_sft_anchor_weight: float
     rlhf_dpo_addon_weight: float
     rlhf_dpo_addon_interval: int
+    rlhf_dpo_light_reuse_rejected_graph: bool
     rlhf_dpo_validation: bool
     rlhf_dpo_validation_percentage: float
     rlhf_dpo_patience_enabled: bool
@@ -1906,6 +1907,10 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
         data.append(("rlhf_dpo_addon_weight", 1.0, float, False))
         data.append(("rlhf_dpo_addon_interval", 0, int, False))
+        # No migration: configs saved without the key load this default,
+        # which is also the intended value for them (same gradient, one
+        # forward fewer per DPO add-on step).
+        data.append(("rlhf_dpo_light_reuse_rejected_graph", True, bool, False))
         data.append(("rlhf_dpo_validation", False, bool, False))
         data.append(("rlhf_dpo_validation_percentage", 10.0, float, False))
         data.append(("rlhf_dpo_patience_enabled", False, bool, False))

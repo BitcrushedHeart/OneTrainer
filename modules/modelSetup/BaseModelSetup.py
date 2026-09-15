@@ -1232,6 +1232,28 @@ class BaseModelSetup(
         # [B,C,H,W] tensors - avoids fp32 copies per step.
         return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
 
+    @staticmethod
+    def _dpo_light_can_hold_rejected_graph(config: TrainConfig) -> bool:
+        """Whether calculate_dpo_loss_light may hold the rejected half's graph
+        through the chosen half's forward and backward.
+
+        Only plain gradient checkpointing makes that cheap: its non-reentrant
+        checkpoints keep just the block inputs (~1.1 GB at 1024px, batch 1).
+        Without checkpointing the held graph is every activation of a forward.
+        CPU-offloaded checkpointing with activation or layer offloading is
+        unsafe: the LayerOffloadConductor clears the offloaded activations at
+        the start of the next forward, so the held graph could not be
+        backwarded. Those setups keep the one-graph-at-a-time sequence.
+        """
+        if not config.rlhf_dpo_light_reuse_rejected_graph:
+            return False
+        checkpointing = config.gradient_checkpointing
+        if not checkpointing.enabled():
+            return False
+        return not (
+            checkpointing.offload() and (config.enable_activation_offloading or config.layer_offload_fraction > 0)
+        )
+
     def calculate_dpo_loss_light(
         self,
         model: BaseModel,
@@ -1240,9 +1262,9 @@ class BaseModelSetup(
         train_progress: TrainProgress,
         backward_fn,
     ) -> Tensor:
-        """DPO on a chosen/rejected pair with single-sample forwards and only one
-        half's autograd graph alive at a time (SFT + DPO add-on steps, where the
-        fused [chosen; rejected] graph on top of the standard sample OOMs).
+        """DPO on a chosen/rejected pair with single-sample forwards (SFT + DPO
+        add-on steps, where the fused [chosen; rejected] graph on top of the
+        standard sample OOMs).
 
         Gradients are accumulated here through ``backward_fn`` (which applies
         the caller's loss scaling and AMP scaler); the returned loss is detached
@@ -1252,6 +1274,15 @@ class BaseModelSetup(
         reseeds from global_step, so all single-sample forwards draw the same
         noise and timestep: ref/policy agree per half and the two halves share
         noise exactly like the fused path.
+
+        The rejected half's value is needed before the chosen half can be
+        backwarded (the chain-rule weight depends on the margin). When
+        ``_dpo_light_can_hold_rejected_graph`` allows it, the rejected policy
+        forward runs with grad first and its graph is held through the chosen
+        half's forward and backward: 4 forwards instead of 5, and the weight
+        comes from the very forward that is backwarded. Otherwise the value
+        comes from an extra no-grad forward and only one half's graph is alive
+        at a time.
         """
         if "latent_image_rejected" not in batch:
             raise RuntimeError(
@@ -1262,29 +1293,33 @@ class BaseModelSetup(
         objective_kwargs = self._dpo_objective_kwargs(config, beta)
         chosen_batch, rejected_batch = split_dpo_pair_batch(batch)
         mse = self._dpo_mse_per_sample
+        hold_rejected_graph = self._dpo_light_can_hold_rejected_graph(config)
+
+        def half_logp(half_batch: dict) -> Tensor:
+            # The output dict dies with this call; only the per-sample log-prob
+            # (and its graph, under grad) outlives it.
+            output = self.predict(model, half_batch, config, train_progress)
+            return -mse(output["predicted"], output["target"])
 
         # Same conditioning-dropout neutralization as the fused path: both
         # halves must see identical prompts.
         te_configs = (config.text_encoder, config.text_encoder_2, config.text_encoder_3, config.text_encoder_4)
         saved_dropout = [te.dropout_probability for te in te_configs]
+        policy_rejected_live = None
         try:
             for te in te_configs:
                 te.dropout_probability = 0.0
 
             with torch.no_grad(), self.reference_model(model, config):
-                out = self.predict(model, chosen_batch, config, train_progress)
-                ref_chosen_logp = -mse(out["predicted"], out["target"])
-                del out
-                out = self.predict(model, rejected_batch, config, train_progress)
-                ref_rejected_logp = -mse(out["predicted"], out["target"])
-                del out
+                ref_chosen_logp = half_logp(chosen_batch)
+                ref_rejected_logp = half_logp(rejected_batch)
 
-            # The rejected half's value is needed before the chosen half can be
-            # backwarded (the chain-rule weight depends on the margin).
-            with torch.no_grad():
-                out = self.predict(model, rejected_batch, config, train_progress)
-                policy_rejected_value = -mse(out["predicted"], out["target"])
-                del out
+            if hold_rejected_graph:
+                policy_rejected_live = half_logp(rejected_batch)
+                policy_rejected_value = policy_rejected_live.detach()
+            else:
+                with torch.no_grad():
+                    policy_rejected_value = half_logp(rejected_batch)
 
             chosen_output = self.predict(model, chosen_batch, config, train_progress)
             policy_timestep = chosen_output.get("timestep")
@@ -1303,11 +1338,13 @@ class BaseModelSetup(
             backward_fn(chosen_term)
             del chosen_output, policy_chosen_live, chosen_term
 
-            rejected_output = self.predict(model, rejected_batch, config, train_progress)
-            policy_rejected_live = -mse(rejected_output["predicted"], rejected_output["target"])
+            if policy_rejected_live is None:
+                policy_rejected_live = half_logp(rejected_batch)
             backward_fn((g_rejected.to(policy_rejected_live.dtype) * policy_rejected_live).sum())
-            del rejected_output, policy_rejected_live
         finally:
+            # Release a held rejected graph on the exception path too: a caught
+            # exception's traceback keeps this frame, and its locals, alive.
+            policy_rejected_live = None
             for te, saved in zip(te_configs, saved_dropout, strict=True):
                 te.dropout_probability = saved
 
