@@ -1,123 +1,138 @@
-from typing import Literal
+from web.backend.services.dpo_replace_service import MAX_IMAGES_PER_PAIR, DPOReplacePairsService
 
-from web.backend.services.dpo_replace_service import DPOReplacePairsService
-
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["dpo-replace"])
 
 
 class StartRequest(BaseModel):
-    # A DPO concept folder with manifest.json, chosen/ and rejected/.
     concept_dir: str
-    # SwarmUI's raw output root: where fresh generations land and where the
-    # settings of the most recent generation are read from.
-    generated_folder: str
+    generated_folder: str = ""
     base_url: str = "http://localhost:7801"
     token: str = ""
-    # stale_first: corrected captions first, then oldest rejected generation.
-    order: Literal["stale_first", "oldest", "least_realistic", "path"] = "stale_first"
-    # Let an image other than the current chosen become the new chosen (the
-    # old chosen may become rejected). Off: only the rejected side is picked.
-    allow_promote: bool = True
-    target_resolution: int = 1024
-    quantization: int = 64
+    images_per_pair: int = Field(default=2, ge=1, le=MAX_IMAGES_PER_PAIR)
+    new_pass: bool = False
 
 
-class GenerateRequest(BaseModel):
-    # How many of the next-ranked pairs to regenerate, unless pair_ids is given.
-    count: int = 10
-    pair_ids: list[int] | None = None
-    # Fresh images per pair; the most photoreal one is proposed.
-    images_per_pair: int = 2
-    concurrency: int = 3
-    # Apply a scored suggestion that keeps the chosen side without review;
-    # anything that would move the chosen side always waits for a person.
-    auto_apply: bool = False
+class SessionRequest(BaseModel):
+    session_id: str
 
 
-class ApplyRequest(BaseModel):
-    # Two images of the group on screen; omitted = the suggestion.
-    chosen_path: str | None = None
-    rejected_path: str | None = None
+class ResumeRequest(SessionRequest):
+    token: str = ""
+
+
+class GroupRequest(SessionRequest):
+    group_id: str
+
+
+class BestRequest(GroupRequest):
+    best_id: str | None = None
+
+
+class ApplyRequest(GroupRequest):
+    best_id: str
+    worst_id: str
+    override_reversal: bool = False
+
+
+class PairModel(BaseModel):
+    chosen_id: str
+    rejected_id: str
+
+
+class ApplyPairsRequest(GroupRequest):
+    # The first pair replaces the reviewed pair; the rest are added. No cap.
+    pairs: list[PairModel] = Field(min_length=1)
+    override_reversal: bool = False
+
+
+def service():
+    return DPOReplacePairsService.get_instance()
 
 
 @router.get("/dpo/replace/concepts")
 def concepts():
-    """Configured DPO concept folders that carry a manifest."""
-    return DPOReplacePairsService.get_instance().concepts()
+    return service().concepts()
 
 
 @router.post("/dpo/replace/start")
 def start(req: StartRequest):
-    return DPOReplacePairsService.get_instance().start(
-        req.concept_dir,
-        req.generated_folder,
-        base_url=req.base_url,
-        token=req.token,
-        order=req.order,
-        allow_promote=req.allow_promote,
-        target_resolution=req.target_resolution,
-        quantization=req.quantization,
-    )
+    return service().start(**req.model_dump())
+
+
+@router.post("/dpo/replace/restore")
+def restore(req: StartRequest):
+    return service().start(**{**req.model_dump(), "new_pass": False, "restore_only": True})
 
 
 @router.get("/dpo/replace/status")
 def status():
-    return DPOReplacePairsService.get_instance().status()
+    return service().status()
 
 
-@router.get("/dpo/replace/pairs")
-def pairs(offset: int = 0, limit: int = 200):
-    """The ranked pair list and the per-model summary."""
-    return DPOReplacePairsService.get_instance().pairs(offset=offset, limit=limit)
+@router.post("/dpo/replace/pause")
+def pause(req: SessionRequest):
+    return service().pause(req.session_id)
 
 
-@router.get("/dpo/replace/params")
-def params():
-    """The settings the next batch would use (the user's last generation)."""
-    return DPOReplacePairsService.get_instance().params()
+@router.post("/dpo/replace/resume")
+def resume(req: ResumeRequest):
+    return service().resume(req.session_id, req.token)
 
 
-@router.post("/dpo/replace/generate")
-def generate(req: GenerateRequest):
-    return DPOReplacePairsService.get_instance().generate(
-        count=req.count,
-        pair_ids=req.pair_ids,
-        images_per_pair=req.images_per_pair,
-        concurrency=req.concurrency,
-        auto_apply=req.auto_apply,
-    )
-
-
-@router.post("/dpo/replace/next")
-def next_proposal():
-    return DPOReplacePairsService.get_instance().next()
+@router.post("/dpo/replace/close")
+def close(req: SessionRequest):
+    return service().pause(req.session_id, close=True)
 
 
 @router.get("/dpo/replace/current")
 def current():
-    return DPOReplacePairsService.get_instance().current()
+    return service().current()
+
+
+@router.post("/dpo/replace/best")
+def best(req: BestRequest):
+    return service().select_best(**req.model_dump())
 
 
 @router.post("/dpo/replace/apply")
-def apply(req: ApplyRequest = ApplyRequest()):  # noqa: B008 — pydantic default body
-    """Make the two picked images the pair's chosen and rejected sides."""
-    return DPOReplacePairsService.get_instance().apply(req.chosen_path, req.rejected_path)
+def apply(req: ApplyRequest):
+    return service().apply(**req.model_dump())
 
 
-@router.post("/dpo/replace/keep")
-def keep():
-    """Leave the pair as it is."""
-    return DPOReplacePairsService.get_instance().keep()
+@router.post("/dpo/replace/apply-pairs")
+def apply_pairs(req: ApplyPairsRequest):
+    return service().apply_pairs(
+        req.session_id,
+        req.group_id,
+        [(pair.chosen_id, pair.rejected_id) for pair in req.pairs],
+        req.override_reversal,
+    )
+
+
+@router.post("/dpo/replace/skip")
+def skip(req: GroupRequest):
+    return service().skip(**req.model_dump())
+
+
+@router.post("/dpo/replace/retry")
+def retry(req: GroupRequest):
+    return service().retry(**req.model_dump())
 
 
 @router.post("/dpo/replace/undo")
-def undo():
-    return DPOReplacePairsService.get_instance().undo()
+def undo(req: SessionRequest):
+    return service().undo(req.session_id)
 
 
-@router.post("/dpo/replace/cancel")
-def cancel():
-    return DPOReplacePairsService.get_instance().cancel()
+@router.get("/dpo/replace/image/{session_id}/{group_id}/{candidate_id}")
+def image(session_id: str, group_id: str, candidate_id: str):
+    try:
+        path = service().image_path(session_id, group_id, candidate_id)
+        # No origin filename in either the URL or response headers.
+        return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+    except (ValueError, KeyError, StopIteration):
+        raise HTTPException(status_code=404, detail="Candidate not found") from None

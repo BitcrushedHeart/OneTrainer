@@ -383,6 +383,17 @@ class TrainUI(ctk.CTk):
         )
         self._update_validation_checker_button_state()
 
+        components.label(
+            frame,
+            9,
+            2,
+            "Epoch Mean Loss",
+            tooltip="Log 'loss/train_epoch' to Tensorboard: the mean training loss over all optimizer "
+            "steps of each epoch, written once per epoch (and for the partial final epoch when "
+            "training stops early). Smoother than the per-step loss for comparing epochs.",
+        )
+        components.switch(frame, 9, 3, self.ui_state, "tensorboard_epoch_loss")
+
         # device
         components.label(
             frame,
@@ -504,6 +515,34 @@ class TrainUI(ctk.CTk):
             wide_tooltip=True,
         )
         components.options(frame, 15, 3, [str(x) for x in list(PatienceMode)], self.ui_state, "patience_mode")
+
+        components.label(
+            frame,
+            16,
+            2,
+            "Patience Min Checks",
+            tooltip="Number of validation checks to ignore before patience starts tracking. "
+            "During this warm-up neither the best checkpoint nor the no-improvement count "
+            "is updated, so an early, barely trained snapshot cannot be chosen as the best "
+            "model on a small or noisy validation set, and patience cannot trigger before "
+            "the model has trained for at least this many checks plus 'Patience Checks'. "
+            "0 disables the warm-up.",
+            wide_tooltip=True,
+        )
+        components.entry(frame, 16, 3, self.ui_state, "patience_min_checks")
+
+        components.label(
+            frame,
+            16,
+            0,
+            "Second-Best Output",
+            tooltip="Also save the checkpoint with the second-lowest validation loss as a third output "
+            "with a '-patience-second' suffix (next to the best-checkpoint model and, in "
+            "Save Alternative At End mode, the '-patience-alt' threshold model). Useful when the "
+            "validation set is small and the single best epoch may be a lucky draw.",
+            wide_tooltip=True,
+        )
+        components.switch(frame, 16, 1, self.ui_state, "patience_save_second_best")
 
         frame.pack(fill="both", expand=1)
         return frame

@@ -255,15 +255,25 @@ def test_changed_prompt_set_encodes_only_misses_and_evicts_stale_entries(tmp_pat
     _assert_same_bank(bank, _legacy_build(_FakeSetup(), _FakeModel(), config, 1))
 
 
-def test_offline_never_encodes_the_negative_prompt(tmp_path):
+def test_plain_offline_never_encodes_the_negative_prompt(tmp_path):
     _offline_dataset(tmp_path)
-    config = _offline_config(tmp_path, text_reward_cfg_scale=5.0)
+    config = _offline_config(tmp_path, text_reward_cfg_scale=5.0, text_reward_init_sigma=0.0)
     setup, model = _FakeSetup(), _FakeModel()
     bank = setup.build_text_reward_bank(model, config, 0)
     assert NEGATIVE not in model.encoded_prompts
     assert bank.negative_embedding is None
     assert NEGATIVE not in setup._text_reward_prompt_embeddings
     _assert_same_bank(bank, _legacy_build(_FakeSetup(), _FakeModel(), config, 0), negative=False)
+
+
+def test_hybrid_offline_encodes_the_negative_prompt_for_its_prefix(tmp_path):
+    _offline_dataset(tmp_path)
+    config = _offline_config(tmp_path, text_reward_cfg_scale=5.0, text_reward_init_sigma=0.8)
+    setup, model = _FakeSetup(), _FakeModel()
+    bank = setup.build_text_reward_bank(model, config, 0)
+    assert model.encoded_prompts.count(NEGATIVE) == 1
+    assert torch.equal(bank.negative_embedding, _embedding_for(NEGATIVE))
+    assert bank.image_paths is not None and len(bank) == 21
 
 
 def test_online_encodes_and_caches_the_negative_prompt():

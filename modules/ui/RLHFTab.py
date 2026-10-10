@@ -231,6 +231,28 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
+            8,
+            0,
+            "Per-Concept Metrics",
+            tooltip="Logs margin, accuracy, rewards, applied beta and gradient weight for each DPO concept "
+            "separately (dpo/concept/<folder>/...) to TensorBoard, instead of only the blend of all of them.",
+        )
+        components.switch(self.scroll_frame, 8, 1, self.ui_state, "rlhf_dpo_concept_logging")
+
+        components.label(
+            self.scroll_frame,
+            8,
+            3,
+            "Live Saturation",
+            tooltip="Tracks every DPO pair while training and writes <workspace>/dpo_live/: report.md (per concept: "
+            "pairs done / learning / violating, and where each beta sits relative to its push peak), pairs.csv "
+            "(one row per pair) and ledger.json. Margins are relative to this run's DPO reference; a rebase "
+            "archives the history and starts over.",
+        )
+        components.switch(self.scroll_frame, 8, 4, self.ui_state, "rlhf_dpo_live_saturation")
+
+        components.label(
+            self.scroll_frame,
             10,
             0,
             "DPO Add-on Weight",
@@ -460,6 +482,54 @@ class RLHFTab:
             "from a small dataset.",
         )
         components.entry(self.scroll_frame, 20, 1, self.ui_state, "text_reward_dataset_repeats")
+        components.label(
+            self.scroll_frame,
+            20,
+            3,
+            "Text Init Sigma",
+            tooltip="Offline Images only. 0: re-noise the dataset image straight to the grad sigma and take one "
+            "step (the plain offline reward; the crop is the source's own letters lightly re-denoised, so the "
+            "gradient can barely change letter identity). Above 0 (try 0.8): re-noise to this high sigma where "
+            "layout and surface survive but letters have not formed, roll the policy down to the grad step "
+            "(CFG applies, costs those extra no-grad forwards), re-detect on the policy's own x0 and score that. "
+            "Must sit above the grad sigma window.",
+        )
+        components.entry(self.scroll_frame, 20, 4, self.ui_state, "text_reward_init_sigma")
+        components.label(
+            self.scroll_frame,
+            21,
+            0,
+            "Grad Sigma Min / Max",
+            tooltip="Window of (shifted) sigma the grad-bearing step is drawn from; 0 / 1 keeps the original rule "
+            "(the second half of the rollout grid). Letter identity is decided around 0.4-0.8; below ~0.3 the "
+            "model only sharpens, and the gradient into the velocity is scaled by sigma anyway. Applies to all "
+            "sources.",
+        )
+        components.entry(self.scroll_frame, 21, 1, self.ui_state, "text_reward_grad_sigma_min")
+        components.entry(self.scroll_frame, 21, 2, self.ui_state, "text_reward_grad_sigma_max")
+        components.label(
+            self.scroll_frame,
+            21,
+            3,
+            "Reuse Probe Graph",
+            tooltip="Online Rollout and the hybrid offline init: the forward that finds the text boxes is also the "
+            "grad-bearing forward (one transformer forward less per reward step, same maths). Its graph is held "
+            "through the full-frame decode and the detector, which is only cheap with gradient checkpointing on "
+            "(~1.1 GB at 1024px); without checkpointing this is ignored. Turn off if reward steps OOM.",
+        )
+        components.switch(self.scroll_frame, 21, 4, self.ui_state, "text_reward_reuse_probe_graph")
+        components.label(
+            self.scroll_frame,
+            22,
+            0,
+            "Grad Steps (DRaFT-K)",
+            tooltip="Consecutive grad-bearing Euler steps starting at the drawn grad step; the scored x0 is the "
+            "one-step estimate after the last of them. 1 is the original single forward on the blurry mid-sigma "
+            "mean. 2-3 lets the loss see letters as they resolve (CFG applies, unconditional branch detached). "
+            "Each extra step holds one more transformer graph (~1.1 GB at 1024px with gradient checkpointing) and "
+            "costs one more forward; clamped to the end of the rollout grid. Applies to all sources.",
+        )
+        components.entry(self.scroll_frame, 22, 1, self.ui_state, "text_reward_grad_steps")
         components.button(
             self.scroll_frame,
             19,

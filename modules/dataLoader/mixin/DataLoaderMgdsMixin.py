@@ -63,13 +63,7 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
 
         return dpo_concepts
 
-    def _create_mgds(
-        self,
-        config: TrainConfig,
-        definition: list,
-        train_progress: TrainProgress,
-        is_validation: bool = False,
-    ):
+    def _select_concepts(self, config: TrainConfig, is_validation: bool = False) -> list[ConceptConfig]:
         concepts = config.concepts
         if concepts is None:
             with open(config.concept_file_name, "r") as f:
@@ -80,14 +74,30 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
         # config.rlhf_enabled forced to False by BaseDataLoader, so it falls
         # into the standard branch; DPO pattern concepts are excluded there so
         # their chosen images aren't double-trained as supervised data.
+        # A plain (non-DPO) validation loader excludes them for the same
+        # reason: a VALIDATION concept with chosen/rejected patterns belongs to
+        # the DPO validation loader, and reading its whole tree as ordinary
+        # validation images would score the rejected images as targets.
         valid_types = (
             {ConceptType.VALIDATION} if is_validation else {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         )
         concepts = [concept for concept in concepts if ConceptType(concept.type) in valid_types]
         if config.rlhf_enabled:
             concepts = self.__filter_dpo_concepts(concepts, config)
-        elif getattr(self, "is_sft_anchor", False):
+        elif is_validation or getattr(self, "is_sft_anchor", False):
             concepts = [c for c in concepts if not c.is_dpo()]
+        return concepts
+
+    def _create_mgds(
+        self,
+        config: TrainConfig,
+        definition: list,
+        train_progress: TrainProgress,
+        is_validation: bool = False,
+        concepts: list[ConceptConfig] | None = None,
+    ):
+        if concepts is None:
+            concepts = self._select_concepts(config, is_validation)
         concepts = [c.to_dict() for c in concepts]
 
         settings = {

@@ -4,7 +4,7 @@ when the package is missing."""
 
 import importlib.util
 
-from modules.util.text_reward_model import boxes_inside_region, latent_crop_region
+from modules.util.text_reward_model import boxes_inside_region, latent_crop_region, select_crop_region
 
 import torch
 
@@ -26,6 +26,33 @@ def test_latent_crop_region_covers_boxes_with_margin_and_respects_cap():
     assert 0 <= cy0 < cy1 <= lh and 0 <= cx0 < cx1 <= lw
 
     assert latent_crop_region([], lh, lw) == (0, lh, 0, lw)
+
+
+def test_select_crop_region_spends_the_budget_on_the_wrong_words_first():
+    lh = lw = 128
+    # three words on one line: left (correct), middle (correct), right (wrong)
+    boxes = [(0.05, 0.45, 0.25, 0.55), (0.30, 0.45, 0.50, 0.55), (0.70, 0.45, 0.95, 0.55)]
+    priorities = [0.0, 0.0, 0.8]
+    region = select_crop_region(boxes, priorities, lh, lw, margin=0.0, max_area=600)
+    kept = boxes_inside_region(boxes, region, lh, lw)
+    assert kept == [2]  # the wrong word is in, the far correct word is out
+    # the old rule centred on all three and lost the edge words
+    old = latent_crop_region(boxes, lh, lw, margin=0.0, max_area=600)
+    assert 2 not in boxes_inside_region(boxes, old, lh, lw)
+    # with no cap (or everything fitting) the window covers all boxes
+    assert select_crop_region(boxes, priorities, lh, lw, margin=0.0) == latent_crop_region(boxes, lh, lw, margin=0.0)
+    assert select_crop_region([], [], lh, lw) == (0, lh, 0, lw)
+    with pytest.raises(ValueError):
+        select_crop_region(boxes, [1.0], lh, lw)
+
+
+def test_select_crop_region_adds_correct_neighbours_while_they_fit():
+    lh = lw = 128
+    boxes = [(0.05, 0.45, 0.25, 0.55), (0.30, 0.45, 0.50, 0.55), (0.70, 0.45, 0.95, 0.55)]
+    priorities = [0.0, 0.5, 0.0]  # the middle word is wrong; both neighbours are correct
+    region = select_crop_region(boxes, priorities, lh, lw, margin=0.0, max_area=900)
+    kept = boxes_inside_region(boxes, region, lh, lw)
+    assert kept == [0, 1]  # the nearer neighbour fits, the far one does not
 
 
 def test_boxes_inside_region_filters_words_outside_the_decoded_window():

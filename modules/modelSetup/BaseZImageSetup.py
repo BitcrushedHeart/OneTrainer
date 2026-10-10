@@ -1,4 +1,5 @@
 from abc import ABCMeta
+from collections.abc import Callable
 from random import Random
 
 import modules.util.multi_gpu_util as multi
@@ -9,6 +10,7 @@ from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiff
 from modules.modelSetup.mixin.ModelSetupEmbeddingMixin import ModelSetupEmbeddingMixin
 from modules.modelSetup.mixin.ModelSetupFlowMatchingMixin import ModelSetupFlowMatchingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
+from modules.modelSetup.mixin.ModelSetupPerceptualLossMixin import ModelSetupPerceptualLossMixin
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.util.checkpointing_util import (
     enable_checkpointing_for_qwen3_encoder_layers,
@@ -22,6 +24,7 @@ from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 from modules.util.transfer_util import (
     TransferForkState,
+    high_frequency_ratio,
     run_late_stack,
     run_prefix_and_capture,
     split_layer_key,
@@ -31,6 +34,10 @@ from modules.util.transfer_util import (
 import torch
 from torch import Tensor
 
+# Noise level of the transfer sharpness probe: high enough that the one-step
+# prediction is dominated by what the model invents rather than what it is shown.
+TRANSFER_SHARPNESS_SIGMA = 0.9
+
 
 class BaseZImageSetup(
     BaseModelSetup,
@@ -38,6 +45,7 @@ class BaseZImageSetup(
     ModelSetupDebugMixin,
     ModelSetupNoiseMixin,
     ModelSetupFlowMatchingMixin,
+    ModelSetupPerceptualLossMixin,
     ModelSetupEmbeddingMixin,
     ModelSetupText2ImageMixin,
     metaclass=ABCMeta,
@@ -341,13 +349,54 @@ class BaseZImageSetup(
         mask = args[1] if len(args) > 1 and isinstance(args[1], Tensor) else kwargs.get("attn_mask")
         return TransferForkState(block_args=args, block_kwargs=kwargs, mask=mask)
 
+    def transfer_sharpness_probe(self, model: ZImageModel, batch: dict, config: TrainConfig, *, seed: int) -> float:
+        """One-step clean-latent prediction from a heavily noised latent, student
+        vs the raw variant (every adapter hook off), compared by high-frequency
+        energy. Caller holds no_grad; the seed fixes the noise so successive
+        validations are comparable."""
+        sigma = TRANSFER_SHARPNESS_SIGMA
+        with model.autocast_context:
+            generator = torch.Generator(device=config.train_device)
+            generator.manual_seed(seed)
+            batch_size = batch["latent_image"].shape[0]
+            text_encoder_output = model.encode_text(
+                train_device=self.train_device,
+                batch_size=batch_size,
+                rand=Random(seed),
+                tokens=batch.get("tokens"),
+                tokens_mask=batch.get("tokens_mask"),
+                text_encoder_output=batch.get("text_encoder_hidden_state"),
+                text_encoder_dropout_probability=None,
+            )
+            scaled_latent_image = model.scale_latents(batch["latent_image"])
+            latent_noise = self._create_noise(scaled_latent_image, config, generator)
+            scaled_noisy_latent_image = (1.0 - sigma) * scaled_latent_image + sigma * latent_noise
+            latent_input_list = list(
+                scaled_noisy_latent_image.unsqueeze(2).to(dtype=model.train_dtype.torch_dtype()).unbind(dim=0)
+            )
+            transformer_timestep = torch.full(
+                (batch_size,), 1.0 - sigma, device=scaled_latent_image.device, dtype=torch.float32
+            )
+
+            def predict_clean_latent() -> Tensor:
+                output_list = model.transformer(
+                    latent_input_list, transformer_timestep, text_encoder_output, return_dict=True
+                ).sample
+                predicted_flow = -torch.stack(output_list, dim=0).squeeze(dim=2)
+                return scaled_noisy_latent_image.float() - predicted_flow.float() * sigma
+
+            student = predict_clean_latent()
+            with self.prior_model(model, config):
+                variant = predict_clean_latent()
+        return high_frequency_ratio(student, variant)
+
     def transfer_late_forward(
         self,
         model: ZImageModel,
         state: TransferForkState,
         config: TrainConfig,
         *,
-        weights: dict[str, Tensor] | None = None,
+        weights: dict[str, Tensor] | Callable[[str], Tensor] | None = None,
     ) -> list[Tensor]:
         transformer = model.transformer
         blocks = list(transformer.layers[config.transfer_late_start :])
@@ -357,6 +406,21 @@ class BaseZImageSetup(
             else None
         )
         with model.autocast_context:
+            if callable(weights):
+                # Lazy weights (stem -> tensor): materialize, swap and release one
+                # block at a time, so the pass never holds a whole extra late stack.
+                swap_modules = self._transfer_swap_modules(model, config)
+                outputs = []
+                x = state.block_args[0]
+                for offset, block in enumerate(blocks):
+                    prefix = f"layers.{config.transfer_late_start + offset}."
+                    block_modules = {stem: module for stem, module in swap_modules.items() if stem.startswith(prefix)}
+                    block_weights = {stem: weights(stem) for stem in block_modules}
+                    with swap_module_weights(block_modules, block_weights):
+                        x = run_late_stack([block], x, state.block_args[1:], state.block_kwargs, checkpointing_fn)[0]
+                    del block_weights
+                    outputs.append(x)
+                return outputs
             if weights is not None:
                 with swap_module_weights(self._transfer_swap_modules(model, config), weights):
                     return run_late_stack(
@@ -373,13 +437,16 @@ class BaseZImageSetup(
         data: dict,
         config: TrainConfig,
     ) -> Tensor:
-        return self._flow_matching_losses(
+        losses = self._flow_matching_losses(
             batch=batch,
             data=data,
             config=config,
             train_device=self.train_device,
             sigmas=model.noise_scheduler.sigmas,
-        ).mean()
+        )
+        # per-sample, before the mean, so loss_weight / scaler semantics match MSE
+        losses = self._add_perceptual_loss(model, batch, data, config, losses)
+        return losses.mean()
 
     @staticmethod
     def _lpips_vae_colocated(vae_device: torch.device, train_device: torch.device) -> bool:

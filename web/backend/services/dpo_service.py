@@ -8,10 +8,60 @@ from contextlib import suppress
 from queue import Empty, Full, Queue
 
 from modules.util.dpo_swiss_service import SwissTournament, outermost_pairs
+from web.backend.services._dpo_session_lock import dpo_session_admission
 from web.backend.services._singleton import SingletonMixin
 from web.backend.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
+
+
+def parse_lora_terms(text: str) -> list[str]:
+    """Comma-separated LoRA filter text as lowercased, de-duplicated search
+    terms in input order. Blank entries vanish, so "" and ", ," both mean no
+    filter."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    terms: list[str] = []
+    for raw in str(text).split(","):
+        term = raw.strip().lower()
+        if term and term not in seen:
+            seen.add(term)
+            terms.append(term)
+    return terms
+
+
+def _lora_basename(name: str) -> str:
+    """ "flux/mychar.safetensors" -> "mychar": the part a user types when the
+    LoRA lives in a subfolder of SwarmUI's model tree."""
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, ext = os.path.splitext(base)
+    return stem if ext.lower() in (".safetensors", ".pt", ".ckpt", ".bin") else base
+
+
+def image_matches_lora_terms(loras, terms: list[str]) -> bool:
+    """True when one of the image's LoRA names contains one of ``terms`` as a
+    substring, or its basename (folder and extension stripped) equals one.
+    Matching is case-insensitive. No terms means every image matches; terms
+    with no LoRAs means none does."""
+    if not terms:
+        return True
+    # parse_lora_terms already lowercases; do it again so a caller handing
+    # over raw terms gets the same case-insensitive match.
+    wanted = [t.strip().lower() for t in terms if isinstance(t, str) and t.strip()]
+    if not wanted:
+        return True
+    for raw in loras or ():
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip().lower()
+        if not name:
+            continue
+        base = _lora_basename(name)
+        for term in wanted:
+            if term in name or term == base:
+                return True
+    return False
 
 
 class DPOService(SingletonMixin):
@@ -31,6 +81,8 @@ class DPOService(SingletonMixin):
         self._min_images_per_group = 2
         self._group_order = "most_realistic"
         self._caption_keywords: list[str] = []
+        # LoRA filter terms (see parse_lora_terms); empty means no filter.
+        self._lora_terms: list[str] = []
         self._ready_queue: Queue = Queue(maxsize=10)
         self._worker_thread: threading.Thread | None = None
         self._worker_stop = threading.Event()
@@ -82,6 +134,15 @@ class DPOService(SingletonMixin):
         self._backfill_thread: threading.Thread | None = None
         self._backfill_stop = threading.Event()
         self._backfill_state: dict = {"running": False}
+        # The backfill's priority lane: groups the user has on screen, scored
+        # next by the backfill thread itself so viewing never loads a model
+        # beside it (see `_await_backfill_coverage`).
+        self._backfill_cv = threading.Condition()
+        self._backfill_priority: list[list[str]] = []
+        self._backfill_covered: set[str] = set()
+        # Images in the order the scan will present them, so a backfill
+        # started mid-session leads the user rather than the filesystem.
+        self._scan_ordered_paths: list[str] = []
         # Serialises use of the resident OCR reader between the backfill
         # thread and the Selection panel: two threads loading the same weights
         # is twice the VRAM.
@@ -370,6 +431,7 @@ class DPOService(SingletonMixin):
 
     # ---- Curation Session ----
 
+    @dpo_session_admission
     def start_session(
         self,
         source_folder: str,
@@ -378,6 +440,7 @@ class DPOService(SingletonMixin):
         mode: str = "selection",
         group_order: str = "most_realistic",
         caption_filter: str = "",
+        lora_filter: str = "",
         min_images_per_group: int = 2,
     ) -> dict:
         from modules.util.dpo_curation_util import (
@@ -409,6 +472,7 @@ class DPOService(SingletonMixin):
         self._mode = mode
         self._group_order = group_order
         self._caption_keywords = parse_caption_keywords(caption_filter)
+        self._lora_terms = parse_lora_terms(lora_filter)
         self._manifest = load_manifest(output_dir)
         pruned = prune_orphaned_pairs(output_dir, self._manifest)
         existing = len(self._manifest.get("pairs", []))
@@ -773,8 +837,13 @@ class DPOService(SingletonMixin):
             if path not in valid:
                 return {"ok": False, "error": "Image is not part of the current group"}
 
+        # A backfill in flight scores the group itself; this call then only
+        # reads what it wrote (see `_await_backfill_coverage`).
+        covered = self._await_backfill_coverage(paths)
+        if self._scoring_disabled():
+            return {"ok": True, "scores": {}, "disabled": True}
         try:
-            scores = score_images_realism(list(paths), cache=cache, device=device)
+            scores = score_images_realism(list(paths), cache=cache, device=device, cache_only=covered)
         except RuntimeError as ex:
             return {"ok": False, "error": str(ex)}
 
@@ -887,10 +956,20 @@ class DPOService(SingletonMixin):
         if not paths:
             return {"ok": True, "scores": {}}
 
+        # While a backfill runs, it is the only thread that touches a model:
+        # the group is handed to its priority lane and scored there, and this
+        # call then answers from the cache alone. Anything still missing after
+        # that is a file the backfill could not score (or an axis whose model
+        # it could not load, reported below) — retrying here would only load
+        # the same model beside the backfill's.
+        covered = self._await_backfill_coverage(paths)
+        if self._scoring_disabled():
+            return {"ok": True, "scores": {}, "disabled": True}
+
         errors: dict[str, str] = {}
         realism: dict[str, float] = {}
         try:
-            realism = score_images_realism(paths, cache=cache, device=device)
+            realism = score_images_realism(paths, cache=cache, device=device, cache_only=covered)
         except RuntimeError as ex:
             errors["realism"] = str(ex)
 
@@ -899,7 +978,7 @@ class DPOService(SingletonMixin):
         ages: dict[str, dict] = {}
         if claimed_age_range(prompt) is not None:
             try:
-                ages = estimate_ages(paths, cache=cache, device=device)
+                ages = estimate_ages(paths, cache=cache, device=device, cache_only=covered)
             except RuntimeError as ex:
                 errors["age"] = str(ex)
 
@@ -915,10 +994,16 @@ class DPOService(SingletonMixin):
             # mentions text, and its verdict gates ahead of every other axis.
             if caption_text_spans(prompt):
                 try:
+                    # The handle is lazy: cache-only reads never load its weights.
                     reader = self._ocr_backend(device)
-                    text = score_images_text(paths, prompt, backend=reader, cache=cache)
+                    text = score_images_text(paths, prompt, backend=reader, cache=cache, cache_only=covered)
                 except RuntimeError as ex:
                     errors["text"] = str(ex)
+        if covered:
+            # An axis the backfill had to retire is missing here for the same
+            # reason; say so rather than showing a blank column.
+            for axis, why in dict(getattr(self, "_backfill_state", {}).get("errors", {})).items():
+                errors.setdefault(axis, why)
         if cache is not None:
             cache.save()
 
@@ -972,15 +1057,105 @@ class DPOService(SingletonMixin):
     #: batch, not for a chunk.
     _BACKFILL_HEAVY_BATCH = 8
 
-    @staticmethod
-    def _extract_group_key(path: str) -> tuple[str, str]:
-        """(normalised prompt, trainer bucket label) for one image — the scan's
-        grouping key and the backfill's way of knowing what each image's
-        caption asks for."""
-        from modules.util.dpo_curation_util import normalize_prompt_for_grouping, resolve_aspect_ratio
-        from modules.util.image_metadata_util import extract_metadata
+    # ---- Fix & Regenerate: growing the current group ----
 
-        meta = extract_metadata(path)
+    def group_snapshot(self) -> dict | None:
+        """What a regeneration run needs to know about the group on screen.
+
+        ``token`` identifies this presentation of the group — the key plus the
+        serial ``next_group`` assigned it — so a result that lands after the
+        user moved on is refused rather than appended to whatever group is
+        showing by then."""
+        with self._lock:
+            group = self._current_group
+            if not group:
+                return None
+            return {
+                "token": [group["prompt"], group["aspectratio"], self._groups_shown],
+                "group_index": self._groups_shown,
+                "images": set(group.get("images", [])),
+                "mode": self._mode,
+                "source_folder": self._source_folder,
+            }
+
+    def add_images_to_current_group(self, paths: list[str], token: list | tuple | None) -> dict:
+        """Append freshly generated images to the group on screen.
+
+        Selection mode only: Swiss copies the pool into its tournament at group
+        start and triage votes over a fixed stack. Nothing about the pick state
+        moves — in the worst phase the new images simply join the worst pool,
+        and a pending pair survives because ``confirm_pair`` recomputes the
+        remaining list at commit time. Once the group is released (confirm,
+        skip, discard, cancel) the token no longer matches and the images are
+        left on disk for a later scan to group normally. A discarded group
+        moves an added file that lives outside the source tree into a
+        ``.discard`` folder beside it; that is where the scanner would look for
+        it, so it stays hidden either way.
+
+        The lists are replaced, never mutated: ``select_image`` reads them
+        without the lock."""
+        paths = [str(p) for p in paths if p]
+        cache = self._hash_cache
+        digests: dict[str, str | None] = {}
+        mismatched: list[str] = []
+        group_key = None
+        with self._lock:
+            group = self._current_group
+            if group:
+                group_key = (group["prompt"], group["aspectratio"])
+        # Decode outside the lock: a full pixel hash plus metadata extraction
+        # per file, and both warm the scan cache for the next session.
+        for path in paths:
+            if not os.path.isfile(path):
+                digests[path] = None
+                continue
+            digests[path] = cache.get_pixel_hash(path) if cache is not None else None
+            if cache is not None and group_key is not None:
+                try:
+                    key = cache.get_group_key(path, self._extract_group_key)
+                except Exception:
+                    key = None
+                if key is not None and tuple(key) != group_key:
+                    mismatched.append(path)
+        with self._lock:
+            group = self._current_group
+            if not group:
+                return {"ok": False, "error": "Group changed"}
+            current = [group["prompt"], group["aspectratio"], self._groups_shown]
+            if token is None or list(token) != current:
+                return {"ok": False, "error": "Group changed"}
+            if self._mode != "selection":
+                return {"ok": False, "error": "Only available in selection mode"}
+            present = set(group.get("images", []))
+            added: list[str] = []
+            skipped: dict[str, str] = {}
+            for path in paths:
+                if path in present or path in added:
+                    skipped[path] = "already_present"
+                    continue
+                if not os.path.isfile(path):
+                    skipped[path] = "missing"
+                    continue
+                digest = digests.get(path)
+                if digest is not None and digest in self._used_pixel_hashes:
+                    skipped[path] = "identical_to_exported"
+                    continue
+                added.append(path)
+            if added:
+                group["images"] = [*group.get("images", []), *added]
+                self._remaining_images = [*self._remaining_images, *added]
+            return {
+                "ok": True,
+                "added": added,
+                "skipped": skipped,
+                "remaining_images": list(self._remaining_images),
+                "mismatched_key": [p for p in mismatched if p in added],
+            }
+
+    @staticmethod
+    def _group_key_from_meta(meta: dict, path: str) -> tuple[str, str]:
+        from modules.util.dpo_curation_util import normalize_prompt_for_grouping, resolve_aspect_ratio
+
         # The aspect component is the trainer bucket label ("7:4", "4:7",
         # ...) derived from actual pixel dimensions, so images that crop
         # to the same AspectBucketing bucket group together even when
@@ -990,6 +1165,24 @@ class DPOService(SingletonMixin):
         ar = resolve_aspect_ratio(meta.get("aspectratio", ""), path)
         prompt = normalize_prompt_for_grouping(meta.get("prompt", ""))
         return prompt, ar
+
+    @staticmethod
+    def _extract_group_key(path: str) -> tuple[str, str]:
+        """(normalised prompt, trainer bucket label) for one image — the scan's
+        grouping key and the backfill's way of knowing what each image's
+        caption asks for."""
+        from modules.util.image_metadata_util import extract_metadata
+
+        return DPOService._group_key_from_meta(extract_metadata(path), path)
+
+    @staticmethod
+    def _extract_group_key_and_loras(path: str) -> tuple[tuple[str, str], list[str]]:
+        """``_extract_group_key`` plus the image's LoRA names, from the same
+        single metadata read, for scans that apply the LoRA filter."""
+        from modules.util.image_metadata_util import extract_metadata
+
+        meta = extract_metadata(path)
+        return DPOService._group_key_from_meta(meta, path), list(meta.get("loras") or [])
 
     def start_score_backfill(self) -> dict:
         """Score every image in the session's source tree on every axis, in
@@ -1037,6 +1230,17 @@ class DPOService(SingletonMixin):
         if not paths:
             return {"ok": False, "error": f"No images found under {source}"}
 
+        # Lead the user: the scan's presentation order first, then whatever
+        # the scan left out (below min_images, already paired, ...).
+        tree = set(paths)
+        ordered = [p for p in getattr(self, "_scan_ordered_paths", []) if p in tree]
+        seen = set(ordered)
+        paths = ordered + [p for p in paths if p not in seen]
+
+        cv = self._backfill_sync()
+        with cv:
+            self._backfill_priority = []
+            self._backfill_covered = set()
         self._backfill_stop.clear()
         self._backfill_state = {
             "running": True,
@@ -1066,6 +1270,50 @@ class DPOService(SingletonMixin):
             key = None
         return key[0] if key else ""
 
+    def _backfill_sync(self) -> threading.Condition:
+        """The priority lane's condition variable (lazily built, like the
+        models lock, so a bare service still works)."""
+        cv = getattr(self, "_backfill_cv", None)
+        if cv is None:
+            cv = self._backfill_cv = threading.Condition()
+        if getattr(self, "_backfill_priority", None) is None:
+            self._backfill_priority = []
+        if getattr(self, "_backfill_covered", None) is None:
+            self._backfill_covered = set()
+        return cv
+
+    def _await_backfill_coverage(self, paths: list[str]) -> bool:
+        """Hand ``paths`` to a backfill in flight and wait until it has scored
+        them on every axis. ``True`` when it has — the caller then reads the
+        cache and loads nothing; ``False`` when no backfill is running (or it
+        stopped before reaching them), and the caller scores on demand as it
+        always did.
+
+        The point: while a backfill runs, one thread owns the models. A group
+        the user opens is scored *by the backfill*, at the front of its queue,
+        rather than by the request thread beside it — which built a second
+        set of sessions and doubled the VRAM."""
+        if not paths:
+            return False
+        cv = self._backfill_sync()
+
+        def running() -> bool:
+            return bool(getattr(self, "_backfill_state", {}).get("running"))
+
+        with cv:
+            if not running():
+                return False
+            missing = [p for p in paths if p not in self._backfill_covered]
+            if missing:
+                self._backfill_priority.append(missing)
+                cv.notify_all()
+            while True:
+                if all(p in self._backfill_covered for p in paths):
+                    return True
+                if not running():
+                    return all(p in self._backfill_covered for p in paths)
+                cv.wait(timeout=1.0)
+
     def _score_backfill_worker(self, paths: list[str], cache) -> None:
         from modules.util.adherence_score_util import claimed_age_range
         from modules.util.age_estimate_util import estimate_ages
@@ -1077,6 +1325,11 @@ class DPOService(SingletonMixin):
         errors: dict[str, str] = state["errors"]
         axes: dict[str, int] = state["axes"]
         lock = self._heavy_models_lock()
+        cv = self._backfill_sync()
+        # Progress counts the tree; a priority group may hold images from
+        # outside it (Fix & Regenerate results, say) which are scored but not
+        # counted against `total`.
+        tree = set(paths)
 
         def stopping() -> bool:
             # Same boundary the device switch is honoured at, for the same
@@ -1084,14 +1337,17 @@ class DPOService(SingletonMixin):
             # just stop displaying it.
             return self._backfill_stop.is_set() or self._scoring_disabled()
 
-        def run_axis(axis: str, count: int, fn, *args, **kwargs) -> None:
+        def counted(items: list[str]) -> int:
+            return sum(1 for p in items if p in tree)
+
+        def run_axis(axis: str, fn, items: list[str], **kwargs) -> None:
             """One scorer over its share of the chunk; a load failure retires
             the axis rather than the backfill."""
-            if axis in errors or count == 0:
+            if axis in errors or not items:
                 return
             try:
-                fn(*args, **kwargs)
-                axes[axis] += count
+                fn(items, **kwargs)
+                axes[axis] += counted(items)
             except RuntimeError as ex:
                 errors[axis] = str(ex)
 
@@ -1101,44 +1357,91 @@ class DPOService(SingletonMixin):
                     return
                 yield items[start : start + self._BACKFILL_HEAVY_BATCH]
 
+        def take_priority() -> list[str]:
+            """Everything the priority lane holds, the group asked for most
+            recently first, minus what is already covered."""
+            with cv:
+                pending, self._backfill_priority = self._backfill_priority, []
+                covered = self._backfill_covered
+                out: list[str] = []
+                seen: set[str] = set()
+                for group in reversed(pending):
+                    for p in group:
+                        if p not in seen and p not in covered:
+                            seen.add(p)
+                            out.append(p)
+            return out
+
+        def serve_priority() -> None:
+            while not stopping():
+                wanted = take_priority()
+                if not wanted:
+                    return
+                score_chunk(wanted, interruptible=False)
+
+        def score_chunk(chunk: list[str], *, interruptible: bool) -> None:
+            """Every axis over ``chunk``, then mark it covered. A tree chunk is
+            ``interruptible``: between its passes (and between OCR batches,
+            the slow part) it serves the priority lane, so a group the user
+            opens waits for one pass, not for the chunk."""
+            if not chunk:
+                return
+            device = self._realism_device
+            prompts = {path: self._backfill_prompt_for(path, cache) for path in chunk}
+            # What each caption asks for, decided once per distinct prompt:
+            # a chunk is mostly a handful of prompts repeated.
+            distinct = set(prompts.values())
+            claims_age = {p: claimed_age_range(p) is not None for p in distinct}
+            has_text = {p: bool(caption_text_spans(p)) for p in distinct}
+
+            # The ONNX heads build a session per call, so the device
+            # setting takes effect at the next chunk without a restart.
+            run_axis("realism", score_images_realism, chunk, cache=cache, device=device)
+            if interruptible:
+                serve_priority()
+            run_axis("quality", score_images_quality, chunk, cache=cache)
+
+            age_paths = [p for p in chunk if claims_age[prompts[p]]]
+            run_axis("age", estimate_ages, age_paths, cache=cache, device=device)
+            if interruptible:
+                serve_priority()
+
+            # SigLIP adherence is switched off: nothing to compute, but the
+            # axis is counted so the progress read keeps its shape.
+            axes["adherence"] += counted(chunk)
+
+            ocr_paths = [p for p in chunk if has_text[prompts[p]]]
+            if ocr_paths and "text" not in errors:
+                try:
+                    with lock:
+                        reader = self._ocr_backend(device)
+                    for batch in batches(ocr_paths):
+                        with lock:
+                            read_image_text(batch, backend=reader, cache=cache)
+                        axes["text"] += counted(batch)
+                        if interruptible:
+                            serve_priority()
+                except RuntimeError as ex:
+                    errors["text"] = str(ex)
+
+            if stopping():
+                # A chunk cut short is not covered: a waiter falls back to
+                # scoring on demand rather than reading half a cache entry.
+                return
+            with cv:
+                self._backfill_covered.update(chunk)
+                cv.notify_all()
+
         try:
             for start in range(0, len(paths), self._BACKFILL_CHUNK):
                 if stopping():
                     break
-                chunk = paths[start : start + self._BACKFILL_CHUNK]
-                device = self._realism_device
-                prompts = {path: self._backfill_prompt_for(path, cache) for path in chunk}
-                # What each caption asks for, decided once per distinct prompt:
-                # a chunk is mostly a handful of prompts repeated.
-                distinct = set(prompts.values())
-                claims_age = {p: claimed_age_range(p) is not None for p in distinct}
-                has_text = {p: bool(caption_text_spans(p)) for p in distinct}
-
-                # The ONNX heads build a session per call, so the device
-                # setting takes effect at the next chunk without a restart.
-                run_axis("realism", len(chunk), score_images_realism, chunk, cache=cache, device=device)
-                run_axis("quality", len(chunk), score_images_quality, chunk, cache=cache)
-
-                age_paths = [p for p in chunk if claims_age[prompts[p]]]
-                run_axis("age", len(age_paths), estimate_ages, age_paths, cache=cache, device=device)
-
-                # SigLIP adherence is switched off: nothing to compute, but the
-                # axis is counted so the progress read keeps its shape.
-                axes["adherence"] += len(chunk)
-
-                ocr_paths = [p for p in chunk if has_text[prompts[p]]]
-                if ocr_paths and "text" not in errors:
-                    try:
-                        with lock:
-                            reader = self._ocr_backend(device)
-                        for batch in batches(ocr_paths):
-                            with lock:
-                                read_image_text(batch, backend=reader, cache=cache)
-                            axes["text"] += len(batch)
-                    except RuntimeError as ex:
-                        errors["text"] = str(ex)
-
-                state["done"] = start + len(chunk)
+                serve_priority()
+                with cv:
+                    covered = self._backfill_covered
+                    chunk = [p for p in paths[start : start + self._BACKFILL_CHUNK] if p not in covered]
+                score_chunk(chunk, interruptible=True)
+                state["done"] = min(len(paths), start + self._BACKFILL_CHUNK)
                 # Persist as we go: a tree this size is minutes of work and a
                 # late failure should not throw all of it away. `save()` is a
                 # no-op when nothing changed.
@@ -1157,6 +1460,10 @@ class DPOService(SingletonMixin):
                 cache.save()
             state["running"] = False
             state["finished"] = True
+            # Wake every waiter: what is not covered by now never will be by
+            # this run, and they score on demand instead.
+            with cv:
+                cv.notify_all()
 
     def score_backfill_status(self) -> dict:
         state = dict(self._backfill_state)
@@ -1510,6 +1817,17 @@ class DPOService(SingletonMixin):
             logger.warning("could not read configured DPO concepts for image exclusion: %s", ex)
             return set(), []
 
+    def _retired_pixel_hashes(self) -> set[str]:
+        from modules.util.dpo_curation_util import retired_pixel_hashes
+        from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
+
+        folders = [self._output_dir] if self._output_dir else []
+        try:
+            folders += [os.path.dirname(chosen) for chosen, _ in dpo_concept_pattern_dirs(self._resolve_concepts())]
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("could not read configured DPO concepts for retired images: %s", ex)
+        return retired_pixel_hashes(folders)
+
     def _hash_paths(self, pool, paths: list[str]) -> dict[str, str]:
         """Hash ``paths`` through the persistent cache on ``pool``. Returns
         ``{path: hash}`` for files that could be hashed; returns early
@@ -1570,7 +1888,22 @@ class DPOService(SingletonMixin):
                 if ext in supported:
                     candidate_paths.append(os.path.join(root, filename))
         self._scan_total = len(candidate_paths)
-        extract_group_key = self._extract_group_key
+        lora_terms = self._lora_terms
+        # With a LoRA filter the scan also needs each image's LoRA list. Both
+        # fall out of the same metadata read, so they are fetched (and cached)
+        # together; without the filter the plain group-key path is unchanged
+        # and an existing cache is served as before.
+        if lora_terms:
+            extract_group_key_and_loras = self._extract_group_key_and_loras
+
+            def fetch(p: str):
+                return self._hash_cache.get_group_key_and_loras(p, extract_group_key_and_loras)
+        else:
+            extract_group_key = self._extract_group_key
+
+            def fetch(p: str):
+                key = self._hash_cache.get_group_key(p, extract_group_key)
+                return None if key is None else (key, [])
 
         # Pass 2: parallel metadata extraction, served from the persistent
         # cache for unchanged files — extraction reads (and for unmarked files,
@@ -1578,22 +1911,25 @@ class DPOService(SingletonMixin):
         # os.stat per file. The grouping dict is mutated only on the consumer
         # side of `as_completed`, so no lock is needed.
         groups_dict: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
+        loras_by_path: dict[str, list[str]] = {}
         if candidate_paths:
             with ThreadPoolExecutor(max_workers=self._metadata_worker_count()) as pool:
-                future_to_path = {
-                    pool.submit(self._hash_cache.get_group_key, p, extract_group_key): p for p in candidate_paths
-                }
+                future_to_path = {pool.submit(fetch, p): p for p in candidate_paths}
                 for future in as_completed(future_to_path):
                     if self._worker_stop.is_set():
                         pool.shutdown(wait=False, cancel_futures=True)
                         return
                     try:
-                        group_key = future.result()
+                        fetched = future.result()
                     except Exception:
-                        group_key = None
+                        fetched = None
                     self._scan_count += 1
-                    if group_key is not None:
-                        groups_dict[group_key].append(future_to_path[future])
+                    if fetched is not None:
+                        group_key, loras = fetched
+                        path = future_to_path[future]
+                        groups_dict[group_key].append(path)
+                        if lora_terms:
+                            loras_by_path[path] = loras
 
         min_images = self._min_images_per_group
         # as_completed scrambles arrival order; re-sort so group contents (and
@@ -1609,12 +1945,22 @@ class DPOService(SingletonMixin):
         if self._caption_keywords:
             keywords = self._caption_keywords
             raw_groups = [g for g in raw_groups if group_matches_keywords(g, keywords)]
+        # A LoRA filter keeps a group only when every image in it was made
+        # with a matching LoRA: one stray base-model generation would
+        # otherwise turn the pair into a LoRA-vs-no-LoRA comparison.
+        if lora_terms:
+            raw_groups = [
+                g
+                for g in raw_groups
+                if all(image_matches_lora_terms(loras_by_path.get(p, ()), lora_terms) for p in g["images"])
+            ]
         # Shuffle first so ties and unscored groups are not presented in
         # filesystem order, then rank: the sort is stable, so the shuffle
         # survives wherever the scores cannot separate two groups (and is the
         # whole order when the session asked for "random").
         random.shuffle(raw_groups)
         raw_groups = self._order_by_realism(raw_groups)
+        self._scan_ordered_paths = [path for group in raw_groups for path in group["images"]]
 
         existing_counts = manifest_pair_counts(self._manifest)
         foreign_sources, foreign_paths = self._foreign_concept_usage()
@@ -1629,6 +1975,9 @@ class DPOService(SingletonMixin):
             # filter alone misses those.
             exported = self._hash_paths(hash_pool, self._exported_image_paths() + foreign_paths)
             self._used_pixel_hashes.update(exported.values())
+            # Images Replace Pairs took out of a pair (here or in another
+            # concept) stay out, even under another name.
+            self._used_pixel_hashes.update(self._retired_pixel_hashes())
             if self._worker_stop.is_set():
                 return
 

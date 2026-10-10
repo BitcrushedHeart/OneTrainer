@@ -139,6 +139,9 @@ class ConceptConfig(BaseConfig):
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
     dpo_beta_override: float
+    unmasked_weight_override: float
+    unmasked_probability_override: float
+    cache_dir: str
 
     image: ConceptImageConfig
     text: ConceptTextConfig
@@ -242,5 +245,14 @@ class ConceptConfig(BaseConfig):
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
         data.append(("dpo_beta_override", 0.0, float, False))
+        # Masked training knobs per concept; negative = inherit the run's value.
+        # Inpainting models apply only the run-wide probability (their mgds
+        # module also blanks the conditioning image), so the probability
+        # override is ignored there.
+        data.append(("unmasked_weight_override", -1.0, float, False))
+        data.append(("unmasked_probability_override", -1.0, float, False))
+        # Empty = the run's cache_dir; otherwise this concept's image/text caches
+        # live under <cache_dir>/image and <cache_dir>/text instead.
+        data.append(("cache_dir", "", str, False))
 
         return ConceptConfig(data)

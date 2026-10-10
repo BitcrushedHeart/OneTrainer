@@ -1133,6 +1133,9 @@ class LoRAModuleWrapper:
                 "train_device": torch.device(config.train_device),
                 "lokr_vec_trick": config.lokr_vec_trick,
             }
+        # Learning rate of the DoRA-OFT magnitude multipliers; None trains them at the
+        # learning rate of the rest of the adapter.
+        self.dora_learning_rate = config.dora_oft_learning_rate if self.klass is DoRAOFTModule else None
         self.lora_modules = self.__create_modules(orig_module, config)
 
     def __create_modules(self, orig_module: nn.Module | None, config: TrainConfig) -> dict[str, PeftBase]:
@@ -1200,6 +1203,14 @@ class LoRAModuleWrapper:
         for module in self.lora_modules.values():
             parameters += module.parameters()
         return parameters
+
+    def dora_multiplier_parameters(self) -> list[Parameter]:
+        """The DoRA-OFT magnitude multipliers; empty for every other adapter type."""
+        return [
+            module.dora_multiplier
+            for module in self.lora_modules.values()
+            if isinstance(module, DoRAOFTModule) and module.dora_multiplier is not None
+        ]
 
     def to(self, device: torch.device = None, dtype: torch.dtype = None) -> "LoRAModuleWrapper":
         for module in self.lora_modules.values():

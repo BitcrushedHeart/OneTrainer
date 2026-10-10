@@ -197,6 +197,7 @@ def test_offline_reward_step_is_one_forward_and_backpropagates(tmp_path):
     config = TrainConfig.default_values()
     config.text_reward_source = TextRewardSource.OFFLINE_IMAGES
     config.text_reward_dataset_dir = str(tmp_path)
+    config.text_reward_init_sigma = 0.0  # the plain re-noise step, not the hybrid default
     config.text_reward_resolution = 768
     config.text_reward_rollout_steps = 25
     config.text_reward_random_grad_step = True
@@ -300,6 +301,10 @@ def _scripted_setup(tmp_path, *, save_interval=0):
     model = _offline_model(vae)
     config = TrainConfig.default_values()
     config.text_reward_source = TextRewardSource.OFFLINE_IMAGES
+    # legacy plain offline step and grad rule; the hybrid tests override these
+    config.text_reward_init_sigma = 0.0
+    config.text_reward_grad_sigma_min = 0.0
+    config.text_reward_grad_sigma_max = 1.0
     config.text_reward_resolution = 256
     config.text_reward_rollout_steps = 25
     config.text_reward_random_grad_step = True
@@ -348,9 +353,94 @@ def test_offline_preview_decode_and_save_run_after_backward(tmp_path):
     assert log == ["decode_crop", "ctc_loss", "backward", "read"]
 
 
-def test_online_rollout_still_runs_the_probe_before_the_grad_forward(tmp_path):
+@pytest.mark.parametrize("reuse", [True, False])
+def test_hybrid_offline_rolls_the_policy_from_the_init_sigma_and_probes(tmp_path, reuse):
+    setup, model, _vae, config, sample, log = _scripted_setup(tmp_path)
+    config.text_reward_reuse_probe_graph = reuse
+    # a grad-bearing velocity so the retained velocity gradient is measurable
+    setup.source = torch.nn.Parameter(torch.zeros(1, 3, 16, 32))
+    config.text_reward_rollout_steps = 8  # no shift on the fake model: 1, .875, .75, .625, .5, ...
+    config.text_reward_random_grad_step = False
+    config.text_reward_init_sigma = 0.8  # nearest grid index 2 (0.75)
+    config.text_reward_grad_sigma_min = 0.4
+    config.text_reward_grad_sigma_max = 0.7  # indices 3, 4 -> fixed pick 4 (0.5)
+    grad_flags = []
+    original_predict = setup.predict_distill_velocity
+
+    def predict_spy(*args, **kwargs):
+        grad_flags.append(torch.is_grad_enabled())
+        log.append("forward")
+        return original_predict(*args, **kwargs)
+
+    setup.predict_distill_velocity = predict_spy
+    _spy_decode(setup, log)
+    progress = SimpleNamespace(global_step=3, epoch=0, epoch_step=3)
+
+    def backward(loss):
+        log.append("backward")
+        loss.backward()
+
+    value = setup.calculate_text_reward_loss(model, sample, config, progress, backward)
+
+    # source encode + its cached detect (miss), 2 prefix forwards (2 -> 4), the
+    # probe forward + full decode + detect on the policy's x0, then the grad
+    # step; with the held graph the probe is the grad forward itself
+    grad_forward = [] if reuse else ["forward"]
+    assert log == ["encode", "detect", "forward", "forward", "forward", "decode_tiled", "detect"] + grad_forward + [
+        "decode_crop",
+        "ctc_loss",
+        "backward",
+    ]
+    assert grad_flags == ([False, False, True] if reuse else [False, False, False, True])
+    assert torch.isfinite(value)
+    metrics = setup.get_last_text_reward_metrics()
+    assert metrics["grad_sigma"] == pytest.approx(0.5)
+    assert metrics["grad_norm_v"] > 0.0
+    assert metrics["scored_words"] == 2 and metrics["scored_wrong_words"] == 0  # the scripted OCR reads them right
+    assert metrics["word_ratio"] == 1.0
+
+    # cache hit on the second visit: only the source encode/detect drop out
+    log.clear()
+    grad_flags.clear()
+    setup.calculate_text_reward_loss(model, sample, config, progress, backward)
+    assert log[:2] == ["forward", "forward"] and "encode" not in log and "read" not in log
+
+
+def test_hybrid_offline_runs_cfg_in_the_prefix_when_a_negative_embedding_exists(tmp_path):
+    setup, model, _vae, config, sample, log = _scripted_setup(tmp_path)
+    config.text_reward_rollout_steps = 8
+    config.text_reward_random_grad_step = False
+    config.text_reward_init_sigma = 0.8
+    config.text_reward_grad_sigma_min = 0.4
+    config.text_reward_grad_sigma_max = 0.7
+    config.text_reward_cfg_scale = 4.0
+    sample = TextRewardSample(sample.spec, sample.embedding, torch.zeros(4, 8), sample.image_path)
+    _log_calls(setup, "predict_distill_velocity", log, "forward")
+    progress = SimpleNamespace(global_step=3, epoch=0, epoch_step=3)
+    setup.calculate_text_reward_loss(model, sample, config, progress, lambda loss: log.append("backward"))
+    # 2 prefix steps x (cond + uncond) = 4, then the probe that is also the grad forward
+    assert log.count("forward") == 5
+
+
+def test_plain_offline_step_with_init_sigma_zero_is_unchanged(tmp_path):
+    setup, model, vae, config, sample, log = _scripted_setup(tmp_path)
+    assert TrainConfig.default_values().text_reward_init_sigma > 0.0  # the hybrid is the default now
+    assert config.text_reward_init_sigma == 0.0  # pinned by the scripted setup
+    _spy_decode(setup, log)
+    progress = SimpleNamespace(global_step=7, epoch=0, epoch_step=7)
+    setup.calculate_text_reward_loss(model, sample, config, progress, lambda loss: loss.backward())
+    assert setup.forwards == 1 and setup.grad_forwards == 1
+    assert log == ["encode", "detect", "decode_crop", "ctc_loss", "read"]
+    metrics = setup.get_last_text_reward_metrics()
+    assert metrics["scored_wrong_words"] == 0.0 and metrics["grad_norm_v"] == 0.0  # no grad-bearing velocity here
+    assert 0.0 < metrics["grad_sigma"] < 1.0
+
+
+@pytest.mark.parametrize("reuse", [True, False])
+def test_online_rollout_still_runs_the_probe_before_the_grad_forward(tmp_path, reuse):
     setup, model, _vae, config, _sample, log = _scripted_setup(tmp_path)
     config.text_reward_source = TextRewardSource.ONLINE_ROLLOUT
+    config.text_reward_reuse_probe_graph = reuse
     config.text_reward_rollout_steps = 4
     config.text_reward_random_grad_step = False  # grad step 3 -> 3 prefix forwards
     sample = TextRewardSample(TextSpec("Sign", " ".join(_WORDS), _WORDS, "words"), torch.zeros(4, 8), None)
@@ -367,7 +457,63 @@ def test_online_rollout_still_runs_the_probe_before_the_grad_forward(tmp_path):
     progress = SimpleNamespace(global_step=3, epoch=0, epoch_step=3)
     setup.calculate_text_reward_loss(model, sample, config, progress, lambda loss: log.append("backward"))
 
-    # 3 prefix forwards + the no-grad probe, its full decode and detect, then the grad forward
-    assert grad_flags == [False, False, False, False, True]
-    assert log == ["forward"] * 4 + ["decode_tiled", "detect", "forward", "decode_crop", "ctc_loss", "backward"]
+    # 3 prefix forwards + the probe, its full decode and detect, then the grad
+    # forward; with the held graph the probe is the grad forward itself
+    if reuse:
+        assert grad_flags == [False, False, False, True]
+        assert log == ["forward"] * 4 + ["decode_tiled", "detect", "decode_crop", "ctc_loss", "backward"]
+    else:
+        assert grad_flags == [False, False, False, False, True]
+        assert log == ["forward"] * 4 + ["decode_tiled", "detect", "forward", "decode_crop", "ctc_loss", "backward"]
     assert not os.path.isdir(os.path.join(config.cache_dir, "text_reward"))
+
+
+def test_held_probe_graph_needs_gradient_checkpointing(tmp_path):
+    from modules.util.enum.GradientCheckpointingMethod import GradientCheckpointingMethod
+
+    config = TrainConfig.default_values()
+    assert config.text_reward_reuse_probe_graph is True
+    assert _FakeSetup._text_reward_can_hold_probe_graph(config)
+    config.gradient_checkpointing = GradientCheckpointingMethod.OFF
+    assert not _FakeSetup._text_reward_can_hold_probe_graph(config)
+    config.gradient_checkpointing = GradientCheckpointingMethod.ON
+    config.text_reward_reuse_probe_graph = False
+    assert not _FakeSetup._text_reward_can_hold_probe_graph(config)
+    assert TrainConfig.default_values().from_dict({"__version": 28}).text_reward_reuse_probe_graph is True
+
+
+def test_plain_offline_skips_the_grad_forward_when_nothing_is_scored(tmp_path):
+    setup, model, _vae, config, sample, log = _scripted_setup(tmp_path)
+    setup._text_reward_model.words = ["zzzz", "qqqq"]  # nothing aligns with the target words
+    _spy_decode(setup, log)
+    progress = SimpleNamespace(global_step=7, epoch=0, epoch_step=7)
+    backwards = []
+    value = setup.calculate_text_reward_loss(model, sample, config, progress, backwards.append)
+    assert setup.forwards == 0 and backwards == [] and float(value) == 0.0
+    assert log == ["encode", "detect"]
+    assert setup.get_last_text_reward_metrics()["scored_words"] == 0.0
+
+
+def test_plain_offline_skip_still_previews_on_a_save_step(tmp_path):
+    setup, model, _vae, config, sample, log = _scripted_setup(tmp_path, save_interval=1)
+    setup._text_reward_model.words = ["zzzz", "qqqq"]
+    _spy_decode(setup, log)
+    progress = SimpleNamespace(global_step=9, epoch=0, epoch_step=9)
+    setup.calculate_text_reward_loss(model, sample, config, progress, lambda loss: log.append("backward"))
+    assert setup.forwards == 1 and setup.grad_forwards == 0  # the preview's no-grad forward only
+    assert log == ["encode", "detect", "decode_tiled"]
+    assert os.path.exists(os.path.join(config.workspace_dir, "text_reward", "00000009.png"))
+
+
+def test_probe_without_held_graph_skips_the_grad_forward_when_nothing_is_scored(tmp_path):
+    setup, model, _vae, config, _sample, log = _scripted_setup(tmp_path)
+    config.text_reward_source = TextRewardSource.ONLINE_ROLLOUT
+    config.text_reward_reuse_probe_graph = False
+    config.text_reward_rollout_steps = 4
+    config.text_reward_random_grad_step = False
+    setup._text_reward_model.words = ["zzzz", "qqqq"]
+    sample = TextRewardSample(TextSpec("Sign", " ".join(_WORDS), _WORDS, "words"), torch.zeros(4, 8), None)
+    progress = SimpleNamespace(global_step=3, epoch=0, epoch_step=3)
+    backwards = []
+    setup.calculate_text_reward_loss(model, sample, config, progress, backwards.append)
+    assert setup.forwards == 4 and setup.grad_forwards == 0 and backwards == []  # 3 prefix + the probe

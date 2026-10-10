@@ -712,8 +712,13 @@ def read_image_text(
     backend,
     cache=None,
     progress: Callable[[int, int], None] | None = None,
+    cache_only: bool = False,
 ) -> dict[str, str]:
     """The OCR reading of every readable path, cache first, model for the rest.
+
+    ``cache_only`` never calls the backend (so a lazy reader handle never
+    loads its weights): a miss is left unread, for a caller that knows a
+    backfill has already been over these paths.
 
     Unreadable files and readings that raise are skipped (the image ends up
     with no text score rather than a wrong one).
@@ -745,6 +750,8 @@ def read_image_text(
     total = len(paths)
     if progress is not None:
         progress(done, total)
+    if cache_only:
+        return readings
     for path in misses:
         try:
             with Image.open(path) as handle:
@@ -783,8 +790,10 @@ def score_images_text(
     cache=None,
     device: str = "auto",
     progress: Callable[[int, int], None] | None = None,
+    cache_only: bool = False,
 ) -> dict[str, dict]:
     """Text adherence of each readable path to the text ``prompt`` claims.
+    ``cache_only`` is passed through to :func:`read_image_text`.
 
     Returns ``{path: {text, text_min, n_text, ocr_text, propositions: [{text,
     axis, label, prob, read}]}}``. A caption that claims no on-image text
@@ -796,7 +805,7 @@ def score_images_text(
         return {}
     if backend is None:
         backend = load_ocr_backend(device=device)
-    readings = read_image_text(list(paths), backend=backend, cache=cache, progress=progress)
+    readings = read_image_text(list(paths), backend=backend, cache=cache, progress=progress, cache_only=cache_only)
     results: dict[str, dict] = {}
     for path, ocr_text in readings.items():
         summary = score_text(spans, ocr_text)

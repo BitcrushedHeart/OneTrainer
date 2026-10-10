@@ -1,11 +1,13 @@
+import hashlib
 import os
 import warnings
 from abc import ABCMeta, abstractmethod
+from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext, suppress
 
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.mixin.ModelSetupTextRewardMixin import ModelSetupTextRewardMixin
-from modules.module.LoRAModule import OFTModule
+from modules.module.LoRAModule import LoRAModuleWrapper, OFTModule
 from modules.module.oft_utils import ROTATION_CACHE_STALE_RATIO, OFTRotationModule
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.distill_dmd2_util import (
@@ -22,11 +24,18 @@ from modules.util.enum.DistillCfgMode import DistillCfgMode
 from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.loss.masked_loss import clamp_mask, masked_mse_per_sample, resolve_unmasked_weight
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.TimedActionMixin import TimedActionMixin
 from modules.util.TrainProgress import TrainProgress
-from modules.util.transfer_util import transfer_activation_loss
+from modules.util.transfer_util import (
+    add_distillation_offset,
+    recover_base_weight,
+    transfer_activation_loss,
+    transfer_education_gaps,
+    transfer_turbo_metrics,
+)
 
 import torch
 from torch import Tensor, nn
@@ -189,6 +198,10 @@ class BaseModelSetup(
         self._dpo_ref_saved = None  # (version, path) of the last dpo_reference.pt written or loaded
         self._dpo_ref_pinned_version = None  # snapshot version already pinned for CUDA uploads
         self._last_dpo_metrics = None
+        # Per-pair values of the last DPO micro-batch, for the per-concept and live
+        # saturation logging (empty unless one of them is enabled).
+        self._last_dpo_pair_records: list[dict] = []
+        self._dpo_ref_fingerprint = None  # (reference version, fingerprint) cache
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
         self._last_distill_metrics = None
@@ -474,6 +487,9 @@ class BaseModelSetup(
 
     def get_last_dpo_metrics(self) -> dict[str, float]:
         return self._last_dpo_metrics or {}
+
+    def get_last_dpo_pair_records(self) -> list[dict]:
+        return self._last_dpo_pair_records
 
     def get_last_distill_metrics(self) -> dict[str, float | str]:
         return self._last_distill_metrics or {}
@@ -1043,15 +1059,34 @@ class BaseModelSetup(
         seed: int | None = None,
         latent_input: Tensor | None = None,
         sigma: Tensor | None = None,
+        turbo_metrics: bool = False,
     ) -> Tensor:
         """Shared core of the transfer losses: one prefix forward, then the
         late stack twice (teacher weights swapped in vs student), per-block
-        activation MSE."""
+        activation MSE.
+
+        With raw Base late weights available (transfer mode), two more
+        hook-free late passes -- raw variant and raw Base -- give the
+        distillation offset. Base weights are recovered from the teacher's one
+        block at a time (``transfer_base_recovery``), so no second copy of the
+        late tensors is held. ``transfer_preserve_distillation`` adds the offset
+        to the teacher
+        target every step; ``turbo_metrics`` (validation) only reports how much
+        of it the student retains."""
         teacher_weights = getattr(model, "transfer_teacher_late_tensors", None)
         if not teacher_weights:
             raise RuntimeError(
                 "transfer teacher tensors are not loaded; setup_model must run with transfer or redistill enabled."
             )
+        base_weights = getattr(model, "transfer_base_late_tensors", None)
+        base_recovery = getattr(model, "transfer_base_recovery", None)
+        if not base_weights and base_recovery:
+
+            def base_weights(stem: str) -> Tensor:
+                return recover_base_weight(teacher_weights[stem], *base_recovery[stem])
+
+        preserve = bool(base_weights) and bool(getattr(config, "transfer_preserve_distillation", False))
+        with_offset = bool(base_weights) and (preserve or turbo_metrics)
 
         # Injection kwargs only when set: keeps overrides with the plain
         # transfer signature working.
@@ -1071,16 +1106,45 @@ class BaseModelSetup(
             # including non-family adapted modules like attention.to_out.0).
             with self.prior_model(model, config):
                 teacher_outs = self.transfer_late_forward(model, state, config, weights=teacher_weights)
+                if with_offset:
+                    # Raw variant (the model's own late weights, hooks off) and
+                    # raw Base from the same fork inputs: their difference is
+                    # the variant's distillation, with no education in it.
+                    variant_outs = self.transfer_late_forward(model, state, config, weights=None)
+                    base_outs = self.transfer_late_forward(model, state, config, weights=base_weights)
+            target_outs = teacher_outs
+            mask = state.mask if config.transfer_mask_padded_tokens else None
+            if with_offset:
+                # While raw Base's outputs are still at hand: how large the
+                # late-stack education's own effect is, block by block.
+                education_gaps = transfer_education_gaps(teacher_outs, base_outs, mask=mask)
+            if preserve:
+                target_outs = add_distillation_offset(teacher_outs, variant_outs, base_outs)
+                # target - teacher IS the offset: keep that pair for the metrics
+                # and drop the two raw passes before the student's graph is built.
+                variant_outs, base_outs = target_outs, teacher_outs
 
         student_outs = self.transfer_late_forward(model, state, config, weights=None)
 
         loss, metrics = transfer_activation_loss(
             student_outs,
-            teacher_outs,
-            mask=state.mask if config.transfer_mask_padded_tokens else None,
+            target_outs,
+            mask=mask,
             normalize=config.transfer_block_loss_normalize,
             block_index_offset=config.transfer_late_start,
         )
+        if with_offset:
+            metrics.update(
+                transfer_turbo_metrics(
+                    student_outs,
+                    teacher_outs,
+                    variant_outs,
+                    base_outs,
+                    mask=mask,
+                    block_index_offset=config.transfer_late_start,
+                    education_gaps=education_gaps,
+                )
+            )
         self._last_transfer_metrics = {**metrics, "loss": float(loss.detach())}
         return loss
 
@@ -1093,10 +1157,19 @@ class BaseModelSetup(
         *,
         deterministic: bool = False,
         seed: int | None = None,
+        turbo_metrics: bool = False,
     ) -> Tensor:
         return self._transfer_activation_match(
-            model, batch, config, train_progress, deterministic=deterministic, seed=seed
+            model, batch, config, train_progress, deterministic=deterministic, seed=seed, turbo_metrics=turbo_metrics
         )
+
+    def transfer_sharpness_probe(
+        self, model: BaseModel, batch: dict, config: TrainConfig, *, seed: int
+    ) -> float | None:
+        """High-noise sharpness of the student's one-step prediction relative to
+        the raw variant's (see transfer_util.high_frequency_ratio). None when the
+        model type has no probe."""
+        return None
 
     def _redistill_rollout_x_k(
         self,
@@ -1173,16 +1246,59 @@ class BaseModelSetup(
     def get_last_transfer_metrics(self) -> dict[str, float]:
         return self._last_transfer_metrics or {}
 
+    _TRANSFER_VAL_BATCHES_FILENAME = "transfer-val-batches.pt"
+
+    def _transfer_val_batches_path(self, config: TrainConfig) -> str:
+        return os.path.join(config.workspace_dir, "backup", self._TRANSFER_VAL_BATCHES_FILENAME)
+
+    def _load_transfer_val_batches(self, config: TrainConfig) -> list[dict]:
+        """The validation batches a continued run saved, or [] to capture anew.
+
+        The residual is only comparable between validations of the SAME batch
+        set. A resume that re-captured its batches used to be scored against the
+        pre-resume best on a different yardstick: when the new set read higher,
+        no validation could beat that best and patience ran out on a run that
+        was still improving."""
+        path = self._transfer_val_batches_path(config)
+        wanted = max(1, int(config.transfer_validation_batches))
+        if not getattr(config, "continue_last_backup", False) or not os.path.isfile(path):
+            return []
+        try:
+            batches = torch.load(path, map_location="cpu", weights_only=True)
+            if not isinstance(batches, list) or len(batches) != wanted:
+                return []
+            return [
+                {key: value.to(self.train_device) if isinstance(value, Tensor) else value for key, value in b.items()}
+                for b in batches
+            ]
+        except Exception as exception:  # noqa: BLE001 - fall back to a fresh capture
+            print(f"Could not read the saved transfer validation batches ({exception}); capturing new ones.")
+            return []
+
+    def _save_transfer_val_batches(self, config: TrainConfig, batches: list[dict]) -> None:
+        path = self._transfer_val_batches_path(config)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            cpu_batches = [
+                {key: value.cpu() if isinstance(value, Tensor) else value for key, value in b.items()} for b in batches
+            ]
+            torch.save(cpu_batches, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        except Exception as exception:  # noqa: BLE001 - costs comparability across a resume, not the run
+            print(f"Could not save the transfer validation batches ({exception}).")
+
     def capture_transfer_val_batch(self, batch: dict, config: TrainConfig):
         """Stash the first N training batches for the deterministic convergence
-        validation (mirrors capture_distill_val_batch; nothing is held out)."""
+        validation (mirrors capture_distill_val_batch; nothing is held out). The
+        full set is saved beside the backups and reused by a continued run."""
         if not getattr(config, "transfer_validation", False):
             return
         cache = getattr(self, "_transfer_val_batches", None)
         if cache is None:
-            cache = []
+            cache = self._load_transfer_val_batches(config)
             self._transfer_val_batches = cache
-        if len(cache) >= max(1, int(config.transfer_validation_batches)):
+        wanted = max(1, int(config.transfer_validation_batches))
+        if len(cache) >= wanted:
             return
         keep: dict = {}
         for key, value in batch.items():
@@ -1191,6 +1307,8 @@ class BaseModelSetup(
             elif isinstance(value, (list, tuple, str, int, float)) or value is None:
                 keep[key] = value
         cache.append(keep)
+        if len(cache) >= wanted:
+            self._save_transfer_val_batches(config, cache)
 
     def run_transfer_validation(self, model: BaseModel, config: TrainConfig, train_progress) -> dict[str, float]:
         """Averaged teacher-match residuals over the cached batches, with fixed
@@ -1198,17 +1316,39 @@ class BaseModelSetup(
         batches = getattr(self, "_transfer_val_batches", None)
         if not batches:
             return {}
+        if len(batches) < max(1, int(config.transfer_validation_batches)):
+            # The cache fills over the first N steps. A validation on a partial
+            # cache (the step-0 one) averages a different batch set, so its
+            # residual is not comparable with later ones -- and when it happens
+            # to be lower it becomes a "best" nothing afterwards can beat.
+            return {}
         sums: dict[str, float] = {}
         # Redistill's Phase A residual must be measured with the redistill loss
         # (student-trajectory inputs), else convergence-stop scores the wrong
         # distribution.
-        loss_fn = self.calculate_redistill_transfer_loss if config.redistill_enabled else self.calculate_transfer_loss
         with torch.no_grad():
             for index, batch in enumerate(batches):
-                loss_fn(model, batch, config, train_progress, deterministic=True, seed=1_000_003 + index)
+                seed = 1_000_003 + index
+                if config.redistill_enabled:
+                    self.calculate_redistill_transfer_loss(
+                        model, batch, config, train_progress, deterministic=True, seed=seed
+                    )
+                else:
+                    self.calculate_transfer_loss(
+                        model, batch, config, train_progress, deterministic=True, seed=seed, turbo_metrics=True
+                    )
                 for key, value in self.get_last_transfer_metrics().items():
                     if isinstance(value, (int, float)):
                         sums[key] = sums.get(key, 0.0) + float(value)
+                if not config.redistill_enabled and not getattr(self, "_transfer_sharpness_failed", False):
+                    try:
+                        sharpness = self.transfer_sharpness_probe(model, batch, config, seed=seed)
+                    except Exception as exception:  # noqa: BLE001 - a diagnostic must not cost the residual
+                        self._transfer_sharpness_failed = True
+                        sharpness = None
+                        print(f"Transfer sharpness probe disabled after error: {exception}")
+                    if sharpness is not None:
+                        sums["turbo_sharpness"] = sums.get("turbo_sharpness", 0.0) + sharpness
         return {key: value / len(batches) for key, value in sums.items()}
 
     def set_dpo_runtime_beta(self, beta: float | None):
@@ -1263,11 +1403,7 @@ class BaseModelSetup(
                 "RLHF DPO requires paired chosen/rejected batches, but the dataloader did not provide rejected samples."
             )
 
-        def mse_per_sample(pred, target):
-            # fp32 accumulation in the reduction instead of upcasting the full
-            # [2B,C,H,W] tensors - avoids four fp32 copies per step.
-            return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
-
+        mse_per_sample = self._dpo_mse_per_sample
         beta = self._resolve_dpo_beta(config, batch)
         supervised_loss = None
 
@@ -1278,6 +1414,12 @@ class BaseModelSetup(
         # supervised/validation batches are B-sized while DPO batches are
         # 2B-sized, so mixing them in one session compiles two graphs.
         batched_input, chosen_b = self._create_dpo_batched_batch(batch)
+        # Masked DPO: latent_mask (and latent_mask_rejected, when the rejected
+        # image has its own mask) are stacked [chosen; rejected] like the
+        # latents, so each half below slices its own mask.
+        mask = self._dpo_mask_weights(batched_input, config)
+        mask_c = mask[:chosen_b] if mask is not None else None
+        mask_r = mask[chosen_b:] if mask is not None else None
 
         # Conditioning (caption) dropout is drawn per-sample inside encode_text.
         # On the [chosen; rejected] batch that independently zeroes the prompt on
@@ -1297,8 +1439,8 @@ class BaseModelSetup(
                 ref_output = self.predict(model, batched_input, config, train_progress)
                 ref_predicted = ref_output["predicted"]
                 ref_target = ref_output["target"]
-                ref_chosen_logp = -mse_per_sample(ref_predicted[:chosen_b], ref_target[:chosen_b])
-                ref_rejected_logp = -mse_per_sample(ref_predicted[chosen_b:], ref_target[chosen_b:])
+                ref_chosen_logp = -mse_per_sample(ref_predicted[:chosen_b], ref_target[:chosen_b], mask_c)
+                ref_rejected_logp = -mse_per_sample(ref_predicted[chosen_b:], ref_target[chosen_b:], mask_r)
                 del ref_output, ref_predicted, ref_target
 
             policy_output = self.predict(model, batched_input, config, train_progress)
@@ -1309,8 +1451,8 @@ class BaseModelSetup(
         policy_timestep = policy_output.get("timestep")
         policy_predicted = policy_output["predicted"]
         policy_target = policy_output["target"]
-        policy_chosen_logp = -mse_per_sample(policy_predicted[:chosen_b], policy_target[:chosen_b])
-        policy_rejected_logp = -mse_per_sample(policy_predicted[chosen_b:], policy_target[chosen_b:])
+        policy_chosen_logp = -mse_per_sample(policy_predicted[:chosen_b], policy_target[:chosen_b], mask_c)
+        policy_rejected_logp = -mse_per_sample(policy_predicted[chosen_b:], policy_target[chosen_b:], mask_r)
         if config.rlhf_supervised_mix > 0:
             chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
             supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
@@ -1330,7 +1472,17 @@ class BaseModelSetup(
             del supervised_loss
 
         self._record_dpo_metrics(
-            model, config, loss, dpo_loss, chosen_ratio, rejected_ratio, margin, policy_timestep, chosen_b, beta
+            model,
+            config,
+            loss,
+            dpo_loss,
+            chosen_ratio,
+            rejected_ratio,
+            margin,
+            policy_timestep,
+            chosen_b,
+            beta,
+            image_paths=batch.get("image_path"),
         )
 
         return loss
@@ -1345,7 +1497,31 @@ class BaseModelSetup(
         }
 
     @staticmethod
-    def _dpo_mse_per_sample(pred: Tensor, target: Tensor) -> Tensor:
+    def _dpo_mask_weights(batch: dict, config: TrainConfig) -> Tensor | None:
+        """The clamped latent mask for masked DPO, or None when the pair's
+        log-probs cover the whole latent.
+
+        Each log-prob then becomes the per-pixel average error inside the
+        weighted region (see masked_mse_per_sample), so the margin does not
+        scale with the mask's area and beta means the same thing for every
+        pair. The chosen and rejected halves each use their own mask: the
+        dataloader loads the rejected image's -masklabel.png when it has one
+        and otherwise shares the chosen mask, which is right for aligned pairs
+        (an in-place fix of the chosen image). The per-concept unmasked weight
+        override rides along per sample like the beta override.
+        """
+        if not config.masked_training or config.model_type.has_conditioning_image_input():
+            return None
+        mask = batch.get("latent_mask")
+        if not isinstance(mask, Tensor):
+            return None
+        mask = mask.to(dtype=torch.float32)
+        return clamp_mask(mask, resolve_unmasked_weight(batch, config, mask.ndim))
+
+    @staticmethod
+    def _dpo_mse_per_sample(pred: Tensor, target: Tensor, mask: Tensor | None = None) -> Tensor:
+        if mask is not None:
+            return masked_mse_per_sample(pred, target, mask)
         # fp32 accumulation in the reduction instead of upcasting the full
         # [B,C,H,W] tensors - avoids fp32 copies per step.
         return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
@@ -1413,11 +1589,16 @@ class BaseModelSetup(
         mse = self._dpo_mse_per_sample
         hold_rejected_graph = self._dpo_light_can_hold_rejected_graph(config)
 
-        def half_logp(half_batch: dict) -> Tensor:
+        # split_dpo_pair_batch hands the rejected half latent_mask_rejected under
+        # the latent_mask key, so each half resolves its own mask here.
+        chosen_mask = self._dpo_mask_weights(chosen_batch, config)
+        rejected_mask = self._dpo_mask_weights(rejected_batch, config)
+
+        def half_logp(half_batch: dict, half_mask: Tensor | None) -> Tensor:
             # The output dict dies with this call; only the per-sample log-prob
             # (and its graph, under grad) outlives it.
             output = self.predict(model, half_batch, config, train_progress)
-            return -mse(output["predicted"], output["target"])
+            return -mse(output["predicted"], output["target"], half_mask)
 
         # Same conditioning-dropout neutralization as the fused path: both
         # halves must see identical prompts.
@@ -1429,21 +1610,21 @@ class BaseModelSetup(
                 te.dropout_probability = 0.0
 
             with torch.no_grad(), self.reference_model(model, config):
-                ref_chosen_logp = half_logp(chosen_batch)
-                ref_rejected_logp = half_logp(rejected_batch)
+                ref_chosen_logp = half_logp(chosen_batch, chosen_mask)
+                ref_rejected_logp = half_logp(rejected_batch, rejected_mask)
 
             if hold_rejected_graph:
-                policy_rejected_live = half_logp(rejected_batch)
+                policy_rejected_live = half_logp(rejected_batch, rejected_mask)
                 policy_rejected_value = policy_rejected_live.detach()
             else:
                 with torch.no_grad():
-                    policy_rejected_value = half_logp(rejected_batch)
+                    policy_rejected_value = half_logp(rejected_batch, rejected_mask)
 
             chosen_output = self.predict(model, chosen_batch, config, train_progress)
             policy_timestep = chosen_output.get("timestep")
             if isinstance(policy_timestep, torch.Tensor):
                 policy_timestep = policy_timestep.detach()
-            policy_chosen_live = -mse(chosen_output["predicted"], chosen_output["target"])
+            policy_chosen_live = -mse(chosen_output["predicted"], chosen_output["target"], chosen_mask)
             g_chosen, g_rejected, (loss, dpo_loss, chosen_ratio, rejected_ratio, margin) = dpo_surrogate_weights(
                 policy_chosen_live, policy_rejected_value, ref_chosen_logp, ref_rejected_logp, **objective_kwargs
             )
@@ -1457,7 +1638,7 @@ class BaseModelSetup(
             del chosen_output, policy_chosen_live, chosen_term
 
             if policy_rejected_live is None:
-                policy_rejected_live = half_logp(rejected_batch)
+                policy_rejected_live = half_logp(rejected_batch, rejected_mask)
             backward_fn((g_rejected.to(policy_rejected_live.dtype) * policy_rejected_live).sum())
         finally:
             # Release a held rejected graph on the exception path too: a caught
@@ -1467,7 +1648,17 @@ class BaseModelSetup(
                 te.dropout_probability = saved
 
         self._record_dpo_metrics(
-            model, config, loss, dpo_loss, chosen_ratio, rejected_ratio, margin, policy_timestep, margin.shape[0], beta
+            model,
+            config,
+            loss,
+            dpo_loss,
+            chosen_ratio,
+            rejected_ratio,
+            margin,
+            policy_timestep,
+            margin.shape[0],
+            beta,
+            image_paths=chosen_batch.get("image_path"),
         )
         return loss
 
@@ -1483,6 +1674,7 @@ class BaseModelSetup(
         policy_timestep,
         chosen_b: int,
         beta: float | Tensor | None = None,
+        image_paths=None,
     ) -> None:
         # Stack the scalar metrics and sync them in a single .tolist() rather
         # than one .item() (one GPU->CPU sync) per metric.
@@ -1504,21 +1696,20 @@ class BaseModelSetup(
         metric_values = torch.stack(metric_tensors).tolist()
         self._last_dpo_metrics = dict(zip(metric_names, metric_values, strict=True))
 
+        pair_logging = config.rlhf_dpo_concept_logging or config.rlhf_dpo_live_saturation
+        self._last_dpo_pair_records = (
+            self._dpo_pair_records(
+                model, config, chosen_ratio, rejected_ratio, margin, policy_timestep, chosen_b, beta, image_paths
+            )
+            if pair_logging
+            else []
+        )
+
         if config.rlhf_dpo_timestep_margin_logging and policy_timestep is not None:
             # Per-sample raw margins bucketed by the chosen half's timestep
             # quartile. Sums and counts are emitted for every quartile so the
             # trainer's accumulation always sees the same key set.
-            raw_t = policy_timestep[:chosen_b].detach()
-            if torch.is_floating_point(raw_t):
-                # Continuous-timestep models already emit t in (0, 1].
-                t = raw_t.float()
-            else:
-                # Discrete schedulers emit integer steps in [0, num_train_timesteps);
-                # normalize by the model's actual count rather than sniffing the
-                # batch max (which misbuckets batches that only sample steps {0,1})
-                # or assuming 1000.
-                num_train_timesteps = model.noise_scheduler.config["num_train_timesteps"]
-                t = raw_t.float() / num_train_timesteps
+            t = self._dpo_timestep_fraction(model, policy_timestep, chosen_b)
             quartile_index = (t * 4).long().clamp(0, 3)
             per_sample_margin = margin.detach().float()
             # bincount for counts + scatter_add for sums, then one sync for all
@@ -1530,6 +1721,63 @@ class BaseModelSetup(
             for quartile in range(4):
                 self._last_dpo_metrics[f"margin_t_q{quartile + 1}_sum"] = sums_l[quartile]
                 self._last_dpo_metrics[f"margin_t_q{quartile + 1}_count"] = counts_l[quartile]
+
+    @staticmethod
+    def _dpo_timestep_fraction(model: BaseModel, policy_timestep: Tensor, chosen_b: int) -> Tensor:
+        """The chosen half's timestep as a fraction of the schedule, in [0, 1]."""
+        raw_t = policy_timestep[:chosen_b].detach()
+        if torch.is_floating_point(raw_t):
+            # Continuous-timestep models already emit t in (0, 1].
+            return raw_t.float()
+        # Discrete schedulers emit integer steps in [0, num_train_timesteps);
+        # normalize by the model's actual count rather than sniffing the
+        # batch max (which misbuckets batches that only sample steps {0,1})
+        # or assuming 1000.
+        num_train_timesteps = model.noise_scheduler.config["num_train_timesteps"]
+        return raw_t.float() / num_train_timesteps
+
+    def _dpo_pair_records(
+        self,
+        model: BaseModel,
+        config: TrainConfig,
+        chosen_ratio: Tensor,
+        rejected_ratio: Tensor,
+        margin: Tensor,
+        policy_timestep,
+        chosen_b: int,
+        beta: float | Tensor | None,
+        image_paths,
+    ) -> list[dict]:
+        """One record per pair of the batch: its chosen image path, raw margin and
+        rewards, the beta the loss applied to it and its timestep fraction.
+        Everything is synced in a single .tolist()."""
+        margin = margin.detach().float()
+        rows = [margin, chosen_ratio.detach().float(), rejected_ratio.detach().float()]
+        if isinstance(beta, Tensor):
+            rows.append(beta.detach().float().reshape(-1).to(margin.device))
+        else:
+            fallback = config.rlhf_dpo_beta if beta is None else beta
+            rows.append(torch.full_like(margin, float(fallback)))
+        if isinstance(policy_timestep, Tensor):
+            rows.append(self._dpo_timestep_fraction(model, policy_timestep, chosen_b).to(margin.device))
+        else:
+            rows.append(torch.full_like(margin, float("nan")))
+        values = torch.stack(rows).tolist()
+        paths = list(image_paths or [])
+        records = []
+        for i in range(margin.shape[0]):
+            t = values[4][i]
+            records.append(
+                {
+                    "path": paths[i] if i < len(paths) else None,
+                    "margin": values[0][i],
+                    "chosen": values[1][i],
+                    "rejected": values[2][i],
+                    "beta": values[3][i],
+                    "t": None if t != t else t,  # NaN: no timestep
+                }
+            )
+        return records
 
     def stop_embedding_training_elapsed(
         self,
@@ -1730,6 +1978,29 @@ class BaseModelSetup(
             self._dpo_ref_params = _capture_dpo_reference(policy, config)
         _bump_dpo_reference_version(self)
 
+    def dpo_reference_fingerprint(self) -> str:
+        """Short content hash of the frozen DPO reference, cached per reference
+        version. A capture or rebase changes it; a resume that restores the same
+        reference from its backup reproduces it, which is how the live saturation
+        ledger tells a continued history from a restarted one. New Adapter mode
+        keeps no snapshot: its reference is the base model, which never changes."""
+        if self._dpo_ref_params is None:
+            return "base-model"
+        version = getattr(self, "_dpo_ref_version", 0)
+        cached = self._dpo_ref_fingerprint
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        digest = hashlib.sha1()
+        for params in self._dpo_ref_params:
+            for tensor in params:
+                flat = tensor.detach().reshape(-1)
+                stride = max(1, flat.numel() // 16)
+                sample = flat[::stride][:16].to(device="cpu", dtype=torch.float32)
+                digest.update(sample.numpy().tobytes())
+        fingerprint = digest.hexdigest()[:16]
+        self._dpo_ref_fingerprint = (version, fingerprint)
+        return fingerprint
+
     _DPO_REFERENCE_FILENAME = "dpo_reference.pt"
 
     def save_dpo_reference(self, backup_path: str) -> None:
@@ -1830,13 +2101,34 @@ class BaseModelSetup(
         else:
             parameters = model.parameters()
 
-        parameter_group_collection.add_group(
-            NamedParameterGroup(
-                unique_name=unique_name,
-                parameters=parameters,
-                learning_rate=config.learning_rate,
-            )
+        self._add_model_part_parameter_groups(
+            parameter_group_collection, unique_name, model, parameters, config.learning_rate
         )
+
+    @staticmethod
+    def _add_model_part_parameter_groups(
+        parameter_group_collection: NamedParameterGroupCollection,
+        unique_name: str,
+        model: torch.nn.Module,
+        parameters: Iterable[nn.Parameter],
+        learning_rate: float | None,
+    ):
+        """Add a model part's trainable parameters as the group ``unique_name``. A DoRA-OFT
+        adapter with its own DoRA learning rate gets its magnitude multipliers in a second
+        group, ``<unique_name>_dora``; the OFT rotations stay in the first."""
+        group = NamedParameterGroup(
+            unique_name=unique_name,
+            parameters=parameters,
+            learning_rate=learning_rate,
+        )
+        parameter_group_collection.add_group(group)
+
+        if isinstance(model, LoRAModuleWrapper) and model.dora_learning_rate is not None:
+            dora_group = group.split(
+                unique_name + "_dora", model.dora_multiplier_parameters(), model.dora_learning_rate
+            )
+            if dora_group is not None:
+                parameter_group_collection.add_group(dora_group)
 
     def _setup_model_part_requires_grad(
         self,

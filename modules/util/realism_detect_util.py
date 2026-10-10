@@ -318,8 +318,13 @@ def score_images_realism(
     progress=None,
     workers: int | None = None,
     device: str = "auto",
+    cache_only: bool = False,
 ) -> dict[str, float]:
     """P(AI-generated) in [0, 1] for each readable path.
+
+    ``cache_only`` answers from the cache and leaves every miss unscored
+    instead of loading the model: the caller knows a backfill has already
+    scored these paths, so a miss is a file the model cannot read anyway.
 
     Cache hits (validated by size, mtime and model version) are served without
     a forward pass; only the misses go through the model. Unreadable files are
@@ -384,7 +389,7 @@ def score_images_realism(
     done = len(scores)
     if progress is not None:
         progress(done, total)
-    if not misses:
+    if not misses or cache_only:
         return scores
     if session is None:
         session, spec = load_realism_model(device=device)

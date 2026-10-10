@@ -653,6 +653,71 @@ def policy_read_metrics(
 # -- scheduling and the per-epoch prompt bank ---------------------------------
 
 
+def grad_step_candidates(
+    sigmas: Sequence[float],
+    steps: int,
+    *,
+    sigma_min: float = 0.0,
+    sigma_max: float = 1.0,
+    after_index: int | None = None,
+) -> list[int]:
+    """Grid indices ``0..steps-1`` the grad-bearing forward may run at.
+    With the default window ``[0, 1]`` this is the second half of the grid
+    (the original rule); a narrower window keeps the indices whose sigma lies
+    inside it. ``after_index`` (the hybrid init step) drops everything at or
+    before it. Never empty: falls back to the index nearest the window, or
+    ``after_index + 1``, clamped to the grid."""
+    last = max(0, int(steps) - 1)
+    if sigma_min <= 0.0 and sigma_max >= 1.0:
+        candidates = list(range(int(steps) // 2, last + 1))
+    else:
+        candidates = [i for i in range(last + 1) if sigma_min <= float(sigmas[i]) <= sigma_max]
+        if not candidates:
+            centre = (sigma_min + sigma_max) / 2
+            candidates = [min(range(last + 1), key=lambda i: abs(float(sigmas[i]) - centre))]
+    if after_index is not None:
+        candidates = [i for i in candidates if i > after_index]
+        if not candidates:
+            candidates = [min(last, int(after_index) + 1)]
+    return candidates
+
+
+def choose_grad_step(
+    sigmas: Sequence[float],
+    steps: int,
+    *,
+    random_grad_step: bool,
+    rng: random.Random,
+    sigma_min: float = 0.0,
+    sigma_max: float = 1.0,
+    after_index: int | None = None,
+) -> int:
+    """Grad step index: a uniform draw from :func:`grad_step_candidates`, or
+    its last (lowest-sigma) entry when ``random_grad_step`` is off. With the
+    defaults that is ``steps - 1``, the original fixed step."""
+    candidates = grad_step_candidates(sigmas, steps, sigma_min=sigma_min, sigma_max=sigma_max, after_index=after_index)
+    return rng.choice(candidates) if random_grad_step else candidates[-1]
+
+
+def grad_window(grad_step: int, grad_steps: int, steps: int) -> tuple[int, int]:
+    """``(first, last)`` grid indices of the grad-bearing Euler chain (DRaFT-K):
+    ``grad_steps`` consecutive steps starting at ``grad_step``, clamped so the
+    last one stays on the grid (``steps - 1``). ``grad_steps <= 1`` is the
+    original single forward, ``first == last``."""
+    last_index = max(0, int(steps) - 1)
+    first = min(max(0, int(grad_step)), last_index)
+    last = min(first + max(1, int(grad_steps)) - 1, last_index)
+    return first, last
+
+
+def nearest_sigma_index(sigmas: Sequence[float], steps: int, sigma: float) -> int:
+    """Grid index in ``0..steps-2`` whose sigma is nearest ``sigma``: the
+    hybrid init step. The cap leaves at least one later index for the grad
+    step."""
+    last = max(0, int(steps) - 2)
+    return min(range(last + 1), key=lambda i: abs(float(sigmas[i]) - float(sigma)))
+
+
 def derive_text_reward_interval(primary_batches: int, samples_per_epoch: int) -> int:
     """Standard micro-batches per reward sample so ``samples_per_epoch`` reward
     steps land inside one epoch of the primary loader (mirrors the DPO add-on

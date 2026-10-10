@@ -24,14 +24,20 @@ def _jpg(path: str, size: tuple[int, int]) -> str:
     return path
 
 
-def _png(path: str, size: tuple[int, int], prompt: str, params: dict | None = None) -> str:
+def _png(path: str, size: tuple[int, int], prompt: str, params: dict | None = None, color=(120, 90, 60)) -> str:
     info = PngInfo()
     info.add_text("prompt", prompt)
     if params is not None:
         # SwarmUI stamps its full parameter set into every image it writes.
         info.add_text("parameters", json.dumps({"prompt": prompt, **params}))
-    Image.new("RGB", size, (120, 90, 60)).save(path, pnginfo=info)
+    Image.new("RGB", size, color).save(path, pnginfo=info)
     return path
+
+
+def _black_png(path: str, size: tuple[int, int], prompt: str, params: dict | None = None) -> str:
+    """What a generation that failed inside SwarmUI's backend looks like on
+    disk: every pixel zero, the parameter block intact."""
+    return _png(path, size, prompt, params, color=(0, 0, 0))
 
 
 def _wait(service: SwarmGenerateService, timeout: float = 20.0) -> dict:
@@ -53,6 +59,10 @@ class FakeClient:
     fail_times: int = 0
     #: Where the "server" writes; set by the dirs fixture.
     output_root: str = ""
+    #: Simulate a backend that fails mid-run: the file is written, but black.
+    write_black: bool = False
+    #: Black for only the next N calls, then healthy again.
+    write_black_times: int = 0
 
     def __init__(self, *args, **kwargs):
         pass
@@ -78,8 +88,14 @@ class FakeClient:
             name = f"{len(FakeClient.calls)}-{index}-{abs(hash(prompt)) % 9999}.png"
             written = os.path.join(FakeClient.output_root, "2026-08-30", name)
             os.makedirs(os.path.dirname(written), exist_ok=True)
-            _png(written, (width, height), prompt)
+            black = FakeClient.write_black or FakeClient.write_black_times > 0
+            if black:
+                _black_png(written, (width, height), prompt, {"model": model, "width": width, "height": height})
+            else:
+                _png(written, (width, height), prompt)
             views.append(f"View/local/raw/2026-08-30/{name}")
+        if FakeClient.write_black_times > 0:
+            FakeClient.write_black_times -= 1
         return views
 
 
@@ -91,6 +107,8 @@ def service(monkeypatch):
     FakeClient.fail_with = None
     FakeClient.fail_times = 0
     FakeClient.output_root = ""
+    FakeClient.write_black = False
+    FakeClient.write_black_times = 0
     monkeypatch.setattr(module, "SwarmClient", FakeClient)
     instance = SwarmGenerateService.__new__(SwarmGenerateService)
     instance.__init__()
@@ -265,8 +283,10 @@ def test_only_one_run_at_a_time(service, dirs, monkeypatch):
     deadline = time.time() + 5
     while not started and time.time() < deadline:
         time.sleep(0.01)
+    # A second start while one runs is queued behind it, not refused.
     second = _start(service, dirs)
-    assert not second["ok"] and "already in progress" in second["error"]
+    assert second["ok"] and second["queued"] and second["position"] == 1
+    assert service.status()["job_total"] == 2
     _wait(service)
 
 
@@ -283,6 +303,9 @@ def test_check_reports_models(service, monkeypatch):
         def list_loaded_models(self):
             return ["SoReal!/SoReal!_Turbo_V1.3.safetensors"]
 
+        def list_yolo_models(self):
+            return ["face_yolov8m.pt"]
+
     monkeypatch.setattr(module, "SwarmClient", Client)
     assert service.check("localhost:7801") == {
         "ok": True,
@@ -290,6 +313,7 @@ def test_check_reports_models(service, monkeypatch):
         "user_id": "local",
         "models": ["a.safetensors"],
         "loras": ["lora-a.safetensors"],
+        "yolo": ["face_yolov8m.pt"],
         "loaded": ["SoReal!/SoReal!_Turbo_V1.3.safetensors"],
         "presets": [],
     }
@@ -429,6 +453,183 @@ def test_preview_params_reports_what_would_be_reused(service, dirs):
     assert "seed" not in params and "width" not in params
 
 
+# --- settings from a reference folder, minus its adapters ---------------------
+
+
+def _folder_options(service, dirs, param_folder: str, **kwargs) -> dict:
+    """The options dict ``start`` would build, for calling ``_resolve_params``
+    directly with a fake client."""
+    import web.backend.services.swarm_generate_service as module
+
+    captured: dict = {}
+
+    def grab(*jobs):
+        captured.update(jobs[0])
+        return {"ok": True, "queued": False, "position": 1}
+
+    kwargs.setdefault("model", "")
+    original = service._enqueue
+    service._enqueue = grab
+    try:
+        assert _start(service, dirs, param_source="folder", param_folder=param_folder, **kwargs)["ok"]
+    finally:
+        service._enqueue = original
+    assert captured, "start did not reach the queue"
+    assert module.PARAM_SOURCES == ("last", "preset", "manual", "folder")
+    return captured
+
+
+def test_folder_source_reads_the_reference_folders_last_generation(service, dirs, tmp_path):
+    reference = tmp_path / "Reference Shots"
+    reference.mkdir()
+    _png(str(reference / "ref.png"), (832, 1216), "a reference prompt", params=LIVE_PARAMS)
+
+    options = _folder_options(service, dirs, str(reference))
+    params = service._resolve_params(FakeClient(), options)
+    assert service.status()["param_source"] == "last generation in Reference Shots"
+    assert params["model"] == LIVE_PARAMS["model"] and params["sigmashift"] == 1.5
+    # The reference folder's own LoRAs ride along unless asked to drop them.
+    assert params["loras"] == ["SoReal!_V43_OFT"] and params["loraweights"] == ["1"]
+    for owned in ("prompt", "width", "height", "seed", "images"):
+        assert owned not in params
+
+
+def test_folder_source_can_drop_the_sources_loras_and_apply_its_own(service, dirs, tmp_path):
+    reference = tmp_path / "ref"
+    reference.mkdir()
+    source = LIVE_PARAMS | {"lorasectionconfs": ["x"], "loratencweights": ["0.5"]}
+    _png(str(reference / "ref.png"), (832, 1216), "p", params=source)
+
+    options = _folder_options(
+        service, dirs, str(reference), drop_source_loras=True, loras=[{"name": "Chars/rosie", "weight": 0.9}]
+    )
+    params = service._resolve_params(FakeClient(), options)
+    assert params["loras"] == ["Chars/rosie"] and params["loraweights"] == ["0.9"]
+    assert not any(key for key in params if key.startswith("lora") and key not in ("loras", "loraweights"))
+    assert params["model"] == LIVE_PARAMS["model"] and params["usetcfg"] is True
+
+    # Dropping without an override leaves no adapter at all.
+    bare = service._resolve_params(FakeClient(), _folder_options(service, dirs, str(reference), drop_source_loras=True))
+    assert not any(key.startswith("lora") for key in bare)
+
+
+def test_folder_source_with_no_generation_falls_back_to_manual(service, dirs, tmp_path):
+    empty = tmp_path / "Empty"
+    empty.mkdir()
+    options = _folder_options(service, dirs, str(empty), model="Other/model.safetensors")
+    params = service._resolve_params(FakeClient(), options)
+    assert service.status()["param_source"] == "manual (no generation found in Empty)"
+    assert params == {"model": "Other/model.safetensors"}
+
+
+def test_folder_source_runs_end_to_end_with_the_label_on_the_job(service, dirs, tmp_path):
+    reference = tmp_path / "ref"
+    reference.mkdir()
+    _png(str(reference / "ref.png"), (832, 1216), "p", params=LIVE_PARAMS)
+    assert _start(
+        service,
+        dirs,
+        model="",
+        param_source="folder",
+        param_folder=str(reference),
+        drop_source_loras=True,
+        loras=[{"name": "Chars/rosie", "weight": 1.0}],
+        label="Rosie Butler",
+    )["ok"]
+    state = _wait(service)
+    assert state["phase"] == "done", state["error"]
+    assert state["param_source"] == "last generation in ref"
+    (call,) = FakeClient.calls
+    assert call["model"] == LIVE_PARAMS["model"]
+    assert call["extra_params"]["loras"] == ["Chars/rosie"] and call["extra_params"]["loraweights"] == ["1.0"]
+
+
+def test_start_validates_the_parameter_folder(service, dirs, tmp_path):
+    assert not _start(service, dirs, param_source="folder", param_folder="")["ok"]
+    assert not _start(service, dirs, param_source="folder", param_folder=str(tmp_path / "missing"))["ok"]
+
+
+def test_job_summary_carries_the_label():
+    from web.backend.services.swarm_generate_service import _job_summary
+
+    assert _job_summary({"label": "Rosie Butler", "captions": 3})["label"] == "Rosie Butler"
+    assert _job_summary({})["label"] == ""
+
+
+def test_queued_jobs_report_their_label(service, dirs, monkeypatch):
+    """The label reaches the status the UI polls, for the run in flight and
+    the ones waiting behind it."""
+    import web.backend.services.swarm_generate_service as module
+
+    gate = threading.Event()
+
+    class Slow(FakeClient):
+        def generate(self, *args, **kwargs):
+            gate.wait(5)
+            return super().generate(*args, **kwargs)
+
+    monkeypatch.setattr(module, "SwarmClient", Slow)
+    assert _start(service, dirs, label="first")["ok"]
+    deadline = time.time() + 5
+    while service.status()["phase"] != "generating" and time.time() < deadline:
+        time.sleep(0.02)
+    assert _start(service, dirs, label="second")["queued"]
+    status = service.status()
+    assert status["current_job"]["label"] == "first"
+    assert [job["label"] for job in status["queued"]] == ["second"]
+    gate.set()
+    _wait(service)
+
+
+def test_preview_params_for_can_drop_the_loras(service, dirs):
+    real, gen, out = dirs
+    assert service.preview_params_for(str(gen), True) == {"ok": True, "params": {}, "source_file": None}
+    _png(str(gen / "recent.png"), (832, 1216), "earlier", params=LIVE_PARAMS)
+    kept = service.preview_params_for(str(gen), False)
+    assert kept["params"]["loras"] == ["SoReal!_V43_OFT"] and kept["source_file"] == "recent.png"
+    dropped = service.preview_params_for(str(gen), True)["params"]
+    assert "loras" not in dropped and "loraweights" not in dropped
+    assert dropped["sigmashift"] == 1.5 and dropped["model"] == kept["params"]["model"]
+    # A missing folder is simply empty, not an error.
+    assert service.preview_params_for(str(gen / "nope"))["source_file"] is None
+
+
+def test_last_generation_source_names_the_newest_image_with_a_parameter_block(service, dirs):
+    from web.backend.services.swarm_generate_service import last_generation_source
+
+    real, gen, out = dirs
+    (gen / "sub").mkdir()
+    (gen / ".pending").mkdir()
+    older = _png(str(gen / "older.png"), (832, 1216), "p", params=LIVE_PARAMS)
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    # Newest, but without a parameter block: skipped in favour of the older one.
+    bare = _png(str(gen / "sub" / "newest-no-params.png"), (832, 1216), "p")
+    os.utime(bare, (1_800_000_000, 1_800_000_000))
+    # Newest with a block, inside a dot-folder: never used.
+    hidden = _png(str(gen / ".pending" / "hidden.png"), (832, 1216), "p", params=LIVE_PARAMS)
+    os.utime(hidden, (1_900_000_000, 1_900_000_000))
+    path, params = last_generation_source(str(gen))
+    assert os.path.basename(path) == "older.png" and params["sigmashift"] == 1.5
+    assert last_generation_source(str(gen / "missing")) == (None, {})
+
+
+def test_last_params_route_accepts_drop_loras(service, dirs):
+    from web.backend.routers.swarm_generate import router
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    real, gen, out = dirs
+    _png(str(gen / "recent.png"), (832, 1216), "earlier", params=LIVE_PARAMS)
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+    kept = client.get("/api/swarm/last-params", params={"generated_folder": str(gen)}).json()
+    assert kept["ok"] and kept["params"]["loras"] == ["SoReal!_V43_OFT"] and kept["source_file"] == "recent.png"
+    dropped = client.get("/api/swarm/last-params", params={"generated_folder": str(gen), "drop_loras": True}).json()
+    assert dropped["ok"] and "loras" not in dropped["params"] and dropped["source_file"] == "recent.png"
+
+
 def test_lora_and_loaded_model_listing_failures_are_not_fatal(service, monkeypatch):
     """A server that cannot list LoRAs is still usable for generation."""
     import web.backend.services.swarm_generate_service as module
@@ -445,10 +646,14 @@ def test_lora_and_loaded_model_listing_failures_are_not_fatal(service, monkeypat
         def list_loaded_models(self):
             raise SwarmError("unsupported")
 
+        def list_yolo_models(self):
+            raise SwarmError("unsupported")
+
     monkeypatch.setattr(module, "SwarmClient", Partial)
     result = service.check("localhost:7801")
     assert result["ok"] and result["models"] == ["a.safetensors"]
     assert result["loras"] == [] and result["loaded"] == [] and result["presets"] == []
+    assert result["yolo"] == []
 
 
 # --- keeping SwarmUI's queue fed --------------------------------------------
@@ -535,3 +740,272 @@ def test_cancelling_a_concurrent_run_stops_it(service, dirs, monkeypatch):
     state = _wait(service, timeout=30)
     assert state["phase"] == "cancelled"
     assert state["done"] < 12
+
+
+# ---------------------------------------------------------------------------
+# Black (failed) generations
+# ---------------------------------------------------------------------------
+
+_BLACK_PARAMS = {
+    "model": "MyModels/test.safetensors",
+    "width": 1280,
+    "height": 832,
+    "steps": 8,
+    "cfgscale": 1.0,
+    "seed": 12345,
+    "sampler": "euler",
+    "loras": ["style"],
+    "loraweights": ["0.8"],
+    "swarm_version": "0.9.6",
+    "date": "2026-09-17",
+}
+
+
+def test_is_black_image_only_matches_all_zero_pixels(tmp_path):
+    from modules.util.swarm_generate_util import is_black_image
+
+    black = _black_png(str(tmp_path / "black.png"), (64, 48), "x")
+    dark = _png(str(tmp_path / "dark.png"), (64, 48), "x", color=(20, 20, 20))
+    normal = _png(str(tmp_path / "normal.png"), (64, 48), "x")
+    (tmp_path / "broken.png").write_bytes(b"not an image")
+    assert is_black_image(black)
+    assert not is_black_image(dark)
+    assert is_black_image(dark, max_level=20)
+    assert not is_black_image(normal)
+    # Unreadable is not black: nothing that cannot be looked at is retired.
+    assert not is_black_image(str(tmp_path / "broken.png"))
+
+
+def test_scan_finds_black_images_and_skips_dot_folders(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), "A woman on a pier at dawn.", _BLACK_PARAMS)
+    _black_png(str(gen / "2026-09-17" / "b.png"), (832, 1280), "A man on a pier at dawn.")
+    (gen / ".black").mkdir()
+    _black_png(str(gen / ".black" / "old.png"), (1280, 832), "Already retired.", _BLACK_PARAMS)
+    result = service.scan_black(str(gen))
+    assert result["ok"] and result["count"] == 2
+    by_name = {os.path.basename(image["path"]): image for image in result["images"]}
+    assert set(by_name) == {"a.png", "b.png"}
+    assert by_name["a.png"]["prompt"] == "A woman on a pier at dawn."
+    assert by_name["a.png"]["size"] == [1280, 832] and by_name["a.png"]["has_params"]
+    # The metadata-only "prompt" chunk is not a parameter block: retire only.
+    assert not by_name["b.png"]["has_params"]
+    assert not service.scan_black(str(gen / "missing"))["ok"]
+
+
+def test_requeue_retires_black_images_and_regenerates_from_their_own_params(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    black = _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), "A woman on a pier at dawn.", _BLACK_PARAMS)
+    no_params = _black_png(str(gen / "2026-09-17" / "b.png"), (832, 1280), "A man on a pier at dawn.")
+    fine = _png(str(gen / "2026-09-17" / "c.png"), (1280, 832), "A dog on a pier at dawn.", _BLACK_PARAMS)
+
+    result = service.requeue_black(str(gen), model="")
+    assert result["ok"] and result["found"] == 2 and result["moved"] == 2 and result["requeued"] == 1
+    assert [os.path.basename(entry["path"]) for entry in result["unresendable"]] == ["b.png"]
+    state = _wait(service)
+    assert state["phase"] == "done" and state["error"] is None
+
+    # Both black files are out of the scanned tree, the good one untouched.
+    assert not os.path.exists(black) and not os.path.exists(no_params) and os.path.exists(fine)
+    retired = sorted(path.name for path in (gen / "2026-09-17" / ".black").iterdir())
+    assert retired == ["a.png", "b.png"]
+    assert service.scan_black(str(gen))["count"] == 0
+
+    # The resend carries the image's own block: prompt, size, model, sampler,
+    # LoRAs — with a fresh seed and without the output-only keys.
+    (call,) = FakeClient.calls
+    assert call["prompt"] == "A woman on a pier at dawn."
+    assert (call["width"], call["height"]) == (1280, 832)
+    assert call["model"] == "MyModels/test.safetensors" and call["images"] == 1
+    assert call["seed"] == -1
+    assert call["loras"] == ["style"] and call["lora_weights"] == [0.8]
+    assert call["extra_params"]["steps"] == 8 and call["extra_params"]["sampler"] == "euler"
+    assert "swarm_version" not in call["extra_params"] and "date" not in call["extra_params"]
+
+    assert state["planned"] == 1 and state["done"] == 1 and state["images"] == 1 and state["failed"] == 0
+    (record,) = state["results"]
+    assert record["ok"] and record["requeued_from"] == black and record["real_path"] is None
+    assert state["param_source"] == "each image's own parameters"
+    assert state["current_job"] is None and state["job_total"] == 1
+
+
+def test_requeue_model_override_replaces_the_recorded_model(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), "A woman on a pier at dawn.", _BLACK_PARAMS)
+    assert service.requeue_black(str(gen), model="Other/new.safetensors")["requeued"] == 1
+    _wait(service)
+    (call,) = FakeClient.calls
+    assert call["model"] == "Other/new.safetensors"
+
+
+def test_requeue_never_retires_an_image_that_is_not_black(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    fine = _png(str(gen / "2026-09-17" / "c.png"), (1280, 832), "A dog on a pier at dawn.", _BLACK_PARAMS)
+    outside = _black_png(str(gen.parent / "elsewhere.png"), (64, 64), "Not in the tree.", _BLACK_PARAMS)
+    result = service.requeue_black(str(gen), paths=[fine, outside])
+    assert result["ok"] and result["found"] == 0 and result["requeued"] == 0
+    assert os.path.exists(fine) and os.path.exists(outside)
+    assert FakeClient.calls == []
+    assert not service.status()["running"]
+
+
+def test_requeue_waits_behind_a_running_generation(service, dirs, monkeypatch):
+    import web.backend.services.swarm_generate_service as module
+
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), "A woman on a pier at dawn.", _BLACK_PARAMS)
+
+    class SlowClient(FakeClient):
+        def generate(self, *args, **kwargs):
+            time.sleep(0.3)
+            return super().generate(*args, **kwargs)
+
+    monkeypatch.setattr(module, "SwarmClient", SlowClient)
+    # The run's own start-of-run scan is off, so the manual requeue is what
+    # picks the black image up.
+    assert _start(service, dirs, auto_requeue_black=False)["ok"]
+    result = service.requeue_black(str(gen))
+    assert result["ok"] and result["queued"] and result["requeued"] == 1
+    status = service.status()
+    assert status["job_total"] == 2 and status["queued"][0]["mode"] == "requeue" and status["queued"][0]["images"] == 1
+    state = _wait(service)
+    assert state["phase"] == "done" and state["job_index"] == 2
+    prompts = sorted(call["prompt"] for call in FakeClient.calls)
+    assert prompts == ["A woman on a pier at dawn.", "A woman stands in a sunlit garden holding a watering can."]
+
+
+def test_a_black_output_from_swarm_is_retired_and_counted_as_a_failure(service, dirs):
+    _real, gen, _out = dirs
+    FakeClient.write_black = True
+    assert _start(service, dirs)["ok"]
+    state = _wait(service)
+    assert state["phase"] == "done"
+    assert state["failed"] == 1 and state["images"] == 0
+    (record,) = state["results"]
+    # One attempt plus _BLACK_RETRIES, every output retired.
+    assert record["ok"] is False and "black" in record["error"] and record["black"] == 3
+    assert len(FakeClient.calls) == 3 and state["black_retried"] == 2
+    # The black files never claim their caption: they are in .black, not the tree.
+    assert not [p for p in (gen / "2026-08-30").iterdir() if p.is_file()]
+    assert len(list((gen / "2026-08-30" / ".black").iterdir())) == 3
+    assert service.scan_black(str(gen))["count"] == 0
+    # ... so the next ordinary run generates for the same caption again.
+    FakeClient.write_black = False
+    FakeClient.calls = []
+    assert _start(service, dirs)["ok"]
+    state = _wait(service)
+    assert state["failed"] == 0 and [call["prompt"] for call in FakeClient.calls] == [
+        "A woman stands in a sunlit garden holding a watering can."
+    ]
+
+
+def test_a_backend_writing_only_black_images_stops_the_run(service, dirs):
+    real, _gen, _out = dirs
+    for index in range(8):
+        _jpg(str(real / f"extra{index}.jpg"), (2400, 1600))
+        (real / f"extra{index}.txt").write_text(
+            f"A woman number {index} stands in a sunlit garden holding a watering can.\n", encoding="utf-8"
+        )
+    FakeClient.write_black = True
+    assert _start(service, dirs)["ok"]
+    state = _wait(service)
+    assert state["phase"] == "error" and "consecutive SwarmUI failures" in state["error"]
+    assert state["failed"] == 5
+
+
+def test_a_transient_black_output_is_retried_with_a_fresh_seed(service, dirs):
+    _real, gen, _out = dirs
+    FakeClient.write_black_times = 1
+    assert _start(service, dirs)["ok"]
+    state = _wait(service)
+    assert state["phase"] == "done" and state["failed"] == 0 and state["images"] == 1
+    assert len(FakeClient.calls) == 2 and state["black_retried"] == 1
+    (record,) = state["results"]
+    assert record["ok"] and record["black"] == 1 and len(record["paths"]) == 1
+    assert len(list((gen / "2026-08-30" / ".black").iterdir())) == 1
+    assert service.scan_black(str(gen))["count"] == 0
+
+
+def test_black_retries_can_be_turned_off(service, dirs):
+    FakeClient.write_black = True
+    assert _start(service, dirs, auto_requeue_black=False)["ok"]
+    state = _wait(service)
+    assert state["failed"] == 1 and len(FakeClient.calls) == 1 and state["black_retried"] == 0
+
+
+def test_a_run_retires_and_regenerates_black_images_before_new_captions(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    # A black generation of prose.jpg's caption: it claims that caption, and
+    # once retired the caption is free again — it must be generated exactly
+    # once, from the image's own block, not drawn a second time as new.
+    prose = "A woman stands in a sunlit garden holding a watering can."
+    black = _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), prose, _BLACK_PARAMS)
+    orphan = _black_png(str(gen / "2026-09-17" / "b.png"), (832, 1280), "A caption no photo has.", _BLACK_PARAMS)
+    assert _start(service, dirs)["ok"]
+    state = _wait(service)
+    assert state["phase"] == "done" and state["error"] is None
+    assert state["black_retired"] == 2 and state["planned"] == 2 and state["failed"] == 0
+    assert not os.path.exists(black) and not os.path.exists(orphan)
+    assert sorted(p.name for p in (gen / "2026-09-17" / ".black").iterdir()) == ["a.png", "b.png"]
+    calls = {call["prompt"]: call for call in FakeClient.calls}
+    assert set(calls) == {prose, "A caption no photo has."}
+    # Each came from its own block (steps recorded there), with a fresh seed.
+    assert calls[prose]["seed"] == -1 and calls[prose]["extra_params"]["steps"] == 8
+    assert {r["requeued_from"] for r in state["results"]} == {black, orphan}
+
+
+def test_auto_requeue_can_be_turned_off(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    prose = "A woman stands in a sunlit garden holding a watering can."
+    black = _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), prose, _BLACK_PARAMS)
+    assert _start(service, dirs, auto_requeue_black=False)["ok"]
+    state = _wait(service)
+    # The black image still claims the caption, so nothing is generated.
+    assert FakeClient.calls == [] and state["black_retired"] == 0 and os.path.exists(black)
+
+
+def test_dry_run_lists_black_images_without_touching_them(service, dirs):
+    _real, gen, _out = dirs
+    (gen / "2026-09-17").mkdir()
+    black = _black_png(str(gen / "2026-09-17" / "a.png"), (1280, 832), "A caption no photo has.", _BLACK_PARAMS)
+    assert _start(service, dirs, dry_run=True)["ok"]
+    state = _wait(service)
+    assert FakeClient.calls == [] and os.path.exists(black) and state["black_retired"] == 0
+    planned = {r["caption"]: r for r in state["results"]}
+    assert planned["A caption no photo has."]["requeued_from"] == black
+    assert planned["A caption no photo has."]["planned_only"]
+    assert "prose" in os.path.basename(
+        planned["A woman stands in a sunlit garden holding a watering can."]["real_path"]
+    )
+
+
+def test_split_keyword_jobs_cleans_entries():
+    from web.backend.services.swarm_generate_service import split_keyword_jobs
+
+    assert split_keyword_jobs([" garden ", "", "brick wall + dusk", "Garden", "a,b"]) == [
+        "garden",
+        "brick wall, dusk",
+        "a, b",
+    ]
+    assert split_keyword_jobs(None) == []
+
+
+def test_bulk_keywords_queue_one_run_each_without_repeating_a_caption(service, dirs):
+    real, _gen, _out = dirs
+    _many_captions(real, count=3)
+    (real / "many0.txt").write_text("A man repairs a bicycle beside a canal.\n", encoding="utf-8")
+    result = _start(service, dirs, captions=5, keywords="ignored", keyword_jobs=["bicycle", "garden", "woman+garden"])
+    assert result["ok"] and result["jobs"] == 3 and result["position"] == 1
+    state = _wait(service)
+    assert state["phase"] == "done" and state["job_total"] == 3 and state["job_index"] == 3
+    prompts = [call["prompt"] for call in FakeClient.calls]
+    # bicycle: 1 caption; garden: prose + many1 + many2; the third run finds them all done.
+    assert len(prompts) == 4 and len(set(prompts)) == 4
+    assert "bicycle" in prompts[0] and all("garden" in prompt for prompt in prompts[1:])

@@ -627,6 +627,25 @@ FIELD_TOOLTIPS: dict[str, str] = {
     ),
     "loss_weight_fn": "Choice of loss weight function. Can help the model learn details more accurately.",
     "loss_weight_strength": ("Inverse strength of loss weighting. Range: 1-20, only applies to Min SNR and P2."),
+    "perceptual_strength": (
+        "Z-Image only. Adds a perceptual distance between the one-step clean estimate and the"
+        " dataset latent, measured in the VAE decoder's feature maps, on low/mid-noise samples."
+        " Never replaces MSE. 0 disables. Tune so perceptual/grad_norm_v is ~0.1-0.2 of"
+        " perceptual/mse_grad_norm_v in TensorBoard."
+    ),
+    "perceptual_snr_gamma": (
+        "Min-SNR cap for the perceptual weight: strength * min(SNR, gamma). Keeps the term's pull on"
+        " the clean estimate constant across sigma and fades it out below sigma ~ 1/sqrt(gamma)."
+    ),
+    "perceptual_sigma_full": "Sigma up to which the perceptual term is at full weight (1 = pure noise).",
+    "perceptual_sigma_max": (
+        "Sigma at which the perceptual term reaches zero; cosine taper between Sigma Full and here."
+        " Keep it wide (~0.75): tight gates (<= 0.4) throw the gain away and see almost no samples."
+    ),
+    "perceptual_crop": (
+        "Edge of the random window (pixels) decoded for the perceptual term; 0 decodes the whole"
+        " frame. Grad-bearing decoder activations scale with this, ~512 fits next to a 24 GB run."
+    ),
     "loss_scaler": (
         "Selects the type of loss scaling to use during training. Functionally equated as: Loss * selection"
     ),
@@ -680,6 +699,11 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " r x block_size^2 over the adapted Linear layers). The accumulated rotation gradient is stored"
         " in bfloat16 with stochastic rounding, adding a small unbiased gradient noise."
         " Requires the bfloat16 train data type and a single GPU; not compatible with the fused back pass."
+    ),
+    "dora_oft_learning_rate": (
+        "The learning rate of the DoRA magnitude (the per-row multiplier) of a DoRA OFT."
+        " The OFT rotation keeps the regular learning rate. Leave empty to train both at the same"
+        " learning rate. Only used when DoRA OFT is enabled."
     ),
     "embedding.model_name": "The base embedding to train on. Leave empty to create a new embedding",
     "embedding.placeholder": "The placeholder used when using the embedding in a prompt",
@@ -926,6 +950,10 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " When selecting 'From single text file', select a text file that contains a list of prompts"
     ),
     "concept.include_subdirectories": "Includes images from subdirectories into the dataset",
+    "concept.cache_dir": (
+        "Optional directory for this concept's latent and text cache, used instead of the run's cache directory."
+        " Lets several runs share one cache for the same dataset. Leave empty to use the run's cache directory."
+    ),
     "concept.image_variations": "The number of different image versions to cache if latent caching is enabled.",
     "concept.text_variations": "The number of different text versions to cache if latent caching is enabled.",
     "concept.balancing": (

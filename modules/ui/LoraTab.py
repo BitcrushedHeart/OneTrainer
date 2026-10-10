@@ -235,6 +235,16 @@ class LoraTab:
             )
             components.entry(master, 5, 1, self.ui_state, "oft_clipped_norm")
 
+            # DoRA-OFT magnitude learning rate
+            components.label(
+                master,
+                7,
+                0,
+                "DoRA Learning Rate",
+                tooltip="The learning rate of the DoRA magnitude (the per-row multiplier) of a DoRA OFT. The OFT rotation keeps the regular learning rate. Leave empty to train both at the same learning rate. Only used when DoRA OFT is enabled.",
+            )
+            components.entry(master, 7, 1, self.ui_state, "dora_oft_learning_rate")
+
             # Dropout Percentage
             components.label(
                 master,

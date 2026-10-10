@@ -134,11 +134,14 @@ def estimate_ages(
     batch_size: int = 4,
     device: str = "auto",
     progress: Callable[[int, int], None] | None = None,
+    cache_only: bool = False,
 ) -> dict[str, dict]:
     """Age estimate per readable path (see :func:`decode_ages` for the shape).
 
     Cache hits (size, mtime, model version) skip the model; unreadable files
     are skipped. Raises ``RuntimeError`` when the model is unavailable.
+    ``cache_only`` never loads the model: misses are left unscored, for a
+    caller that knows a backfill has already been over these paths.
     """
     if not paths:
         return {}
@@ -173,7 +176,7 @@ def estimate_ages(
     total = len(paths)
     if progress is not None:
         progress(len(results), total)
-    if not misses:
+    if not misses or cache_only:
         return results
     if session is None:
         session, spec = load_age_model(device=device)

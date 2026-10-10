@@ -22,6 +22,7 @@ import os
 import shutil
 import time
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlsplit
 
 from modules.util.dpo_curation_util import (
     _normalize_source_path,
@@ -729,7 +730,13 @@ def local_path_for_view(view_path: str, generated_folder: str) -> str | None:
     """Map a SwarmUI ``View/local/raw/<date>/<name>`` path to the file under
     the generated folder (SwarmUI's raw output root). Falls back to a
     basename search when the layout differs."""
-    parts = [p for p in view_path.replace("\\", "/").split("/") if p]
+    # A result the tool already stored itself (``save_to`` runs) is a local path.
+    if os.path.isfile(view_path):
+        return view_path
+    # API results are URLs: query strings/fragments are not filename text,
+    # and spaces or non-ASCII characters may be percent-encoded.
+    path = unquote(urlsplit(view_path.replace("\\", "/")).path)
+    parts = [p for p in path.split("/") if p]
     if "raw" in parts:
         rel = parts[parts.index("raw") + 1 :]
     elif parts and parts[0] == "View":

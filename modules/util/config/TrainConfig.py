@@ -423,6 +423,37 @@ _TEXT_REWARD_DEFAULTS = (
     ("text_reward_source", TextRewardSource.ONLINE_ROLLOUT),
     ("text_reward_dataset_dir", ""),
     ("text_reward_dataset_repeats", 1),
+    # hybrid offline source: SDEdit init from the dataset image at this sigma,
+    # then the policy writes the letters itself (0 = plain re-noise at the
+    # grad sigma, the original offline step). Default on: the plain step
+    # scores the source's own letters and cannot change their identity.
+    ("text_reward_init_sigma", 0.8),
+    # sigma window for the grad-bearing step, where letter identity is decided;
+    # [0, 1] restores the original "second half of the grid" rule
+    ("text_reward_grad_sigma_min", 0.45),
+    ("text_reward_grad_sigma_max", 0.7),
+    # DRaFT-K: the drawn grad step is the FIRST of this many consecutive
+    # grad-bearing Euler steps; the scored x0 is the one-step estimate after
+    # the last of them. 1 is the original single forward. Each extra step
+    # holds one more transformer graph (block inputs only under gradient
+    # checkpointing, ~1.1 GB at 1024px), clamped to the end of the grid.
+    ("text_reward_grad_steps", 1),
+    # online / hybrid: the box probe is the grad-bearing forward itself (one
+    # transformer forward less); needs gradient checkpointing, else ignored
+    ("text_reward_reuse_probe_graph", True),
+)
+
+# Low-sigma perceptual term on the one-step clean estimate, measured in the
+# VAE decoder's feature maps (ModelSetupPerceptualLossMixin). Added to MSE,
+# never replacing it. Weight: strength * min(SNR, gamma) * g(sigma), with g = 1
+# up to sigma_full and a cosine taper to 0 at sigma_max.
+_PERCEPTUAL_DEFAULTS = (
+    ("perceptual_strength", 0.0),
+    ("perceptual_snr_gamma", 5.0),
+    ("perceptual_sigma_full", 0.5),
+    ("perceptual_sigma_max", 0.75),
+    # decode window edge in pixels (0 = whole frame); latent edge is crop // 8
+    ("perceptual_crop", 512),
 )
 
 
@@ -436,12 +467,15 @@ class TrainConfig(BaseConfig):
     tensorboard: bool
     tensorboard_expose: bool
     tensorboard_always_on: bool
+    tensorboard_epoch_loss: bool
     tensorboard_port: str
     validation: bool
     validate_after: float
     validate_after_unit: TimeUnit
     patience: bool
     patience_epochs: int
+    patience_min_checks: int
+    patience_save_second_best: bool
     patience_mode: PatienceMode
     continue_last_backup: bool
     prevent_overwrites: bool
@@ -511,6 +545,11 @@ class TrainConfig(BaseConfig):
     vb_loss_strength: float
     loss_weight_fn: LossWeight
     loss_weight_strength: float
+    perceptual_strength: float
+    perceptual_snr_gamma: float
+    perceptual_sigma_full: float
+    perceptual_sigma_max: float
+    perceptual_crop: int
     dropout_probability: float  # this is LoRA dropout!
     loss_scaler: LossScaler
     learning_rate_scaler: LearningRateScaler
@@ -620,6 +659,7 @@ class TrainConfig(BaseConfig):
     oft_block_size: int
     oft_block_share: bool
     dora_oft: bool
+    dora_oft_learning_rate: float | None
     oft_scaled: bool
     oft_clipped_norm: float | None
     oft_cans: bool
@@ -679,6 +719,9 @@ class TrainConfig(BaseConfig):
     transfer_patience_checks: int
     transfer_min_relative_improvement: float
     transfer_target_residual: float
+    transfer_preserve_distillation: bool
+    transfer_min_turbo_retention: float
+    transfer_min_turbo_sharpness: float
 
     # dpo
     rlhf_mode: RLHFMode
@@ -692,6 +735,8 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_ipo_tau: float
     rlhf_dpo_adaptive_beta: bool
     rlhf_dpo_timestep_margin_logging: bool
+    rlhf_dpo_concept_logging: bool
+    rlhf_dpo_live_saturation: bool
     rlhf_supervised_mix: float
     rlhf_sft_anchor_weight: float
     rlhf_dpo_addon_weight: float
@@ -721,6 +766,11 @@ class TrainConfig(BaseConfig):
     text_reward_source: TextRewardSource
     text_reward_dataset_dir: str
     text_reward_dataset_repeats: int
+    text_reward_init_sigma: float
+    text_reward_grad_sigma_min: float
+    text_reward_grad_sigma_max: float
+    text_reward_grad_steps: int
+    text_reward_reuse_probe_graph: bool
 
     # optimizer
     optimizer: TrainOptimizerConfig
@@ -758,7 +808,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=28,
+            config_version=34,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -789,6 +839,12 @@ class TrainConfig(BaseConfig):
                 26: self.__migration_26,
                 27: self.__migration_27,
                 28: self.__migration_28,
+                29: self.__migration_29,
+                30: self.__migration_30,
+                31: self.__migration_31,
+                32: self.__migration_32,
+                33: self.__migration_33,
+                34: self.__migration_34,
             },
         )
 
@@ -1171,6 +1227,46 @@ class TrainConfig(BaseConfig):
             migrated_data.setdefault(name, default)
         return migrated_data
 
+    def __migration_29(self, data: dict) -> dict:
+        # Text reward: hybrid offline init sigma and the grad-step sigma window.
+        migrated_data = data.copy()
+        for name, default in _TEXT_REWARD_DEFAULTS:
+            migrated_data.setdefault(name, default)
+        return migrated_data
+
+    def __migration_30(self, data: dict) -> dict:
+        # Low-sigma perceptual term (VAE decoder features on x0_hat).
+        migrated_data = data.copy()
+        for name, default in _PERCEPTUAL_DEFAULTS:
+            migrated_data.setdefault(name, default)
+        return migrated_data
+
+    def __migration_31(self, data: dict) -> dict:
+        # Transfer: distillation-preserving target and the de-distillation guards.
+        migrated_data = data.copy()
+        migrated_data.setdefault("transfer_preserve_distillation", True)
+        migrated_data.setdefault("transfer_min_turbo_retention", 0.5)
+        migrated_data.setdefault("transfer_min_turbo_sharpness", 0.0)
+        return migrated_data
+
+    def __migration_32(self, data: dict) -> dict:
+        # Patience: validation checks to ignore before best/no-improvement tracking starts.
+        migrated_data = data.copy()
+        migrated_data.setdefault("patience_min_checks", 0)
+        return migrated_data
+
+    def __migration_33(self, data: dict) -> dict:
+        # Tensorboard: per-epoch mean training loss scalar.
+        migrated_data = data.copy()
+        migrated_data.setdefault("tensorboard_epoch_loss", True)
+        return migrated_data
+
+    def __migration_34(self, data: dict) -> dict:
+        # Patience: optional second-best validation checkpoint output.
+        migrated_data = data.copy()
+        migrated_data.setdefault("patience_save_second_best", False)
+        return migrated_data
+
     def from_dict(self, data: dict) -> "TrainConfig":
         # oft_clipped_norm was briefly a bool on this branch (clip on/off at a
         # hard-coded 0.999) before upstream PR #1492 settled on float | None
@@ -1259,6 +1355,18 @@ class TrainConfig(BaseConfig):
                 return "The text reward dataset folder holds no image with a prompt (.txt / .json) beside it."
         if self.text_reward_min_words < 1 or self.text_reward_max_words < self.text_reward_min_words:
             return "The text reward word range must satisfy 1 <= min <= max."
+        if not 0.0 <= self.text_reward_grad_sigma_min < self.text_reward_grad_sigma_max <= 1.0:
+            return "The text reward grad sigma window must satisfy 0 <= min < max <= 1."
+        if self.text_reward_grad_steps < 1:
+            return "The text reward needs at least one grad-bearing step."
+        if self.text_reward_grad_steps > self.text_reward_rollout_steps:
+            return "The text reward grad steps cannot exceed the rollout steps."
+        if not 0.0 <= self.text_reward_init_sigma < 1.0:
+            return "The text reward init sigma must lie in [0, 1); 0 disables the hybrid rollout."
+        if 0.0 < self.text_reward_init_sigma <= self.text_reward_grad_sigma_min:
+            return "The text reward init sigma must be above the grad sigma window (the rollout runs down from it)."
+        if self.text_reward_init_sigma > 0.0 and self.text_reward_rollout_steps < 2:
+            return "The hybrid text reward rollout needs at least two steps (one init, one grad)."
         if self.distill_phase_active() or self.transfer_enabled or self.rlhf_dpo_primary():
             return "The text reward rides on the standard finetune loss (plain or SFT + DPO), not on distill, transfer or DPO-primary runs."
         if self.optimizer is not None and getattr(self.optimizer, "fused_back_pass", False):
@@ -1428,6 +1536,8 @@ class TrainConfig(BaseConfig):
             return "Transfer requires dropout_probability = 0 (dropout breaks the deterministic validation)."
         if (self.transfer_patience_enabled or self.transfer_target_residual > 0.0) and not self.transfer_validation:
             return "Transfer auto-stop (patience / target residual) requires transfer_validation."
+        if self.transfer_min_turbo_retention < 0.0 or self.transfer_min_turbo_sharpness < 0.0:
+            return "The transfer turbo retention and sharpness guards must be 0 (off) or positive."
         if not self.transfer_base_model_name or not os.path.isfile(self.transfer_base_model_name):
             return "Transfer requires an existing Base checkpoint file (transfer_base_model_name)."
         if not self.transfer_teacher_adapter_name or not os.path.isfile(self.transfer_teacher_adapter_name):
@@ -1624,12 +1734,15 @@ class TrainConfig(BaseConfig):
         data.append(("tensorboard", True, bool, False))
         data.append(("tensorboard_expose", False, bool, False))
         data.append(("tensorboard_always_on", False, bool, False))
+        data.append(("tensorboard_epoch_loss", True, bool, False))
         data.append(("tensorboard_port", 6006, int, False))
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
         data.append(("patience", False, bool, False))
         data.append(("patience_epochs", 5, int, False))
+        data.append(("patience_min_checks", 0, int, False))
+        data.append(("patience_save_second_best", False, bool, False))
         data.append(("patience_mode", PatienceMode.STOP_TRAINING, PatienceMode, False))
         data.append(("continue_last_backup", False, bool, False))
         data.append(("prevent_overwrites", False, bool, False))
@@ -1699,6 +1812,8 @@ class TrainConfig(BaseConfig):
         data.append(("vb_loss_strength", 1.0, float, False))
         data.append(("loss_weight_fn", LossWeight.CONSTANT, LossWeight, False))
         data.append(("loss_weight_strength", 5.0, float, False))
+        for name, default in _PERCEPTUAL_DEFAULTS:
+            data.append((name, default, type(default), False))
         data.append(("dropout_probability", 0.0, float, False))
         data.append(("loss_scaler", LossScaler.NONE, LossScaler, False))
         data.append(("learning_rate_scaler", LearningRateScaler.NONE, LearningRateScaler, False))
@@ -1853,6 +1968,7 @@ class TrainConfig(BaseConfig):
         data.append(("oft_block_size", 32, int, False))
         data.append(("oft_block_share", False, bool, False))
         data.append(("dora_oft", False, bool, False))
+        data.append(("dora_oft_learning_rate", None, float, True))
         data.append(("oft_scaled", False, bool, False))
         data.append(("oft_clipped_norm", 0.95, float, True))
         data.append(("oft_cans", False, bool, False))
@@ -1911,6 +2027,9 @@ class TrainConfig(BaseConfig):
         data.append(("transfer_patience_checks", 5, int, False))
         data.append(("transfer_min_relative_improvement", 0.005, float, False))
         data.append(("transfer_target_residual", 0.0, float, False))
+        data.append(("transfer_preserve_distillation", True, bool, False))
+        data.append(("transfer_min_turbo_retention", 0.5, float, False))
+        data.append(("transfer_min_turbo_sharpness", 0.0, float, False))
 
         # dpo
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
@@ -1924,6 +2043,10 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
         data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
+        # No migration for the two below: configs saved without the keys load
+        # these defaults (logging off), which is what those runs did.
+        data.append(("rlhf_dpo_concept_logging", False, bool, False))
+        data.append(("rlhf_dpo_live_saturation", False, bool, False))
         data.append(("rlhf_supervised_mix", 0.25, float, False))
         data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
         data.append(("rlhf_dpo_addon_weight", 1.0, float, False))

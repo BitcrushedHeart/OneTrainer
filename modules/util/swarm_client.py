@@ -12,13 +12,14 @@ https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/API.md
 
 import logging
 import threading
+from urllib.parse import urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://localhost:7801"
-#: A generation call blocks until the images exist; a queued batch on a busy
-#: GPU can sit for minutes, so this is deliberately generous.
-DEFAULT_TIMEOUT = 900
+#: A generation call blocks until the images exist; a request queued behind a
+#: long SwarmUI queue can sit for well over an hour, so this is 1.5 hours.
+DEFAULT_TIMEOUT = 5400
 
 
 class SwarmError(RuntimeError):
@@ -155,6 +156,46 @@ class SwarmClient:
             if isinstance(name, str) and name:
                 names.append(name)
         return sorted(names)
+
+    def list_yolo_models(self) -> list[str]:
+        """Detection models usable in a ``<segment:yolo-NAME>`` tag. SwarmUI
+        has no model subtype for them; it exposes the list as the values of
+        an internal parameter."""
+        data = self._call("ListT2IParams", {})
+        for param in data.get("list") or []:
+            if isinstance(param, dict) and param.get("id") == "yolomodelinternal":
+                return [str(name) for name in param.get("values") or [] if str(name).strip()]
+        return []
+
+    def fetch_view(self, view_path: str, timeout: int = 120) -> bytes:
+        """The bytes of an image SwarmUI reported as a ``View/...`` path.
+
+        Only needed when the file cannot be found on disk (SwarmUI runs on
+        another machine, or its output root is not one of the folders the
+        tool knows); the session cookie travels with the request so a
+        token-protected server answers too."""
+        import requests
+
+        view = urlsplit(view_path)
+        if view.scheme or view.netloc:
+            url = urljoin(self.base_url + "/", view_path)
+            parsed, server = urlsplit(url), urlsplit(self.base_url)
+
+            def origin(parts):
+                return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+
+            if origin(parsed) != origin(server) or parsed.username or parsed.password:
+                raise SwarmError("SwarmUI returned an image URL outside the configured server")
+        else:
+            # Keep reverse-proxy prefixes for the usual View/... response.
+            url = f"{self.base_url}/{view_path.lstrip('/')}"
+        try:
+            response = self._client().get(url, timeout=timeout)
+        except requests.RequestException as ex:
+            raise SwarmError(f"Could not download {view_path} from SwarmUI: {ex}") from ex
+        if response.status_code != 200 or not response.content:
+            raise SwarmError(f"SwarmUI returned {response.status_code} for {view_path}")
+        return response.content
 
     def generate(
         self,

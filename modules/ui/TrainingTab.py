@@ -1224,6 +1224,98 @@ class TrainingTab:
             )
             row += 1
 
+        # Low-sigma perceptual term (Z-Image: VAE decoder features on x0_hat)
+        if self.train_config.model_type.is_z_image():
+            components.label(
+                frame,
+                row,
+                0,
+                "Perceptual Strength",
+                tooltip="Adds a VAE-decoder-feature distance between the one-step clean estimate and the dataset "
+                "latent on low/mid-noise samples. Never replaces MSE. 0 disables. Tune so TensorBoard "
+                "perceptual/grad_norm_v is ~0.1-0.2 of perceptual/mse_grad_norm_v.",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "perceptual_strength",
+                extra_validate=check_range(lower=0, message="Perceptual strength must be >= 0"),
+            )
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "Perceptual SNR Gamma",
+                tooltip="Min-SNR cap for the perceptual weight: strength * min(SNR, gamma). Keeps the pull on the "
+                "clean estimate constant across sigma and fades it out below sigma ~ 1/sqrt(gamma).",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "perceptual_snr_gamma",
+                extra_validate=check_range(lower=1, upper=100, message="Perceptual SNR gamma must be 1-100"),
+            )
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "Perceptual Sigma Full",
+                tooltip="Sigma up to which the perceptual term is at full weight (1 = pure noise).",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "perceptual_sigma_full",
+                extra_validate=check_range(lower=0, upper=1, message="Perceptual sigma full must be 0-1"),
+            )
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "Perceptual Sigma Max",
+                tooltip="Sigma at which the perceptual term reaches zero; cosine taper from Sigma Full. Keep it "
+                "wide (~0.75): tight gates (<= 0.4) throw the gain away and see almost no samples.",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "perceptual_sigma_max",
+                extra_validate=check_range(lower=0, upper=1, message="Perceptual sigma max must be 0-1"),
+            )
+            row += 1
+
+            components.label(
+                frame,
+                row,
+                0,
+                "Perceptual Crop",
+                tooltip="Edge in pixels of the random window decoded for the perceptual term; 0 decodes the whole "
+                "frame. Grad-bearing decoder activations scale with it; ~512 fits next to a 24 GB run.",
+            )
+            components.entry(
+                frame,
+                row,
+                1,
+                self.ui_state,
+                "perceptual_crop",
+                extra_validate=check_range(lower=0, message="Perceptual crop must be >= 0"),
+            )
+            row += 1
+
         # Loss Scaler
         components.label(
             frame,

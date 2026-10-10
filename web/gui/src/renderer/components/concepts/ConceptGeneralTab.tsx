@@ -48,6 +48,14 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Include Subdirectories</span>
       <Toggle value={draft.include_subdirectories} onChange={(v) => update("include_subdirectories", v)} />
 
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Cache Directory</span>
+      <DirPicker
+        label=""
+        value={draft.cache_dir ?? ""}
+        onChange={(v) => update("cache_dir", v)}
+        tooltip="Optional. Caches this concept's latents and text encodings here (in image/ and text/ subfolders) instead of the run's cache directory, so every run that trains on this concept can share one cache. Leave empty to use the run's cache directory. Clear Cache leaves this folder alone; Cache GC sweeps it."
+      />
+
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Image Variations</span>
       <FormEntry
         label=""
@@ -103,6 +111,24 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
         value={draft.dpo_beta_override}
         onChange={(v) => update("dpo_beta_override", v)}
         tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. 0 inherits the global beta. Adaptive beta still applies, scaling every concept by the same factor. Ignored by the IPO objective, which uses tau."
+      />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Unmasked Weight Override</span>
+      <FormEntry
+        label=""
+        type="number"
+        value={draft.unmasked_weight_override}
+        onChange={(v) => update("unmasked_weight_override", v)}
+        tooltip="Loss weight outside the mask for this concept only (masked training). 0 trains the masked region alone; a DPO concept's margin is then computed inside the mask only. Negative inherits the run's Unmasked Weight."
+      />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Unmasked Probability Override</span>
+      <FormEntry
+        label=""
+        type="number"
+        value={draft.unmasked_probability_override}
+        onChange={(v) => update("unmasked_probability_override", v)}
+        tooltip="Chance (0-1) that a sample of this concept trains on the whole image instead of its mask, drawn per sample each epoch; a DPO pair is unmasked together. Negative inherits the run's Unmasked Probability. Inpainting models apply only the run-wide value."
       />
     </div>
   );

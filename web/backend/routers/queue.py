@@ -77,6 +77,19 @@ def duplicate_entry(entry_id: str):
     return service.duplicate_entry(entry_id)
 
 
+@router.post("/queue/entry/{entry_id}/reset", response_model=QueueActionResponse)
+def reset_entry(entry_id: str):
+    """Mark a completed / failed / skipped entry as pending so the next run trains it again."""
+    service = QueueService.get_instance()
+    return QueueActionResponse(**service.reset_entry(entry_id))
+
+
+@router.post("/queue/reset-all", response_model=QueueActionResponse)
+def reset_all():
+    service = QueueService.get_instance()
+    return QueueActionResponse(**service.reset_all())
+
+
 @router.post("/queue/reorder")
 def reorder(req: ReorderRequest):
     service = QueueService.get_instance()

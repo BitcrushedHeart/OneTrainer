@@ -249,6 +249,13 @@ def split_parameters_for_muon(
             group["optim_type"] = "muon"
         return parameters, MuonWithAuxAdam
 
+    dora_multiplier_ids = {
+        id(p)
+        for module in vars(model).values()
+        if isinstance(module, LoRAModuleWrapper) and module.dora_learning_rate is not None
+        for p in module.dora_multiplier_parameters()
+    }
+
     final_param_groups = []
     for group in parameters:
         muon_params = [p for p in group["params"] if p.requires_grad and layer_key_fn.get(id(p)) == "muon"]
@@ -276,6 +283,9 @@ def split_parameters_for_muon(
                 adam_lr = te1_adam_lr if te1_adam_lr is not None else base_adam_lr
             if original_name in ("text_encoder_2", "text_encoder_2_lora"):
                 adam_lr = te2_adam_lr if te2_adam_lr is not None else base_adam_lr
+            if all(id(p) in dora_multiplier_ids for p in adam_params):
+                # the DoRA-OFT magnitudes' own learning rate, already on their group
+                adam_lr = group["lr"]
             adam_group["lr"] = adam_lr
             adam_group["initial_lr"] = adam_lr
             final_param_groups.append(adam_group)

@@ -212,6 +212,77 @@ export interface BucketAnalysisResult {
   targets: BucketAnalysisTarget[];
 }
 
+/** One `<segment:…>` fix for Fix & Regenerate. */
+export interface RegenFix {
+  target: string;
+  creativity: number;
+  threshold: number;
+  sub_prompt: string;
+}
+
+/** SwarmUI's "Segment Refining" group by API id; the server coerces values. */
+export type RegenSegmentParams = Record<string, string | number | boolean>;
+
+export interface RegenPreviewItem {
+  path: string;
+  ok: boolean;
+  error: string | null;
+  warnings: string[];
+  original_prompt: string;
+  prompt: string;
+  seed: number | null;
+  model: string;
+  width: number | null;
+  height: number | null;
+  steps: number | null;
+  cfgscale: number | null;
+  sampler: string | null;
+  scheduler: string | null;
+  loras: string[];
+  negativeprompt: string;
+}
+
+export interface RegenPreviewResponse {
+  ok: boolean;
+  error?: string;
+  group_index?: number;
+  items?: RegenPreviewItem[];
+  segment_params?: RegenSegmentParams;
+}
+
+export interface RegenItemStatus {
+  status: "queued" | "running" | "done" | "failed" | "dropped" | "skipped";
+  output: string | null;
+  error: string | null;
+  prompt: string;
+}
+
+export interface RegenStatus {
+  ok: boolean;
+  running: boolean;
+  phase: "idle" | "generating" | "done" | "error" | "cancelled";
+  group_index: number;
+  planned: number;
+  done: number;
+  failed: number;
+  items: Record<string, RegenItemStatus>;
+  added: string[];
+  dropped: string[];
+  error: string | null;
+  warning: string | null;
+}
+
+export interface RegenStartOptions {
+  paths: string[];
+  fixes: RegenFix[];
+  segment_params: RegenSegmentParams;
+  model_override: string;
+  base_url: string;
+  token: string;
+  generated_folder: string;
+  concurrency: number;
+}
+
 export const dpoApi = {
   checkPairs: () =>
     request<{ ok: boolean; result?: PairCheckResult; error?: string }>("/dpo/check-pairs", {
@@ -265,6 +336,7 @@ export const dpoApi = {
     groupOrder: GroupOrder = "most_realistic",
     captionFilter = "",
     minImagesPerGroup = 2,
+    loraFilter = "",
   ) =>
     request<{ ok: boolean; existing_pairs?: number; pruned?: number; error?: string }>("/dpo/session/start", {
       method: "POST",
@@ -275,6 +347,7 @@ export const dpoApi = {
         mode,
         group_order: groupOrder,
         caption_filter: captionFilter,
+        lora_filter: loraFilter,
         min_images_per_group: minImagesPerGroup,
       }),
     }),
@@ -288,6 +361,26 @@ export const dpoApi = {
       method: "POST",
       body: JSON.stringify({ path }),
     }),
+
+  // Fix & Regenerate: what would be resent for each selected image (composed
+  // prompt, seed, model, size), and which images carry no parameter block.
+  regenPreview: (paths: string[], fixes: RegenFix[], segmentParams: RegenSegmentParams, modelOverride = "") =>
+    request<RegenPreviewResponse>("/dpo/session/regen/preview", {
+      method: "POST",
+      body: JSON.stringify({ paths, fixes, segment_params: segmentParams, model_override: modelOverride }),
+    }),
+
+  // Starts the background run; poll regenStatus. Results are appended to the
+  // current group as they land.
+  regenStart: (options: RegenStartOptions) =>
+    request<{ ok: boolean; error?: string; planned?: number; group_index?: number }>("/dpo/session/regen/start", {
+      method: "POST",
+      body: JSON.stringify(options),
+    }),
+
+  regenStatus: () => request<RegenStatus>("/dpo/session/regen/status"),
+
+  regenCancel: () => request<{ ok: boolean }>("/dpo/session/regen/cancel", { method: "POST" }),
 
   // discardRest commits the pair and then retires the whole group from the
   // source tree (paired sources → .chosen/.rejected, leftovers → .discard).

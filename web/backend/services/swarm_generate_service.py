@@ -22,13 +22,19 @@ from contextlib import suppress
 from modules.util.caption_style import classify_caption_type
 from modules.util.swarm_client import DEFAULT_BASE_URL, SwarmClient, SwarmError
 from modules.util.swarm_generate_util import (
+    BLACK_FOLDER,
+    DEFAULT_BLACK_MAX_LEVEL,
     DEFAULT_QUANTIZATION,
     DEFAULT_TARGET_RESOLUTION,
+    describe_black_image,
     filter_pool_lines,
+    find_black_images,
+    is_black_image,
     merge_params,
     plan_generations,
     read_last_generation_params,
     sanitize_source_params,
+    save_generation_locally,
 )
 from web.backend.services._singleton import SingletonMixin
 
@@ -46,15 +52,88 @@ _MAX_CONSECUTIVE_FAILURES = 5
 DEFAULT_CONCURRENCY = 3
 _MAX_CONCURRENCY = 8
 
+#: Extra attempts a job gets when every image it produced came back black.
+#: A fresh seed each time; after these the job is a failure like any other,
+#: so a backend that only writes black still trips the consecutive-failure
+#: stop instead of looping.
+_BLACK_RETRIES = 2
+
+
+def split_keyword_jobs(entries: list[str] | None) -> list[str]:
+    """Bulk keyword entries as one keyword filter per run: trimmed, blanks
+    and repeats dropped, and ``a+b`` turned into the all-required ``a, b``."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in entries or []:
+        terms = [term.strip() for term in str(entry).replace(",", "+").split("+") if term.strip()]
+        keywords = ", ".join(terms)
+        if not keywords or keywords.casefold() in seen:
+            continue
+        seen.add(keywords.casefold())
+        out.append(keywords)
+    return out
+
 
 def _job_summary(options: dict) -> dict:
     """The few fields that identify a queued run in the UI."""
     return {
+        "mode": options.get("mode", "generate"),
+        # Free text from the caller (the character a run is for, say).
+        "label": options.get("label", ""),
         "keywords": options.get("keywords", ""),
         "captions": options.get("captions", 0),
         "images_per_caption": options.get("images_per_caption", 1),
+        "images": len(options.get("jobs") or []),
         "dry_run": options.get("dry_run", False),
     }
+
+
+#: Where a run's settings come from. "last" and "folder" both read the newest
+#: image's parameter block — from the generated folder, or from any folder the
+#: caller names (a reference set generated the way the user likes).
+PARAM_SOURCES = ("last", "preset", "manual", "folder")
+
+
+def strip_source_loras(params: dict) -> dict:
+    """``params`` without any adapter keys SwarmUI records (``loras``,
+    ``loraweights``, ``lorasectionconfs``, ``loratencweights``, ...), so only
+    the LoRAs a caller passes explicitly reach the generation."""
+    return {key: value for key, value in (params or {}).items() if not str(key).lower().startswith("lora")}
+
+
+def _folder_source_label(folder: str, found: bool) -> str:
+    name = os.path.basename(os.path.normpath(folder)) or folder
+    return f"last generation in {name}" if found else f"manual (no generation found in {name})"
+
+
+def last_generation_source(folder: str, search_limit: int = 40) -> tuple[str | None, dict]:
+    """``(path, params)`` of the newest image under ``folder`` that carries a
+    SwarmUI parameter block — the same search as
+    :func:`read_last_generation_params`, with the file it settled on, so the
+    UI can name it. ``(None, {})`` when there is none."""
+    from modules.util.path_util import supported_image_extensions
+    from modules.util.swarm_generate_util import _params_from_image
+
+    supported = supported_image_extensions()
+    candidates: list[tuple[float, str]] = []
+    if os.path.isdir(folder or ""):
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                if os.path.splitext(name)[1].lower() not in supported:
+                    continue
+                path = os.path.join(root, name)
+                with suppress(OSError):
+                    candidates.append((os.path.getmtime(path), path))
+    candidates.sort(reverse=True)
+    for _mtime, path in candidates[:search_limit]:
+        params = _params_from_image(path)
+        if params:
+            return path, params
+    return None, {}
+
+
+_BLACK_OUTPUT = f"SwarmUI wrote a black image (backend failure); moved to {BLACK_FOLDER}"
 
 
 class SwarmGenerateService(SingletonMixin):
@@ -72,6 +151,10 @@ class SwarmGenerateService(SingletonMixin):
         #: instead of babysitting one run at a time.
         self._queue: list[dict] = []
         self._rng = random.Random()
+        #: Makes finding black images and retiring them one step, so a manual
+        #: requeue and a run's own start-of-run scan cannot both claim the
+        #: same file and generate it twice.
+        self._black_lock = threading.Lock()
 
     @staticmethod
     def _idle_state() -> dict:
@@ -95,6 +178,10 @@ class SwarmGenerateService(SingletonMixin):
             "job_total": 0,
             "current_job": None,
             "queued": [],
+            # Black images found in the tree at the start of a run and
+            # retired to .black, and in-run black outputs retried.
+            "black_retired": 0,
+            "black_retried": 0,
         }
 
     # ------------------------------------------------------------------ #
@@ -116,6 +203,10 @@ class SwarmGenerateService(SingletonMixin):
         except SwarmError:
             loras = []
         try:
+            yolo = client.list_yolo_models()
+        except SwarmError:
+            yolo = []
+        try:
             loaded = client.list_loaded_models()
         except SwarmError:
             loaded = []
@@ -129,6 +220,7 @@ class SwarmGenerateService(SingletonMixin):
             "user_id": info.get("user_id"),
             "models": models,
             "loras": loras,
+            "yolo": yolo,
             "loaded": loaded,
             "presets": [preset["title"] for preset in presets],
         }
@@ -292,26 +384,47 @@ class SwarmGenerateService(SingletonMixin):
         loras: list[dict] | None = None,
         # Where the generation settings come from: "last" reuses the newest
         # image in the generated folder (what the user is generating with right
-        # now), "preset" a saved SwarmUI preset, "manual" only the fields here.
+        # now), "preset" a saved SwarmUI preset, "manual" only the fields here,
+        # "folder" the newest image in ``param_folder``.
         param_source: str = "last",
         preset_name: str = "",
+        param_folder: str = "",
+        # Drop the source's own LoRAs so only ``loras`` applies — a reference
+        # folder generated with one character's adapter must not carry it
+        # into another character's negatives.
+        drop_source_loras: bool = False,
+        # Free text shown against the queued run (the character it is for).
+        label: str = "",
+        # When set, SwarmUI is asked not to save (``donotsave``) and every
+        # result is written into this folder as a self-describing PNG instead
+        # of landing in SwarmUI's output tree. Used for per-character folders.
+        save_to: str = "",
         concurrency: int = DEFAULT_CONCURRENCY,
         aspect_tolerance: float = 0.15,
         target_resolution: int = DEFAULT_TARGET_RESOLUTION,
         quantization: int = DEFAULT_QUANTIZATION,
         dry_run: bool = False,
+        # Retire and regenerate black images already in the tree before the
+        # new captions, and retry an in-run black output with a fresh seed.
+        auto_requeue_black: bool = True,
+        # Bulk: one run per entry, each with its own ``captions`` budget and
+        # the entry as its keyword filter ("a+b" requires both). Replaces
+        # ``keywords`` when it holds anything.
+        keyword_jobs: list[str] | None = None,
     ) -> dict:
-        for label, folder in (("Real photo", real_folder), ("Generated", generated_folder)):
+        for what, folder in (("Real photo", real_folder), ("Generated", generated_folder)):
             if not os.path.isdir(folder):
-                return {"ok": False, "error": f"{label} folder not found: {folder}"}
+                return {"ok": False, "error": f"{what} folder not found: {folder}"}
         if not output_dir:
             return {"ok": False, "error": "Output folder is required"}
-        if param_source not in ("last", "preset", "manual"):
-            return {"ok": False, "error": "param_source must be 'last', 'preset' or 'manual'"}
+        if param_source not in PARAM_SOURCES:
+            return {"ok": False, "error": "param_source must be 'last', 'preset', 'manual' or 'folder'"}
         if param_source == "manual" and not dry_run and not model:
             return {"ok": False, "error": "Pick a model"}
         if param_source == "preset" and not preset_name:
             return {"ok": False, "error": "Pick a preset"}
+        if param_source == "folder" and not os.path.isdir(param_folder or ""):
+            return {"ok": False, "error": f"Parameter folder not found: {param_folder}"}
         if captions < 1 or images_per_caption < 1:
             return {"ok": False, "error": "Captions and images per caption must be at least 1"}
 
@@ -333,20 +446,37 @@ class SwarmGenerateService(SingletonMixin):
             "loras": [entry for entry in (loras or []) if entry.get("name")],
             "param_source": param_source,
             "preset_name": preset_name,
+            "param_folder": param_folder,
+            "drop_source_loras": bool(drop_source_loras),
+            "label": label or "",
+            "save_to": save_to or "",
             "concurrency": max(1, min(int(concurrency), _MAX_CONCURRENCY)),
             "aspect_tolerance": aspect_tolerance,
             "target_resolution": target_resolution,
             "quantization": quantization,
             "dry_run": dry_run,
+            "auto_requeue_black": bool(auto_requeue_black),
         }
 
+        bulk = split_keyword_jobs(keyword_jobs)
+        if not bulk:
+            return self._enqueue(options)
+        # Runs drain in order and each reads the pool afresh, so a caption two
+        # keywords share is generated once, by the first run that reaches it.
+        result = self._enqueue(*[{**options, "keywords": keywords} for keywords in bulk])
+        return {**result, "jobs": len(bulk)}
+
+    def _enqueue(self, *jobs: dict) -> dict:
+        """Add runs to the queue, starting the worker if none is draining.
+        ``position`` is the first new run's place in the queue."""
+        options = jobs[0]
         with self._lock:
-            self._queue.append(options)
-            position = len(self._queue)
+            position = len(self._queue) + 1
+            self._queue.extend(jobs)
             if self._state["running"]:
                 # A run is in flight: this one waits its turn, and the
                 # worker picks it up without any idle time in between.
-                self._state["job_total"] += 1
+                self._state["job_total"] += len(jobs)
                 self._state["queued"] = [_job_summary(job) for job in self._queue]
                 return {"ok": True, "queued": True, "position": position}
             self._generation += 1
@@ -357,7 +487,7 @@ class SwarmGenerateService(SingletonMixin):
                 {
                     "running": True,
                     "phase": "starting",
-                    "dry_run": dry_run,
+                    "dry_run": options.get("dry_run", False),
                     "job_total": len(self._queue),
                     "queued": [_job_summary(job) for job in self._queue],
                 }
@@ -386,8 +516,11 @@ class SwarmGenerateService(SingletonMixin):
                     self._state["job_index"] += 1
                     self._state["current_job"] = _job_summary(options)
                     self._state["queued"] = [_job_summary(job) for job in self._queue]
-                    self._state["dry_run"] = options["dry_run"]
-                self._run_inner(generation, stop, options)
+                    self._state["dry_run"] = options.get("dry_run", False)
+                if options.get("mode") == "requeue":
+                    self._requeue_inner(generation, stop, options)
+                else:
+                    self._run_inner(generation, stop, options)
                 if self._state["phase"] in ("error", "cancelled"):
                     break
         except Exception as ex:  # surfaced, never swallowed
@@ -406,8 +539,25 @@ class SwarmGenerateService(SingletonMixin):
                         self._state["phase"] = "done"
 
     def _run_inner(self, generation: int, stop: threading.Event, options: dict) -> None:
-        from modules.util.dpo_curation_util import parse_caption_keywords
-        from modules.util.dpo_offpolicy_util import filter_pool_by_keywords, suggest_captions
+        from modules.util.dpo_curation_util import move_to_dot_bucket, parse_caption_keywords
+        from modules.util.dpo_offpolicy_util import caption_match_key, filter_pool_by_keywords, suggest_captions
+
+        # Black images already in the tree (an earlier backend failure) are
+        # retired before the pool is read, so their captions count as
+        # un-generated again, and regenerated ahead of the new captions. A
+        # plan-only run lists them without touching them.
+        black_jobs: list[dict] = []
+        black_keys: set[str] = set()
+        if options.get("auto_requeue_black"):
+            self._state["phase"] = "scanning"
+            with self._black_lock:
+                black, black_jobs, _unresendable = self._plan_black_jobs(options["generated_folder"], options["model"])
+                if black and not options["dry_run"]:
+                    self._state["black_retired"] += move_to_dot_bucket(black, BLACK_FOLDER)
+            black_keys = {caption_match_key(job["caption"]) for job in black_jobs}
+            if not self._live(generation, stop):
+                self._state["phase"] = "cancelled"
+                return
 
         pool = self._collect_pool(
             options["real_folder"], options["generated_folder"], options["output_dir"], options["aspect_tolerance"]
@@ -416,6 +566,14 @@ class SwarmGenerateService(SingletonMixin):
             self._state["phase"] = "cancelled"
             return
         pool = filter_pool_by_keywords(pool, parse_caption_keywords(options["keywords"]))
+        if black_keys:
+            # A caption freed by retiring its black image is already covered
+            # by the requeue; it must not be drawn a second time here.
+            pool = [
+                (photo, kept)
+                for photo, lines in pool
+                if (kept := [line for line in lines if caption_match_key(line) not in black_keys])
+            ]
         # Tag-style and word-minimum filters narrow each photo's eligible
         # *lines* before the draw, so a photo is never judged by whichever of
         # its caption lines the random pick landed on.
@@ -433,22 +591,21 @@ class SwarmGenerateService(SingletonMixin):
             target_resolution=options["target_resolution"],
             quantization=options["quantization"],
         )
-        jobs = jobs[: options["captions"]]
+        jobs = black_jobs + jobs[: options["captions"]]
         self._state["skipped_tag_style"] = stats["tag_style"] + plan_stats.get("tag_style", 0)
         self._state["skipped_short"] = stats["too_short"] + plan_stats.get("too_short", 0)
         self._state["planned"] = len(jobs)
 
         if options["dry_run"]:
-            if options["param_source"] == "last":
-                self._state["params"] = merge_params(
-                    read_last_generation_params(options["generated_folder"]),
-                    {"model": options["model"]} if options["model"] else {},
-                )
-                self._state["param_source"] = "last generation"
+            if options["param_source"] in ("last", "folder"):
+                source, source_label = self._image_source_params(options)
+                self._state["params"] = merge_params(source, {"model": options["model"]} if options["model"] else {})
+                self._state["param_source"] = source_label
             self._state["results"] = [
                 {
                     "caption": job["caption"],
                     "real_path": job["real_path"],
+                    "requeued_from": job.get("requeued_from"),
                     "size": [job["width"], job["height"]],
                     "exact_size": job.get("exact_size", False),
                     "images": job["images"],
@@ -480,6 +637,215 @@ class SwarmGenerateService(SingletonMixin):
         self._state["phase"] = "generating"
 
         extra = {key: value for key, value in params.items() if key != "model"}
+        save_to = options.get("save_to") or ""
+        if save_to:
+            extra = {**extra, "donotsave": True}
+
+        def run_job(client: SwarmClient, job: dict) -> list[str]:
+            if "_kwargs" in job:
+                # A retired black image: its own recorded parameters.
+                kwargs = job["_kwargs"]
+                if save_to:
+                    kwargs = {**kwargs, "extra_params": {**(kwargs.get("extra_params") or {}), "donotsave": True}}
+                views = client.generate(**kwargs)
+                request = {
+                    **(kwargs.get("extra_params") or {}),
+                    "prompt": kwargs.get("prompt", ""),
+                    "model": kwargs.get("model", ""),
+                }
+            else:
+                views = client.generate(
+                    prompt=job["caption"],
+                    width=job["width"],
+                    height=job["height"],
+                    model=params["model"],
+                    images=job["images"],
+                    extra_params=extra,
+                )
+                request = {
+                    **extra,
+                    "prompt": job["caption"],
+                    "model": params["model"],
+                    "width": job["width"],
+                    "height": job["height"],
+                }
+            if not save_to:
+                return views
+            return self._store_locally(client, views, save_to, request)
+
+        self._execute(generation, stop, options, jobs, run_job)
+
+    @staticmethod
+    def _store_locally(client: SwarmClient, views: list[str], save_to: str, request: dict) -> list[str]:
+        """Pull each ``donotsave`` result back (data URI or a download) and write
+        it into ``save_to``; returns the local paths in place of SwarmUI views."""
+        import base64
+        import hashlib
+        import time
+
+        request = {key: value for key, value in request.items() if key != "donotsave"}
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        digest = hashlib.sha1(str(request.get("prompt", "")).encode("utf-8")).hexdigest()[:8]
+        stored = []
+        for index, view in enumerate(views, start=1):
+            data = base64.b64decode(view.split(",", 1)[1]) if view.startswith("data:") else client.fetch_view(view)
+            stored.append(save_generation_locally(data, save_to, f"{stamp}-{digest}-{index}", request))
+        return stored
+
+    # ------------------------------------------------------------------ #
+    # Black (failed) generations
+    # ------------------------------------------------------------------ #
+
+    def scan_black(self, generated_folder: str, max_level: int = DEFAULT_BLACK_MAX_LEVEL) -> dict:
+        """Every black image in the generated tree, with what it recorded.
+
+        A generation that failed inside SwarmUI's backend still lands on disk
+        as an all-black file, and because it carries the prompt it claims
+        that caption as generated: the off-policy builder would never
+        suggest it again and could only ever pair the photo with a black
+        rejected image. These are what :meth:`requeue_black` retires."""
+        if not os.path.isdir(generated_folder):
+            return {"ok": False, "error": f"Generated folder not found: {generated_folder}"}
+        paths = find_black_images(generated_folder, max_level=max_level)
+        images = [describe_black_image(path) for path in paths]
+        return {"ok": True, "count": len(images), "images": images}
+
+    def _plan_black_jobs(
+        self,
+        generated_folder: str,
+        model: str = "",
+        paths: list[str] | None = None,
+        max_level: int = DEFAULT_BLACK_MAX_LEVEL,
+    ) -> tuple[list[str], list[dict], list[dict]]:
+        """``(black, jobs, unresendable)``: the black images found (or those
+        of ``paths`` that really are black and inside the tree), one resend
+        job per image that carries a parameter block, and the rest with the
+        reason. Nothing is moved here."""
+        from modules.util.dpo_regen_util import build_generate_kwargs, resend_params_from_image
+
+        if paths:
+            root = os.path.normcase(os.path.abspath(generated_folder)).rstrip(os.sep) + os.sep
+            black: list[str] = []
+            for path in paths:
+                full = os.path.abspath(str(path))
+                inside = os.path.normcase(full).startswith(root)
+                if inside and os.path.isfile(full) and is_black_image(full, max_level):
+                    black.append(full)
+        else:
+            black = find_black_images(generated_folder, max_level=max_level)
+
+        override = (model or "").strip()
+        jobs: list[dict] = []
+        unresendable: list[dict] = []
+        for path in black:
+            params = resend_params_from_image(path)
+            params.pop("seed", None)  # a fresh sample, like the run that made it
+            prompt = str(params.get("prompt") or "").strip()
+            if not params or not prompt:
+                unresendable.append({"path": path, "error": "No SwarmUI parameter block in this image"})
+                continue
+            try:
+                kwargs = build_generate_kwargs(params, prompt, {}, override)
+            except ValueError as ex:
+                unresendable.append({"path": path, "error": str(ex)})
+                continue
+            jobs.append(
+                {
+                    "caption": prompt,
+                    "real_path": None,
+                    "requeued_from": path,
+                    "width": kwargs["width"],
+                    "height": kwargs["height"],
+                    "images": 1,
+                    "_kwargs": kwargs,
+                }
+            )
+        return black, jobs, unresendable
+
+    def requeue_black(
+        self,
+        generated_folder: str,
+        base_url: str = DEFAULT_BASE_URL,
+        token: str = "",
+        model: str = "",
+        concurrency: int = DEFAULT_CONCURRENCY,
+        paths: list[str] | None = None,
+        max_level: int = DEFAULT_BLACK_MAX_LEVEL,
+    ) -> dict:
+        """Retire the black images and queue a fresh generation for each.
+
+        Every image is moved into ``.black`` beside itself first, whether or
+        not it can be resent, so its caption is free again for the builder
+        and for an ordinary run even if the resend fails. The resend uses the
+        image's own recorded parameter block (prompt, size, sampler, LoRAs,
+        model unless overridden) with a fresh seed, the way the original run
+        would have made it. ``paths`` limits the requeue to those images;
+        each must still be black — a non-black file is never retired.
+
+        An ordinary run does the same on its own when ``auto_requeue_black``
+        is on; this is the way to do it without generating anything new."""
+        from modules.util.dpo_curation_util import move_to_dot_bucket
+
+        if not os.path.isdir(generated_folder):
+            return {"ok": False, "error": f"Generated folder not found: {generated_folder}"}
+        with self._black_lock:
+            black, jobs, unresendable = self._plan_black_jobs(generated_folder, model, paths, max_level)
+            if not black:
+                return {"ok": True, "queued": False, "found": 0, "moved": 0, "requeued": 0, "unresendable": []}
+            moved = move_to_dot_bucket(black, BLACK_FOLDER)
+        if not jobs:
+            return {
+                "ok": True,
+                "queued": False,
+                "found": len(black),
+                "moved": moved,
+                "requeued": 0,
+                "unresendable": unresendable,
+            }
+        options = {
+            "mode": "requeue",
+            "generated_folder": generated_folder,
+            "base_url": base_url,
+            "token": token,
+            "model": (model or "").strip(),
+            "concurrency": max(1, min(int(concurrency), _MAX_CONCURRENCY)),
+            "jobs": jobs,
+            "dry_run": False,
+        }
+        result = self._enqueue(options)
+        result.update({"found": len(black), "moved": moved, "requeued": len(jobs), "unresendable": unresendable})
+        return result
+
+    def _requeue_inner(self, generation: int, stop: threading.Event, options: dict) -> None:
+        jobs = options["jobs"]
+        self._state["planned"] += len(jobs)
+        self._state["param_source"] = "each image's own parameters"
+        self._state["phase"] = "generating"
+
+        def run_job(client: SwarmClient, job: dict) -> list[str]:
+            return client.generate(**job["_kwargs"])
+
+        self._execute(generation, stop, options, jobs, run_job)
+
+    # ------------------------------------------------------------------ #
+    # Shared run loop
+    # ------------------------------------------------------------------ #
+
+    def _execute(self, generation: int, stop: threading.Event, options: dict, jobs: list[dict], run_job) -> None:
+        """Send every job through a worker pool and record the outcomes.
+
+        ``run_job(client, job)`` returns SwarmUI's ``View/...`` paths. Each
+        returned image is checked on disk: a black file is a backend failure
+        that SwarmUI reported as success, so it is retired to ``.black`` at
+        once. A job whose every image came back black is retried with a fresh
+        seed (:data:`_BLACK_RETRIES` times, unless ``auto_requeue_black`` is
+        off) and only then counted as a failure — a dead backend then stops
+        the run like any other consecutive-failure streak, instead of filling
+        the tree with black images that claim their captions."""
+        from modules.util.dpo_curation_util import move_to_dot_bucket
+        from modules.util.dpo_replace_util import local_path_for_view
+
+        generated_folder = options.get("generated_folder") or ""
         # One client per worker thread: a client owns a session and an HTTP
         # connection, neither of which wants to be shared mid-request.
         thread_state = threading.local()
@@ -491,15 +857,30 @@ class SwarmGenerateService(SingletonMixin):
                 thread_state.client = existing
             return existing
 
-        def run_job(job: dict) -> tuple[dict, list[str]]:
-            return job, worker_client().generate(
-                prompt=job["caption"],
-                width=job["width"],
-                height=job["height"],
-                model=params["model"],
-                images=job["images"],
-                extra_params=extra,
-            )
+        def split_black(views: list[str]) -> tuple[list[str], list[str]]:
+            good, black = [], []
+            for view in views:
+                local = local_path_for_view(view, generated_folder) if generated_folder else None
+                if local and is_black_image(local):
+                    black.append(local)
+                else:
+                    good.append(view)
+            return good, black
+
+        retries = _BLACK_RETRIES if options.get("auto_requeue_black", True) else 0
+
+        def submit(job: dict) -> tuple[dict, list[str], int, int]:
+            """``(job, good views, black outputs retired, retries made)``."""
+            client = worker_client()
+            retired = 0
+            for attempt in range(1 + retries):
+                good, black = split_black(run_job(client, job))
+                if black:
+                    move_to_dot_bucket(black, BLACK_FOLDER)
+                    retired += len(black)
+                if good or not black or not self._live(generation, stop):
+                    return job, good, retired, attempt
+            return job, [], retired, retries
 
         failures_since_success = 0
         aborted = False
@@ -507,7 +888,7 @@ class SwarmGenerateService(SingletonMixin):
         # request queued behind the one it is running — no idle GPU between
         # batches — while the pool keeps only `concurrency` in flight.
         with ThreadPoolExecutor(max_workers=options["concurrency"]) as pool:
-            futures = {pool.submit(run_job, job): job for job in jobs}
+            futures = {pool.submit(submit, job): job for job in jobs}
             for future in as_completed(futures):
                 if not self._live(generation, stop):
                     pool.shutdown(wait=False, cancel_futures=True)
@@ -516,18 +897,30 @@ class SwarmGenerateService(SingletonMixin):
                 job = futures[future]
                 record = {
                     "caption": job["caption"],
-                    "real_path": job["real_path"],
+                    "real_path": job.get("real_path"),
+                    "requeued_from": job.get("requeued_from"),
                     "size": [job["width"], job["height"]],
                     "exact_size": job.get("exact_size", False),
                     "images": job["images"],
                     "caption_type": classify_caption_type(job["caption"]).value,
                 }
+                error: str | None = None
+                paths: list[str] = []
                 try:
-                    _job, paths = future.result()
+                    _job, paths, retired, retried = future.result()
                 except CancelledError:
                     continue
                 except SwarmError as ex:
-                    record.update({"ok": False, "error": str(ex)})
+                    error = str(ex)
+                if error is None:
+                    if retired:
+                        record["black"] = retired
+                        with self._results_lock:
+                            self._state["black_retried"] += retried
+                    if not paths:
+                        error = _BLACK_OUTPUT
+                if error is not None:
+                    record.update({"ok": False, "error": error})
                     with self._results_lock:
                         failures_since_success += 1
                         self._state["failed"] += 1
@@ -536,7 +929,7 @@ class SwarmGenerateService(SingletonMixin):
                         give_up = failures_since_success >= _MAX_CONSECUTIVE_FAILURES
                     if give_up:
                         self._state["error"] = (
-                            f"Stopped after {failures_since_success} consecutive SwarmUI failures: {ex}"
+                            f"Stopped after {failures_since_success} consecutive SwarmUI failures: {error}"
                         )
                         self._state["phase"] = "error"
                         pool.shutdown(wait=False, cancel_futures=True)
@@ -562,9 +955,8 @@ class SwarmGenerateService(SingletonMixin):
         generates, rather than with this tool's idea of defaults."""
         source: dict = {}
         source_label = "manual"
-        if options["param_source"] == "last":
-            source = read_last_generation_params(options["generated_folder"])
-            source_label = "last generation" if source else "manual (no previous generation found)"
+        if options["param_source"] in ("last", "folder"):
+            source, source_label = self._image_source_params(options)
         elif options["param_source"] == "preset":
             wanted = options["preset_name"]
             for preset in client.presets():
@@ -591,11 +983,38 @@ class SwarmGenerateService(SingletonMixin):
         self._state["param_source"] = source_label
         return params
 
+    @staticmethod
+    def _image_source_params(options: dict) -> tuple[dict, str]:
+        """``(source params, label)`` for the sources read from an image's
+        parameter block: the generated folder ("last") or ``param_folder``
+        ("folder"). Adapter keys are stripped when ``drop_source_loras`` is
+        set, so only the run's explicit ``loras`` override applies."""
+        if options["param_source"] == "folder":
+            folder = options["param_folder"]
+            source = read_last_generation_params(folder)
+            source_label = _folder_source_label(folder, bool(source))
+        else:
+            source = read_last_generation_params(options["generated_folder"])
+            source_label = "last generation" if source else "manual (no previous generation found)"
+        if options.get("drop_source_loras"):
+            source = strip_source_loras(source)
+        return source, source_label
+
     def preview_params(self, generated_folder: str) -> dict:
         """What "reuse my last generation" would apply, for the UI to show
         before anything is generated."""
-        params = sanitize_source_params(read_last_generation_params(generated_folder))
-        return {"ok": True, "params": params}
+        return self.preview_params_for(generated_folder, False)
+
+    def preview_params_for(self, param_folder: str, drop_source_loras: bool = False) -> dict:
+        """The settings the newest image in ``param_folder`` would supply, as
+        a run with ``param_source="folder"`` (or "last") would reuse them —
+        minus adapters when ``drop_source_loras`` is set — and the name of
+        the image they came from (``source_file``, None when there is none)."""
+        source_path, source = last_generation_source(param_folder)
+        params = sanitize_source_params(source)
+        if drop_source_loras:
+            params = strip_source_loras(params)
+        return {"ok": True, "params": params, "source_file": os.path.basename(source_path) if source_path else None}
 
     def status(self) -> dict:
         state = dict(self._state)

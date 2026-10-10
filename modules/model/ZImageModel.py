@@ -107,6 +107,12 @@ class ZImageModel(BaseModel):
     # transfer mode: Base + original-adapter education per late module,
     # swapped in for the teacher late pass (bare 'layers.N.stem' keys)
     transfer_teacher_late_tensors: dict[str, torch.Tensor] | None
+    # transfer mode: what turns each teacher tensor back into the RAW Base one
+    # (inverse rotation minus identity, DoRA multiplier), for the passes that
+    # measure the variant's distillation offset (same keys). An eager
+    # transfer_base_late_tensors dict takes precedence when set.
+    transfer_base_recovery: dict[str, tuple[torch.Tensor, torch.Tensor | None]] | None
+    transfer_base_late_tensors: dict[str, torch.Tensor] | None
 
     def __init__(
         self,
@@ -137,6 +143,8 @@ class ZImageModel(BaseModel):
         self.transformer_fake_lora = None
 
         self.transfer_teacher_late_tensors = None
+        self.transfer_base_recovery = None
+        self.transfer_base_late_tensors = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
         return [
@@ -201,6 +209,15 @@ class ZImageModel(BaseModel):
             # the model (backup/save/sampling windows) actually frees them.
             self.transfer_teacher_late_tensors = {
                 stem: tensor.to(device=device) for stem, tensor in self.transfer_teacher_late_tensors.items()
+            }
+        if self.transfer_base_recovery is not None:
+            self.transfer_base_recovery = {
+                stem: (delta.to(device=device), None if multiplier is None else multiplier.to(device=device))
+                for stem, (delta, multiplier) in self.transfer_base_recovery.items()
+            }
+        if self.transfer_base_late_tensors is not None:
+            self.transfer_base_late_tensors = {
+                stem: tensor.to(device=device) for stem, tensor in self.transfer_base_late_tensors.items()
             }
 
     def to(self, device: torch.device):

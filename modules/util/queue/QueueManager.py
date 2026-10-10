@@ -99,9 +99,27 @@ class QueueManager:
             entry.status = status
             self.save()
 
+    def reset_entry(self, entry_id: str) -> bool:
+        """Mark a finished entry as untrained again so the next run picks it up."""
+        entry = self.get_entry(entry_id)
+        if entry is None or entry.status == QueueEntryStatus.RUNNING:
+            return False
+        entry.status = QueueEntryStatus.PENDING
+        entry.failure_history = []
+        self.save()
+        return True
+
     def reset_all_to_pending(self):
         for e in self.entries:
             if e.status in (QueueEntryStatus.COMPLETED, QueueEntryStatus.FAILED, QueueEntryStatus.SKIPPED):
+                e.status = QueueEntryStatus.PENDING
+                e.failure_history = []
+        self.save()
+
+    def reset_unfinished_to_pending(self):
+        """Pre-run reset: failed / skipped entries get another go, completed ones stay done."""
+        for e in self.entries:
+            if e.status in (QueueEntryStatus.FAILED, QueueEntryStatus.SKIPPED):
                 e.status = QueueEntryStatus.PENDING
                 e.failure_history = []
         self.save()

@@ -21,6 +21,23 @@ class ImageMetadataUtilTest(unittest.TestCase):
         prompt = "foo<wildcard:bar>baz"
         self.assertEqual(strip_angle_bracket_segments(prompt), "foobaz")
 
+    def test_strip_angle_bracket_segments_removes_orphaned_weight_tails(self):
+        for prompt in (
+            "portrait, 0.65||>, sharp focus",
+            "portrait, 0.85||> sharp focus",
+            "portrait 0.65>, sharp focus",
+            "portrait, <segment:face,0.65||>, 0.65>, sharp focus",
+            "portrait, segment:face||>, sharp focus",
+            "portrait, segment:face,0.6,0.5> sharp focus",
+            "portrait, Segment:face||> 0.2||>, sharp focus",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(strip_angle_bracket_segments(prompt), "portrait, sharp focus")
+
+    def test_strip_angle_bracket_segments_keeps_numbers_without_closing_bracket(self):
+        prompt = "3 people, 1.5m tall, v1.4 style, subject: woman, base: marble"
+        self.assertEqual(strip_angle_bracket_segments(prompt), prompt)
+
     def test_extract_metadata_reads_png_json_prompt_and_aspectratio(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "sample.png"
@@ -42,6 +59,7 @@ class ImageMetadataUtilTest(unittest.TestCase):
                 {
                     "prompt": "portrait, <segment:face>, sharp focus",
                     "aspectratio": "16:9",
+                    "loras": [],
                 },
             )
 
@@ -78,6 +96,7 @@ class ImageMetadataUtilTest(unittest.TestCase):
                 {
                     "prompt": "portrait, <wildcard:hair>, sharp focus",
                     "aspectratio": "3:2",
+                    "loras": [],
                 },
             )
 
@@ -101,7 +120,7 @@ class ImageMetadataUtilTest(unittest.TestCase):
 
             self.assertEqual(
                 extract_metadata(str(image_path)),
-                {"prompt": "top level wins", "aspectratio": "1:1"},
+                {"prompt": "top level wins", "aspectratio": "1:1", "loras": []},
             )
 
     def test_extract_metadata_ignores_nested_params_with_blank_prompt(self):
@@ -122,7 +141,7 @@ class ImageMetadataUtilTest(unittest.TestCase):
 
             self.assertEqual(
                 extract_metadata(str(image_path)),
-                {"prompt": "the real one", "aspectratio": "4:3"},
+                {"prompt": "the real one", "aspectratio": "4:3", "loras": []},
             )
 
     def test_extract_metadata_reads_raw_json_and_preserves_unicode(self):
@@ -135,6 +154,7 @@ class ImageMetadataUtilTest(unittest.TestCase):
                 {
                     "prompt": "caf\u00e9, <wildcard:fur>, cat",
                     "aspectratio": "4:3",
+                    "loras": [],
                 },
             )
 
@@ -151,6 +171,7 @@ class ImageMetadataUtilTest(unittest.TestCase):
                 {
                     "prompt": "a beautiful landscape",
                     "aspectratio": "16:9",
+                    "loras": [],
                 },
             )
 

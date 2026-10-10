@@ -68,7 +68,9 @@ class ZImageFineTuneSetup(
         model: ZImageModel,
         config: TrainConfig,
     ):
-        vae_on_train_device = not config.latent_caching
+        # The perceptual term decodes x0_hat crops every gated step; keep the
+        # VAE resident (~170 MB bf16) instead of paging it per step.
+        vae_on_train_device = not config.latent_caching or config.perceptual_strength > 0
         text_encoder_on_train_device = not config.latent_caching
 
         model.text_encoder_to(self.train_device if text_encoder_on_train_device else self.temp_device)

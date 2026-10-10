@@ -7,10 +7,14 @@ from modules.util.text_reward_util import (
     TextRewardScheduler,
     TextSpec,
     align_words,
+    choose_grad_step,
     derive_text_reward_interval,
     filter_to_vocab,
     generate_text_spec,
     generate_text_specs,
+    grad_step_candidates,
+    grad_window,
+    nearest_sigma_index,
     reading_order,
     text_reward_metrics,
 )
@@ -132,3 +136,50 @@ def test_bank_cycles():
     assert bank.next().embedding == "e2"
     with pytest.raises(ValueError):
         TextRewardBank(specs, ["e0"], None)
+
+
+# -- grad step selection on the sigma grid -------------------------------------
+
+_GRID = [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.0]  # 8 steps, shift 1
+
+
+def test_default_window_is_the_original_second_half_rule():
+    assert grad_step_candidates(_GRID, 8) == [4, 5, 6, 7]
+    # bit-identical to the original rng.randint(steps // 2, steps - 1) draw
+    for seed in range(50):
+        legacy = random.Random(seed).randint(4, 7)
+        assert choose_grad_step(_GRID, 8, random_grad_step=True, rng=random.Random(seed)) == legacy
+    assert choose_grad_step(_GRID, 8, random_grad_step=False, rng=random.Random(0)) == 7
+
+
+def test_sigma_window_selects_by_sigma_and_never_comes_back_empty():
+    assert grad_step_candidates(_GRID, 8, sigma_min=0.4, sigma_max=0.7) == [3, 4]
+    assert choose_grad_step(_GRID, 8, random_grad_step=False, rng=random.Random(0), sigma_min=0.4, sigma_max=0.7) == 4
+    for seed in range(20):
+        pick = choose_grad_step(_GRID, 8, random_grad_step=True, rng=random.Random(seed), sigma_min=0.4, sigma_max=0.7)
+        assert pick in (3, 4)
+    # a window between grid points falls back to the nearest index
+    assert grad_step_candidates(_GRID, 8, sigma_min=0.66, sigma_max=0.70) == [3]
+
+
+def test_hybrid_init_index_sits_below_the_grad_step():
+    assert nearest_sigma_index(_GRID, 8, 0.8) == 2
+    assert nearest_sigma_index(_GRID, 8, 0.99) == 0
+    assert nearest_sigma_index(_GRID, 8, 0.0) == 6  # capped at steps - 2 so a grad step remains
+    assert grad_step_candidates(_GRID, 8, sigma_min=0.4, sigma_max=0.7, after_index=2) == [3, 4]
+    assert grad_step_candidates(_GRID, 8, sigma_min=0.4, sigma_max=0.7, after_index=4) == [5]
+    assert grad_step_candidates(_GRID, 8, after_index=6) == [7]
+    assert grad_step_candidates(_GRID, 8, after_index=7) == [7]
+
+
+def test_grad_window_is_the_single_step_for_k1_and_clamps_to_the_grid():
+    # K = 1: first == last == the drawn step (the original single forward)
+    assert grad_window(4, 1, 8) == (4, 4)
+    assert grad_window(4, 0, 8) == (4, 4)
+    # K = 3 from index 3: the chain runs 3, 4 and scores the estimate at 5
+    assert grad_window(3, 3, 8) == (3, 5)
+    # a chain that would run off the grid stops at the last index
+    assert grad_window(6, 3, 8) == (6, 7)
+    assert grad_window(7, 2, 8) == (7, 7)
+    # a drawn step past the grid is clamped before the chain is built
+    assert grad_window(12, 2, 8) == (7, 7)

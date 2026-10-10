@@ -4,15 +4,19 @@ from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
+from modules.dataLoader.dpo.ConceptLatentMaskRemove import ConceptLatentMaskRemove
 from modules.dataLoader.dpo.CoverScaleCropImage import CoverScaleCropImage
 from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
 from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
+from modules.dataLoader.dpo.PairedCircularMaskShrink import PairedCircularMaskShrink
+from modules.dataLoader.dpo.ScaleMaskToLatent import ScaleMaskToLatent
 from modules.dataLoader.promptOnly.CollectPromptPaths import CollectPromptPaths
 from modules.dataLoader.promptOnly.SynthesizeResolution import SynthesizeResolution
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.util import path_util
+from modules.util.concept_cache_util import concept_cache_roots, uses_concept_cache_roots
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
 from modules.util.sourceless_cache_util import sourceless_cache_problems
@@ -25,6 +29,7 @@ from mgds.pipelineModules.AspectBucketing import AspectBucketing
 from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CapitalizeTags import CapitalizeTags
 from mgds.pipelineModules.CollectPaths import CollectPaths
+from mgds.pipelineModules.ConceptCacheRouter import ConceptCacheRouter
 from mgds.pipelineModules.DistributedSampler import DistributedSampler
 from mgds.pipelineModules.DownloadHuggingfaceDatasets import DownloadHuggingfaceDatasets
 from mgds.pipelineModules.DropTags import DropTags
@@ -138,6 +143,15 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             modules.append(DeriveDPORejectedPath())
         if config.masked_training:
             modules.append(mask_path)
+            if config.rlhf_enabled:
+                modules.append(
+                    ModifyPath(
+                        in_name="image_path_rejected",
+                        out_name="mask_path_rejected",
+                        postfix="-masklabel",
+                        extension=".png",
+                    )
+                )
         if config.custom_conditioning_image:
             modules.append(cond_path)
 
@@ -240,6 +254,23 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         if config.masked_training:
             modules.append(generate_mask)
             modules.append(load_mask)
+            if config.rlhf_enabled:
+                # The rejected image's own -masklabel.png when it has one.
+                # LoadImage yields None for a missing file, so an aligned pair
+                # (an in-place fix of the chosen image, the common case) needs
+                # no second mask and shares the chosen one.
+                modules.append(
+                    LoadImage(
+                        path_in_name="mask_path_rejected",
+                        image_out_name="mask_rejected_file",
+                        range_min=0,
+                        range_max=1,
+                        channels=1,
+                        supported_extensions={".png"},
+                        dtype=train_dtype.torch_dtype(),
+                    )
+                )
+                modules.append(SelectFirstInput(in_names=["mask_rejected_file", "mask"], out_name="mask_rejected"))
         elif config.model_type.has_mask_input():
             modules.append(generate_mask)
 
@@ -248,6 +279,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if vae_frame_dim:
             modules.append(mask_to_video)
+            if config.masked_training and config.rlhf_enabled:
+                modules.append(ImageToVideo(in_name="mask_rejected", out_name="mask_rejected"))
 
         return modules
 
@@ -259,6 +292,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if config.rlhf_enabled:
             inputs.append("image_rejected")
+            if config.masked_training:
+                # Rotate/crop is driven by the chosen mask; the rejected mask
+                # takes the same transform so the pair keeps one framing.
+                inputs.append("mask_rejected")
 
         lowest_resolution = min([int(x.strip()) for x in re.split(r"\D", config.resolution) if x.strip() != ""])
         circular_mask_shrink = RandomCircularMaskShrink(
@@ -278,10 +315,21 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             enabled_in_name="concept.image.enable_random_mask_rotate_crop",
         )
 
+        rejected_mask_shrink = PairedCircularMaskShrink(
+            paired_with=circular_mask_shrink,
+            mask_name="mask_rejected",
+            shrink_probability=1.0,
+            shrink_factor_min=0.2,
+            shrink_factor_max=1.0,
+            enabled_in_name="concept.image.enable_random_circular_mask_shrink",
+        )
+
         modules = []
 
         if config.masked_training or config.model_type.has_mask_input():
             modules.append(circular_mask_shrink)
+            if config.masked_training and config.rlhf_enabled:
+                modules.append(rejected_mask_shrink)
 
         if config.masked_training or config.model_type.has_mask_input():
             modules.append(random_mask_rotate_crop)
@@ -395,7 +443,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # identical to the old path.
             modules.append(
                 CoverScaleCropImage(
-                    names=["image_rejected"],
+                    names=["image_rejected"] + (["mask_rejected"] if config.masked_training else []),
                     scale_resolution_in_name="scale_resolution",
                     crop_resolution_in_name="crop_resolution",
                     crop_offset_in_name="crop_offset",
@@ -416,6 +464,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if config.masked_training or config.model_type.has_mask_input():
             inputs.append("mask")
+            if config.masked_training and config.rlhf_enabled:
+                inputs.append("mask_rejected")
 
         if config.model_type.has_depth_input():
             inputs.append("depth")
@@ -556,6 +606,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if config.rlhf_enabled:
             output_names = output_names + ["latent_image_rejected"]
+            if config.masked_training:
+                output_names = output_names + ["latent_mask_rejected"]
 
         resolved_output_names = [self.__as_output_mapping(name) for name in output_names]
 
@@ -571,6 +623,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # Concept fields never key the disk cache, so betas can be retuned
             # between runs without re-caching latents.
             output_names.append(("concept.dpo_beta_override", "dpo_beta_override"))
+
+        if config.masked_training:
+            # Per-concept unmasked weight (negative = inherit the global value).
+            # Travels per sample for the same reason as the beta override.
+            output_names.append(("concept.unmasked_weight_override", "unmasked_weight_override"))
 
         if config.validation:
             output_names.append(("concept.name", "concept_name"))
@@ -591,10 +648,20 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             before_cache_fun=before_cache_image_fun,
         )
 
+        concept_mask_remove = ConceptLatentMaskRemove(
+            latent_mask_names=["latent_mask"] + (["latent_mask_rejected"] if config.rlhf_enabled else []),
+            probability_in_name="concept.unmasked_probability_override",
+            default_probability=config.unmasked_probability,
+        )
+
         modules = []
 
         if config.model_type.has_mask_input():
+            # Inpainting: mgds' module blanks the conditioning image too, but
+            # knows only the run-wide probability.
             modules.append(mask_remove)
+        elif config.masked_training:
+            modules.append(concept_mask_remove)
 
         world_size = (
             multi.world_size() if config.multi_gpu else 1
@@ -695,6 +762,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # also constrains tier eligibility.
             image_split_names = image_split_names + ["latent_image_rejected"]
             image_extra_watched.append("image_path_rejected")
+            if config.masked_training:
+                image_split_names = image_split_names + ["latent_mask_rejected"]
+                image_extra_watched.append("mask_path_rejected")
 
         # The DPO patterns change which rows a concept produces, so they join
         # the variation group keys. Group keys only organize balancing and
@@ -705,37 +775,36 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             ["concept.dpo_chosen_pattern", "concept.dpo_rejected_pattern"] if config.rlhf_enabled else []
         )
 
-        image_disk_cache = SmartDiskCache(
-            cache_dir=image_cache_dir,
-            split_names=image_split_names,
-            aggregate_names=image_aggregate_names,
-            variations_in_name="concept.image_variations",
-            balancing_in_name="concept.balancing",
-            balancing_strategy_in_name="concept.balancing_strategy",
-            variations_group_in_name=[
+        image_cache_kwargs = {
+            "split_names": image_split_names,
+            "aggregate_names": image_aggregate_names,
+            "variations_in_name": "concept.image_variations",
+            "balancing_in_name": "concept.balancing",
+            "balancing_strategy_in_name": "concept.balancing_strategy",
+            "variations_group_in_name": [
                 "concept.path",
                 "concept.seed",
                 "concept.include_subdirectories",
                 "concept.image",
             ]
             + variations_group_extra,
-            group_enabled_in_name="concept.enabled",
-            before_cache_fun=before_cache_image_fun,
-            stop_check_fun=stop_check,
-            modeltype=config.model_type.value,
-            source_path_in_name="image_path",
-            sourceless=sourceless,
-            bucket_method_provider=bucket_method_provider,
-            rebucket_provider=rebucket_provider,
-            aspect_bucketing=aspect_bucketing,
-            extra_watched_paths_in_names=image_extra_watched or None,
-            trust_cache=config.skip_cache_validation,
-            adaptive_resolution=config.adaptive_resolution,
-            adaptive_resolution_ladder=config.adaptive_resolution_ladder,
-            additional_resolution_in_names=(
+            "group_enabled_in_name": "concept.enabled",
+            "before_cache_fun": before_cache_image_fun,
+            "stop_check_fun": stop_check,
+            "modeltype": config.model_type.value,
+            "source_path_in_name": "image_path",
+            "sourceless": sourceless,
+            "bucket_method_provider": bucket_method_provider,
+            "rebucket_provider": rebucket_provider,
+            "aspect_bucketing": aspect_bucketing,
+            "extra_watched_paths_in_names": image_extra_watched or None,
+            "trust_cache": config.skip_cache_validation,
+            "adaptive_resolution": config.adaptive_resolution,
+            "adaptive_resolution_ladder": config.adaptive_resolution_ladder,
+            "additional_resolution_in_names": (
                 ["original_resolution_rejected"] if config.rlhf_enabled and config.adaptive_resolution else None
             ),
-            adaptive_resolution_max=(
+            "adaptive_resolution_max": (
                 max(
                     target_resolutions_for_spec(
                         config.resolution,
@@ -747,40 +816,59 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 if config.adaptive_resolution
                 else None
             ),
-        )
+        }
 
-        text_disk_cache = SmartDiskCache(
-            cache_dir=text_cache_dir,
-            split_names=text_split_names,
-            aggregate_names=[],
-            variations_in_name="concept.text_variations",
-            balancing_in_name="concept.balancing",
-            balancing_strategy_in_name="concept.balancing_strategy",
-            variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"]
+        text_cache_kwargs = {
+            "split_names": text_split_names,
+            "aggregate_names": [],
+            "variations_in_name": "concept.text_variations",
+            "balancing_in_name": "concept.balancing",
+            "balancing_strategy_in_name": "concept.balancing_strategy",
+            "variations_group_in_name": [
+                "concept.path",
+                "concept.seed",
+                "concept.include_subdirectories",
+                "concept.text",
+            ]
             + variations_group_extra,
-            group_enabled_in_name="concept.enabled",
-            before_cache_fun=before_cache_text_fun,
-            stop_check_fun=stop_check,
-            modeltype=config.model_type.value,
-            source_path_in_name="sample_prompt_path",
-            sourceless=sourceless,
-            trust_cache=config.skip_cache_validation,
+            "group_enabled_in_name": "concept.enabled",
+            "before_cache_fun": before_cache_text_fun,
+            "stop_check_fun": stop_check,
+            "modeltype": config.model_type.value,
+            "source_path_in_name": "sample_prompt_path",
+            "sourceless": sourceless,
+            "trust_cache": config.skip_cache_validation,
             # A caption .txt is optional: an image with no caption trains with
             # an empty prompt. Tolerate the missing source file so the text
             # cache still builds an (empty-caption) entry for it instead of
             # skipping it — otherwise the image is cached but its text
             # counterpart is not, leaving the pair misaligned for sourceless
             # training. Captions that DO exist are still edit-checked normally.
-            tolerate_missing_source=True,
+            "tolerate_missing_source": True,
             # Content-addressed reuse: the final post-augmentation prompt
             # string fully determines the cached text payload, so identical
             # caption lines are encoded once and reused everywhere — across
             # variations, files and concepts. Editing one line of a
             # multi-line caption re-encodes only that line; a bulk edit that
             # appends the same line to every file encodes it once total.
-            content_key_in_name="prompt",
-            build_max_workers=text_cache_build_workers,
-        )
+            "content_key_in_name": "prompt",
+            "build_max_workers": text_cache_build_workers,
+        }
+
+        # Concepts with their own cache_dir are routed to a SmartDiskCache per
+        # root. Runs without overrides keep the plain single-directory caches.
+        concepts = getattr(self, "_concepts_for_cache", None) or []
+        if uses_concept_cache_roots(concepts, config.cache_dir):
+            sourceless_roots = concept_cache_roots(concepts, config.cache_dir)
+            image_disk_cache = ConceptCacheRouter(
+                config.cache_dir, "image", image_cache_kwargs, sourceless_roots=sourceless_roots
+            )
+            text_disk_cache = ConceptCacheRouter(
+                config.cache_dir, "text", text_cache_kwargs, sourceless_roots=sourceless_roots
+            )
+        else:
+            image_disk_cache = SmartDiskCache(cache_dir=image_cache_dir, **image_cache_kwargs)
+            text_disk_cache = SmartDiskCache(cache_dir=text_cache_dir, **text_cache_kwargs)
 
         modules = []
 
@@ -835,6 +923,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         # current AspectBucketing instance here so _cache_modules can wire
         # bucket-method drift detection into SmartDiskCache.
         self._aspect_bucketing_for_cache = None
+        # The concepts this loader trains on; _cache_modules routes the ones
+        # with a cache_dir override to their own cache roots.
+        concepts = self._select_concepts(config, is_validation)
+        self._concepts_for_cache = concepts
 
         output_modules = self._output_modules(config, model, model_setup, is_validation=is_validation)
 
@@ -849,8 +941,10 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         augmentation_modules = self._augmentation_modules(config)
         if supports_inpainting:
             inpainting_modules = self._inpainting_modules(config)
-        preparation_modules = self._preparation_modules(config, model) + self._dpo_rejected_preparation_modules(
-            config, model
+        preparation_modules = (
+            self._preparation_modules(config, model)
+            + self._dpo_rejected_preparation_modules(config, model)
+            + self._dpo_rejected_mask_modules(config)
         )
 
         debug_modules = self._debug_modules(config, model)
@@ -878,7 +972,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # with a clear, UI-surfaced message rather than letting mgds raise
             # deep in __init_sourceless (or, worse, silently train on misaligned
             # data).
-            problems = sourceless_cache_problems(config.cache_dir)
+            problems = []
+            for root in concept_cache_roots(concepts, config.cache_dir) or [config.cache_dir]:
+                problems += sourceless_cache_problems(root)
             if problems:
                 raise RuntimeError(
                     "Sourceless training cannot start — the cache is not metadata-complete:\n  - "
@@ -889,6 +985,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 [self._placeholder_modules_for(pre_cache_modules), cache_modules, output_modules],
                 train_progress,
                 is_validation,
+                concepts=concepts,
             )
 
         return self._create_mgds(
@@ -901,7 +998,23 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             ],
             train_progress,
             is_validation,
+            concepts=concepts,
         )
+
+    def _dpo_rejected_mask_modules(self, config: TrainConfig) -> list:
+        # The rejected mask at latent resolution. Sized from the rejected latent
+        # itself, so the per-model VAE factor (and the loaders that override
+        # _dpo_rejected_preparation_modules) need no mirror of downscale_mask.
+        if not (config.rlhf_enabled and config.masked_training):
+            return []
+
+        return [
+            ScaleMaskToLatent(
+                mask_in_name="mask_rejected",
+                latent_in_name="latent_image_rejected",
+                out_name="latent_mask_rejected",
+            )
+        ]
 
     def _dpo_rejected_preparation_modules(self, config: TrainConfig, model: BaseModel) -> list:
         # Mirrors the standard chosen-image VAE encode for 'image_rejected'.

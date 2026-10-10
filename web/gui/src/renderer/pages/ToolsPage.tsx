@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Shuffle,
   Sparkles,
+  Stethoscope,
   Type,
   Video,
   Wand2,
@@ -21,6 +22,7 @@ import { useState } from "react";
 
 import { BucketAnalysisModal } from "@/components/modals/BucketAnalysisModal";
 import { CaptionToolModal } from "@/components/modals/CaptionToolModal";
+import { CharacterDpoModal } from "@/components/modals/CharacterDpoModal";
 import { ConvertModelModal } from "@/components/modals/ConvertModelModal";
 import { DistillDatasetModal } from "@/components/modals/DistillDatasetModal";
 import { DPOSaturationModal } from "@/components/modals/DPOSaturationModal";
@@ -34,6 +36,7 @@ import { ReplacePairsModal } from "@/components/modals/ReplacePairsModal";
 import { StandaloneSamplingModal } from "@/components/modals/StandaloneSamplingModal";
 import { SwarmGenerateModal } from "@/components/modals/SwarmGenerateModal";
 import { TextAlignmentDatasetModal } from "@/components/modals/TextAlignmentDatasetModal";
+import { TriageFixModal } from "@/components/modals/TriageFixModal";
 import { VideoToolModal } from "@/components/modals/VideoToolModal";
 import { Button, Card } from "@/components/shared";
 import { useUiStore } from "@/store/uiStore";
@@ -75,8 +78,10 @@ export default function ToolsPage() {
   const [offPolicyOpen, setOffPolicyOpen] = useState(false);
   const [swarmOpen, setSwarmOpen] = useState(false);
   const [replaceOpen, setReplaceOpen] = useState(false);
+  const [triageFixOpen, setTriageFixOpen] = useState(false);
   const [saturationOpen, setSaturationOpen] = useState(false);
   const [textAlignOpen, setTextAlignOpen] = useState(false);
+  const [characterDpoOpen, setCharacterDpoOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
 
   return (
@@ -149,10 +154,22 @@ export default function ToolsPage() {
           onLaunch={() => setOffPolicyOpen(true)}
         />
         <ToolCard
+          icon={<Layers className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Character DPO"
+          description="Per-character pipeline: publish the LoRA, generate negatives, pair, curate, import, finalize and stack queue entries"
+          onLaunch={() => setCharacterDpoOpen(true)}
+        />
+        <ToolCard
           icon={<ListRestart className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="Replace Pairs"
-          description="Regenerate existing DPO pairs with the checkpoint you last used in SwarmUI and swap in harder negatives or stronger positives"
+          description="Generate alternatives with SwarmUI, then blindly select the best and worst images to replace each DPO pair"
           onLaunch={() => setReplaceOpen(true)}
+        />
+        <ToolCard
+          icon={<Stethoscope className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Triage & Fix"
+          description="Tag chosen images of a DPO dataset with the fixes they need, repair them with Flux.2 Klein through SwarmUI, compare and commit"
+          onLaunch={() => setTriageFixOpen(true)}
         />
         <ToolCard
           icon={<Gauge className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
@@ -200,8 +217,10 @@ export default function ToolsPage() {
       <OffPolicyDpoModal open={offPolicyOpen} onClose={() => setOffPolicyOpen(false)} />
       <SwarmGenerateModal open={swarmOpen} onClose={() => setSwarmOpen(false)} />
       <ReplacePairsModal open={replaceOpen} onClose={() => setReplaceOpen(false)} />
+      <TriageFixModal open={triageFixOpen} onClose={() => setTriageFixOpen(false)} />
       <DPOSaturationModal open={saturationOpen} onClose={() => setSaturationOpen(false)} />
       <TextAlignmentDatasetModal open={textAlignOpen} onClose={() => setTextAlignOpen(false)} />
+      <CharacterDpoModal open={characterDpoOpen} onClose={() => setCharacterDpoOpen(false)} />
     </>
   );
 }

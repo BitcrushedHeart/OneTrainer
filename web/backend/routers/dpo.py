@@ -1,5 +1,6 @@
-from typing import Literal
+from typing import Any, Literal
 
+from web.backend.services.dpo_regen_service import DPORegenService
 from web.backend.services.dpo_service import DPOService
 
 from fastapi import APIRouter
@@ -31,6 +32,10 @@ class StartSessionRequest(BaseModel):
     # Comma-separated caption keywords; every term must appear in a group's
     # prompt for the group to be shown. Empty means no filtering.
     caption_filter: str = ""
+    # Comma-separated LoRA name substrings (case-insensitive); a group is kept
+    # only when every one of its images used a LoRA matching at least one
+    # term. Empty means no filtering.
+    lora_filter: str = ""
     # Smallest group to present. 2 (the floor a pair needs) shows everything;
     # raise it to skip prompts with only a handful of generations.
     min_images_per_group: int = 2
@@ -109,6 +114,32 @@ class ApplyCaptionRequest(BaseModel):
 
 class RepairRejectedRequest(BaseModel):
     quality_floor: float = 0.85
+
+
+class RegenFix(BaseModel):
+    # What to segment (CLIPSeg text, "a|b" for one merged mask, or a
+    # "yolo-<model>" name), and SwarmUI's inpaint strength / mask threshold.
+    target: str
+    creativity: float = 0.95
+    threshold: float = 0.3
+    sub_prompt: str = ""
+
+
+class RegenPreviewRequest(BaseModel):
+    paths: list[str]
+    fixes: list[RegenFix]
+    # SwarmUI's "Segment Refining" group, by API id; blanks are not sent.
+    segment_params: dict[str, Any] = {}
+    # Blank = the image's own model.
+    model_override: str = ""
+
+
+class RegenStartRequest(RegenPreviewRequest):
+    base_url: str = "http://localhost:7801"
+    token: str = ""
+    # SwarmUI's raw output root, searched after the session's source folder.
+    generated_folder: str = ""
+    concurrency: int = 2
 
 
 @router.post("/dpo/check-pairs")
@@ -201,6 +232,7 @@ def start_session(req: StartSessionRequest):
         req.mode,
         group_order=req.group_order,
         caption_filter=req.caption_filter,
+        lora_filter=req.lora_filter,
         min_images_per_group=req.min_images_per_group,
     )
 
@@ -330,6 +362,37 @@ def finalize_session(req: FinalizeRequest):
 def cancel_session():
     service = DPOService.get_instance()
     return ActionResponse(**service.cancel_session())
+
+
+@router.post("/dpo/session/regen/preview")
+def regen_preview(req: RegenPreviewRequest):
+    return DPORegenService.get_instance().preview(
+        req.paths, [f.model_dump() for f in req.fixes], req.segment_params, req.model_override
+    )
+
+
+@router.post("/dpo/session/regen/start")
+def regen_start(req: RegenStartRequest):
+    return DPORegenService.get_instance().start(
+        req.paths,
+        [f.model_dump() for f in req.fixes],
+        req.segment_params,
+        base_url=req.base_url,
+        token=req.token,
+        generated_folder=req.generated_folder,
+        concurrency=req.concurrency,
+        model_override=req.model_override,
+    )
+
+
+@router.get("/dpo/session/regen/status")
+def regen_status():
+    return DPORegenService.get_instance().status()
+
+
+@router.post("/dpo/session/regen/cancel", response_model=ActionResponse)
+def regen_cancel():
+    return DPORegenService.get_instance().cancel()
 
 
 @router.get("/dpo/session/image")

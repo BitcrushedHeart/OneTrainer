@@ -116,6 +116,10 @@ export const queueApi = {
       method: "POST",
     }),
 
+  resetEntry: (entryId: string) => request<ActionResponse>(`/queue/entry/${entryId}/reset`, { method: "POST" }),
+
+  resetAll: () => request<ActionResponse>("/queue/reset-all", { method: "POST" }),
+
   reorder: (entryId: string, direction: "up" | "down") =>
     request<ActionResponse>("/queue/reorder", {
       method: "POST",

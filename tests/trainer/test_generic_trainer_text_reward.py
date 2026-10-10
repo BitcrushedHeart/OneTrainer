@@ -37,6 +37,12 @@ def test_validation_accepts_plain_and_sft_dpo_runs():
         {"distill_enabled": True},
         {"transfer_enabled": True},
         {"rlhf_enabled": True, "rlhf_mode": RLHFMode.DPO},
+        {"text_reward_grad_sigma_min": 0.7, "text_reward_grad_sigma_max": 0.5},
+        {"text_reward_grad_sigma_max": 1.5},
+        {"text_reward_init_sigma": 1.0},
+        {"text_reward_init_sigma": -0.1},
+        {"text_reward_init_sigma": 0.3, "text_reward_grad_sigma_min": 0.4, "text_reward_grad_sigma_max": 0.7},
+        {"text_reward_init_sigma": 0.8, "text_reward_rollout_steps": 1},
     ],
 )
 def test_validation_rejects_bad_configs(overrides):
@@ -58,6 +64,21 @@ def test_config_round_trips_through_migration():
     restored = TrainConfig.default_values().from_dict(stale)
     assert restored.text_reward_enabled is False
     assert restored.text_reward_samples_per_epoch == 1000
+
+    # a version-28 file predates the hybrid fields: migration 29 fills them in
+    v28 = {k: v for k, v in data.items() if k not in ("text_reward_init_sigma", "text_reward_grad_sigma_min")}
+    v28["__version"] = 28
+    v28["text_reward_source"] = "OFFLINE_IMAGES"
+    restored = TrainConfig.default_values().from_dict(v28)
+    # the hybrid settings are the defaults, so an old preset picks them up on load
+    assert restored.text_reward_init_sigma == 0.8
+    assert restored.text_reward_grad_sigma_min == 0.45 and restored.text_reward_grad_sigma_max == 0.7
+    assert restored.text_reward_source == TextRewardSource.OFFLINE_IMAGES
+
+
+def test_hybrid_window_validates():
+    config = _config(text_reward_init_sigma=0.8, text_reward_grad_sigma_min=0.4, text_reward_grad_sigma_max=0.7)
+    assert config.validate_text_reward_startup() is None
 
 
 def test_epoch_start_builds_bank_and_sizes_interval(capsys):

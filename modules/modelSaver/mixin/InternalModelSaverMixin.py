@@ -23,6 +23,10 @@ class InternalModelSaverMixin(metaclass=ABCMeta):
         optimizer_state_dict["param_group_optimizer_mapping"] = [
             str(model.train_config.optimizer.optimizer) for _ in model.param_group_mapping
         ]
+        if model.parameters is not None and model.param_group_mapping == model.parameters.unique_name_mapping:
+            # which parameter each saved state belongs to, so a resume can follow a
+            # group split (the DoRA-OFT magnitudes with their own learning rate)
+            optimizer_state_dict["param_group_keys"] = model.parameters.key_mapping
 
         torch.save(optimizer_state_dict, os.path.join(destination, "optimizer", "optimizer.pt"))
 

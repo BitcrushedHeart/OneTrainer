@@ -117,6 +117,7 @@ def create_data_loader(
     train_progress: TrainProgress | None = None,
     is_validation: bool = False,
     is_sft_anchor: bool = False,
+    dpo_validation: bool | None = None,
 ) -> BaseDataLoader | None:
     if config.gradient_checkpointing.offload() and config.layer_offload_fraction > 0 and config.dataloader_threads > 1:
         raise RuntimeError('layer offloading can not be activated if "dataloader_threads" > 1')
@@ -137,6 +138,7 @@ def create_data_loader(
             train_progress,
             is_validation,
             is_sft_anchor,
+            dpo_validation=dpo_validation,
         )
         if cls is not None
         else None
@@ -1227,52 +1229,88 @@ def create_optimizer(
             else:
                 new_group_mapping = parameter_group_collection.unique_name_mapping
 
+            # Parameter keys, (key space, key indices) per group: positional within the
+            # group, except that the groups of a split (the DoRA-OFT magnitudes with
+            # their own learning rate) share the key space and indices of the unsplit
+            # group. State saved under one layout is found again under the other.
+            # A backup without saved keys predates the split and is positional.
+            def _positional_keys(names: list[str], groups: list[dict]) -> list[tuple[str, list[int]]]:
+                return [(name, list(range(len(group["params"])))) for name, group in zip(names, groups, strict=False)]
+
+            new_group_keys = _positional_keys(new_group_mapping, new_param_groups)
+            old_group_keys = _positional_keys(old_group_mapping, old_param_groups)
+            if not config.optimizer.MuonWithAuxAdam:
+                new_group_keys = parameter_group_collection.key_mapping
+                saved_group_keys = state_dict.get("param_group_keys")
+                if saved_group_keys is not None and [len(indices) for _, indices in saved_group_keys] == [
+                    len(group["params"]) for group in old_param_groups
+                ]:
+                    old_group_keys = saved_group_keys
+
+            # where each saved parameter's state lives: key -> (saved group index, saved state index)
+            saved_slots = {}
+            saved_key_space_sizes = {}
+            for old_group_index, (key_space, key_indices) in enumerate(old_group_keys):
+                if old_group_optimizer_mapping[old_group_index] != str(config.optimizer.optimizer):
+                    continue
+                saved_key_space_sizes[key_space] = saved_key_space_sizes.get(key_space, 0) + len(key_indices)
+                for key_index, old_state_index in zip(
+                    key_indices, old_param_groups[old_group_index]["params"], strict=True
+                ):
+                    saved_slots[(key_space, key_index)] = (old_group_index, old_state_index)
+            new_key_space_sizes = {}
+            for key_space, key_indices in new_group_keys:
+                new_key_space_sizes[key_space] = new_key_space_sizes.get(key_space, 0) + len(key_indices)
+
             state = {}
             param_groups = []
             state_index = 0
 
             for new_group_index, unique_group_name in enumerate(new_group_mapping):
                 new_group = new_param_groups[new_group_index]
+                key_space, key_indices = new_group_keys[new_group_index]
+                slots = [saved_slots.get((key_space, key_index)) for key_index in key_indices]
 
-                group_state_saved = (
-                    unique_group_name in old_group_mapping
-                    and str(config.optimizer.optimizer)
-                    == old_group_optimizer_mapping[old_group_mapping.index(unique_group_name)]
-                )
+                # Optimizer state binds to parameters by key, which is positional
+                # within a key space. If the key space's parameter count changed
+                # since the state was saved -- e.g. enabling dora_oft adds a
+                # dora_multiplier interleaved with each module's oft_R -- reusing
+                # the keys would bind saved momentum onto the wrong parameters.
+                # The saved state carries no identity beyond the key to remap by,
+                # so drop this group's state and start it fresh rather than
+                # silently corrupt it. Model weights still resume from the adapter
+                # backup; only the optimizer momentum for this group is reset and
+                # re-warms over the next steps.
+                old_group_index = None
+                if saved_key_space_sizes.get(key_space) == new_key_space_sizes[key_space] and None not in slots:
+                    if unique_group_name in old_group_mapping:
+                        old_group_index = old_group_mapping.index(unique_group_name)
+                    elif slots:
+                        # a group split out since the state was saved continues from
+                        # the hyperparameters of the group its parameters were saved in
+                        old_group_index = slots[0][0]
+                elif key_space in saved_key_space_sizes:
+                    print(
+                        f"WARN: optimizer group '{unique_group_name}' changed parameter count "
+                        f"({saved_key_space_sizes[key_space]} saved vs {new_key_space_sizes[key_space]} current); "
+                        f"the layout is no longer positionally comparable, so this group's optimizer "
+                        f"state is reinitialized (momentum reset). Model weights resume normally."
+                    )
 
-                if group_state_saved:
-                    old_group_index = old_group_mapping.index(unique_group_name)
-                    old_group = old_param_groups[old_group_index]
-                    # Optimizer state binds to parameters positionally within a
-                    # group. If the group's parameter count changed since the
-                    # state was saved -- e.g. enabling dora_oft adds a
-                    # dora_multiplier interleaved after each module's oft_R --
-                    # positional reuse would bind saved momentum onto the wrong
-                    # parameters. There is no per-parameter identity in the saved
-                    # state to remap by, so drop this group's state and start it
-                    # fresh rather than silently corrupt it. Model weights still
-                    # resume from the adapter backup; only the optimizer momentum
-                    # for this group is reset and re-warms over the next steps.
-                    if len(old_group["params"]) != len(new_group["params"]):
-                        print(
-                            f"WARN: optimizer group '{unique_group_name}' changed parameter count "
-                            f"({len(old_group['params'])} saved vs {len(new_group['params'])} current); "
-                            f"the layout is no longer positionally comparable, so this group's optimizer "
-                            f"state is reinitialized (momentum reset). Model weights resume normally."
-                        )
-                        group_state_saved = False
-
-                if group_state_saved:
+                if old_group_index is not None:
                     # the group state was saved in state_dict
-                    for i, old_state_index in enumerate(old_group["params"]):
+                    old_group = dict(old_param_groups[old_group_index])
+                    old_group["params"] = list(range(state_index, state_index + len(slots)))
+                    for _, old_state_index in slots:
                         if old_state_index in old_state:
                             state[state_index] = old_state[old_state_index]
-                        old_group["params"][i] = state_index
                         state_index += 1
                     param_groups.append(old_group)
 
                     old_group["lr"] = new_group["lr"]
                     old_group["initial_lr"] = new_group["initial_lr"]
+                    if "name" in new_group:
+                        old_group["name"] = new_group["name"]
                 else:
                     # the group state was not saved (or was dropped above);
                     # initialize with an empty group state

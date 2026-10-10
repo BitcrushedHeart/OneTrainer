@@ -365,6 +365,22 @@ function createWindow(): Promise<BrowserWindow> {
       });
     }
 
+    // The application menu is removed, which also removes Electron's default
+    // reload accelerator. Reloading the renderer leaves the backend child
+    // process (and any running tool session) untouched.
+    win.webContents.on("before-input-event", (event, input) => {
+      if (input.type !== "keyDown") return;
+      const ctrl = input.control || input.meta;
+      const key = input.key.toLowerCase();
+      if ((ctrl && key === "r" && !input.shift) || key === "f5") {
+        event.preventDefault();
+        win.webContents.reload();
+      } else if (ctrl && input.shift && key === "i") {
+        event.preventDefault();
+        win.webContents.toggleDevTools();
+      }
+    });
+
     win.webContents.on("will-navigate", (event, url) => {
       const parsed = new URL(url);
       if (parsed.hostname === "localhost") return;

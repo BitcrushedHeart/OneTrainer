@@ -9,7 +9,7 @@ from modules.util.adapter_io import read_layer_weights_buffered
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.TrainProgress import TrainProgress
 from modules.util.transfer_util import (
@@ -128,12 +128,12 @@ class ZImageLoRASetup(
                     f"families '{config.transfer_families}' at layers >= {config.transfer_late_start}"
                 )
             self.frozen_parameters["transformer"] = frozen
-            parameter_group_collection.add_group(
-                NamedParameterGroup(
-                    unique_name="transformer",
-                    parameters=selected,
-                    learning_rate=config.transformer.learning_rate,
-                )
+            self._add_model_part_parameter_groups(
+                parameter_group_collection,
+                "transformer",
+                model.transformer_lora,
+                selected,
+                config.transformer.learning_rate,
             )
             # Redistill Phase B additionally needs the fake critic; a single
             # optimizer holds both groups from step 0 (Phase A produces no
@@ -241,8 +241,9 @@ class ZImageLoRASetup(
     def __setup_transfer_teacher(self, model: ZImageModel, config: TrainConfig):
         """Build the in-memory teacher: Base's late tensors + the ORIGINAL
         adapter's education, one tensor per late adapter-covered module. Built
-        in fp32 on CPU; cast/moved to each module's weight dtype/device in
-        setup_train_device so the per-step swap stays pointer-only."""
+        in fp32 on CPU and cast to each module's weight dtype before anything
+        moves it to the train device; setup_train_device then only moves it, so
+        the per-step swap stays pointer-only."""
         swap_modules = self._transfer_swap_modules(model, config)
         if not swap_modules:
             raise ValueError(
@@ -254,13 +255,22 @@ class ZImageLoRASetup(
                     f"transfer mode does not support quantized late modules ({stem} is {module.weight.dtype})"
                 )
         expected_shapes = {stem: module.weight.shape for stem, module in swap_modules.items()}
+        # Raw Base late weights, with the model's own, give the variant's
+        # distillation offset, which the loss preserves and the validation
+        # reports. They are recovered from the teacher tensors on the fly (a
+        # second stored copy of the late stack does not fit beside the teacher
+        # on a 24 GB card); only the small inverse rotations are kept.
+        base_recovery = {} if config.transfer_preserve_distillation or config.transfer_validation else None
         model.transfer_teacher_late_tensors = build_teacher_late_tensors(
             config.transfer_base_model_name,
             config.transfer_teacher_adapter_name,
             config.transfer_late_start,
             None,  # every late adapter-covered stem, not just the trainable families
             expected_shapes=expected_shapes,
+            base_recovery=base_recovery,
         )
+        model.transfer_base_recovery = base_recovery
+        self.__cast_transfer_tensors(model, swap_modules)
 
         # Misconfiguration probe: if transfer_base_model_name points at the
         # VARIANT, its late tensors equal the loaded model's bit-for-bit.
@@ -295,13 +305,40 @@ class ZImageLoRASetup(
             set(swap_modules),
             expected_shapes=expected_shapes,
         )
+        self.__cast_transfer_tensors(model, swap_modules)
+
+    @staticmethod
+    def __cast_transfer_tensors(
+        model: ZImageModel, swap_modules: dict[str, torch.nn.Module], *, move: bool = False
+    ) -> None:
+        """Cast the teacher tensors (and Base-recovery deltas) to their module's
+        weight dtype, and with ``move`` onto its device. Entry by entry, each
+        replaced in place: the fp32 originals are twice the size of a bf16
+        model's weights, and following the transformer to the GPU before the
+        cast -- or being cast there with every original still referenced --
+        peaks several GB above the steady state, enough to run a 24 GB card out
+        of memory. The DoRA multiplier sits near 1.0 and stays fp32."""
+        teacher = model.transfer_teacher_late_tensors
+        for stem in list(teacher):
+            weight = swap_modules[stem].weight
+            teacher[stem] = teacher[stem].to(device=weight.device if move else None, dtype=weight.dtype)
+        recovery = model.transfer_base_recovery
+        for stem in list(recovery or ()):
+            weight = swap_modules[stem].weight
+            delta, multiplier = recovery[stem]
+            recovery[stem] = (
+                delta.to(device=weight.device if move else None, dtype=weight.dtype),
+                multiplier if multiplier is None or not move else multiplier.to(device=weight.device),
+            )
 
     def setup_train_device(
         self,
         model: ZImageModel,
         config: TrainConfig,
     ):
-        vae_on_train_device = not config.latent_caching
+        # The perceptual term decodes x0_hat crops every gated step; keep the
+        # VAE resident (~170 MB bf16) instead of paging it per step.
+        vae_on_train_device = not config.latent_caching or config.perceptual_strength > 0
         text_encoder_on_train_device = not config.latent_caching
 
         model.text_encoder_to(self.train_device if text_encoder_on_train_device else self.temp_device)
@@ -309,17 +346,14 @@ class ZImageLoRASetup(
         model.transformer_to(self.train_device)
 
         if (config.transfer_enabled or config.redistill_enabled) and model.transfer_teacher_late_tensors is not None:
-            # Pre-cast/move once so the per-step teacher swap is a pure pointer
-            # swap. Idempotent: .to() no-ops when already matching. (The
-            # base-points-at-variant misconfiguration probe lives in
-            # __setup_transfer_teacher, where the RAW base tensors are at hand --
-            # the education-baked teacher always differs from the module weight
-            # for a real adapter, so comparing it here could never fire.)
-            swap_modules = self._transfer_swap_modules(model, config)
-            model.transfer_teacher_late_tensors = {
-                stem: tensor.to(device=swap_modules[stem].weight.device, dtype=swap_modules[stem].weight.dtype)
-                for stem, tensor in model.transfer_teacher_late_tensors.items()
-            }
+            # Already in module dtype (cast at setup) and moved with the
+            # transformer, so this is a no-op safety net that keeps the per-step
+            # teacher swap a pure pointer swap. (The base-points-at-variant
+            # misconfiguration probe lives in __setup_transfer_teacher, where
+            # the RAW base tensors are at hand -- the education-baked teacher
+            # always differs from the module weight for a real adapter, so
+            # comparing it here could never fire.)
+            self.__cast_transfer_tensors(model, self._transfer_swap_modules(model, config), move=True)
 
         model.text_encoder.eval()
         model.vae.eval()

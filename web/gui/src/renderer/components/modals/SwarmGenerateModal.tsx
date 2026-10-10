@@ -1,14 +1,41 @@
-import { AlertCircle, CheckCircle2, Loader2, Plug, Plus, Sparkles, StopCircle, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  ImageOff,
+  Loader2,
+  Plug,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  StopCircle,
+  X,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { swarmApi, type SwarmLora, type SwarmStatus } from "@/api/swarmApi";
+import { swarmApi, type SwarmBlackImage, type SwarmLora, type SwarmStatus } from "@/api/swarmApi";
 import { Button, DirPicker, FormEntry, SectionCard, Select, Toggle } from "@/components/shared";
 
 import { ModalBase } from "./ModalBase";
 
+/**
+ * Fields another tool can pre-fill when it opens the modal (the Character
+ * DPO flow hands over its folders and LoRA). Applied, and persisted like a
+ * manual edit, each time `open` turns true; fields left undefined keep the
+ * stored values. `loras` entries are SwarmUI model-list names.
+ */
+export interface SwarmGenerateInitial {
+  realFolder?: string;
+  generatedFolder?: string;
+  outputDir?: string;
+  loras?: Array<{ name: string; weight: number }>;
+  imagesPerCaption?: number;
+  captions?: number;
+}
+
 export interface SwarmGenerateModalProps {
   open: boolean;
   onClose: () => void;
+  initial?: SwarmGenerateInitial;
 }
 
 const STORAGE_KEY = "ot.swarmGenerate";
@@ -25,6 +52,8 @@ interface Settings {
   captions: number;
   imagesPerCaption: number;
   keywords: string;
+  /** One run per comma-separated keyword instead of one run requiring them all. */
+  bulkKeywords: boolean;
   excludeTagStyle: boolean;
   minCaptionWords: number;
   steps: string;
@@ -34,6 +63,7 @@ interface Settings {
   paramSource: "last" | "preset" | "manual";
   presetName: string;
   concurrency: number;
+  autoRequeueBlack: boolean;
 }
 
 const DEFAULTS: Settings = {
@@ -46,6 +76,7 @@ const DEFAULTS: Settings = {
   captions: 10,
   imagesPerCaption: 1,
   keywords: "",
+  bulkKeywords: false,
   excludeTagStyle: true,
   minCaptionWords: 0,
   steps: "",
@@ -55,6 +86,7 @@ const DEFAULTS: Settings = {
   paramSource: "last",
   presetName: "",
   concurrency: 3,
+  autoRequeueBlack: true,
 };
 
 function loadSettings(): Settings {
@@ -89,7 +121,7 @@ const PHASE_LABEL: Record<SwarmStatus["phase"], string> = {
   cancelled: "Stopped",
 };
 
-export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
+export function SwarmGenerateModal({ open, onClose, initial }: SwarmGenerateModalProps) {
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [models, setModels] = useState<string[]>([]);
   const [connection, setConnection] = useState<string | null>(null);
@@ -103,6 +135,11 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
   const [loraWeight, setLoraWeight] = useState(1);
   const [presets, setPresets] = useState<string[]>([]);
   const [lastParams, setLastParams] = useState<Record<string, unknown> | null>(null);
+  // Black (failed) generations found by the last scan; null = not scanned yet.
+  const [blackImages, setBlackImages] = useState<SwarmBlackImage[] | null>(null);
+  const [blackScanning, setBlackScanning] = useState(false);
+  const [blackBusy, setBlackBusy] = useState(false);
+  const [blackNotice, setBlackNotice] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
 
   const update = useCallback((patch: Partial<Settings>) => {
@@ -116,6 +153,27 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
       return next;
     });
   }, []);
+
+  // Seed from `initial` on each open, through `update` so the values persist
+  // exactly as if typed. Read via a ref so a caller rebuilding the object
+  // literal every render does not re-apply it while the modal is open.
+  const initialRef = useRef(initial);
+  initialRef.current = initial;
+  useEffect(() => {
+    if (!open) return;
+    const seed = initialRef.current;
+    if (!seed) return;
+    const patch: Partial<Settings> = {};
+    if (seed.realFolder !== undefined) patch.real = seed.realFolder;
+    if (seed.generatedFolder !== undefined) patch.generated = seed.generatedFolder;
+    if (seed.outputDir !== undefined) patch.output = seed.outputDir;
+    if (seed.loras !== undefined) {
+      patch.loras = seed.loras.map((entry) => ({ name: entry.name, weight: Number(entry.weight) || 1 }));
+    }
+    if (seed.imagesPerCaption !== undefined) patch.imagesPerCaption = Math.max(1, Number(seed.imagesPerCaption) || 1);
+    if (seed.captions !== undefined) patch.captions = Math.max(1, Number(seed.captions) || 1);
+    if (Object.keys(patch).length > 0) update(patch);
+  }, [open, update]);
 
   const clearPoll = useCallback(() => {
     if (pollRef.current !== null) {
@@ -189,8 +247,27 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
     }
   }, [settings.baseUrl, settings.token, settings.model, settings.paramSource, update]);
 
+  /** Bulk mode: the keyword field split into one entry per run. */
+  const bulkJobs = useMemo(() => {
+    const seen = new Set<string>();
+    return settings.keywords
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => {
+        if (!entry || seen.has(entry.toLowerCase())) return false;
+        seen.add(entry.toLowerCase());
+        return true;
+      });
+  }, [settings.keywords]);
+  const bulkCaptions = Math.max(1, Number(settings.captions) || 1);
+  const bulkPerCaption = Math.max(1, Number(settings.imagesPerCaption) || 1);
+
   const run = useCallback(
     async (dryRun: boolean) => {
+      if (settings.bulkKeywords && bulkJobs.length === 0) {
+        setError("Enter at least one keyword, or turn off One run per keyword");
+        return;
+      }
       setBusy(true);
       setError(null);
       try {
@@ -203,7 +280,8 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
           token: settings.token,
           captions: Number(settings.captions) || 1,
           images_per_caption: Number(settings.imagesPerCaption) || 1,
-          keywords: settings.keywords,
+          keywords: settings.bulkKeywords ? "" : settings.keywords,
+          keyword_jobs: settings.bulkKeywords ? bulkJobs : [],
           exclude_tag_style: settings.excludeTagStyle,
           min_caption_words: Number(settings.minCaptionWords) || 0,
           steps: settings.steps.trim() === "" ? null : Number(settings.steps),
@@ -214,6 +292,7 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
           preset_name: settings.presetName,
           concurrency: Number(settings.concurrency) || 1,
           dry_run: dryRun,
+          auto_requeue_black: settings.autoRequeueBlack,
         });
         if (!result.ok) {
           setError(result.error ?? "Could not start");
@@ -226,7 +305,7 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
         setBusy(false);
       }
     },
-    [settings, startPolling],
+    [settings, startPolling, bulkJobs],
   );
 
   const cancel = useCallback(async () => {
@@ -236,6 +315,58 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
       /* best effort */
     }
   }, []);
+
+  const scanBlack = useCallback(async () => {
+    if (!settings.generated) return;
+    setBlackScanning(true);
+    setBlackNotice(null);
+    setError(null);
+    try {
+      const result = await swarmApi.scanBlack(settings.generated);
+      if (!result.ok) {
+        setError(result.error ?? "Scan failed");
+        return;
+      }
+      setBlackImages(result.images ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBlackScanning(false);
+    }
+  }, [settings.generated]);
+
+  const requeueBlack = useCallback(async () => {
+    if (!settings.generated) return;
+    setBlackBusy(true);
+    setBlackNotice(null);
+    setError(null);
+    try {
+      const result = await swarmApi.requeueBlack({
+        generated_folder: settings.generated,
+        base_url: settings.baseUrl,
+        token: settings.token,
+        model: settings.model,
+        concurrency: Number(settings.concurrency) || 1,
+        // Everything the scan found; the server re-checks each is still black.
+        paths: (blackImages ?? []).map((image) => image.path),
+      });
+      if (!result.ok) {
+        setError(result.error ?? "Could not requeue");
+        return;
+      }
+      const unresendable = result.unresendable ?? [];
+      const parts = [`${result.moved ?? 0} moved to .black`, `${result.requeued ?? 0} requeued`];
+      if (unresendable.length > 0) parts.push(`${unresendable.length} without parameters (retired only)`);
+      if (result.queued) parts.push("waiting behind the current run");
+      setBlackNotice(parts.join(" · "));
+      setBlackImages([]);
+      if ((result.requeued ?? 0) > 0) startPolling();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBlackBusy(false);
+    }
+  }, [settings, blackImages, startPolling]);
 
   const refreshLastParams = useCallback(async () => {
     if (!settings.generated) return;
@@ -450,11 +581,15 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
         <SectionCard title="What to generate">
           <div className="grid grid-cols-4 gap-3 items-end">
             <FormEntry
-              label="Captions"
+              label={settings.bulkKeywords ? "Captions per keyword" : "Captions"}
               type="number"
               value={settings.captions}
               onChange={(v) => update({ captions: Number(v) })}
-              tooltip="How many different captions to generate for this run."
+              tooltip={
+                settings.bulkKeywords
+                  ? "How many different captions to generate for each keyword's run."
+                  : "How many different captions to generate for this run."
+              }
             />
             <FormEntry
               label="Images per caption"
@@ -464,10 +599,12 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
               tooltip="More images per caption gives the builder a harder negative to choose from."
             />
             <FormEntry
-              label="Caption keywords"
+              label={settings.bulkKeywords ? "Bulk keywords" : "Caption keywords"}
               value={settings.keywords}
               onChange={(v) => update({ keywords: String(v) })}
-              placeholder="comma-separated, all required"
+              placeholder={
+                settings.bulkKeywords ? "comma-separated, one run each (a+b = both)" : "comma-separated, all required"
+              }
             />
             <FormEntry
               label="Min caption words (0 = off)"
@@ -484,14 +621,108 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
               tooltip="How many generation requests to keep queued at SwarmUI at once. Above 1 the next request is already waiting when the current one finishes, so the GPU never sits idle between batches."
             />
           </div>
-          <div className="pt-3">
+          {settings.bulkKeywords && (
+            <div className="text-xs text-[var(--color-on-surface-secondary)] pt-2 tabular-nums">
+              {bulkJobs.length === 0
+                ? "Enter at least one keyword: each becomes its own queued run."
+                : `${bulkJobs.length} run${bulkJobs.length === 1 ? "" : "s"} × ${bulkCaptions} caption${
+                    bulkCaptions === 1 ? "" : "s"
+                  } × ${bulkPerCaption} image${bulkPerCaption === 1 ? "" : "s"} = up to ${
+                    bulkJobs.length * bulkCaptions * bulkPerCaption
+                  } images. A keyword with fewer un-generated captions than that gives fewer.`}
+            </div>
+          )}
+          <div className="flex flex-wrap gap-6 pt-3">
+            <Toggle
+              label="One run per keyword"
+              value={settings.bulkKeywords}
+              onChange={(value) => update({ bulkKeywords: value })}
+              tooltip="Bulk add: every comma-separated keyword becomes its own queued run with the full captions count, e.g. 3 keywords at 30 captions = 90 images. Join words with + when one run needs them all (beach+sunset). Runs go in order and a caption two keywords share is generated only once."
+            />
             <Toggle
               label="Skip tag-style captions"
               value={settings.excludeTagStyle}
               onChange={(value) => update({ excludeTagStyle: value })}
               tooltip="Booru-style tag lists ('blonde hair, blue eyes, outdoors') make poor realism prompts: the generation shares only keywords with the photo, so the pair teaches composition rather than realism."
             />
+            <Toggle
+              label="Auto-regenerate black images"
+              value={settings.autoRequeueBlack}
+              onChange={(value) => update({ autoRequeueBlack: value })}
+              tooltip="At the start of each run, black images already in the generated folder (failed generations) are moved to .black and regenerated from their own settings ahead of the new captions. During the run, an output that comes back black is retried with a fresh seed up to two more times before it counts as a failure."
+            />
           </div>
+        </SectionCard>
+
+        <SectionCard title="Black (failed) generations">
+          <div className="text-xs text-[var(--color-on-surface-secondary)]">
+            A generation that fails inside SwarmUI&apos;s backend (a dtype error mid-run, for instance) still lands in
+            the output folder as a completely black image. It carries the prompt, so the builder counts its caption as
+            generated and can never pair the photo properly. Scanning finds them; requeuing moves them into a{" "}
+            <span className="font-mono">.black</span> folder beside themselves (which every scan skips) and generates
+            each one again from its own recorded settings with a fresh seed. With &quot;Auto-regenerate black
+            images&quot; on, every run does this by itself first; use this section to do it without generating anything
+            new.
+          </div>
+          <div className="flex flex-wrap items-center gap-2 pt-3">
+            <Button
+              variant="secondary"
+              onClick={() => void scanBlack()}
+              disabled={blackScanning || !settings.generated}
+            >
+              {blackScanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageOff className="w-4 h-4" />}
+              Scan for black images
+            </Button>
+            <Button
+              variant="primary"
+              onClick={() => void requeueBlack()}
+              disabled={blackBusy || !blackImages || blackImages.length === 0}
+            >
+              {blackBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCcw className="w-4 h-4" />}
+              Retire and requeue{blackImages && blackImages.length > 0 ? ` (${blackImages.length})` : ""}
+            </Button>
+            {blackImages !== null && !blackNotice && (
+              <span className="text-xs text-[var(--color-on-surface-secondary)] tabular-nums">
+                {blackImages.length === 0
+                  ? "No black images found."
+                  : `${blackImages.length} black image${blackImages.length === 1 ? "" : "s"} found${
+                      blackImages.some((image) => !image.has_params)
+                        ? ` · ${blackImages.filter((image) => !image.has_params).length} without parameters`
+                        : ""
+                    }`}
+              </span>
+            )}
+            {blackNotice && <span className="text-xs text-[var(--color-success-500)]">{blackNotice}</span>}
+          </div>
+          {blackImages && blackImages.length > 0 && (
+            <div className="flex flex-col gap-1 pt-3 max-h-[24vh] overflow-y-auto">
+              {blackImages.slice(0, 200).map((image) => (
+                <div
+                  key={image.path}
+                  className="flex items-center gap-2 text-xs bg-[var(--color-surface-container)] rounded px-3 py-1"
+                >
+                  <span className="flex-1 truncate" title={image.prompt || image.path}>
+                    {image.prompt || <span className="italic">no prompt recorded</span>}
+                  </span>
+                  <span className="tabular-nums text-[var(--color-on-surface-secondary)]">
+                    {image.size ? `${image.size[0]}×${image.size[1]}` : "?"}
+                  </span>
+                  {!image.has_params && <span className="text-[var(--color-error-500)]">no parameters</span>}
+                  <span
+                    className="text-[10px] text-[var(--color-on-surface-secondary)] truncate max-w-[30%]"
+                    title={image.path}
+                  >
+                    {image.path.split(/[\\/]/).pop()}
+                  </span>
+                </div>
+              ))}
+              {blackImages.length > 200 && (
+                <div className="text-[10px] text-[var(--color-on-surface-secondary)]">
+                  … and {blackImages.length - 200} more
+                </div>
+              )}
+            </div>
+          )}
         </SectionCard>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -539,9 +770,19 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
             {status.job_total > 1 && (
               <div className="text-xs text-[var(--color-on-surface-secondary)]">
                 run {status.job_index} of {status.job_total}
-                {status.current_job?.keywords ? ` — "${status.current_job.keywords}"` : ""}
+                {status.current_job?.mode === "requeue"
+                  ? ` — requeue of ${status.current_job.images} black image${status.current_job.images === 1 ? "" : "s"}`
+                  : status.current_job?.keywords
+                    ? ` — "${status.current_job.keywords}"`
+                    : ""}
                 {status.queued.length > 0 && (
-                  <> · next: {status.queued.map((j) => j.keywords || "(no keywords)").join(", ")}</>
+                  <>
+                    {" "}
+                    · next:{" "}
+                    {status.queued
+                      .map((j) => (j.mode === "requeue" ? `requeue ${j.images} black` : j.keywords || "(no keywords)"))
+                      .join(", ")}
+                  </>
                 )}
               </div>
             )}
@@ -554,6 +795,8 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
               {status.failed > 0 && <span className="text-[var(--color-error-500)]">{status.failed} failed</span>}
               {status.skipped_tag_style > 0 && <span>{status.skipped_tag_style} tag-style skipped</span>}
               {status.skipped_short > 0 && <span>{status.skipped_short} too short</span>}
+              {status.black_retired > 0 && <span>{status.black_retired} black retired and requeued</span>}
+              {status.black_retried > 0 && <span>{status.black_retried} black outputs retried</span>}
             </div>
             {status.param_source && (
               <div className="text-xs text-[var(--color-on-surface-secondary)]">
@@ -584,11 +827,25 @@ export function SwarmGenerateModal({ open, onClose }: SwarmGenerateModalProps) {
                   </span>
                   <span>{result.caption_type}</span>
                   {result.planned_only && <span>planned</span>}
+                  {result.requeued_from && <span>requeued</span>}
                   {result.ok && !result.planned_only && (
                     <span className="text-[var(--color-success-500)]">generated</span>
                   )}
+                  {(result.black ?? 0) > 0 && (
+                    <span className="text-[var(--color-error-500)]">
+                      {result.black} black output{result.black === 1 ? "" : "s"} retired
+                    </span>
+                  )}
                   {result.ok === false && <span className="text-[var(--color-error-500)]">{result.error}</span>}
                 </div>
+                {result.requeued_from && (
+                  <div
+                    className="text-[10px] text-[var(--color-on-surface-secondary)] truncate"
+                    title={result.requeued_from}
+                  >
+                    was {result.requeued_from}
+                  </div>
+                )}
                 {result.real_path && (
                   <div
                     className="text-[10px] text-[var(--color-on-surface-secondary)] truncate"

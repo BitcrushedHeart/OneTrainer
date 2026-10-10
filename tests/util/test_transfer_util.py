@@ -10,13 +10,17 @@ tests/modelSetup/test_transfer_loss_step.py.
 
 from modules.util.transfer_util import (
     TransferStopCriterion,
+    add_distillation_offset,
     collect_late_weight_modules,
+    high_frequency_ratio,
     is_late_family_key,
     parse_transfer_families,
     run_late_stack,
     run_prefix_and_capture,
     swap_module_weights,
     transfer_activation_loss,
+    transfer_education_gaps,
+    transfer_turbo_metrics,
 )
 
 import torch
@@ -148,6 +152,62 @@ def test_run_prefix_and_capture_requires_fork_hit():
         run_prefix_and_capture(lambda: stack(torch.randn(2, 8)), other)
 
 
+@pytest.mark.parametrize("checkpointed", [False, True])
+@pytest.mark.parametrize("warm_compile", [False, True])
+def test_run_prefix_and_capture_compiled_block(checkpointed, warm_compile):
+    """The capture trap must bypass Module.compile, including compiled checkpoints."""
+    stack = _Stack(hidden=8, layers=4)
+    if checkpointed:
+        from modules.util.checkpointing_util import CheckpointLayer
+
+        for i, block in enumerate(stack.layers):
+            stack.layers[i] = CheckpointLayer(block, None, torch.device("cpu"))
+    for block in stack.layers:
+        block.compile(backend="eager", fullgraph=True)
+    fork = stack.layers[2]
+    compiled_call = fork._compiled_call_impl
+    x = torch.randn(2, 8)
+
+    with torch.no_grad():
+        if warm_compile:
+            stack(x, offset=0.5)
+        args, kwargs = run_prefix_and_capture(lambda: stack(x, offset=0.5), fork)
+        expected_prefix = stack.layers[1](stack.layers[0](x, offset=0.5), offset=0.5)
+        torch.testing.assert_close(args[0], expected_prefix)
+        assert kwargs == {"offset": 0.5}
+        assert fork._compiled_call_impl is compiled_call
+        assert "forward" not in fork.__dict__
+        expected = stack(x, offset=0.5)
+
+    outs = run_late_stack(list(stack.layers[2:]), args[0], args[1:], kwargs)
+    torch.testing.assert_close(outs[-1], expected)
+    outs[-1].square().mean().backward()
+    assert all(p.grad is None for block in stack.layers[:2] for p in block.parameters())
+    for block in stack.layers[2:]:
+        original = block.checkpoint if checkpointed else block
+        assert original.attention.to_q.weight.grad is not None
+        assert original.feed_forward.w1.weight.grad is not None
+
+
+@pytest.mark.parametrize("failure", ["missing_fork", "forward_error"])
+def test_run_prefix_and_capture_restores_compiled_block_on_failure(failure):
+    fork = _Block(8)
+    original_forward = fork.forward
+    fork.forward = original_forward  # Preserve an existing instance override too.
+    fork.compile(backend="eager", fullgraph=True)
+    compiled_call = fork._compiled_call_impl
+
+    def call_forward():
+        if failure == "forward_error":
+            raise ValueError("prefix failed")
+
+    error = ValueError if failure == "forward_error" else RuntimeError
+    with pytest.raises(error, match="prefix failed|without reaching the fork"):
+        run_prefix_and_capture(call_forward, fork)
+    assert fork.forward is original_forward
+    assert fork._compiled_call_impl is compiled_call
+
+
 def test_transfer_activation_loss_values_and_metrics():
     student = [torch.full((2, 3, 4), 2.0), torch.full((2, 3, 4), 1.0)]
     teacher = [torch.full((2, 3, 4), 1.0), torch.full((2, 3, 4), 1.0)]
@@ -224,3 +284,123 @@ def test_stop_criterion_target_residual():
     # patience=0 means patience never fires on its own
     crit2 = TransferStopCriterion(patience=0, min_relative_improvement=0.005)
     assert not any(crit2.update(1.0 + i) for i in range(10))
+
+
+def test_stop_criterion_guard_blocks_best_and_counts_patience():
+    """A guard-tripped validation never becomes the best, even with the lowest
+    residual, counts against patience and cannot satisfy the target."""
+    crit = TransferStopCriterion(patience=2, min_relative_improvement=0.005, target_residual=0.1)
+    assert not crit.update(1.0, tag=0)
+    assert not crit.update(0.05, tag=1, guard_ok=False)  # below target and best, but guarded
+    assert crit.best_residual == pytest.approx(1.0)
+    assert crit.best_tag == 0
+    assert crit.counter == 1
+    assert crit.update(0.04, tag=2, guard_ok=False)  # patience exhausted
+    assert crit.best_tag == 0
+
+
+def test_add_distillation_offset():
+    teacher = [torch.full((2, 3, 4), 1.0, dtype=torch.bfloat16)]
+    variant = [torch.full((2, 3, 4), 0.75)]
+    base = [torch.full((2, 3, 4), 0.25)]
+    (target,) = add_distillation_offset(teacher, variant, base)
+    assert target.dtype == torch.float32
+    assert torch.allclose(target, torch.full((2, 3, 4), 1.5))
+    with pytest.raises(ValueError, match="blocks"):
+        add_distillation_offset(teacher, variant, [])
+
+
+def test_transfer_turbo_metrics_retention_and_split():
+    torch.manual_seed(0)
+    teacher = torch.randn(2, 5, 8)
+    base = torch.randn(2, 5, 8)
+    direction = torch.randn(2, 5, 8)
+    variant = base + direction
+    # A component orthogonal to the distillation direction: pure education error.
+    noise = torch.randn(2, 5, 8)
+    perp = noise - (noise * direction).sum() / direction.pow(2).sum() * direction
+
+    def run(student):
+        return transfer_turbo_metrics([student], [teacher], [variant], [base], block_index_offset=22)
+
+    full = run(teacher + direction)
+    assert full["turbo_retention"] == pytest.approx(1.0)
+    assert full["turbo_retention_block_22"] == pytest.approx(1.0)
+    assert full["education_residual"] == pytest.approx(0.0, abs=1e-9)
+    assert full["turbo_gap"] == pytest.approx(float(direction.pow(2).sum() / teacher.pow(2).sum()), rel=1e-5)
+    assert full["teacher_residual"] == pytest.approx(full["turbo_gap"], rel=1e-5)
+
+    collapsed = run(teacher.clone())
+    assert collapsed["turbo_retention"] == pytest.approx(0.0, abs=1e-9)
+    assert collapsed["teacher_residual"] == pytest.approx(0.0, abs=1e-9)
+
+    half = run(teacher + 0.5 * direction + perp)
+    assert half["turbo_retention"] == pytest.approx(0.5, abs=1e-5)
+    assert half["education_residual"] == pytest.approx(float(perp.pow(2).sum() / teacher.pow(2).sum()), rel=1e-4)
+
+
+def test_transfer_turbo_metrics_mask_and_block_mean():
+    teacher = torch.ones(1, 2, 4)
+    base = torch.zeros(1, 2, 4)
+    variant = torch.ones(1, 2, 4)
+    student = teacher.clone()
+    student[:, 0] += 1.0  # token 0 keeps the full offset, token 1 none
+    mask = torch.tensor([[True, False]])
+    masked = transfer_turbo_metrics([student], [teacher], [variant], [base], mask=mask)
+    assert masked["turbo_retention"] == pytest.approx(1.0)
+    unmasked = transfer_turbo_metrics([student], [teacher], [variant], [base])
+    assert unmasked["turbo_retention"] == pytest.approx(0.5)
+
+    two = transfer_turbo_metrics([student, teacher], [teacher, teacher], [variant, variant], [base, base], mask=mask)
+    assert two["turbo_retention_block_0"] == pytest.approx(1.0)
+    assert two["turbo_retention_block_1"] == pytest.approx(0.0, abs=1e-9)
+    assert two["turbo_retention"] == pytest.approx(0.5)
+
+    # No distillation offset at all (variant == base): finite, zero retention.
+    flat = transfer_turbo_metrics([student], [teacher], [base], [base])
+    assert flat["turbo_retention"] == 0.0 and flat["turbo_gap"] == 0.0
+
+
+def test_high_frequency_ratio():
+    torch.manual_seed(0)
+    sharp = torch.randn(2, 4, 16, 16)
+    blurred = torch.nn.functional.avg_pool2d(sharp, kernel_size=3, stride=1, padding=1)
+    assert high_frequency_ratio(sharp, sharp) == pytest.approx(1.0)
+    assert high_frequency_ratio(blurred, sharp) < 0.5
+    assert high_frequency_ratio(sharp, blurred) > 2.0
+
+
+def test_education_gap_and_missing_fraction():
+    """education_missing reads the education residual as a fraction of the
+    education's own effect (teacher minus raw Base), per block."""
+    torch.manual_seed(0)
+    base = torch.randn(2, 5, 8)
+    education = 0.1 * torch.randn(2, 5, 8)
+    teacher = base + education
+    direction = torch.randn(2, 5, 8)
+    variant = base + direction
+    # Orthogonal to the distillation direction, so it all counts as education error.
+    perp = education - (education * direction).sum() / direction.pow(2).sum() * direction
+
+    (gap,) = transfer_education_gaps([teacher], [base])
+    assert gap == pytest.approx(float(education.pow(2).sum() / teacher.pow(2).sum()), rel=1e-5)
+
+    def run(student):
+        return transfer_turbo_metrics([student], [teacher], [variant], [base], education_gaps=[gap])
+
+    exact = run(teacher + direction)
+    assert exact["education_gap"] == pytest.approx(gap)
+    assert exact["education_missing"] == pytest.approx(0.0, abs=1e-6)
+
+    half = run(teacher + direction - 0.5 * perp)
+    assert half["education_missing"] == pytest.approx(
+        0.25 * float(perp.pow(2).sum() / education.pow(2).sum()), rel=1e-3
+    )
+
+    assert "education_missing" not in transfer_turbo_metrics([teacher], [teacher], [variant], [base])
+    mask = torch.zeros(2, 5, dtype=torch.bool)
+    mask[:, 0] = True
+    (masked,) = transfer_education_gaps([teacher], [base], mask=mask)
+    assert masked == pytest.approx(float(education[:, 0].pow(2).sum() / teacher[:, 0].pow(2).sum()), rel=1e-5)
+    with pytest.raises(ValueError, match="education gaps"):
+        transfer_turbo_metrics([teacher], [teacher], [variant], [base], education_gaps=[gap, gap])

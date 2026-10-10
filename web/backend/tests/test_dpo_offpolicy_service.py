@@ -264,7 +264,7 @@ def test_start_refuses_nested_folders(service, tmp_path):
     assert service.status()["active"] is False
 
 
-def test_start_refuses_output_dir_of_an_active_curation_session(service, monkeypatch, tmp_path):
+def test_start_shares_output_dir_with_an_active_curation_session(service, monkeypatch, tmp_path):
     real = tmp_path / "real"
     gen = tmp_path / "gen"
     out = tmp_path / "out"
@@ -274,9 +274,7 @@ def test_start_refuses_output_dir_of_an_active_curation_session(service, monkeyp
     curation._session_active = True
     curation._output_dir = str(out)
     monkeypatch.setattr(DPOService, "get_instance", classmethod(lambda cls: curation))
-    res = service.start(str(gen), str(real), str(out))
-    assert not res["ok"] and "curation" in res["error"]
-    curation._session_active = False
+    # Manifest saves merge, so another tool's open session no longer blocks.
     assert service.start(str(gen), str(real), str(out))["ok"]
 
 
@@ -736,6 +734,61 @@ def test_reroll_shows_another_generation_and_confirm_uses_it(service, scores, fi
     # d has a single generation: re-roll refuses.
     assert os.path.basename(service.next()["candidate"]["real_path"]) == "d.jpg"
     assert service.reroll()["ok"] is False
+
+
+def test_choose_picks_a_named_generation_and_confirm_uses_it(service, scores, fixture_dirs):
+    """The side-by-side picker: every generation is listed, and naming one
+    makes it the rejected image (the scored pick stays the default)."""
+    real, gen, out = fixture_dirs
+    scores.update({"a2_soft.png": 0.9, "a2_hard.png": 0.1, "d.png": 0.5})
+    assert service.start(str(gen), str(real), str(out), aspect_tolerance=0.2, order="path")["ok"]
+    _wait_finished(service)
+    assert service.choose(str(gen / "a2_soft.png")) == {"ok": False, "error": "No candidate on screen"}
+    cand = service.next()["candidate"]
+    assert [os.path.basename(p) for p in cand["generated_paths"]] == ["a2_hard.png", "a2_soft.png"]
+    assert cand["rejected_index"] == 0 and cand["shown_count"] == 1
+
+    # A path that is not one of this photo's generations is refused.
+    assert service.choose(str(gen / "d.png"))["ok"] is False
+    assert service.choose("")["ok"] is False
+
+    # Spelling differences do not matter: the path is one of the listed ones.
+    spelled = os.path.join(str(gen), ".", "a2_soft.png").replace(os.sep, "/")
+    if os.name == "nt":
+        spelled = spelled.upper()
+    res = service.choose(spelled)
+    assert res["ok"], res
+    picked = res["candidate"]
+    assert os.path.basename(picked["rejected_path"]) == "a2_soft.png"
+    assert picked["rejected_index"] == 1 and picked["rejected_score"] == 0.9 and picked["scored"] is True
+    assert picked["shown_count"] == 2
+
+    # Choosing the one already picked is a no-op that still answers ok.
+    again = service.choose(str(gen / "a2_soft.png"))["candidate"]
+    assert again["rejected_index"] == 1 and again["shown_count"] == 2
+
+    assert service.confirm()["ok"]
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert os.path.basename(manifest["pairs"][0]["rejected_source"]) == "a2_soft.png"
+
+
+def test_choose_round_trips_through_the_http_router(service, scores, fixture_dirs):
+    from web.backend.routers.dpo_offpolicy import router
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    real, gen, out = fixture_dirs
+    scores.update({"a2_soft.png": 0.9, "a2_hard.png": 0.1})
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+    assert service.start(str(gen), str(real), str(out), aspect_tolerance=0.2, order="path")["ok"]
+    _wait_finished(service)
+    cand = client.post("/api/dpo/offpolicy/next").json()["candidate"]
+    res = client.post("/api/dpo/offpolicy/choose", json={"path": cand["generated_paths"][1]}).json()
+    assert res["ok"] and res["candidate"]["rejected_index"] == 1
+    assert client.get("/api/dpo/offpolicy/current").json()["candidate"]["rejected_index"] == 1
 
 
 def test_allowed_upscale_is_a_start_parameter(service, scores, tmp_path):

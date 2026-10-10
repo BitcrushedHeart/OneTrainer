@@ -226,8 +226,11 @@ def load_transformer_weights(model, path: str):
     torch_gc()
 
 
-def _per_sample_mse(model_setup, out) -> list[float]:
-    return model_setup._dpo_mse_per_sample(out["predicted"], out["target"]).tolist()
+def _per_sample_mse(model_setup, out, batch, config) -> list[float]:
+    # Same region weighting as the trainer: masked DPO scores the masked
+    # area only, so the saturation margins stay in the loss's units.
+    mask = model_setup._dpo_mask_weights(batch, config)
+    return model_setup._dpo_mse_per_sample(out["predicted"], out["target"], mask).tolist()
 
 
 def _timesteps(out, batch_size: int) -> list[int]:
@@ -251,11 +254,11 @@ def score_batch_side(model_setup, model, config, progress, chosen_batch, rejecte
             with forced_timestep(model_setup, draw["t"]):
                 out = model_setup.predict(model, chosen_batch, config, progress)
                 t_c = _timesteps(out, batch_size)
-                mse_c = _per_sample_mse(model_setup, out)
+                mse_c = _per_sample_mse(model_setup, out, chosen_batch, config)
                 del out
                 out = model_setup.predict(model, rejected_batch, config, progress)
                 t_r = _timesteps(out, batch_size)
-                mse_r = _per_sample_mse(model_setup, out)
+                mse_r = _per_sample_mse(model_setup, out, rejected_batch, config)
                 del out
             if t_c != t_r:
                 raise RuntimeError(f"chosen/rejected timesteps desynchronised for seed {draw['seed']}: {t_c} vs {t_r}")

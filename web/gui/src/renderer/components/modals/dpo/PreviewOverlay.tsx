@@ -8,9 +8,10 @@ export interface PreviewOverlayProps {
   onClose: () => void;
   onPick?: () => void;
   caption?: string;
+  imageUrl?: string;
 }
 
-export function PreviewOverlay({ path, onClose, onPick, caption }: PreviewOverlayProps) {
+export function PreviewOverlay({ path, onClose, onPick, caption, imageUrl }: PreviewOverlayProps) {
   useEffect(() => {
     // Capture phase + stopPropagation so the enclosing ModalBase's
     // document-level Escape listener doesn't also fire and close the
@@ -24,7 +25,7 @@ export function PreviewOverlay({ path, onClose, onPick, caption }: PreviewOverla
     return () => window.removeEventListener("keydown", handleKey, true);
   }, [onClose]);
 
-  const src = `${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`;
+  const src = imageUrl ?? `${API_BASE}/dpo/session/image?path=${encodeURIComponent(path)}`;
   const fileName = caption ?? path.split(/[/\\]/).pop() ?? path;
 
   const handleBackdropClick = (e: React.MouseEvent<HTMLDivElement>) => {

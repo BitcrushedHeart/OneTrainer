@@ -26,6 +26,7 @@ from modules.util.dpo_offpolicy_util import (
     bucket_summary,
     build_candidates,
     caption_match_key,
+    choose_negative,
     entry_stamp,
     filter_pool_by_keywords,
     find_photos_by_name,
@@ -52,6 +53,7 @@ from modules.util.dpo_offpolicy_util import (
     used_caption_keys_from_manifest,
     walk_entries_skipping_dotted,
 )
+from web.backend.services._dpo_session_lock import dpo_session_admission
 from web.backend.services._singleton import SingletonMixin
 
 logger = logging.getLogger(__name__)
@@ -145,20 +147,6 @@ class DPOOffPolicyService(SingletonMixin):
                 return f"The {label} folder must not be inside the output folder"
         return None
 
-    def _curation_session_conflict(self, output_dir: str) -> str | None:
-        """Two services writing one manifest from separate in-memory copies
-        would overwrite each other's pairs on every save."""
-        from web.backend.services.dpo_service import DPOService
-
-        try:
-            curation = DPOService.get_instance()
-            other = curation._output_dir
-            if curation._session_active and other and is_within(other, output_dir) and is_within(output_dir, other):
-                return "The DPO curation tool has an active session on this output folder — finish it first"
-        except Exception:  # noqa: BLE001 — the other service is advisory here
-            return None
-        return None
-
     @staticmethod
     def _foreign_cache_paths(output_dir: str) -> list[str]:
         """``.dpo_hash_cache.json`` of every configured DPO concept other than
@@ -192,6 +180,7 @@ class DPOOffPolicyService(SingletonMixin):
             imported += n
         return imported
 
+    @dpo_session_admission
     def start(
         self,
         generated_folder: str,
@@ -224,10 +213,6 @@ class DPOOffPolicyService(SingletonMixin):
         layout_error = self._folder_layout_error(generated_folder, real_folder, output_dir)
         if layout_error:
             return {"ok": False, "error": layout_error}
-        conflict = self._curation_session_conflict(output_dir)
-        if conflict:
-            return {"ok": False, "error": conflict}
-
         with self._lock:
             if self._active:
                 return {"ok": False, "error": "Session already active"}
@@ -692,6 +677,18 @@ class DPOOffPolicyService(SingletonMixin):
                 return {"ok": False, "error": "No candidate on screen"}
             if not reroll_negative(candidate, self._cached_score, self._rng):
                 return {"ok": False, "error": "This photo has only one usable generation"}
+            return {"ok": True, "candidate": self._candidate_payload(candidate)}
+
+    def choose(self, path: str) -> dict:
+        """Make one of the on-screen photo's generations (by path, from
+        ``generated_paths``) the rejected image — the side-by-side picker's
+        explicit choice, where :meth:`reroll` cycles."""
+        with self._lock:
+            candidate = self._current
+            if candidate is None:
+                return {"ok": False, "error": "No candidate on screen"}
+            if not path or not choose_negative(candidate, str(path), self._cached_score):
+                return {"ok": False, "error": "That image is not one of this photo's generations"}
             return {"ok": True, "candidate": self._candidate_payload(candidate)}
 
     def current(self) -> dict:

@@ -11,6 +11,7 @@ import {
   Pencil,
   Play,
   Plus,
+  RotateCcw,
   SkipForward,
   Sparkles,
   Square,
@@ -58,10 +59,19 @@ function EntryList() {
   const removeEntry = useQueueStore((s) => s.removeEntry);
   const duplicateEntry = useQueueStore((s) => s.duplicateEntry);
   const reorder = useQueueStore((s) => s.reorder);
+  const resetEntry = useQueueStore((s) => s.resetEntry);
   const loadQueue = useQueueStore((s) => s.loadQueue);
   const status = useQueueStore((s) => s.status);
   const isRunning = status === "running" || status === "stopping";
   const fromFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleReset = async (id: string) => {
+    try {
+      await resetEntry(id);
+    } catch (err) {
+      alert(`Reset failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   const handleAddFromFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -175,7 +185,23 @@ function EntryList() {
                 >
                   {entry.name || `Entry ${i + 1}`}
                 </span>
-                <StatusBadge status={entry.status} />
+                <span className="flex items-center gap-1 shrink-0">
+                  {entry.status !== "PENDING" && entry.status !== "RUNNING" && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleReset(entry.id);
+                      }}
+                      title="Reset to pending (train again on the next run)"
+                      aria-label="Reset entry"
+                      className="opacity-60 hover:opacity-100 text-[var(--color-on-surface-secondary)]"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                  <StatusBadge status={entry.status} />
+                </span>
               </div>
               {Object.keys(entry.overrides).length > 0 && (
                 <div className="text-xs text-[var(--color-on-surface-secondary)] mt-0.5">
@@ -360,8 +386,24 @@ export default function QueuePage() {
   const autoBatchEvents = useQueueStore((s) => s.autoBatchEvents);
   const dismissAutoBatchEvent = useQueueStore((s) => s.dismissAutoBatchEvent);
   const entries = useQueueStore((s) => s.entries);
+  const resetAll = useQueueStore((s) => s.resetAll);
+  const finishedCount = entries.filter((e) => e.status !== "PENDING" && e.status !== "RUNNING").length;
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleResetAll = async () => {
+    if (
+      !confirm(
+        `Reset ${finishedCount} finished entr${finishedCount === 1 ? "y" : "ies"} to pending so they train again?`,
+      )
+    )
+      return;
+    try {
+      await resetAll();
+    } catch (err) {
+      alert(`Reset failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   useEffect(() => {
     loadQueue();
@@ -399,7 +441,12 @@ export default function QueuePage() {
       {/* Action bar */}
       <div className="flex items-center gap-2 flex-wrap">
         {!isRunning ? (
-          <Button variant="primary" onClick={execute} disabled={loading}>
+          <Button
+            variant="primary"
+            onClick={execute}
+            disabled={loading}
+            title="Trains the pending entries (failed / skipped ones are retried). Completed entries stay completed — reset one to train it again."
+          >
             <Play className="w-4 h-4 mr-1" />
             Start Queue
           </Button>
@@ -418,6 +465,15 @@ export default function QueuePage() {
         <Button variant="secondary" onClick={validate} disabled={isRunning}>
           <AlertTriangle className="w-4 h-4 mr-1" />
           Validate
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={handleResetAll}
+          disabled={isRunning || finishedCount === 0}
+          title="Mark every completed / failed / skipped entry as pending so the next run trains them all again"
+        >
+          <RotateCcw className="w-4 h-4 mr-1" />
+          Reset All{finishedCount > 0 ? ` (${finishedCount})` : ""}
         </Button>
         <Button variant="secondary" onClick={() => setAutoBatchAllOpen(true)} disabled={isRunning}>
           <Sparkles className="w-4 h-4 mr-1" />
@@ -476,7 +532,7 @@ export default function QueuePage() {
                 <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
                 <div className="flex-1 text-[var(--text-caption)] leading-snug">
                   <div className="font-semibold">
-                    Auto-Batch {isFailed ? "failed" : "warning"} — {entryName}
+                    {evt.title ?? `Auto-Batch ${isFailed ? "failed" : "warning"} — ${entryName}`}
                   </div>
                   <div>{evt.message}</div>
                 </div>

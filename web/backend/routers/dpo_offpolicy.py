@@ -92,6 +92,17 @@ def reroll():
     return DPOOffPolicyService.get_instance().reroll()
 
 
+class ChooseRequest(BaseModel):
+    # One of the current candidate's ``generated_paths``.
+    path: str
+
+
+@router.post("/dpo/offpolicy/choose")
+def choose(req: ChooseRequest):
+    """Make the named generation the rejected image for the photo on screen."""
+    return DPOOffPolicyService.get_instance().choose(req.path)
+
+
 @router.post("/dpo/offpolicy/undo")
 def undo():
     """Reverse the last confirm / skip / delete and show that candidate again."""

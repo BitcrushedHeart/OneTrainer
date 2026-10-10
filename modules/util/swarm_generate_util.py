@@ -249,6 +249,40 @@ def _params_from_image(path: str) -> dict:
     return {}
 
 
+def save_generation_locally(data: bytes, target_dir: str, stem: str, params: dict) -> str:
+    """Write an image SwarmUI returned without saving (``donotsave``) into
+    ``target_dir`` as a PNG that carries the request's parameter block, so
+    the file reads back exactly like one from SwarmUI's own output tree
+    (prompt grouping, ``file_is_generation``, provenance all work). A
+    parameter block already embedded by SwarmUI is kept verbatim."""
+    import io
+
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, f"{stem}.png")
+    counter = 1
+    while os.path.exists(target):
+        counter += 1
+        target = os.path.join(target_dir, f"{stem}-{counter}.png")
+
+    with Image.open(io.BytesIO(data)) as img:
+        img.load()
+        info = PngInfo()
+        existing = {key: img.info.get(key) for key in _PARAM_METADATA_KEYS}
+        if any(isinstance(value, str) and value for value in existing.values()):
+            for key, value in existing.items():
+                if isinstance(value, str) and value:
+                    info.add_text(key, value)
+        else:
+            info.add_text("sui_image_params", json.dumps({"sui_image_params": params}))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        img.save(target, format="PNG", pnginfo=info)
+    return target
+
+
 def read_last_generation_params(generated_folder: str, search_limit: int = 40) -> dict:
     """Parameters of the most recent image in the generated tree.
 
@@ -292,3 +326,97 @@ def merge_params(base: dict, overrides: dict) -> dict:
             continue
         merged[key] = value
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Failed generations: black images
+# ---------------------------------------------------------------------------
+
+#: Where a black generation is retired to, beside the file: a dot-folder, so
+#: :func:`~modules.util.dpo_curation_util.walk_skipping_dotted` never yields
+#: it again and its caption counts as un-generated on the next scan.
+BLACK_FOLDER = ".black"
+
+#: Highest grey level (0–255) an image may reach and still count as black. A
+#: backend failure (a dtype error mid-run, a NaN latent) writes exact zeros;
+#: the slack only covers a lossy encoder's ringing around them.
+DEFAULT_BLACK_MAX_LEVEL = 8
+
+#: An all-black image compresses to a few kilobytes, a real generation at
+#: ~1024² to a megabyte or more. A scan never decodes a file above this size,
+#: which keeps the walk over a large output tree at the cost of a stat.
+BLACK_SCAN_MAX_FILE_BYTES = 768 * 1024
+
+
+def is_black_image(path: str, max_level: int = DEFAULT_BLACK_MAX_LEVEL) -> bool:
+    """Whether every pixel of ``path`` is at or below ``max_level`` grey.
+
+    Unreadable files are *not* black — the caller must never retire an image
+    it could not look at."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            _lo, hi = img.convert("L").getextrema()
+    except Exception:
+        return False
+    return hi <= max_level
+
+
+def find_black_images(
+    generated_folder: str,
+    max_level: int = DEFAULT_BLACK_MAX_LEVEL,
+    max_file_bytes: int = BLACK_SCAN_MAX_FILE_BYTES,
+    workers: int | None = None,
+) -> list[str]:
+    """Every black image in the generated tree, sorted, dot-folders skipped.
+
+    Files above ``max_file_bytes`` are skipped without decoding (see
+    :data:`BLACK_SCAN_MAX_FILE_BYTES`); ``max_file_bytes <= 0`` decodes all."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from modules.util.dpo_curation_util import walk_skipping_dotted
+    from modules.util.path_util import supported_image_extensions
+
+    supported = supported_image_extensions()
+    candidates: list[str] = []
+    for root, files in walk_skipping_dotted(generated_folder):
+        for name in files:
+            if os.path.splitext(name)[1].lower() not in supported:
+                continue
+            path = os.path.join(root, name)
+            if max_file_bytes > 0:
+                try:
+                    if os.path.getsize(path) > max_file_bytes:
+                        continue
+                except OSError:
+                    continue
+            candidates.append(path)
+    if not candidates:
+        return []
+    workers = workers or min(16, (os.cpu_count() or 4) * 2)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        flags = list(pool.map(lambda p: is_black_image(p, max_level), candidates))
+    return sorted(path for path, black in zip(candidates, flags, strict=True) if black)
+
+
+def describe_black_image(path: str) -> dict:
+    """What the UI needs to show about one black image: its recorded prompt,
+    size and model, and whether it carries a parameter block at all."""
+    params = _params_from_image(path)
+    size: list[int] | None = None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            size = [int(img.size[0]), int(img.size[1])]
+    except Exception:
+        size = None
+    return {
+        "path": path,
+        "prompt": str(params.get("prompt") or ""),
+        "model": str(params.get("model") or ""),
+        "seed": params.get("seed"),
+        "size": size,
+        "has_params": bool(params),
+    }

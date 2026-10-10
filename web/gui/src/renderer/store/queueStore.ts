@@ -15,6 +15,8 @@ export interface AutoBatchEvent {
   kind: "failed" | "warning";
   message: string;
   timestamp: number;
+  /** Custom banner heading; defaults to "Auto-Batch failed/warning — <entry>". */
+  title?: string;
 }
 
 interface QueueStore {
@@ -40,6 +42,8 @@ interface QueueStore {
   removeEntry: (id: string) => Promise<void>;
   duplicateEntry: (id: string) => Promise<void>;
   reorder: (id: string, direction: "up" | "down") => Promise<void>;
+  resetEntry: (id: string) => Promise<void>;
+  resetAll: () => Promise<void>;
   selectEntry: (id: string | null) => void;
   updateSettings: (settings: Partial<QueueSettingsData>) => Promise<void>;
   validate: () => Promise<void>;
@@ -132,6 +136,18 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     await get().loadQueue();
   },
 
+  resetEntry: async (id) => {
+    const result = await queueApi.resetEntry(id);
+    if (!result.ok) throw new Error(result.error ?? "Reset failed");
+    await get().loadQueue();
+  },
+
+  resetAll: async () => {
+    const result = await queueApi.resetAll();
+    if (!result.ok) throw new Error(result.error ?? "Reset failed");
+    await get().loadQueue();
+  },
+
   selectEntry: (id) => set({ selectedEntryId: id }),
 
   updateSettings: async (settings) => {
@@ -160,6 +176,17 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
         set((s) => ({ autoBatchEvents: [...s.autoBatchEvents, ...events].slice(-10) }));
       }
       await get().loadQueue();
+    } else if (result.error) {
+      const ts = Date.now();
+      const event: AutoBatchEvent = {
+        id: ts,
+        entryId: "",
+        kind: "failed",
+        message: result.error,
+        timestamp: ts,
+        title: "Queue not started",
+      };
+      set((s) => ({ autoBatchEvents: [...s.autoBatchEvents, event].slice(-10) }));
     }
   },
 

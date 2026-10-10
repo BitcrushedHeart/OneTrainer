@@ -8,6 +8,7 @@ import type {
   SwissScores,
 } from "@/api/dpoApi";
 
+import type { RegenStartRequest, RegenUiState } from "./regenFixes";
 import type { ScoreSortMode, ScoreWeights } from "./scoreCombine";
 
 export type { GroupData, GroupOrder, RealismDevice, ReviewPair, ScoreBreakdown, SessionStatus, SwissScores };
@@ -26,6 +27,11 @@ export interface SessionConfig {
   groupOrder: GroupOrder;
   /** Comma-separated caption keywords; all must appear. Empty = no filter. */
   captionFilter: string;
+  /**
+   * Comma-separated LoRA name substrings; a group is kept only when every
+   * image in it used a matching LoRA. Empty = no filter.
+   */
+  loraFilter: string;
   /** Skip prompts with fewer images than this. 2 (the pair floor) = no filter. */
   minImagesPerGroup: number;
 }
@@ -47,12 +53,14 @@ export interface SetupStepProps {
   pairsPerGroup: number;
   groupOrder: GroupOrder;
   captionFilter: string;
+  loraFilter: string;
   minImagesPerGroup: number;
   onSourceChange: (dir: string) => void;
   onOutputChange: (dir: string) => void;
   onPairsPerGroupChange: (n: number) => void;
   onGroupOrderChange: (order: GroupOrder) => void;
   onCaptionFilterChange: (text: string) => void;
+  onLoraFilterChange: (text: string) => void;
   onMinImagesPerGroupChange: (n: number) => void;
   onStart: (config: SessionConfig) => Promise<void>;
   onReview: () => void;
@@ -127,6 +135,14 @@ export interface SelectionStepProps {
   onSetScoreWeights?: (weights: ScoreWeights) => void;
   scoreSortMode?: ScoreSortMode;
   onSetScoreSortMode?: (mode: ScoreSortMode) => void;
+  // Fix & Regenerate. Shift+Click toggles an image into regenSelection;
+  // Shift+Right-click opens the fix dialog for the selection plus that image.
+  // Results are appended to remainingImages by the session hook as they land.
+  regenSelection?: string[];
+  onToggleRegenSelect?: (path: string) => void;
+  regen?: RegenUiState;
+  onStartRegen?: (req: RegenStartRequest) => Promise<string | null>;
+  onCancelRegen?: () => void;
 }
 
 export interface TournamentStepProps {

@@ -100,7 +100,7 @@ def fakes(monkeypatch):
         calls["age"] += 1
         return {p: {"age": 34.0 + 5 * i, "p_none": 0.05} for i, p in enumerate(paths)}
 
-    def fake_read_image_text(paths, *, backend, cache=None, progress=None):
+    def fake_read_image_text(paths, *, backend, cache=None, progress=None, cache_only=False):
         calls["ocr"] += 1
         out = {}
         for p in paths:
@@ -443,3 +443,189 @@ def test_siglip_is_never_loaded_and_stale_vectors_are_left_alone(backfill_servic
     assert all(s["adherence"] is None for s in res["scores"].values())
     assert all(s["age"] is not None for s in res["scores"].values())
     assert np.array_equal(cache.peek_adherence_embedding(paths[0], "old-siglip/1"), stale)
+
+
+# --------------------------------------------------------------------------- #
+# The priority lane: a group opened while the backfill runs is scored by the
+# backfill thread, not beside it
+# --------------------------------------------------------------------------- #
+#
+# The failure this guards against: the tree walks in one order, the user views
+# groups in another, and the breakdown used to score the group on demand in
+# the request thread — a second set of ONNX sessions and a second OCR reader
+# next to the backfill's. Now the request hands its paths to the backfill and
+# waits; every model load happens on the backfill thread.
+
+
+def _record_loaders(monkeypatch):
+    """Every session build, tagged with the thread that asked for it."""
+    loads: list[tuple[str, int]] = []
+
+    def realism(device="auto"):
+        loads.append(("realism", threading.get_ident()))
+        return FakeOnnxSession(2), REALISM_SPEC
+
+    def age(device="auto"):
+        loads.append(("age", threading.get_ident()))
+        return FakeOnnxSession(4), AGE_SPEC
+
+    monkeypatch.setattr(rdu, "load_realism_model", realism)
+    monkeypatch.setattr(aeu, "load_age_model", age)
+    return loads
+
+
+def _gate_first_chunk(svc, monkeypatch):
+    """Hold the worker at the top of its first chunk until ``gate`` is set,
+    so a test can act while the backfill is provably in flight."""
+    gate = threading.Event()
+    entered = threading.Event()
+    original = DPOService._backfill_prompt_for
+    calls = {"n": 0}
+
+    def gated(self, path, cache):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            assert gate.wait(30)
+        return original(self, path, cache)
+
+    monkeypatch.setattr(DPOService, "_backfill_prompt_for", gated)
+    return gate, entered
+
+
+@pytest.fixture
+def lane_service(backfill_service, tmp_path):
+    """The backfill fixture plus three ``a*`` images that sort ahead of the
+    group's ``b*`` images in the tree walk, and one-image chunks so the walk
+    is fine-grained."""
+    from PIL import Image
+
+    svc, paths, built = backfill_service
+    ahead = []
+    for i in range(3):
+        p = tmp_path / f"a{i}.png"
+        Image.new("RGB", (64, 96), (30, i * 60, 30)).save(p)
+        ahead.append(str(p))
+    svc._BACKFILL_CHUNK = 1
+    return svc, paths, ahead, built
+
+
+def test_a_group_opened_mid_backfill_is_scored_on_the_backfill_thread(lane_service, monkeypatch):
+    svc, group, ahead, _built = lane_service
+    loads = _record_loaders(monkeypatch)
+    gate, entered = _gate_first_chunk(svc, monkeypatch)
+
+    res = svc.start_score_backfill()
+    assert res["ok"] and res["total"] == 6
+    assert entered.wait(10)
+    worker_ident = svc._backfill_thread.ident
+
+    # The request blocks until the lane has served it, so it runs on a thread.
+    result: dict = {}
+    breakdown = threading.Thread(target=lambda: result.update(svc.score_breakdown(group)))
+    breakdown.start()
+    deadline = threading.Event()
+    for _ in range(100):
+        with svc._backfill_cv:
+            if svc._backfill_priority:
+                break
+        deadline.wait(0.05)
+    with svc._backfill_cv:
+        assert svc._backfill_priority == [group]
+
+    gate.set()
+    breakdown.join(60)
+    assert not breakdown.is_alive()
+    svc._backfill_thread.join(60)
+
+    assert result["ok"] and result["errors"] == {}, result
+    assert set(result["scores"]) == set(group)
+    for s in result["scores"].values():
+        assert s["realism"] is not None and s["quality"] is not None
+        assert s["age"] is not None and s["text"] == pytest.approx(1.0)
+    # Every model was built by the backfill thread — the request thread
+    # loaded nothing, which is the whole point of the lane.
+    assert loads and all(ident == worker_ident for _axis, ident in loads)
+    # The group was served ahead of the tree images that sort before it.
+    status = svc.score_backfill_status()
+    assert status["finished"] and status["done"] == 6
+    assert status["axes"]["realism"] == 6 and status["axes"]["text"] == 6
+    assert svc._backfill_covered == set(group) | set(ahead)
+
+
+def test_a_waiter_is_released_when_the_backfill_is_stopped(lane_service, monkeypatch):
+    """Stop while a group is waiting on the lane: the request must come back
+    (scoring on demand, as with no backfill) rather than hang."""
+    svc, group, _ahead, _built = lane_service
+    _record_loaders(monkeypatch)
+    gate, entered = _gate_first_chunk(svc, monkeypatch)
+
+    assert svc.start_score_backfill()["ok"]
+    assert entered.wait(10)
+    result: dict = {}
+    breakdown = threading.Thread(target=lambda: result.update(svc.score_breakdown(group)))
+    breakdown.start()
+    for _ in range(100):
+        with svc._backfill_cv:
+            if svc._backfill_priority:
+                break
+        threading.Event().wait(0.05)
+
+    svc.stop_score_backfill()
+    gate.set()
+    breakdown.join(60)
+    assert not breakdown.is_alive()
+    svc._backfill_thread.join(60)
+    assert result["ok"] and set(result["scores"]) == set(group)
+    assert all(s["realism"] is not None for s in result["scores"].values())
+
+
+def test_backfill_walks_the_tree_in_the_scans_presentation_order(lane_service, monkeypatch):
+    svc, group, ahead, _built = lane_service
+    seen: list[list[str]] = []
+
+    def recording(paths, **_kw):
+        seen.append(list(paths))
+        return dict.fromkeys(paths, 0.5)
+
+    monkeypatch.setattr(rdu, "score_images_realism", recording)
+    # The scan would present the group first, most-realistic image first;
+    # `ahead` sorts before it on disk and is not part of any group.
+    svc._scan_ordered_paths = [group[2], group[0], group[1]]
+    _run_backfill(svc)
+    assert seen == [[group[2]], [group[0]], [group[1]], *[[p] for p in ahead]]
+
+
+def test_after_the_backfill_a_retired_axis_is_reported_not_retried(backfill_service, monkeypatch):
+    """A scorer the backfill could not load is missing from the cache; with
+    no backfill running the breakdown tries it itself, and the model is
+    still missing, so the column reports the error either way."""
+    svc, paths, _built = backfill_service
+    monkeypatch.setattr(aeu, "load_age_model", lambda device="auto": (None, None))
+    status = _run_backfill(svc)
+    assert "age" in status["errors"]
+    res = svc.score_breakdown(paths)
+    assert res["ok"] and "age" in res["errors"]
+    assert all(s["age"] is None and s["realism"] is not None for s in res["scores"].values())
+
+
+def test_cache_only_scorers_never_build_a_session(backfill_service, monkeypatch):
+    """The mode the breakdown uses after the lane has served it: a miss is
+    left unscored rather than loading the model."""
+    svc, paths, _built = backfill_service
+    cache = svc._hash_cache
+    monkeypatch.setattr(rdu, "load_realism_model", _explode)
+    monkeypatch.setattr(aeu, "load_age_model", _explode)
+    assert rdu.score_images_realism(paths, cache=cache, device="cpu", cache_only=True) == {}
+    assert aeu.estimate_ages(paths, cache=cache, device="cpu", cache_only=True) == {}
+
+    class NeverReads:
+        model_version = "ocr-test/1"
+        candidate_versions = ["ocr-test/1"]
+
+        def read(self, pil):
+            raise AssertionError("cache-only must not read")
+
+    assert tau.read_image_text(paths, backend=NeverReads(), cache=cache, cache_only=True) == {}
+    cache.store_versioned(paths[0], tau.OCR_CACHE_FIELD, "OPEN", "ocr-test/1")
+    assert tau.read_image_text(paths, backend=NeverReads(), cache=cache, cache_only=True) == {paths[0]: "OPEN"}

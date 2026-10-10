@@ -133,6 +133,118 @@ def test_segment_and_fragment_helpers():
     assert not is_nl_fragment("blue eyes")
 
 
+# Upstream ``test_caption_tag_style_regressions.py``: reported tag lists that
+# were being read as prose.
+REPORTED_TAG_LINES = [
+    "Cum On Body, Cum On Breasts, Cum On Stomach, Cumshot, pornpics",
+    "Cum On Body, Cum On Breasts, Cum on face, cum",
+    "2020s, Alexander Skarsg, Alexander Skarsg?rd, Man, Swedish, actor, facial hair, "
+    "film actor, film director, handsome, male focus, pants, reddit, reddit:LadyBoners, "
+    "screenwriter, shirt, sunglasses, television actor",
+    "natural body, screenshot from a video, watermark in center",
+    "2010s, Chlo, Chlo? Grace Moretz, Photo taken in 2014, Woman, Young teenage girl, "
+    "Young woman, actor, blonde hair, dress, film actor, model, natural body, red carpet, "
+    "sensitive, solo, television actor, voice actor, white ethnicity, woman posing",
+    "2010s, Elderly man, Pedro Almod, Pedro Almod?var, Photo taken in 2011, Spanish, actor, "
+    "blurry, blurry background, camera, collared shirt, director, film director, film "
+    "producer, film screenwriter, general, male focus, screenwriter, shirt, singer, smile, "
+    "stage actor, striped clothes, white hair, writer",
+    "Bruno Dickemz, She Is New, Stella Banxxx, Team Skeet, pornpics",
+    "male pov, missionary position, motion blur, the viewer is fucking her in the missionary position, east asian,",
+    "1970s, Alexander Skarsg?rd, Photo taken in 1976, Vintage, brown hair, facial hair, male focus, man, shirt, solo",
+    "leaning to the side, motion blur on hand, sitting",
+    "On Knees, light brown skin on knees, looking at viewer",
+    "black bedding, fingering her own pussy, fingering herself, lying on side",
+    "Deep Depth of Field, Sharp Focus, Shot on Canon",
+    "2010s, Alfonso Cuar, Alfonso Cuar?n, Mature man, Photo taken in 2013, black necktie, "
+    "cinematographer, film director, film editor, film producer, filmmaker, general, "
+    "necktie, screenwriter, shirt, television actor, television director, "
+    "television producer, waving",
+    "Asian woman, Undressing, Undressing herself, black bra, camera while, city skyline, "
+    "dark hair, dark hair as, hair as, long dark, long dark hair, long dark hair as, "
+    "looking directly, matching black, mini dress, pulls down, red lipstick, showing off, "
+    "slender frame, solo, the viewer is watching as she undresses herself, tight black, "
+    "underwear, undresses herself, viewer sees, watching as, watching as she undresses "
+    "herself, young Asian, young Asian woman",
+    "Pierced Nipples, Topless, sitting on bench, bench, Tanlines, Medium breasts, Relaxed Breasts",
+    # Class vocabulary ending in "-ed" is a descriptor, not a sentence fragment.
+    "London, Shot on Sony, fine grain, eye-level, professional photo, subdued colour, subdued",
+    "30-year-old, dark lighting, heavy grain, medium shot, muted colour, relaxed breasts, tanned skin",
+    "colourful image, eye-level, fair skin, medium-to-large breasts, natural breasts, warm tone",
+    # An on-image-text token never reads as prose, however sentence-shaped.
+    'text: "OPEN 24 HOURS"',
+    'woman, storefront, night, text: "The quick brown fox jumps over the lazy dog. She is standing here and '
+    'this sign has lots of words on it"',
+    'poster, indoors, text: "WHO ARE YOU? — THE MOVIE"',
+]
+
+TAG_LIST_EXCEPTION_NL_LINES = [
+    "red dress, blue eyes, Who Is She?, solo",
+    "red dress, blue eyes, Who Is She? standing beside the window, solo",
+    "red dress, blue eyes, Where? Near the window, solo",
+    "red dress, blue eyes, What? Now, solo",
+    "red dress, blue eyes, Really? Yes, solo",
+    "red dress, blue eyes, close-up — soft light, solo",
+    "red dress, blue eyes, close-up – soft light, solo",  # noqa: RUF001 — en dash
+    "red dress, blue eyes, She Is Smiling, solo",
+    "red dress, blue eyes, She Is Happy, solo",
+    "red dress, blue eyes, She Is New Here, solo",
+    "red dress, blue eyes, she is new, solo",
+    "red dress, blue eyes, solo, long hair, portrait, warm light, "
+    "the woman stands by the window, smiling, indoor, wooden floor",
+    "red dress, blue eyes, solo, long hair, portrait, warm light, she holds a flower, smiling, indoor, wooden floor",
+    "the viewer is watching",
+    "the viewer is watching, red dress, blue eyes, solo",
+    "the viewer is watching, red dress, blue eyes, solo, the viewer is watching",
+    "She Is New, red dress, blue eyes, solo, She Is New",
+    "red dress, blue eyes, solo. the viewer is watching, the viewer is watching",
+    "red dress, the viewer is watching",
+    "red dress, blue eyes, the viewer is watching",
+    "red dress, blue eyes, solo, the viewer is watching. She is smiling",
+    "red dress, the viewer is watching., blue eyes, solo",
+    "red dress, blue eyes, solo, the viewer is watching.",
+    "red dress, the viewer is watching, blue eyes, solo.",
+    "solo, portrait, outdoor, the viewer is watching her stand beside the tall window",
+    "solo, portrait, outdoor, looking toward the far horizon beyond the trees across the river",
+    # A preamble list in front of a long sentence body: no tag token is that long.
+    "Neutral, front view, high-angle, fine grain amateur close-up of a Caucasian "
+    "woman with fair skin inserting a translucent pink dildo into her hairy pussy",
+    # Only the ``text: "..."`` token form is exempt from prose detection.
+    'A woman stands beside a sign that reads "OPEN 24 HOURS".',
+]
+
+
+@pytest.mark.parametrize("line", REPORTED_TAG_LINES)
+def test_reported_tag_lines_are_detected(line: str):
+    assert is_tag_line(line) is True, line
+    assert classify_caption_type(line) is CaptionType.TAG
+
+
+@pytest.mark.parametrize("line", TAG_LIST_EXCEPTION_NL_LINES)
+def test_tag_list_exceptions_preserve_natural_language(line: str):
+    assert is_tag_line(line) is False, line
+    assert classify_caption_type(line, min_nl_words=0) is not CaptionType.TAG
+
+
+@pytest.mark.parametrize("clause_label", ["She Is New", "the viewer is watching"])
+def test_known_nl_segment_overrides_clause_shaped_tag_exception(clause_label: str):
+    line = f"red dress, blue eyes, solo, {clause_label}"
+    assert is_tag_line(line)
+    assert not is_tag_line(line, {clause_label.lower()})
+
+
+@pytest.mark.parametrize(
+    "segment", ["subdued", "muted colour", "tanned skin", "relaxed breasts", "mixed race", "dark-skinned male"]
+)
+def test_short_ed_segments_are_tags_not_fragments(segment: str):
+    assert not is_nl_fragment(segment)
+
+
+@pytest.mark.parametrize("segment", ["seated on a wooden bench", "captured at a low angle"])
+def test_long_ed_segments_are_still_fragments(segment: str):
+    assert is_nl_fragment(segment)
+
+
 def test_the_users_own_caption_style_is_natural_language():
     """SoReal captions open with comma-separated modifiers before the prose;
     they must not be filtered out as tag lists."""

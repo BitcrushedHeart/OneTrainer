@@ -340,3 +340,61 @@ def test_flag_defaults_on_and_survives_round_trip_and_old_configs():
     del old["rlhf_dpo_light_reuse_rejected_graph"]
     assert TrainConfig.default_values().from_dict(old).rlhf_dpo_light_reuse_rejected_graph is True
     assert TrainConfig.default_values().from_dict({"__version": 26}).rlhf_dpo_light_reuse_rejected_graph is True
+
+
+def _pair_logging_batch(beta_override=None) -> dict:
+    batch = _batch(beta_override)
+    batch["image_path"] = ["c0.png", "c1.png", "c2.png"]
+    return batch
+
+
+def test_pair_records_carry_each_pairs_path_beta_timestep_and_margin():
+    config = _config()
+    config.rlhf_dpo_live_saturation = True
+    setup, _, _, _ = _run(config, _pair_logging_batch(beta_override=torch.tensor([3.0, 0.0, 5.0])))
+    records = setup.get_last_dpo_pair_records()
+    metrics = setup.get_last_dpo_metrics()
+    assert [r["path"] for r in records] == ["c0.png", "c1.png", "c2.png"]
+    assert [r["beta"] for r in records] == pytest.approx([3.0, 2.0, 5.0])  # an override of 0 inherits the global beta
+    assert [r["t"] for r in records] == pytest.approx([0.1, 0.6, 0.9])
+    assert sum(r["margin"] for r in records) / BATCH == pytest.approx(metrics["reward_margin"], abs=1e-6)
+    assert sum(r["chosen"] for r in records) / BATCH == pytest.approx(metrics["chosen_reward"], abs=1e-6)
+    for record in records:
+        assert record["margin"] == pytest.approx(record["chosen"] - record["rejected"], abs=1e-6)
+
+
+def test_pair_records_stay_empty_while_pair_logging_is_off():
+    setup, _, _, _ = _run(_config(), _pair_logging_batch())
+    assert setup.get_last_dpo_pair_records() == []
+
+
+def test_pair_records_without_image_paths_or_timesteps():
+    config = _config()
+    config.rlhf_dpo_concept_logging = True
+    setup = _FakeSetup()
+    chosen = torch.tensor([0.1, -0.2])
+    rejected = torch.zeros(2)
+    setup._record_dpo_metrics(
+        None, config, torch.tensor(0.5), torch.tensor(0.5), chosen, rejected, chosen - rejected, None, 2, 4.0
+    )
+    records = setup.get_last_dpo_pair_records()
+    assert [r["path"] for r in records] == [None, None]
+    assert [r["t"] for r in records] == [None, None]
+    assert [r["beta"] for r in records] == [4.0, 4.0]
+
+
+def test_reference_fingerprint_follows_the_reference_contents():
+    setup = _FakeSetup()
+    assert setup.dpo_reference_fingerprint() == "base-model"  # no snapshot: New Adapter mode
+    reference = [[torch.arange(40, dtype=torch.bfloat16).reshape(8, 5), torch.ones(3)]]
+    setup._dpo_ref_params = reference
+    setup._dpo_ref_version = 1
+    first = setup.dpo_reference_fingerprint()
+    # A resume restores the same values under a new version: same fingerprint.
+    setup._dpo_ref_params = [[t.clone() for t in params] for params in reference]
+    setup._dpo_ref_version = 2
+    assert setup.dpo_reference_fingerprint() == first
+    # A rebase copies new values in and bumps the version.
+    setup._dpo_ref_params[0][0].add_(1)
+    setup._dpo_ref_version = 3
+    assert setup.dpo_reference_fingerprint() != first

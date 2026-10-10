@@ -67,7 +67,8 @@ def _render_latent(text: str, size: int):
 
 
 @pytest.mark.skipif(not HAS_DOCTR, reason="python-doctr not installed")
-def test_reward_step_backpropagates_ctc_into_the_policy(tmp_path):
+@pytest.mark.parametrize("grad_steps", [1, 2])
+def test_reward_step_backpropagates_ctc_into_the_policy(tmp_path, grad_steps):
     size = 768
     words = ("Open", "Daily", "£4.50")
     target = torch.nn.Parameter(_render_latent(" ".join(words), size))
@@ -84,6 +85,7 @@ def test_reward_step_backpropagates_ctc_into_the_policy(tmp_path):
     config.text_reward_resolution = size
     config.text_reward_rollout_steps = 4
     config.text_reward_random_grad_step = False
+    config.text_reward_grad_steps = grad_steps
     config.text_reward_max_decode_pixels = 512
     config.text_reward_save_interval = 1
     config.workspace_dir = str(tmp_path)
@@ -93,7 +95,8 @@ def test_reward_step_backpropagates_ctc_into_the_policy(tmp_path):
     backwards = []
     value = setup.calculate_text_reward_loss(model, sample, config, progress, backwards.append)
 
-    assert setup.grad_forwards == 1
+    # DRaFT-K: one grad forward per step of the chain, all backwarded at once
+    assert setup.grad_forwards == grad_steps
     assert len(backwards) == 1
     assert torch.isfinite(value) and float(value) > 0
     loss = backwards[0]
@@ -104,6 +107,12 @@ def test_reward_step_backpropagates_ctc_into_the_policy(tmp_path):
     assert 0 < len(nonzero_rows) < target.shape[-2]
 
     metrics = setup.get_last_text_reward_metrics()
+    assert metrics["grad_steps"] == grad_steps
+    if grad_steps == 1:
+        assert metrics["x0_sigma"] == metrics["grad_sigma"]
+    else:
+        # the scored estimate sits one grid step below the first grad step
+        assert 0.0 < metrics["x0_sigma"] < metrics["grad_sigma"]
     assert metrics["scored_words"] >= 2
     assert metrics["word_ratio"] > 0.5
     assert metrics["family_count/price"] == 1.0

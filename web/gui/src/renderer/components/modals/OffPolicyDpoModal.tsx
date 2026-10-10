@@ -27,9 +27,21 @@ import { Button, DirPicker, FormEntry, SectionCard, Select } from "@/components/
 import { PreviewOverlay } from "./dpo/PreviewOverlay";
 import { ModalBase } from "./ModalBase";
 
+/**
+ * Folders another tool can pre-fill when it opens the modal (the Character
+ * DPO flow hands over its own). Applied, and persisted like a manual edit,
+ * each time `open` turns true; fields left undefined keep the stored values.
+ */
+export interface OffPolicyDpoInitial {
+  generated?: string;
+  real?: string;
+  output?: string;
+}
+
 export interface OffPolicyDpoModalProps {
   open: boolean;
   onClose: () => void;
+  initial?: OffPolicyDpoInitial;
 }
 
 const STORAGE_KEY = "ot.offpolicyDpo.folders";
@@ -84,7 +96,7 @@ function pct(done: number, total: number) {
   return total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
 }
 
-export function OffPolicyDpoModal({ open, onClose }: OffPolicyDpoModalProps) {
+export function OffPolicyDpoModal({ open, onClose, initial }: OffPolicyDpoModalProps) {
   const [folders, setFolders] = useState<Folders>(loadFolders);
   const [active, setActive] = useState(false);
   const [status, setStatus] = useState<OffPolicyStatus | null>(null);
@@ -123,6 +135,22 @@ export function OffPolicyDpoModal({ open, onClose }: OffPolicyDpoModalProps) {
       return next;
     });
   }, []);
+
+  // Seed from `initial` on each open, through `updateFolders` so the values
+  // persist exactly as if typed. Read via a ref so a caller rebuilding the
+  // object literal every render does not re-apply it while the modal is open.
+  const initialRef = useRef(initial);
+  initialRef.current = initial;
+  useEffect(() => {
+    if (!open) return;
+    const seed = initialRef.current;
+    if (!seed) return;
+    const patch: Partial<Folders> = {};
+    if (seed.generated !== undefined) patch.generated = seed.generated;
+    if (seed.real !== undefined) patch.real = seed.real;
+    if (seed.output !== undefined) patch.output = seed.output;
+    if (Object.keys(patch).length > 0) updateFolders(patch);
+  }, [open, updateFolders]);
 
   const clearPoll = useCallback(() => {
     if (pollRef.current !== null) {

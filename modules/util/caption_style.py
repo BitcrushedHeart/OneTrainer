@@ -2,14 +2,16 @@
 
 Ported verbatim (logic-for-logic) from the Bitcrush Suite's caption SSoT,
 ``packages/pyshared/src/bitcrush_pyshared/caption/utils.py`` plus the
-``CaptionType`` classifier from ``caption/autosort.py``. That implementation
+``CaptionType`` classifier from ``caption/autosort.py`` and the on-image-text
+token shapes from ``caption/image_text.py``. That implementation
 is battle-tested against a real 96k-caption dataset and is deliberately
 stdlib-only, which is why it is copied rather than imported: importing it
 would pull in the whole ``bitcrush_pyshared`` package (structlog, pillow,
 sqlalchemy, ...) for two functions.
 
 Keep this file in sync with the upstream SSoT by porting changes, not by
-re-deriving behaviour — the tests carry its ground-truth corpora.
+re-deriving behaviour — the tests carry its ground-truth corpora. The one
+intentional difference is marked ``LOCAL DEVIATION`` in :func:`is_tag_line`.
 
 Used here to keep tag-style captions out of off-policy DPO generation: a tag
 list is a poor prompt for a realism negative (it under-specifies the scene,
@@ -21,6 +23,13 @@ import unicodedata
 from enum import Enum
 
 _WHITESPACE_RE = re.compile(r"\s+")
+
+#: Prefix of an on-image-text tag (``text: "OPEN 24 HOURS"`` or the legacy
+#: ``text:<reading>``).
+TEXT_TAG_PREFIX = "text:"
+
+#: The quoted tag-line token, e.g. ``text: "OPEN 24 HOURS"``.
+IMAGE_TEXT_TOKEN_RE = re.compile(r'text:\s*"[^"\r\n]*"', re.IGNORECASE)
 
 
 def normalize_caption(text: str | None) -> str:
@@ -98,6 +107,8 @@ TAG_KNOWN_PATTERNS: tuple[str, ...] = (
 # characters, so prose protection comes from the clause checks below, not
 # from line length.
 _MAX_TAG_LINE_LENGTH = 2000
+#: A comma segment of this many words is prose, never a tag token.
+_MAX_TAG_SEGMENT_WORDS = 10
 _PIECE_SPLIT_RE = re.compile(r"\.\s+")
 
 # Verbs that mark a comma/period piece as a genuine clause rather than a
@@ -116,6 +127,12 @@ TAG_EXACT_ALLOWLIST: frozenset[str] = frozenset({
     "professional photo", "amateur photo", "professional", "amateur",
 })  # fmt: skip
 
+# Proper-name metadata that resembles a clause. Case-sensitive, and only
+# accepted inside a list with at least three independently tag-shaped pieces.
+_TAG_LIST_CLAUSE_LABELS: frozenset[str] = frozenset({"She Is New"})
+_TAG_LIST_PREPOSITIONS: frozenset[str] = frozenset({"on", "in", "from"})
+_TAG_NAME_QUESTION_STARTERS = NL_STARTERS | {"what", "why", "how", "really"}
+
 
 def is_nl_fragment(segment: str) -> bool:
     """Whether a comma/period ``segment`` reads as a natural-language fragment."""
@@ -130,7 +147,12 @@ def is_nl_fragment(segment: str) -> bool:
         return True
     if first.endswith("ing") and len(first) > 4 and first not in NL_TAG_ING_ALLOWLIST:
         return True
-    if first.endswith("ed") and len(first) > 3 and first not in NL_TAG_ED_ALLOWLIST:
+    # A past-participle opener only reads as a clause when it has an object or
+    # complement behind it ("seated on a bench", "captured at a low angle"). A
+    # one- or two-word segment is a descriptor tag ("subdued", "tanned skin",
+    # "mixed race"); reading those as prose tipped whole tag lines under the
+    # tag ratio.
+    if first.endswith("ed") and len(first) > 3 and first not in NL_TAG_ED_ALLOWLIST and len(words) >= 3:
         return True
     if "'s " in lower or "’s " in lower or "?s " in lower:
         return True
@@ -166,6 +188,50 @@ def is_tag_like_segment(segment: str) -> bool:
     return len(words) <= 3
 
 
+def _neutralise_image_text(line: str) -> str:
+    """Collapse on-image-text tokens to the bare tag ``text``.
+
+    A transcription is whatever the image says — often a full sentence — so it
+    must never vote on whether its line is prose. Both the quoted tag-line token
+    (``text: "OPEN 24 HOURS"``) and a legacy ``text:<reading>`` segment count as
+    one ordinary tag.
+    """
+    line = IMAGE_TEXT_TOKEN_RE.sub("text", line)
+    return ",".join(
+        " text" if segment.strip().casefold().startswith(TEXT_TAG_PREFIX) else segment for segment in line.split(",")
+    ).strip()
+
+
+def _is_tag_list_piece(piece: str, nl_segments: set[str] | None) -> bool:
+    """Vote on list metadata without relaxing standalone fragment detection."""
+    lower = piece.lower()
+    words = lower.split()
+    if (nl_segments and lower in nl_segments) or is_nl_fragment(piece) or len(words) >= 6:
+        return False
+    if is_tag_like_segment(piece.rstrip(".")):
+        return True
+    # Short descriptors such as "watermark in center", "motion blur on hand"
+    # and "Shot on Canon" have prepositions but no sentence grammar. Keep
+    # article-bearing fragments ("screenshot from a video") as negative votes.
+    return bool(_TAG_LIST_PREPOSITIONS.intersection(words)) and not (
+        NL_GRAMMAR_WORDS.intersection(words) or NL_CLAUSE_VERBS.intersection(words)
+    )
+
+
+def _is_damaged_tag_name(segment: str) -> bool:
+    """Recognize replacement '?' characters in short proper-name metadata."""
+    words = segment.split()
+    return (
+        2 <= len(words) <= 4
+        and not segment.endswith("?")
+        and words[0].rstrip("?").lower() not in _TAG_NAME_QUESTION_STARTERS
+        and not is_nl_fragment(segment)
+        and not NL_CLAUSE_VERBS.intersection(segment.lower().split())
+        and all(word.replace("?", "a").istitle() for word in words)
+        and all(index > 0 and segment[index - 1].isalpha() for index, char in enumerate(segment) if char == "?")
+    )
+
+
 def is_tag_line(line: str, nl_segments: set[str] | None = None) -> bool:
     """Classify a caption line as a tag list ("blonde hair, blue eyes,
     outdoors") versus natural language ("A woman stands in a garden.").
@@ -177,7 +243,9 @@ def is_tag_line(line: str, nl_segments: set[str] | None = None) -> bool:
     line = line.strip()
     if not line or len(line) > _MAX_TAG_LINE_LENGTH:
         return False
-    if "?" in line or "—" in line or "–" in line:  # em/en dashes signal prose
+    if TEXT_TAG_PREFIX in line.casefold():
+        line = _neutralise_image_text(line)
+    if "—" in line or "–" in line:  # em/en dashes signal prose
         return False
     if nl_segments and line.lower() in nl_segments:
         return False
@@ -186,21 +254,58 @@ def is_tag_line(line: str, nl_segments: set[str] | None = None) -> bool:
     line = line.removesuffix(".").rstrip()
     if not line:
         return False
+    segments = [segment.strip() for segment in line.split(",") if segment.strip()]
+    if not segments:
+        return False
+    # Scraped name tags can contain lost accents ("Alexander Skarsg?rd",
+    # "Chlo? Grace Moretz"). Only tolerate them within multi-token lists;
+    # question marks at the end of a segment remain a decisive prose signal.
+    if "?" in line and (
+        len(segments) < 3 or any("?" in segment and not _is_damaged_tag_name(segment) for segment in segments)
+    ):
+        return False
     # A genuine clause anywhere in the line means prose is present and the
     # line must never be classified as a tag list. A clause needs a verb —
     # article-bearing tag idioms ("screenshot from a video") and short tag
     # pieces around a stray period ("fair skin. nipples") are tolerated.
-    pieces = [p.strip() for chunk in line.split(",") for p in _PIECE_SPLIT_RE.split(chunk) if p.strip()]
+    pieces = [
+        (index, piece.strip())
+        for index, segment in enumerate(segments)
+        for piece in _PIECE_SPLIT_RE.split(segment)
+        if piece.strip()
+    ]
+    tag_count = sum(_is_tag_list_piece(piece, nl_segments) for _, piece in pieces) if len(segments) >= 3 else 0
+    clause_label_indices: set[int] = set()
+    if len(segments) >= 4 and tag_count >= 3 and not had_period:
+        # A named label or viewer-perspective tag may resemble a sentence.
+        # It must follow other metadata, occupy a whole comma segment, and
+        # stay short and unpunctuated. It does not itself earn a tag vote.
+        clause_label_indices = {
+            index
+            for index, segment in enumerate(segments)
+            if index > 0
+            and not (nl_segments and segment.lower() in nl_segments)
+            and not any(char in segment for char in ".?!;:")
+            and len(segment.split()) < _MAX_TAG_SEGMENT_WORDS
+            and (segment in _TAG_LIST_CLAUSE_LABELS or segment.lower().startswith("the viewer is "))
+        }
     if any(
         len(words := [word.strip(".") for word in piece.lower().split()]) >= 3
         and is_nl_fragment(piece)
         and NL_CLAUSE_VERBS.intersection(words)
-        for piece in pieces
+        and index not in clause_label_indices
+        for index, piece in pieces
     ):
         return False
 
-    segments = [segment.strip() for segment in line.split(",") if segment.strip()]
-    if not segments:
+    # No tag token is ten words long. When one comma-free run of that length
+    # carries more than half the line's words, the line IS that sentence and
+    # the short list pieces in front of it are its preamble ("Neutral, front
+    # view, high-angle, fine grain amateur close-up of a woman ... into her
+    # hair"); the piece ratio must not outvote it. A mixed paragraph whose
+    # long piece is a minority of the words keeps its list classification.
+    longest = max(len(segment.split()) for segment in segments)
+    if longest >= _MAX_TAG_SEGMENT_WORDS and longest * 2 > len(line.split()):
         return False
 
     if len(segments) <= 2:
@@ -215,13 +320,14 @@ def is_tag_line(line: str, nl_segments: set[str] | None = None) -> bool:
     # with appended tags; only list-shaped lines (4+ segments) tolerate one.
     if had_period and len(segments) < 4:
         return False
-    tag_count = sum(
-        not (nl_segments and piece.lower() in nl_segments)
-        and not is_nl_fragment(piece)
-        and len(piece.split()) < 6
-        and is_tag_like_segment(piece.rstrip("."))
-        for piece in pieces
-    )
+    # LOCAL DEVIATION from the upstream SSoT (remove once upstream handles it):
+    # a line that opens with an article and closes with a full stop is a
+    # sentence with a comma-separated modifier preamble ("A subdued, eye-level,
+    # straight on, three-quarter view, clean photo of a person with dark
+    # hair."). Upstream's preposition-tag vote counts "straight on" as a tag
+    # and tips this shape over the ratio.
+    if had_period and segments[0].split()[0].lower() in {"a", "an", "the"}:
+        return False
     return tag_count / len(pieces) >= 0.6
 
 

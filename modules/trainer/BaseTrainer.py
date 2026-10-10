@@ -63,6 +63,7 @@ class BaseTrainer(
         train_progress: TrainProgress,
         is_validation=False,
         is_sft_anchor=False,
+        dpo_validation: bool | None = None,
     ):
         return create.create_data_loader(
             self.train_device,
@@ -75,6 +76,7 @@ class BaseTrainer(
             train_progress,
             is_validation,
             is_sft_anchor,
+            dpo_validation=dpo_validation,
         )
 
     def create_model_saver(self) -> BaseModelSaver:

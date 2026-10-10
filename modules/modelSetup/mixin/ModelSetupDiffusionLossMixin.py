@@ -4,7 +4,12 @@ from collections.abc import Callable
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.DiffusionScheduleCoefficients import DiffusionScheduleCoefficients
 from modules.util.enum.LossWeight import LossWeight
-from modules.util.loss.masked_loss import masked_losses, masked_losses_with_prior
+from modules.util.loss.masked_loss import (
+    clamp_mask,
+    masked_losses,
+    masked_losses_with_prior,
+    resolve_unmasked_weight,
+)
 from modules.util.loss.vb_loss import vb_losses
 
 import torch
@@ -45,6 +50,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         losses = 0
 
         mean_dim = list(range(1, data["predicted"].ndim))
+        unmasked_weight = resolve_unmasked_weight(batch, config, data["predicted"].ndim)
 
         # MSE/L2 Loss
         if config.mse_strength != 0:
@@ -63,7 +69,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     if "prior_target" in data
                     else None,
                     mask=batch["latent_mask"].to(dtype=torch.float32),
-                    unmasked_weight=config.unmasked_weight,
+                    unmasked_weight=unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
                     masked_prior_preservation_weight=config.masked_prior_preservation_weight,
                 ).mean(mean_dim)
@@ -87,7 +93,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     if "prior_target" in data
                     else None,
                     mask=batch["latent_mask"].to(dtype=torch.float32),
-                    unmasked_weight=config.unmasked_weight,
+                    unmasked_weight=unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
                     masked_prior_preservation_weight=config.masked_prior_preservation_weight,
                 ).mean(mean_dim)
@@ -107,7 +113,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     if "prior_target" in data
                     else None,
                     mask=batch["latent_mask"].to(dtype=torch.float32),
-                    unmasked_weight=config.unmasked_weight,
+                    unmasked_weight=unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
                     masked_prior_preservation_weight=config.masked_prior_preservation_weight,
                 ).mean(mean_dim)
@@ -133,7 +139,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     if "prior_target" in data
                     else None,
                     mask=batch["latent_mask"].to(dtype=torch.float32),
-                    unmasked_weight=config.unmasked_weight,
+                    unmasked_weight=unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
                     masked_prior_preservation_weight=config.masked_prior_preservation_weight,
                 ).mean(mean_dim)
@@ -153,7 +159,7 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         predicted_var_values=data["predicted_var_values"].to(dtype=torch.float32),
                     ),
                     mask=batch["latent_mask"].to(dtype=torch.float32),
-                    unmasked_weight=config.unmasked_weight,
+                    unmasked_weight=unmasked_weight,
                     normalize_masked_area_loss=config.normalize_masked_area_loss,
                 ).mean(mean_dim)
                 * config.vb_loss_strength
@@ -225,7 +231,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             )
 
         if config.masked_training and config.normalize_masked_area_loss:
-            clamped_mask = torch.clamp(batch["latent_mask"], config.unmasked_weight, 1)
+            clamped_mask = clamp_mask(
+                batch["latent_mask"], resolve_unmasked_weight(batch, config, batch["latent_mask"].ndim)
+            )
             mask_mean = clamped_mask.mean(mean_dim)
             losses /= mask_mean
 

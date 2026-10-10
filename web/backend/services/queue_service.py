@@ -64,6 +64,17 @@ class QueueService(SingletonMixin):
         self._manager.remove_entry(entry_id)
         return {"ok": True}
 
+    def reset_entry(self, entry_id: str) -> dict:
+        if self._manager.reset_entry(entry_id):
+            return {"ok": True}
+        return {"ok": False, "error": "Entry not found or currently running"}
+
+    def reset_all(self) -> dict:
+        if self._status != "idle":
+            return {"ok": False, "error": f"Queue is {self._status}; stop it before resetting every entry"}
+        self._manager.reset_all_to_pending()
+        return {"ok": True}
+
     def duplicate_entry(self, entry_id: str) -> dict:
         new_entry = self._manager.duplicate_entry(entry_id)
         if new_entry is None:
@@ -215,13 +226,20 @@ class QueueService(SingletonMixin):
         with self._lock:
             if self._status != "idle":
                 return {"ok": False, "error": f"Queue is already {self._status}"}
+            # Completed entries stay completed: a run only trains what is still
+            # pending (plus failed / skipped retries). Reset an entry to train it again.
+            self._manager.reset_unfinished_to_pending()
+            if self._manager.get_next_runnable() is None:
+                return {
+                    "ok": False,
+                    "error": "Nothing to run: every included entry is already completed. Reset the entries you want to train again.",
+                }
             self._status = "running"
 
         config_service = ConfigService.get_instance()
         global_config = config_service.get_config_for_training()
 
         auto_batch_events = self._resolve_auto_batch_for_run()
-        self._manager.reset_all_to_pending()
         self._executor = QueueExecutor(
             queue_manager=self._manager,
             global_config=global_config,

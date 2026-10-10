@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 import { ExportStep } from "./dpo/ExportStep";
 import { RankingStep } from "./dpo/RankingStep";
@@ -12,9 +12,22 @@ import type { CurationStep } from "./dpo/types";
 import { useDpoSession } from "./dpo/useDpoSession";
 import { ModalBase } from "./ModalBase";
 
+/**
+ * Setup-step fields another tool can pre-fill when it opens the modal (the
+ * Character DPO flow hands over its folders and LoRA). Applied each time
+ * `open` turns true; fields left undefined keep whatever the session holds.
+ */
+export interface DPOToolInitial {
+  sourceFolder?: string;
+  outputDir?: string;
+  captionFilter?: string;
+  loraFilter?: string;
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
+  initial?: DPOToolInitial;
 }
 
 const titleByStep: Record<CurationStep, string> = {
@@ -39,7 +52,7 @@ const sizeByStep: Record<CurationStep, "lg" | "full"> = {
   export: "lg",
 };
 
-export function DPOToolModal({ open, onClose }: Props) {
+export function DPOToolModal({ open, onClose, initial }: Props) {
   const session = useDpoSession();
   const {
     step,
@@ -49,6 +62,7 @@ export function DPOToolModal({ open, onClose }: Props) {
     pairsPerGroup,
     groupOrder,
     captionFilter,
+    loraFilter,
     minImagesPerGroup,
     scanCount,
     scanTotal,
@@ -66,6 +80,8 @@ export function DPOToolModal({ open, onClose }: Props) {
     realismError,
     realismDevice,
     backfill,
+    regenSelection,
+    regen,
     pairsDone,
     swissMatch,
     swissRound,
@@ -88,6 +104,27 @@ export function DPOToolModal({ open, onClose }: Props) {
 
   const sessionActive =
     step === "scanning" || step === "selecting" || step === "swiss" || step === "ranking" || step === "triage";
+
+  // Seed the setup step from `initial` on each open. Read through refs so a
+  // caller re-creating the object literal every render does not re-apply it
+  // mid-session, and so the (stable) setters need not be effect deps.
+  const initialRef = useRef(initial);
+  initialRef.current = initial;
+  const actionsRef = useRef(actions);
+  actionsRef.current = actions;
+  useEffect(() => {
+    if (!open) return;
+    const seed = initialRef.current;
+    if (!seed) return;
+    const { setSourceFolder, setOutputDir, loadOutputManifest, setCaptionFilter, setLoraFilter } = actionsRef.current;
+    if (seed.sourceFolder !== undefined) setSourceFolder(seed.sourceFolder);
+    if (seed.outputDir !== undefined) {
+      setOutputDir(seed.outputDir);
+      loadOutputManifest(seed.outputDir);
+    }
+    if (seed.captionFilter !== undefined) setCaptionFilter(seed.captionFilter);
+    if (seed.loraFilter !== undefined) setLoraFilter(seed.loraFilter);
+  }, [open]);
 
   const handleClose = useCallback(() => {
     if (sessionActive) {
@@ -116,12 +153,14 @@ export function DPOToolModal({ open, onClose }: Props) {
           pairsPerGroup={pairsPerGroup}
           groupOrder={groupOrder}
           captionFilter={captionFilter}
+          loraFilter={loraFilter}
           minImagesPerGroup={minImagesPerGroup}
           onSourceChange={actions.setSourceFolder}
           onOutputChange={actions.setOutputDir}
           onPairsPerGroupChange={actions.setPairsPerGroup}
           onGroupOrderChange={actions.setGroupOrder}
           onCaptionFilterChange={actions.setCaptionFilter}
+          onLoraFilterChange={actions.setLoraFilter}
           onMinImagesPerGroupChange={actions.setMinImagesPerGroup}
           onStart={actions.startSession}
           onReview={actions.goToReview}
@@ -173,6 +212,11 @@ export function DPOToolModal({ open, onClose }: Props) {
           onSetScoreWeights={actions.setScoreWeights}
           scoreSortMode={scoreSortMode}
           onSetScoreSortMode={actions.setScoreSortMode}
+          regenSelection={regenSelection}
+          onToggleRegenSelect={actions.toggleRegenSelect}
+          regen={regen}
+          onStartRegen={actions.startRegen}
+          onCancelRegen={() => void actions.cancelRegen()}
         />
       )}
 

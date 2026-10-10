@@ -119,3 +119,23 @@ def test_teacher_equals_warmstart_warns_but_passes(transfer_config, capsys):
     transfer_config.transfer_teacher_adapter_name = transfer_config.lora_model_name
     assert transfer_config.validate_transfer_startup() is None
     assert "warm-start" in capsys.readouterr().out.lower()
+
+
+def test_distillation_guard_defaults_and_migration():
+    config = TrainConfig.default_values()
+    assert config.transfer_preserve_distillation is True
+    assert config.transfer_min_turbo_retention == pytest.approx(0.5)
+    assert config.transfer_min_turbo_sharpness == 0.0
+
+    old = TrainConfig.default_values().to_dict()
+    for key in ("transfer_preserve_distillation", "transfer_min_turbo_retention", "transfer_min_turbo_sharpness"):
+        del old[key]
+    old["__version"] = 30
+    migrated = TrainConfig.default_values().from_dict(old)
+    assert migrated.transfer_preserve_distillation is True
+    assert migrated.transfer_min_turbo_retention == pytest.approx(0.5)
+
+
+def test_negative_guard_fails(transfer_config):
+    transfer_config.transfer_min_turbo_retention = -0.1
+    assert "retention" in transfer_config.validate_transfer_startup()

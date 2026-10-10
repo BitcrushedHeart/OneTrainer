@@ -35,6 +35,13 @@ from modules.util.dpo_addon_util import (
     is_dpo_addon_step,
 )
 from modules.util.dpo_beta_controller import DPOBetaController
+from modules.util.dpo_live_saturation import (
+    LIVE_DIRNAME,
+    DPOConceptResolver,
+    DPOConceptWindow,
+    LiveSaturationLedger,
+    dpo_concept_infos,
+)
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DPOObjective import DPOObjective
@@ -74,6 +81,12 @@ class GenericTrainer(BaseTrainer):
     model_sampler: BaseModelSampler
     model: BaseModel | None
     validation_data_loader: BaseDataLoader
+    # Second validation loader of a run that has BOTH standard validation (val
+    # loss on the plain VALIDATION concepts -> patience) and DPO validation
+    # (accuracy/margin on the chosen/rejected VALIDATION concepts -> DPO
+    # patience). None when the run has at most one kind; then
+    # validation_data_loader is that one loader (DPO or standard).
+    dpo_validation_data_loader: BaseDataLoader | None
 
     previous_sample_time: float
     sample_queue: list[Callable]
@@ -83,6 +96,14 @@ class GenericTrainer(BaseTrainer):
     tensorboard: SummaryWriter
 
     grad_hook_handles: list[RemovableHandle]
+
+    # Per-concept DPO metrics and the live saturation ledger, set up in start().
+    # Class-level defaults, so end() and __backup() are safe on a trainer whose
+    # start() never ran.
+    _dpo_concept_resolver: DPOConceptResolver | None = None
+    _dpo_concept_window: DPOConceptWindow | None = None
+    _dpo_live_ledger: LiveSaturationLedger | None = None
+    _dpo_unmapped_pair_warned: bool = False
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
@@ -130,6 +151,7 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+        self.dpo_validation_data_loader = None
 
         # Loop-local state mirrored on the trainer instance so the
         # save path (__backup / __save) can read it without having to
@@ -348,24 +370,43 @@ class GenericTrainer(BaseTrainer):
                 f"loss += {self.config.text_reward_weight} * ctc (never on a DPO add-on micro-batch)."
             )
 
-        if self.config.validation or self.config.dpo_validation_active():
-            self.validation_data_loader = self.create_data_loader(
-                self.model, self.model_setup, self.model.train_progress, is_validation=True
-            )
+        self.__setup_dpo_pair_logging()
 
         if self.config.patience and not self.config.validation:
+            # Flipped before the loaders are built: config.validation also
+            # switches on the per-concept outputs the validation-loss pass reads.
             print("Warning: Patience enabled without Validation. Auto-enabling Validation.")
             self.config.validation = True
+
+        self.dpo_validation_data_loader = None
+        if self.config.validation and self.config.dpo_validation_active():
+            # Both kinds of validation: the plain loader reads the VALIDATION
+            # concepts without DPO patterns (val loss -> patience), the DPO
+            # loader reads the ones with patterns (accuracy/margin -> DPO
+            # patience). They are different pipelines, so one loader each.
+            self.validation_data_loader = self.create_data_loader(
+                self.model, self.model_setup, self.model.train_progress, is_validation=True, dpo_validation=False
+            )
+            self.dpo_validation_data_loader = self.create_data_loader(
+                self.model, self.model_setup, self.model.train_progress, is_validation=True, dpo_validation=True
+            )
+        elif self.config.validation or self.config.dpo_validation_active():
+            # One kind only: the loader follows the config (DPO pipeline when
+            # DPO validation is active, plain validation loss otherwise).
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
 
         self._patience_counter = 0
+        self._patience_checks = 0
         self._patience_best_loss = float("inf")
         self._patience_best_step = -1
         self._patience_best_backup_path: str | None = None
         self._patience_alt_backup_path: str | None = None
         self._patience_alt_step = -1
+        self._patience_second_backup_path: str | None = None
+        self._patience_second_loss = float("inf")
+        self._patience_second_step = -1
 
         self._dpo_patience_counter = 0
         self._dpo_best_accuracy = float("-inf")
@@ -521,10 +562,9 @@ class GenericTrainer(BaseTrainer):
                     f"({dpo_batches} pair batches vs {sft_batches} standard batches per epoch)."
                 )
 
-    def __count_sft_anchor_concepts(self) -> int:
-        """Return the number of enabled STANDARD/PRIOR_PREDICTION concepts.
+    def __load_concepts(self) -> list:
+        """The run's concepts, from the config or else its concept file.
 
-        Used to decide whether the parallel SFT-anchor data loader is needed.
         Mirrors the loading logic in DataLoaderMgdsMixin._create_mgds.
         """
         from modules.util.config.ConceptConfig import ConceptConfig
@@ -533,13 +573,77 @@ class GenericTrainer(BaseTrainer):
         if concepts is None:
             concept_file = self.config.concept_file_name
             if not concept_file or not os.path.isfile(concept_file):
-                return 0
+                return []
             with open(concept_file, "r") as f:
                 concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+        return concepts
+
+    def __count_sft_anchor_concepts(self) -> int:
+        """Return the number of enabled STANDARD/PRIOR_PREDICTION concepts.
+
+        Used to decide whether the parallel SFT-anchor data loader is needed.
+        """
+        concepts = self.__load_concepts()
         # DPO pattern concepts are typed STANDARD but feed the DPO pipeline;
         # exclude them so their chosen images aren't double-trained as anchors.
         anchor_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         return sum(1 for c in concepts if c.enabled and ConceptType(c.type) in anchor_types and not c.is_dpo())
+
+    def __setup_dpo_pair_logging(self):
+        """Per-concept DPO metrics (TensorBoard) and the live saturation ledger
+        (<workspace>/dpo_live/), both fed from the per-pair records the model
+        setup keeps for the last DPO micro-batch."""
+        self._dpo_concept_resolver = None
+        self._dpo_concept_window = None
+        self._dpo_live_ledger = None
+        if not self.config.rlhf_enabled or not (
+            self.config.rlhf_dpo_concept_logging or self.config.rlhf_dpo_live_saturation
+        ):
+            return
+        infos = dpo_concept_infos(self.__load_concepts())
+        if not infos:
+            return
+        self._dpo_concept_resolver = DPOConceptResolver(infos)
+        sigmoid = self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
+        if self.config.rlhf_dpo_concept_logging:
+            self._dpo_concept_window = DPOConceptWindow(with_weight=sigmoid)
+        if self.config.rlhf_dpo_live_saturation and multi.is_master():
+            if not sigmoid:
+                print("DPO live saturation needs the sigmoid objective (IPO has no beta to saturate); not tracking.")
+                return
+            out_dir = path_util.canonical_join(self.config.workspace_dir, LIVE_DIRNAME)
+            self._dpo_live_ledger = LiveSaturationLedger(
+                out_dir,
+                infos,
+                global_beta=self.config.rlhf_dpo_beta,
+                start_step=self.model.train_progress.global_step,
+            )
+            print(f"DPO live saturation: tracking {len(infos)} concepts in {out_dir}")
+
+    def __collect_dpo_pairs(self, train_progress: TrainProgress):
+        """Hands the last DPO micro-batch's per-pair records to the per-concept
+        window and the live saturation ledger."""
+        if self._dpo_concept_resolver is None:
+            return
+        records = self.model_setup.get_last_dpo_pair_records()
+        if not records:
+            return
+        # Only the ledger needs it, and it is cached per reference version.
+        reference = self.model_setup.dpo_reference_fingerprint() if self._dpo_live_ledger is not None else None
+        for record in records:
+            info = self._dpo_concept_resolver.resolve(record["path"])
+            if info is None:
+                if not self._dpo_unmapped_pair_warned:
+                    self._dpo_unmapped_pair_warned = True
+                    print(
+                        f"DPO pair logging: '{record['path']}' is under no DPO concept's chosen folder; "
+                        "pairs like it are left out of the per-concept metrics."
+                    )
+                continue
+            if self._dpo_concept_window is not None:
+                self._dpo_concept_window.add(info, record)
+            if self._dpo_live_ledger is not None:
+                self._dpo_live_ledger.record(train_progress.global_step, info, record, reference)
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -784,7 +888,7 @@ class GenericTrainer(BaseTrainer):
             self._transfer_val_failures = 0
             for key, value in metrics.items():
                 self.tensorboard.add_scalar(f"transfer_val/{key}", value, train_progress.global_step)
-            self.__check_transfer_convergence(metrics.get("residual"), train_progress)
+            self.__check_transfer_convergence(metrics, train_progress)
         except Exception as exception:  # noqa: BLE001 - validation must not abort training
             self._transfer_val_failures += 1
             print(f"Transfer validation skipped after error: {exception}")
@@ -795,14 +899,38 @@ class GenericTrainer(BaseTrainer):
                     "epochs cap and the final save will use last-step parameters."
                 )
 
-    def __check_transfer_convergence(self, residual: float | None, train_progress: TrainProgress):
+    def __transfer_guard_violations(self, metrics: dict[str, float]) -> list[str]:
+        """De-distillation guards tripped by this validation (transfer mode only;
+        redistill's Phase A teacher IS the distilled variant)."""
+        if not self.config.transfer_enabled or self.config.redistill_enabled:
+            return []
+        violations = []
+        for key, minimum in (
+            ("turbo_retention", self.config.transfer_min_turbo_retention),
+            ("turbo_sharpness", self.config.transfer_min_turbo_sharpness),
+        ):
+            value = metrics.get(key)
+            if minimum > 0.0 and value is not None and value < minimum:
+                violations.append(f"{key} {value:.3f} < {minimum:g}")
+        return violations
+
+    def __check_transfer_convergence(self, metrics: dict[str, float], train_progress: TrainProgress):
+        residual = metrics.get("residual")
         if residual is None:
             return
+        violations = self.__transfer_guard_violations(metrics)
+        guard_ok = not violations
+        self.tensorboard.add_scalar("transfer/deturbo_guard", 0.0 if guard_ok else 1.0, train_progress.global_step)
+        if violations:
+            print(
+                f"Transfer de-distillation guard tripped at step {train_progress.global_step} "
+                f"({', '.join(violations)}): not a best-checkpoint candidate, counted against patience."
+            )
         # Snapshot on every numeric improvement, BEFORE the criterion folds the
         # value into its best: the final save always uses the best-seen adapter.
-        if residual < self._transfer_stop.best_residual:
+        if guard_ok and residual < self._transfer_stop.best_residual:
             self._transfer_best_backup_path = self.__save_transfer_best(residual, train_progress)
-        should_stop = self._transfer_stop.update(residual, tag=train_progress.global_step)
+        should_stop = self._transfer_stop.update(residual, tag=train_progress.global_step, guard_ok=guard_ok)
         self.tensorboard.add_scalar(
             "transfer/patience_counter", self._transfer_stop.counter, train_progress.global_step
         )
@@ -868,6 +996,8 @@ class GenericTrainer(BaseTrainer):
         # The Phase A teacher (~2-3 GB of late tensors) is dead weight in Phase B.
         if self.model is not None and getattr(self.model, "transfer_teacher_late_tensors", None) is not None:
             self.model.transfer_teacher_late_tensors = None
+            self.model.transfer_base_recovery = None
+            self.model.transfer_base_late_tensors = None
             torch_gc()
 
         # Phase B's fake-critic warmup and TTUR schedule count from the boundary.
@@ -919,136 +1049,188 @@ class GenericTrainer(BaseTrainer):
             if self.__needs_validate(train_progress):
                 self.__validate_distill(train_progress)
             return
-        if self.__needs_validate(train_progress):
-            self.validation_data_loader.get_data_set().start_next_epoch()
-            current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+        if not self.__needs_validate(train_progress):
+            return
 
-            if current_epoch_length_validation == 0:
-                return
+        # DPO validation (paired chosen/rejected samples) and standard
+        # validation (plain validation loss) are different data pipelines, so
+        # they never share a loader. A run can have one, the other, or both.
+        if self.dpo_validation_data_loader is not None:
+            dpo_loader, standard_loader = self.dpo_validation_data_loader, self.validation_data_loader
+        elif self.config.dpo_validation_active():
+            dpo_loader, standard_loader = self.validation_data_loader, None
+        else:
+            dpo_loader, standard_loader = None, self.validation_data_loader
 
-            self.callbacks.on_update_status("Calculating validation loss")
-            self.model_setup.setup_train_device(self.model, self.config)
+        # Every loader advances its epoch before the model goes back on the
+        # train device: start_next_epoch runs the caching pass, which parks the
+        # model on the temp device whenever it has something left to encode.
+        loaders = [loader for loader in (dpo_loader, standard_loader) if loader is not None]
+        for loader in loaders:
+            loader.get_data_set().start_next_epoch()
+        if all(loader.get_data_set().approximate_length() == 0 for loader in loaders):
+            return
 
-            torch_gc()
+        self.callbacks.on_update_status("Calculating validation loss")
+        self.model_setup.setup_train_device(self.model, self.config)
 
-            step_tqdm_validation = tqdm(
-                self.validation_data_loader.get_data_loader(),
-                desc="validation_step",
-                total=current_epoch_length_validation,
-            )
+        torch_gc()
 
-            if self.config.dpo_validation_active():
-                dpo_val_accuracy = []
-                dpo_val_chosen_reward = []
-                dpo_val_rejected_reward = []
-                dpo_val_reward_margin = []
+        if dpo_loader is not None:
+            self.__validate_dpo(dpo_loader, train_progress)
+        if standard_loader is not None:
+            self.__validate_standard(standard_loader, train_progress)
 
-                for validation_batch in step_tqdm_validation:
-                    if self.__needs_gc(train_progress):
-                        torch_gc()
+    def __validate_dpo(self, loader: BaseDataLoader, train_progress: TrainProgress):
+        """Held-out ranking accuracy / reward margin on the DPO validation
+        pairs; feeds the dpo/val_* scalars and DPO patience. The loader's
+        epoch has already been started by __validate."""
+        current_epoch_length_validation = loader.get_data_set().approximate_length()
+        if current_epoch_length_validation == 0:
+            return
 
-                    with torch.no_grad():
-                        self.model_setup.calculate_dpo_loss(self.model, validation_batch, self.config, train_progress)
-                    dpo_metrics = self.model_setup.get_last_dpo_metrics()
-                    dpo_val_accuracy.append(dpo_metrics["accuracy"])
-                    dpo_val_chosen_reward.append(dpo_metrics["chosen_reward"])
-                    dpo_val_rejected_reward.append(dpo_metrics["rejected_reward"])
-                    dpo_val_reward_margin.append(dpo_metrics["reward_margin"])
+        step_tqdm_validation = tqdm(
+            loader.get_data_loader(),
+            desc="dpo_validation_step",
+            total=current_epoch_length_validation,
+        )
 
-                if dpo_val_accuracy:
-                    # Validation loss is intentionally not tracked: reward hacking
-                    # drives it toward zero, so a low val loss is not evidence of a
-                    # good model. Held-out ranking accuracy is hack-resistant.
-                    val_accuracy = sum(dpo_val_accuracy) / len(dpo_val_accuracy)
-                    val_chosen_reward = sum(dpo_val_chosen_reward) / len(dpo_val_chosen_reward)
-                    val_rejected_reward = sum(dpo_val_rejected_reward) / len(dpo_val_rejected_reward)
-                    val_reward_margin = sum(dpo_val_reward_margin) / len(dpo_val_reward_margin)
+        dpo_val_accuracy = []
+        dpo_val_chosen_reward = []
+        dpo_val_rejected_reward = []
+        dpo_val_reward_margin = []
 
-                    self.tensorboard.add_scalar("dpo/val_accuracy", val_accuracy, train_progress.global_step)
-                    self.tensorboard.add_scalar("dpo/val_chosen_reward", val_chosen_reward, train_progress.global_step)
-                    self.tensorboard.add_scalar(
-                        "dpo/val_rejected_reward", val_rejected_reward, train_progress.global_step
-                    )
-                    self.tensorboard.add_scalar("dpo/val_reward_margin", val_reward_margin, train_progress.global_step)
-                    self.__check_dpo_patience(val_accuracy, val_reward_margin, train_progress)
+        for validation_batch in step_tqdm_validation:
+            if self.__needs_gc(train_progress):
+                torch_gc()
 
-                # DPO validation uses a different data pipeline (paired samples) than
-                # standard validation, so they cannot share the same data loader.
-                return
+            with torch.no_grad():
+                self.model_setup.calculate_dpo_loss(self.model, validation_batch, self.config, train_progress)
+            dpo_metrics = self.model_setup.get_last_dpo_metrics()
+            dpo_val_accuracy.append(dpo_metrics["accuracy"])
+            dpo_val_chosen_reward.append(dpo_metrics["chosen_reward"])
+            dpo_val_rejected_reward.append(dpo_metrics["rejected_reward"])
+            dpo_val_reward_margin.append(dpo_metrics["reward_margin"])
 
-            accumulated_loss_per_concept = {}
-            concept_counts = {}
-            mapping_seed_to_label = {}
-            mapping_label_to_seed = {}
+        if dpo_val_accuracy:
+            # Validation loss is intentionally not tracked: reward hacking
+            # drives it toward zero, so a low val loss is not evidence of a
+            # good model. Held-out ranking accuracy is hack-resistant.
+            val_accuracy = sum(dpo_val_accuracy) / len(dpo_val_accuracy)
+            val_chosen_reward = sum(dpo_val_chosen_reward) / len(dpo_val_chosen_reward)
+            val_rejected_reward = sum(dpo_val_rejected_reward) / len(dpo_val_rejected_reward)
+            val_reward_margin = sum(dpo_val_reward_margin) / len(dpo_val_reward_margin)
 
-            for validation_batch in step_tqdm_validation:
-                if self.__needs_gc(train_progress):
-                    torch_gc()
+            self.tensorboard.add_scalar("dpo/val_accuracy", val_accuracy, train_progress.global_step)
+            self.tensorboard.add_scalar("dpo/val_chosen_reward", val_chosen_reward, train_progress.global_step)
+            self.tensorboard.add_scalar("dpo/val_rejected_reward", val_rejected_reward, train_progress.global_step)
+            self.tensorboard.add_scalar("dpo/val_reward_margin", val_reward_margin, train_progress.global_step)
+            self.__check_dpo_patience(val_accuracy, val_reward_margin, train_progress)
 
-                with torch.no_grad():
-                    model_output_data = self.model_setup.predict(
-                        self.model, validation_batch, self.config, train_progress, deterministic=True
-                    )
-                    loss_validation = self.model_setup.calculate_loss(
-                        self.model, validation_batch, model_output_data, self.config
-                    )
+    def __validate_standard(self, loader: BaseDataLoader, train_progress: TrainProgress):
+        """Plain validation loss per concept on the non-DPO VALIDATION
+        concepts; feeds loss/validation_step/* and patience. The loader's
+        epoch has already been started by __validate."""
+        current_epoch_length_validation = loader.get_data_set().approximate_length()
+        if current_epoch_length_validation == 0:
+            return
 
-                concept_name = validation_batch["concept_name"][0]
-                concept_path = validation_batch["concept_path"][0]
-                concept_seed = validation_batch["concept_seed"].item()
-                loss = loss_validation.item()
+        step_tqdm_validation = tqdm(
+            loader.get_data_loader(),
+            desc="validation_step",
+            total=current_epoch_length_validation,
+        )
 
-                label = concept_name if concept_name else os.path.basename(concept_path)
-                if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
-                    suffix = 1
-                    new_label = f"{label}({suffix})"
-                    while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
-                        suffix += 1
-                        new_label = f"{label}({suffix})"
-                    label = new_label
+        accumulated_loss_per_concept = {}
+        concept_counts = {}
+        mapping_seed_to_label = {}
+        mapping_label_to_seed = {}
 
-                if concept_seed not in mapping_seed_to_label:
-                    mapping_seed_to_label[concept_seed] = label
-                    mapping_label_to_seed[label] = concept_seed
+        for validation_batch in step_tqdm_validation:
+            if self.__needs_gc(train_progress):
+                torch_gc()
 
-                accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
-                concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
-
-            for concept_seed, total_loss in accumulated_loss_per_concept.items():
-                average_loss = total_loss / concept_counts[concept_seed]
-                label = mapping_seed_to_label[concept_seed]
-
-                self.tensorboard.add_scalar(f"loss/validation_step/{label}", average_loss, train_progress.global_step)
-
-            total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
-            total_count = sum(concept_counts[key] for key in concept_counts)
-            if total_count == 0:
-                # approximate_length() estimated a non-empty validation set, but the
-                # data loader yielded no usable batches (e.g. all samples filtered out
-                # at runtime). Skip rather than crash the training run.
-                print("Warning: validation produced no batches, skipping validation loss")
-                return
-            total_average_loss = total_loss / total_count
-
-            if len(concept_counts) > 1:
-                self.tensorboard.add_scalar(
-                    "loss/validation_step/total_average", total_average_loss, train_progress.global_step
+            with torch.no_grad():
+                model_output_data = self.model_setup.predict(
+                    self.model, validation_batch, self.config, train_progress, deterministic=True
+                )
+                loss_validation = self.model_setup.calculate_loss(
+                    self.model, validation_batch, model_output_data, self.config
                 )
 
-            if self.config.patience:
-                self.__check_patience(total_average_loss, train_progress)
+            concept_name = validation_batch["concept_name"][0]
+            concept_path = validation_batch["concept_path"][0]
+            concept_seed = validation_batch["concept_seed"].item()
+            loss = loss_validation.item()
+
+            label = concept_name if concept_name else os.path.basename(concept_path)
+            if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
+                suffix = 1
+                new_label = f"{label}({suffix})"
+                while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
+                    suffix += 1
+                    new_label = f"{label}({suffix})"
+                label = new_label
+
+            if concept_seed not in mapping_seed_to_label:
+                mapping_seed_to_label[concept_seed] = label
+                mapping_label_to_seed[label] = concept_seed
+
+            accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
+            concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
+
+        for concept_seed, total_loss in accumulated_loss_per_concept.items():
+            average_loss = total_loss / concept_counts[concept_seed]
+            label = mapping_seed_to_label[concept_seed]
+
+            self.tensorboard.add_scalar(f"loss/validation_step/{label}", average_loss, train_progress.global_step)
+
+        total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
+        total_count = sum(concept_counts[key] for key in concept_counts)
+        if total_count == 0:
+            # approximate_length() estimated a non-empty validation set, but the
+            # data loader yielded no usable batches (e.g. all samples filtered out
+            # at runtime). Skip rather than crash the training run.
+            print("Warning: validation produced no batches, skipping validation loss")
+            return
+        total_average_loss = total_loss / total_count
+
+        if len(concept_counts) > 1:
+            self.tensorboard.add_scalar(
+                "loss/validation_step/total_average", total_average_loss, train_progress.global_step
+            )
+
+        if self.config.patience:
+            self.__check_patience(total_average_loss, train_progress)
 
     def __check_patience(self, val_loss: float, train_progress: TrainProgress):
+        self._patience_checks += 1
+        if self._patience_checks <= self.config.patience_min_checks:
+            # Warm-up window: neither the best checkpoint nor the no-improvement
+            # counter is tracked yet, so an untrained early snapshot cannot win
+            # on a noisy validation set and patience cannot fire before the
+            # model has had a chance to learn anything.
+            self.tensorboard.add_scalar("patience/counter", 0, train_progress.global_step)
+            return
+
         is_new_best = val_loss < self._patience_best_loss
         stop_mode = self.config.patience_mode == PatienceMode.STOP_TRAINING
 
         if is_new_best:
+            if self.config.patience_save_second_best and self._patience_best_backup_path:
+                # The outgoing best is, by construction, at least as good as the
+                # current runner-up: demote it instead of re-snapshotting.
+                self.__promote_best_to_second()
             self._patience_best_backup_path = self.__save_patience_best(train_progress)
             self._patience_best_step = train_progress.global_step
             self._patience_best_loss = val_loss
             self._patience_counter = 0
         else:
             self._patience_counter += 1
+            if self.config.patience_save_second_best and val_loss < self._patience_second_loss:
+                self._patience_second_backup_path = self.__save_patience_second(train_progress)
+                self._patience_second_step = train_progress.global_step
+                self._patience_second_loss = val_loss
 
         self.tensorboard.add_scalar("patience/counter", self._patience_counter, train_progress.global_step)
         self.tensorboard.add_scalar("patience/best_val_loss", self._patience_best_loss, train_progress.global_step)
@@ -1073,43 +1255,84 @@ class GenericTrainer(BaseTrainer):
             self._patience_alt_step = train_progress.global_step
             self.commands.stop()
 
-    def __save_patience_alternative_output(self, final_save_path: str):
-        if (
-            not self.config.patience
-            or self.config.patience_mode != PatienceMode.SAVE_ALTERNATIVE_AT_END
-            or not self._patience_alt_backup_path
-            or not os.path.isfile(self._patience_alt_backup_path)
-        ):
+    def __save_patience_extra_outputs(self, final_save_path: str):
+        """Write the extra patience outputs next to the final model: the threshold
+        weights ('-patience-alt', SAVE_ALTERNATIVE_AT_END mode) and the runner-up
+        validation checkpoint ('-patience-second', when enabled)."""
+        if not self.config.patience:
             return
+        if self.config.patience_mode == PatienceMode.SAVE_ALTERNATIVE_AT_END and self._patience_alt_backup_path:
+            self.__save_patience_snapshot_output(
+                final_save_path,
+                "-patience-alt",
+                self._patience_alt_backup_path,
+                f"patience alternative snapshot from step {self._patience_alt_step} "
+                f"(best val_loss {self._patience_best_loss:.6f} at step {self._patience_best_step})",
+            )
+        if self.config.patience_save_second_best and self._patience_second_backup_path:
+            self.__save_patience_snapshot_output(
+                final_save_path,
+                "-patience-second",
+                self._patience_second_backup_path,
+                f"second-best validation checkpoint from step {self._patience_second_step} "
+                f"(val_loss {self._patience_second_loss:.6f}; best {self._patience_best_loss:.6f} "
+                f"at step {self._patience_best_step})",
+            )
 
+    def __save_patience_snapshot_output(self, final_save_path: str, suffix: str, backup_path: str, label: str):
+        if not os.path.isfile(backup_path):
+            return
         if self.config.output_model_format.is_single_file():
             root, ext = os.path.splitext(final_save_path)
-            alt_save_path = f"{root}-patience-alt{ext}"
+            save_path = f"{root}{suffix}{ext}"
         else:
-            alt_save_path = final_save_path.rstrip("/\\") + "-patience-alt"
+            save_path = final_save_path.rstrip("/\\") + suffix
 
         try:
-            print(
-                f"Restoring patience alternative snapshot from step {self._patience_alt_step} "
-                f"(best val_loss {self._patience_best_loss:.6f} at step {self._patience_best_step})"
-            )
-            self.callbacks.on_update_status("Saving the patience alternative model")
-            alt_state = torch.load(self._patience_alt_backup_path, map_location=self.temp_device)
-            for param, saved in zip(self.parameters, alt_state, strict=True):
+            print(f"Restoring {label}")
+            self.callbacks.on_update_status(f"Saving the {suffix[1:]} model")
+            state = torch.load(backup_path, map_location=self.temp_device)
+            for param, saved in zip(self.parameters, state, strict=True):
                 param.data.copy_(saved)
-            del alt_state
+            del state
 
-            print("Saving " + alt_save_path)
+            print("Saving " + save_path)
             self.model_saver.save(
                 model=self.model,
                 model_type=self.config.model_type,
                 output_model_format=self.config.output_model_format,
-                output_model_destination=alt_save_path,
+                output_model_destination=save_path,
                 dtype=self.config.output_dtype.torch_dtype(),
             )
-        except Exception:  # noqa: BLE001 - the alternative must never take the final save down with it
+        except Exception:  # noqa: BLE001 - an extra output must never take the final save down with it
             traceback.print_exc()
-            print("Could not save the patience alternative model; the final model was saved normally.")
+            print(f"Could not save the {suffix[1:]} model; the final model was saved normally.")
+
+    def __promote_best_to_second(self):
+        """The current best snapshot becomes the runner-up (a new best is about to replace it)."""
+        second_path = os.path.join(self.config.workspace_dir, "backup", "patience-second.pt")
+        try:
+            os.replace(self._patience_best_backup_path, second_path)
+        except OSError:
+            traceback.print_exc()
+            print("Could not keep the previous best checkpoint as the second-best snapshot.")
+            return
+        self._patience_second_backup_path = second_path
+        self._patience_second_loss = self._patience_best_loss
+        self._patience_second_step = self._patience_best_step
+
+    def __save_patience_second(self, train_progress: TrainProgress) -> str:
+        second_path = os.path.join(self.config.workspace_dir, "backup", "patience-second.pt")
+        os.makedirs(os.path.dirname(second_path), exist_ok=True)
+        try:
+            state = [p.data.clone().cpu() for p in self.parameters]
+            torch.save(state, second_path)
+            print(f"Saved patience second-best checkpoint at step {train_progress.global_step}")
+        except Exception:
+            traceback.print_exc()
+            print("Could not save patience second-best checkpoint.")
+            return self._patience_second_backup_path or ""
+        return second_path
 
     def __save_patience_alternative(self, train_progress: TrainProgress) -> str:
         alt_path = os.path.join(self.config.workspace_dir, "backup", "patience-alternative.pt")
@@ -1240,6 +1463,8 @@ class GenericTrainer(BaseTrainer):
 
             self.__save_backup_config(backup_path)
             self.model_setup.save_dpo_reference(backup_path)
+            if self._dpo_live_ledger is not None:
+                self._dpo_live_ledger.flush(train_progress.global_step, force=True)
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -1631,6 +1856,28 @@ class GenericTrainer(BaseTrainer):
         accumulated_transfer_metrics: dict[str, float] | None = None
         ema_loss = None
         ema_loss_steps = 0
+        # Mean of the (accumulation-averaged) training loss over the optimizer
+        # steps of the current epoch; logged once per epoch when enabled.
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
+
+        def log_epoch_loss(min_steps: int = 1):
+            """Log the epoch mean and reset. ``min_steps`` (batches) suppresses a
+            near-empty partial epoch at an early stop, whose one-or-two-step mean
+            would just be a noise spike at the end of the curve."""
+            nonlocal epoch_loss_sum, epoch_loss_count
+            steps_seen = epoch_loss_count * self.config.gradient_accumulation_steps
+            if (
+                self.config.tensorboard_epoch_loss
+                and epoch_loss_count > 0
+                and steps_seen >= min_steps
+                and multi.is_master()
+            ):
+                self.tensorboard.add_scalar(
+                    "loss/train_epoch", epoch_loss_sum / epoch_loss_count, train_progress.global_step
+                )
+            epoch_loss_sum, epoch_loss_count = 0.0, 0
+
         ema_reward_margin = None
         ema_reward_margin_steps = 0
         ema_chosen_reward = None
@@ -1801,6 +2048,7 @@ class GenericTrainer(BaseTrainer):
                             self.model_setup.get_last_dpo_metrics(),
                             extra_keys=("sft_anchor_loss",) if self.sft_anchor_source is not None else (),
                         )
+                        self.__collect_dpo_pairs(train_progress)
 
                         if self.sft_anchor_source is not None:
                             sft_batch = self.sft_anchor_source.next()
@@ -1929,12 +2177,24 @@ class GenericTrainer(BaseTrainer):
                             # is not supported in this mode (two backwards per
                             # micro-step).
                             addon_sft_loss = loss / self.config.gradient_accumulation_steps
+                            # On a text step, keep the standard loss's gradient
+                            # on the velocity output: the text term reports its
+                            # own on the same tensor, so the two norms compare
+                            # the actual push each term lands per micro-step.
+                            sft_predicted = model_output_data.get("predicted") if text_step else None
+                            if isinstance(sft_predicted, torch.Tensor) and sft_predicted.requires_grad:
+                                sft_predicted.retain_grad()
+                            else:
+                                sft_predicted = None
                             if scaler:
                                 scaler.scale(addon_sft_loss).backward()
                             else:
                                 addon_sft_loss.backward()
                             addon_sft_loss = addon_sft_loss.detach()
-                            del loss, model_output_data
+                            sft_grad_norm_v = None
+                            if sft_predicted is not None and sft_predicted.grad is not None:
+                                sft_grad_norm_v = float(sft_predicted.grad.detach().float().norm())
+                            del loss, model_output_data, sft_predicted
 
                         if text_step:
                             text_scale = self.config.text_reward_weight / self.config.gradient_accumulation_steps
@@ -1950,9 +2210,10 @@ class GenericTrainer(BaseTrainer):
                                 self.model, self._text_reward_bank.next(), self.config, train_progress, _text_backward
                             )
                             addon_text_loss = text_value.detach() * text_scale
-                            accumulated_text_metrics = accumulate_dpo_metrics(
-                                accumulated_text_metrics, self.model_setup.get_last_text_reward_metrics()
-                            )
+                            text_metrics = self.model_setup.get_last_text_reward_metrics()
+                            if sft_grad_norm_v is not None:
+                                text_metrics["sft_grad_norm_v"] = sft_grad_norm_v
+                            accumulated_text_metrics = accumulate_dpo_metrics(accumulated_text_metrics, text_metrics)
 
                         if dpo_step:
                             # The pair itself is evaluated half by half with one
@@ -1977,6 +2238,7 @@ class GenericTrainer(BaseTrainer):
                                 accumulated_dpo_metrics, self.model_setup.get_last_dpo_metrics()
                             )
                             self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
+                            self.__collect_dpo_pairs(train_progress)
 
                     if addon_sft_loss is None:
                         loss = loss / self.config.gradient_accumulation_steps
@@ -2089,6 +2351,8 @@ class GenericTrainer(BaseTrainer):
                             self.tensorboard.add_scalar(
                                 "loss/train_step", accumulated_loss_cpu, train_progress.global_step
                             )
+                            epoch_loss_sum += accumulated_loss_cpu
+                            epoch_loss_count += 1
                             if self.config.rlhf_enabled and accumulated_dpo_metrics is not None:
                                 count = accumulated_dpo_metrics.pop("_count")
                                 dpo_metrics = {k: v / count for k, v in accumulated_dpo_metrics.items()}
@@ -2175,6 +2439,11 @@ class GenericTrainer(BaseTrainer):
                                                 dpo_metrics[f"margin_t_q{quartile + 1}_sum"] / quartile_count,
                                                 train_progress.global_step,
                                             )
+                                if self._dpo_concept_window is not None:
+                                    for tag, value in self._dpo_concept_window.scalars().items():
+                                        self.tensorboard.add_scalar(tag, value, train_progress.global_step)
+                                if self._dpo_live_ledger is not None:
+                                    self._dpo_live_ledger.flush(train_progress.global_step)
                             if accumulated_text_metrics is not None:
                                 text_count = accumulated_text_metrics.pop("_count")
                                 self.tensorboard.add_scalar(
@@ -2201,6 +2470,12 @@ class GenericTrainer(BaseTrainer):
                                         f"text_reward/{key}", value / text_count, train_progress.global_step
                                     )
                                 accumulated_text_metrics = None
+                            pop_perceptual_metrics = getattr(self.model_setup, "pop_perceptual_metrics", None)
+                            if pop_perceptual_metrics is not None:
+                                # Averages over this optimiser step's micro-steps;
+                                # empty unless the perceptual term ran.
+                                for key, value in pop_perceptual_metrics().items():
+                                    self.tensorboard.add_scalar(f"perceptual/{key}", value, train_progress.global_step)
                             if self.config.redistill_enabled:
                                 self.tensorboard.add_scalar(
                                     "redistill/phase",
@@ -2253,6 +2528,8 @@ class GenericTrainer(BaseTrainer):
 
                         accumulated_loss = 0.0
                         accumulated_dpo_metrics = None
+                        if self._dpo_concept_window is not None:
+                            self._dpo_concept_window.reset()
                         accumulated_text_metrics = None
                         accumulated_distill_metrics = None
                         accumulated_transfer_metrics = None
@@ -2294,8 +2571,10 @@ class GenericTrainer(BaseTrainer):
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
                 if self.commands.get_stop_command():
+                    log_epoch_loss(min_steps=current_epoch_length // 2)  # final epoch only if mostly complete
                     return
 
+            log_epoch_loss()
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
@@ -2306,6 +2585,9 @@ class GenericTrainer(BaseTrainer):
         # Thaw the heap frozen at epoch start first, so it stays collectable for
         # later runs in this process (UI, queue worker) even if the final save raises.
         gc.unfreeze()
+
+        if self._dpo_live_ledger is not None:
+            self._dpo_live_ledger.flush(self.model.train_progress.global_step, force=True)
 
         if self.one_step_trained:
             if self.config.oft_rotation_cache_applies():
@@ -2396,7 +2678,7 @@ class GenericTrainer(BaseTrainer):
                     dtype=self.config.output_dtype.torch_dtype(),
                 )
 
-                self.__save_patience_alternative_output(save_path)
+                self.__save_patience_extra_outputs(save_path)
 
         if self.model is not None:
             self.model.to(self.temp_device)
@@ -2423,8 +2705,12 @@ class GenericTrainer(BaseTrainer):
         self.model_sampler = None
         self.data_loader = None
         self.validation_data_loader = None
+        self.dpo_validation_data_loader = None
         self.sft_anchor_source = None
         self.dpo_addon_source = None
+        self._dpo_concept_resolver = None
+        self._dpo_concept_window = None
+        self._dpo_live_ledger = None
         self.parameters = None
         self.tensorboard = None
         self.sample_queue = []

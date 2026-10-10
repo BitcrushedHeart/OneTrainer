@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { GroupOrder, RealismDevice, ScoreBreakdown, SwissStateResponse } from "@/api/dpoApi";
 import { dpoApi } from "@/api/dpoApi";
 
+import { EMPTY_REGEN, mergeAdded, type RegenStartRequest, type RegenUiState } from "./regenFixes";
 import { DEFAULT_SCORE_WEIGHTS, type ScoreSortMode, type ScoreWeights } from "./scoreCombine";
 import type {
   CurationMode,
@@ -41,6 +42,7 @@ export interface UseDpoSessionResult {
   pairsPerGroup: number;
   groupOrder: GroupOrder;
   captionFilter: string;
+  loraFilter: string;
   minImagesPerGroup: number;
   mode: CurationMode;
   scanCount: number;
@@ -77,6 +79,10 @@ export interface UseDpoSessionResult {
    * model is loaded while curating.
    */
   backfill: BackfillState;
+  /** Images Shift+clicked for Fix & Regenerate in the current group. */
+  regenSelection: string[];
+  /** The Fix & Regenerate run: per-source status and what it added. */
+  regen: RegenUiState;
   swissMatch: [string, string] | null;
   swissRound: number;
   swissTotalRounds: number;
@@ -100,6 +106,7 @@ export interface UseDpoSessionResult {
     setPairsPerGroup: (n: number) => void;
     setGroupOrder: (order: GroupOrder) => void;
     setCaptionFilter: (text: string) => void;
+    setLoraFilter: (text: string) => void;
     setMinImagesPerGroup: (n: number) => void;
     startSession: (config: SessionConfig) => Promise<void>;
     pickImage: (path: string) => Promise<void>;
@@ -132,6 +139,11 @@ export interface UseDpoSessionResult {
     setRealismDevice: (device: RealismDevice) => Promise<void>;
     setScoreWeights: (weights: ScoreWeights) => void;
     setScoreSortMode: (mode: ScoreSortMode) => void;
+    toggleRegenSelect: (path: string) => void;
+    clearRegenSelection: () => void;
+    /** Resolves to an error message, or null when the run started. */
+    startRegen: (req: RegenStartRequest) => Promise<string | null>;
+    cancelRegen: () => Promise<void>;
   };
 }
 
@@ -151,6 +163,7 @@ export function useDpoSession(): UseDpoSessionResult {
   const [pairsPerGroup, setPairsPerGroup] = useState(1);
   const [groupOrder, setGroupOrder] = useState<GroupOrder>("most_realistic");
   const [captionFilter, setCaptionFilter] = useState("");
+  const [loraFilter, setLoraFilter] = useState("");
   const [minImagesPerGroup, setMinImagesPerGroup] = useState(2);
   const [mode, setMode] = useState<CurationMode>("selection");
   const [scanCount, setScanCount] = useState(0);
@@ -198,6 +211,15 @@ export function useDpoSession(): UseDpoSessionResult {
     error: null,
   });
   const backfillTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Fix & Regenerate. Polled like the backfill; results are appended to the
+  // group as they land. The group index taken at fetchNextGroup keeps a run
+  // that outlives its group from painting spinners on the next one.
+  const [regenSelection, setRegenSelection] = useState<string[]>([]);
+  const [regen, setRegen] = useState<RegenUiState>(EMPTY_REGEN);
+  const regenTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const regenGroupIndexRef = useRef(0);
+  const appendedRef = useRef<Set<string>>(new Set());
 
   const pollBackfill = useCallback(async () => {
     const res = await dpoApi.scoreBackfillStatus().catch(() => null);
@@ -276,6 +298,7 @@ export function useDpoSession(): UseDpoSessionResult {
   useEffect(
     () => () => {
       if (backfillTimerRef.current) clearInterval(backfillTimerRef.current);
+      if (regenTimerRef.current) clearInterval(regenTimerRef.current);
     },
     [],
   );
@@ -396,6 +419,118 @@ export function useDpoSession(): UseDpoSessionResult {
     }
   }, []);
 
+  // Scores for images added mid-group. Merged into the maps rather than
+  // replacing them: the loaders above wipe everything and bump the request
+  // token, which would throw away the scores already on screen.
+  const mergeScoresFor = useCallback(async (images: string[]) => {
+    if (images.length === 0 || realismDeviceRef.current === "off") return;
+    const realismToken = realismRequestRef.current;
+    const breakdownToken = breakdownRequestRef.current;
+    void dpoApi
+      .realismScores(images)
+      .then((res) => {
+        if (realismToken !== realismRequestRef.current || !res.ok || !res.scores) return;
+        const scores = res.scores;
+        setRealismScores((prev) => ({ ...prev, ...scores }));
+      })
+      .catch(() => undefined);
+    void dpoApi
+      .scoreBreakdown(images)
+      .then((res) => {
+        if (breakdownToken !== breakdownRequestRef.current || !res.ok || !res.scores) return;
+        const scores = res.scores;
+        setScoreBreakdown((prev) => ({ ...prev, ...scores }));
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const stopRegenTimer = useCallback(() => {
+    if (regenTimerRef.current) {
+      clearInterval(regenTimerRef.current);
+      regenTimerRef.current = null;
+    }
+  }, []);
+
+  const pollRegen = useCallback(async () => {
+    const res = await dpoApi.regenStatus().catch(() => null);
+    if (!res) return;
+    if (res.group_index !== regenGroupIndexRef.current) {
+      // A run for a group that is no longer on screen: the server refuses its
+      // results; here only the "still running" chip is worth keeping.
+      setRegen((r) => ({ ...r, running: res.running }));
+      if (!res.running) stopRegenTimer();
+      return;
+    }
+    const fresh = res.added.filter((p) => !appendedRef.current.has(p));
+    if (fresh.length > 0) {
+      for (const p of fresh) appendedRef.current.add(p);
+      setRemainingImages((prev) => mergeAdded(prev, fresh));
+      setGroup((g) => (g ? { ...g, images: mergeAdded(g.images, fresh) } : g));
+      void mergeScoresFor(fresh);
+    }
+    setRegen({
+      running: res.running,
+      phase: res.phase,
+      planned: res.planned,
+      done: res.done,
+      failed: res.failed,
+      items: res.items,
+      added: res.added,
+      dropped: res.dropped,
+      error: res.error,
+      warning: res.warning,
+      groupIndex: res.group_index,
+    });
+    if (!res.running) {
+      stopRegenTimer();
+      const skipped = Object.values(res.items).filter((item) => item.status === "skipped").length;
+      if (res.error) {
+        setError(res.error);
+      } else {
+        const parts = [`${res.added.length} added`, `${res.failed} failed`];
+        if (skipped > 0) parts.push(`${skipped} identical skipped`);
+        if (res.dropped.length > 0) parts.push(`${res.dropped.length} finished after the group changed`);
+        setToast(`Fix & Regenerate: ${parts.join(", ")}`);
+      }
+    }
+  }, [mergeScoresFor, stopRegenTimer]);
+
+  const startRegen = useCallback(
+    async (req: RegenStartRequest): Promise<string | null> => {
+      const res = await dpoApi
+        .regenStart({
+          paths: req.paths,
+          fixes: req.fixes,
+          segment_params: req.segmentParams,
+          model_override: req.modelOverride,
+          base_url: req.baseUrl,
+          token: req.token,
+          generated_folder: req.generatedFolder,
+          concurrency: req.concurrency,
+        })
+        .catch((e: unknown): { ok: boolean; error?: string; planned?: number } => ({ ok: false, error: String(e) }));
+      if (!res.ok) return res.error ?? "Could not start the regeneration";
+      setRegenSelection([]);
+      setRegen({ ...EMPTY_REGEN, running: true, phase: "generating", planned: res.planned ?? req.paths.length });
+      stopRegenTimer();
+      regenTimerRef.current = setInterval(() => void pollRegen(), 1000);
+      void pollRegen();
+      return null;
+    },
+    [pollRegen, stopRegenTimer],
+  );
+
+  const cancelRegen = useCallback(async () => {
+    await dpoApi.regenCancel().catch(() => null);
+    await pollRegen();
+  }, [pollRegen]);
+
+  const toggleRegenSelect = useCallback((path: string) => {
+    setRegenSelection((prev) => (prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path]));
+  }, []);
+
+  const clearRegenSelection = useCallback(() => setRegenSelection([]), []);
+
   const fetchNextGroup = useCallback(async () => {
     const signal = scanAbortRef.current?.signal;
     while (!signal?.aborted) {
@@ -420,6 +555,12 @@ export function useDpoSession(): UseDpoSessionResult {
       if (res.group) {
         setGroup(res.group);
         setRemainingImages(res.group.images);
+        regenGroupIndexRef.current = res.group.group_index;
+        appendedRef.current = new Set();
+        setRegenSelection([]);
+        // A run still going belongs to the previous group; keep its chip,
+        // drop its per-tile state so nothing here is painted as regenerating.
+        setRegen((r) => (r.running ? { ...r, items: {}, added: [], dropped: [] } : EMPTY_REGEN));
         void loadRealismScores(res.group.images);
         void loadScoreBreakdown(res.group.images);
         setPhase("best");
@@ -483,6 +624,7 @@ export function useDpoSession(): UseDpoSessionResult {
       setPairsPerGroup(config.pairsPerGroup);
       setGroupOrder(config.groupOrder);
       setCaptionFilter(config.captionFilter);
+      setLoraFilter(config.loraFilter);
       setMinImagesPerGroup(config.minImagesPerGroup);
       setScanCount(0);
       setScanTotal(0);
@@ -497,6 +639,7 @@ export function useDpoSession(): UseDpoSessionResult {
         config.groupOrder,
         config.captionFilter,
         config.minImagesPerGroup,
+        config.loraFilter,
       );
       if (!res.ok) {
         setError(res.error ?? "Failed to start session");
@@ -668,6 +811,12 @@ export function useDpoSession(): UseDpoSessionResult {
     setResume(null);
     setError(null);
     setToast(null);
+    if (regenTimerRef.current) {
+      clearInterval(regenTimerRef.current);
+      regenTimerRef.current = null;
+    }
+    setRegenSelection([]);
+    setRegen(EMPTY_REGEN);
   }, []);
 
   const swissVote = useCallback(
@@ -765,6 +914,7 @@ export function useDpoSession(): UseDpoSessionResult {
     pairsPerGroup,
     groupOrder,
     captionFilter,
+    loraFilter,
     minImagesPerGroup,
     mode,
     scanCount,
@@ -784,6 +934,8 @@ export function useDpoSession(): UseDpoSessionResult {
     scoreWeights,
     scoreSortMode,
     backfill,
+    regenSelection,
+    regen,
     swissMatch,
     swissRound,
     swissTotalRounds,
@@ -807,6 +959,7 @@ export function useDpoSession(): UseDpoSessionResult {
       setPairsPerGroup,
       setGroupOrder,
       setCaptionFilter,
+      setLoraFilter,
       setMinImagesPerGroup,
       startSession,
       pickImage,
@@ -832,6 +985,10 @@ export function useDpoSession(): UseDpoSessionResult {
       setRealismDevice,
       setScoreWeights,
       setScoreSortMode,
+      toggleRegenSelect,
+      clearRegenSelection,
+      startRegen,
+      cancelRegen,
     },
   };
 }

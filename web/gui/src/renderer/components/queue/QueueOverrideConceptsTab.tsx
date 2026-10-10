@@ -25,6 +25,9 @@ const DEFAULT_CONCEPT: ConceptConfig = {
   dpo_chosen_pattern: "",
   dpo_rejected_pattern: "",
   dpo_beta_override: 0,
+  unmasked_weight_override: -1,
+  unmasked_probability_override: -1,
+  cache_dir: "",
   concept_stats: {},
   image: {
     enable_crop_jitter: true,

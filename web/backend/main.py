@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, PROJECT_ROOT)
 
 from web.backend.routers import (
+    character_dpo,
     cloud,
     concepts,
     config,
@@ -19,6 +20,7 @@ from web.backend.routers import (
     dpo_offpolicy,
     dpo_replace,
     dpo_saturation,
+    dpo_triage_fix,
     health,
     mask_editor,
     merge_oft,
@@ -93,6 +95,8 @@ _routers = [
     dpo_offpolicy.router,
     dpo_replace.router,
     dpo_saturation.router,
+    dpo_triage_fix.router,
+    character_dpo.router,
     swarm_generate.router,
     text_alignment.router,
     wiki.router,

@@ -33,3 +33,20 @@ Clicking on the `Generate Masks` button opens the batch masking modal. Here you 
 masking. Some models like ClipSeg support masking based on a prompt. Play around with Threshold, Smooth and Expand values to find what works best for your dataset.
 
 To generate the masks, press the "Create Masks" button at the bottom. When you use this for the first time, it has to download the model. Depending on the model you chose, this can take a while.
+
+### Masked DPO
+
+When masked training is enabled on an RLHF DPO run, each pair's preference margin is computed inside the mask. The
+chosen image uses its own `-masklabel.png`. The rejected image uses its own `-masklabel.png` when one exists next to it
+and otherwise shares the chosen image's mask, which is the right choice for aligned pairs (a rejected image fixed in
+place to produce the chosen one). Pairs whose compositions differ need a mask on both images.
+
+Each half's log-probability is the per-pixel average error inside its weighted region, so the margin does not scale
+with the mask's area and beta means the same thing for every pair. The `Unmasked Weight` still applies: with a weight
+above zero the background keeps contributing to the margin, so region-focused DPO usually wants it at or near zero.
+
+Two per-concept overrides in the concept window apply to masked SFT and DPO concepts alike. `Unmasked Weight Override`
+replaces the run's unmasked weight for that concept. `Unmasked Probability Override` trains a sample on the whole image
+with that chance, drawn per sample each epoch; a DPO pair is unmasked together. A negative value inherits the run's
+setting. Inpainting models apply only the run-wide `Unmasked Probability`, because their unmasking step also blanks
+the conditioning image.

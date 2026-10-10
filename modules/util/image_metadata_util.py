@@ -4,6 +4,17 @@ import re
 import zlib
 
 _ANGLE_BRACKET_SEGMENT_PATTERN = re.compile(r"<[^<>]*>")
+# Orphaned tail of a mistyped segment tag whose opening "<" was lost, e.g.
+# "0.65||>" or "0.85>". Runs after the full-tag pass, so a "<...>" pair never
+# reaches it.
+_STRAY_WEIGHT_TAIL_PATTERN = re.compile(r"\s*(?<![\w.])(?:\d+(?:\.\d+)?|\.\d+)\s*\|*\s*>")
+# Same, but the tag body survived: "segment:face||>". Limited to SwarmUI
+# prompt-syntax tag names so ordinary "label: text" prose is never eaten.
+_STRAY_TAG_BODY_PATTERN = re.compile(
+    r"\s*(?<![\w.])(?:segment|object|region|lora|embed|embedding|wildcard|random|alternate|alt|fromto"
+    r"|setvar|var|preset|trigger|param|repeat|extend|refiner|base|comment):[^<>\n]*>",
+    re.IGNORECASE,
+)
 
 _CLIP_TEXT_ENCODE_TYPES = frozenset(
     {
@@ -24,15 +35,77 @@ _SAMPLER_TYPES = frozenset(
     },
 )
 
+_LORA_LOADER_TYPES = frozenset(
+    {
+        "LoraLoader",
+        "LoraLoaderModelOnly",
+    },
+)
+
+# ``<lora:NAME:0.8>`` / ``<lora:NAME>`` prompt-syntax tags (SwarmUI, A1111,
+# Forge). The name runs to the first ":" so a weight (or a SwarmUI
+# ``:weight:tencweight`` pair) never leaks into it.
+_LORA_TAG_PATTERN = re.compile(r"<lora:([^:<>]+)(?::[^<>]*)?>", re.IGNORECASE)
+
 
 def extract_metadata(path: str) -> dict:
-    """Extract prompt and aspectratio from image metadata. Read-only."""
+    """Extract prompt, aspectratio and the LoRAs used from image metadata.
+    Read-only.
+
+    Always returns the keys ``prompt`` (str), ``aspectratio`` (str) and
+    ``loras`` (``list[str]``: lowercased LoRA names, de-duplicated, in the
+    order they were found — from the generator's parameter block first, then
+    from ``<lora:...>`` tags in the raw prompt). ``loras`` is ``[]`` when the
+    file records none."""
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".png":
         return _extract_png_metadata(path)
     else:
         return _extract_raw_metadata(path)
+
+
+def _result(prompt, aspectratio, loras=()) -> dict:
+    """The ``extract_metadata`` return shape. ``loras`` are the names already
+    recorded by the generator; tags in the prompt are merged in here so every
+    path through the extractors reports them."""
+    prompt = prompt if isinstance(prompt, str) else ""
+    return {
+        "prompt": prompt,
+        "aspectratio": aspectratio if isinstance(aspectratio, str) else "",
+        "loras": _normalize_lora_names(list(loras) + _lora_names_from_prompt(prompt)),
+    }
+
+
+def _as_lora_list(value) -> list[str]:
+    """SwarmUI's ``loras`` field as a list of names: a JSON list in current
+    versions, a comma-separated string in older ones, absent otherwise."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if x is not None]
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _lora_names_from_prompt(prompt: str) -> list[str]:
+    if not prompt:
+        return []
+    return [m.group(1).strip() for m in _LORA_TAG_PATTERN.finditer(prompt)]
+
+
+def _normalize_lora_names(names) -> list[str]:
+    """Lowercase, strip, drop blanks and duplicates, keep first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in names:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 def _extract_png_metadata(path: str) -> dict:
@@ -46,26 +119,20 @@ def _extract_png_metadata(path: str) -> dict:
             data = json.loads(value)
             if isinstance(data, dict):
                 if "prompt" in data:
-                    return {
-                        "prompt": data["prompt"],
-                        "aspectratio": data.get("aspectratio", ""),
-                    }
+                    return _result(data["prompt"], data.get("aspectratio", ""), _as_lora_list(data.get("loras")))
                 nested = _extract_nested_params(data)
                 if nested is not None:
                     return nested
                 prompt = _extract_comfyui_prompt(data)
                 if prompt:
-                    return {"prompt": prompt, "aspectratio": ""}
+                    return _result(prompt, "", _extract_comfyui_loras(data))
         except (json.JSONDecodeError, TypeError):
             if key == "parameters":
                 prompt = _extract_a1111_prompt(value)
                 if prompt:
-                    return {"prompt": prompt, "aspectratio": ""}
+                    return _result(prompt, "")
 
-    return {
-        "prompt": info.get("prompt", ""),
-        "aspectratio": info.get("aspectratio", ""),
-    }
+    return _result(info.get("prompt", ""), info.get("aspectratio", ""))
 
 
 #: Chunk payloads that nest the generation settings one level down instead of
@@ -77,7 +144,7 @@ _NESTED_PARAM_KEYS = ("sui_image_params",)
 
 
 def _extract_nested_params(data: dict) -> dict | None:
-    """Return prompt/aspectratio from a nested settings dict, or None.
+    """Return prompt/aspectratio/loras from a nested settings dict, or None.
 
     Returns None (rather than a blank prompt) when nothing usable is nested, so
     the caller keeps looking at the remaining chunks instead of settling for an
@@ -89,11 +156,7 @@ def _extract_nested_params(data: dict) -> dict | None:
             continue
         prompt = params.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
-            aspectratio = params.get("aspectratio")
-            return {
-                "prompt": prompt,
-                "aspectratio": aspectratio if isinstance(aspectratio, str) else "",
-            }
+            return _result(prompt, params.get("aspectratio"), _as_lora_list(params.get("loras")))
     return None
 
 
@@ -154,6 +217,8 @@ def _parse_png_text_chunk(chunk_type: bytes, data: bytes, info: dict[str, str]):
 def strip_angle_bracket_segments(prompt: str) -> str:
     """Remove metadata-like <...> segments from a prompt for caption export."""
     cleaned = _ANGLE_BRACKET_SEGMENT_PATTERN.sub("", prompt)
+    cleaned = _STRAY_TAG_BODY_PATTERN.sub("", cleaned)
+    cleaned = _STRAY_WEIGHT_TAIL_PATTERN.sub("", cleaned)
     cleaned = re.sub(r",\s*,+", ", ", cleaned)
     cleaned = re.sub(r" {2,}", " ", cleaned)
     cleaned = re.sub(r"^\s*,\s*|\s*,\s*$", "", cleaned)
@@ -217,6 +282,20 @@ def _extract_comfyui_prompt(data: dict) -> str:
     return max(text_nodes.values(), key=len)
 
 
+def _extract_comfyui_loras(data: dict) -> list[str]:
+    """LoRA file names from the LoraLoader nodes of a ComfyUI workflow dict,
+    without the ``.safetensors`` suffix so they compare like SwarmUI names."""
+    names: list[str] = []
+    for node in data.values():
+        if not isinstance(node, dict) or node.get("class_type") not in _LORA_LOADER_TYPES:
+            continue
+        inputs = node.get("inputs", {})
+        name = inputs.get("lora_name") if isinstance(inputs, dict) else None
+        if isinstance(name, str) and name.strip():
+            names.append(os.path.splitext(name)[0] if name.lower().endswith(".safetensors") else name)
+    return names
+
+
 def _has_metadata_marker(raw: bytes) -> bool:
     """Byte-level (C-speed) check for a prompt/params marker in UTF-8,
     UTF-16-LE, or UTF-16-BE encoding."""
@@ -242,7 +321,7 @@ def _extract_raw_metadata(path: str) -> dict:
         if not _has_metadata_marker(raw):
             raw += f.read()  # metadata may sit past the first chunk
             if not _has_metadata_marker(raw):
-                return {"prompt": "", "aspectratio": ""}
+                return _result("", "")
 
     # Try UTF-8 first, then UTF-16 variants for generators that embed
     # metadata in wide-character encoding (e.g. SwarmUI WebP EXIF).
@@ -252,31 +331,33 @@ def _extract_raw_metadata(path: str) -> dict:
         prompt = _find_json_string(text, "prompt")
         if prompt:
             aspectratio = _find_json_string(text, "aspectratio")
-            return {"prompt": prompt, "aspectratio": aspectratio or ""}
+            # Same C-speed regex pass for the LoRA list: SwarmUI writes it a
+            # few keys after the prompt in the same parameter block.
+            return _result(prompt, aspectratio or "", _find_json_lora_list(text))
 
-        prompt, aspectratio = _try_json_block(text)
-        if prompt is not None:
-            return {"prompt": prompt, "aspectratio": aspectratio or ""}
+        block = _try_json_block(text)
+        if block is not None:
+            return _result(block.get("prompt"), block.get("aspectratio"), _as_lora_list(block.get("loras")))
 
-    return {"prompt": "", "aspectratio": ""}
+    return _result("", "")
 
 
-def _try_json_block(text: str) -> tuple[str | None, str | None]:
+def _try_json_block(text: str) -> dict | None:
     """Try to find and parse a JSON object containing 'prompt'."""
     for block in _iter_json_objects(text):
         result = _parse_prompt_block(block)
         if result is not None:
             return result
-    return None, None
+    return None
 
 
-def _parse_prompt_block(block: str) -> tuple[str, str | None] | None:
+def _parse_prompt_block(block: str) -> dict | None:
     try:
         data = json.loads(block)
     except (json.JSONDecodeError, TypeError):
         return None
     if isinstance(data, dict) and "prompt" in data:
-        return data.get("prompt"), data.get("aspectratio")
+        return data
     return None
 
 
@@ -291,6 +372,22 @@ def _find_json_string(text: str, key: str) -> str | None:
         except json.JSONDecodeError:
             return value.replace('\\"', '"').replace("\\\\", "\\")
     return None
+
+
+_JSON_STRING_LIST_PATTERN = r'\[\s*(?:"(?:[^"\\]|\\.)*"\s*(?:,\s*"(?:[^"\\]|\\.)*"\s*)*)?\]'
+
+
+def _find_json_lora_list(text: str) -> list[str]:
+    """The ``"loras"`` value out of loose text: a JSON list of strings, or
+    the comma-separated string older SwarmUI versions wrote. Empty when the
+    key is absent or not in either shape."""
+    match = re.search(r'"loras"\s*:\s*(' + _JSON_STRING_LIST_PATTERN + r")", text)
+    if match:
+        try:
+            return _as_lora_list(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            return []
+    return _as_lora_list(_find_json_string(text, "loras"))
 
 
 def _iter_json_objects(text: str):

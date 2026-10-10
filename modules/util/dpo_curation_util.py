@@ -215,7 +215,66 @@ def manifest_used_sources(manifest: dict) -> set[str]:
             normed = _normalize_source_path(entry.get(key))
             if normed:
                 used.add(normed)
+    for record in manifest_retired(manifest):
+        normed = _normalize_source_path(record.get("source"))
+        if normed:
+            used.add(normed)
     return used
+
+
+#: Top-level manifest key: images a tool took out of the dataset (a pair side
+#: Replace Pairs displaced, a generation it judged and left unused). They count
+#: as used, so no tool offers them again: an image judged worse in one pair
+#: must not come back as another pair's chosen.
+RETIRED_KEY = "retired"
+
+
+def manifest_retired(manifest: dict) -> list[dict]:
+    records = manifest.get(RETIRED_KEY)
+    return [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
+
+
+def retired_pixel_hashes(manifest_dirs: list[str]) -> set[str]:
+    """Pixel hashes of the retired images in these concepts' manifests, for a
+    tool that matches by pixels (a retired image renamed or moved still counts)."""
+    hashes: set[str] = set()
+    for folder in dict.fromkeys(manifest_dirs):
+        if not os.path.isfile(os.path.join(folder, "manifest.json")):
+            continue
+        try:
+            manifest = load_manifest(folder)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        hashes.update(r["pixel_hash"] for r in manifest_retired(manifest) if r.get("pixel_hash"))
+    return hashes
+
+
+def retire_images(manifest: dict, records: list[dict]) -> int:
+    """Add ``{source, sha256, size}`` records to the manifest's retired list,
+    skipping ones already covered by source or content. Returns how many were
+    added. The caller saves the manifest."""
+    known = manifest_retired(manifest)
+    sources = {_normalize_source_path(r.get("source")) for r in known} - {None}
+    digests = {(r.get("sha256"), r.get("size")) for r in known if r.get("sha256")}
+    added = []
+    for record in records:
+        source = _normalize_source_path(record.get("source"))
+        digest = record.get("sha256")
+        size = record.get("size")
+        if not source and not digest:
+            continue
+        if (source and source in sources) or (digest and (digest, size) in digests):
+            continue
+        entry = {"source": source, "sha256": digest, "size": size, "at": time.time()}
+        entry.update({k: v for k, v in record.items() if k not in entry and v is not None})
+        added.append(entry)
+        if source:
+            sources.add(source)
+        if digest:
+            digests.add((digest, size))
+    if added:
+        manifest[RETIRED_KEY] = known + added
+    return len(added)
 
 
 def is_source_used(used_sources: set[str], path: str) -> bool:
@@ -294,7 +353,33 @@ class DpoScanCache:
 
     # v2: group_key aspect component changed from exact reduced/metadata
     # strings to trainer bucket labels (trainer_bucket_key).
-    _VERSION = 2
+    # v3: prompt normalization strips orphaned weight tails ("0.65||>").
+    # v4: ... and orphaned tag bodies ("segment:face||>").
+    # v5: additive ``loras`` field (lowercased LoRA names from the image's
+    # parameter block / prompt tags). Nothing is dropped: an entry without
+    # the field simply misses on it and is recomputed.
+    _VERSION = 5
+    # Older versions whose entries stay valid once the listed fields are
+    # dropped — keeps pixel hashes and embeddings across a prompt-only change.
+    _MIGRATE_DROP_FIELDS = {2: ("group_key",), 3: ("group_key",), 4: ()}
+
+    @classmethod
+    def _entries_from(cls, data) -> dict[str, dict] | None:
+        """Entries of a loaded cache file at the current version, or migrated
+        from a compatible older one; None when the file is unusable."""
+        if not (isinstance(data, dict) and isinstance(data.get("entries"), dict)):
+            return None
+        version = data.get("version")
+        if version == cls._VERSION:
+            return data["entries"]
+        drop = cls._MIGRATE_DROP_FIELDS.get(version)
+        if drop is None:
+            return None
+        entries = {}
+        for key, entry in data["entries"].items():
+            if isinstance(entry, dict):
+                entries[key] = {k: v for k, v in entry.items() if k not in drop}
+        return entries
 
     def __init__(self, cache_path: str):
         self._cache_path = cache_path
@@ -312,12 +397,10 @@ class DpoScanCache:
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if (
-                isinstance(data, dict)
-                and data.get("version") == self._VERSION
-                and isinstance(data.get("entries"), dict)
-            ):
-                self._entries = data["entries"]
+            entries = self._entries_from(data)
+            if entries is not None:
+                self._entries = entries
+                self._dirty = data.get("version") != self._VERSION
                 if isinstance(data.get("globals"), dict):
                     self._globals = data["globals"]
         except (OSError, json.JSONDecodeError):
@@ -356,6 +439,45 @@ class DpoScanCache:
             self._dirty = True
         return value
 
+    def _get_fields(self, path: str, fields: tuple[str, ...], compute) -> dict | None:
+        """Several fields that one ``compute(path)`` produces together, as a
+        ``{field: value}`` dict. Served from the cache only when *every* field
+        is present for an unchanged file; otherwise ``compute`` runs once and
+        each field it returns is stored (overwriting any stale partial set).
+        The companion to ``_get_field`` for values that come out of the same
+        expensive read — the grouping key and the LoRA list both fall out of
+        one metadata extraction, and reading the file twice to cache them
+        separately would double the scan's I/O."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            entry = self._entries.get(key)
+            if (
+                entry is not None
+                and entry.get("size") == st.st_size
+                and entry.get("mtime_ns") == st.st_mtime_ns
+                and all(field in entry for field in fields)
+            ):
+                self.hits += 1
+                return {field: entry[field] for field in fields}
+        self.misses += 1
+        values = compute(path)
+        if values is None:
+            return None
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.get("size") != st.st_size or entry.get("mtime_ns") != st.st_mtime_ns:
+                entry = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+                self._entries[key] = entry
+            for field in fields:
+                if field in values and values[field] is not None:
+                    entry[field] = values[field]
+            self._dirty = True
+        return {field: values.get(field) for field in fields}
+
     def get_pixel_hash(self, path: str) -> str | None:
         return self._get_field(path, "hash", compute_pixel_hash)
 
@@ -367,6 +489,31 @@ class DpoScanCache:
         if value is None:
             return None
         return tuple(value)
+
+    def get_loras(self, path: str, compute) -> list[str] | None:
+        """Cached LoRA names (lowercased, as ``extract_metadata`` reports them)
+        for ``path``. ``compute(path)`` must return a sequence of names; an
+        image that used none caches ``[]`` so it is not re-read next scan.
+        Same lazy pattern as ``get_group_key``: exceptions propagate."""
+        value = self._get_field(path, "loras", lambda p: [str(x) for x in compute(p)])
+        if value is None:
+            return None
+        return list(value)
+
+    def get_group_key_and_loras(self, path: str, compute) -> tuple[tuple[str, str], list[str]] | None:
+        """``(group_key, loras)`` from one metadata read. ``compute(path)``
+        returns ``((prompt, aspectratio), loras)``; both fields are cached
+        together, so a scan that needs the LoRA filter costs the same one
+        read per file as a scan that does not."""
+
+        def _compute(p: str) -> dict:
+            group_key, loras = compute(p)
+            return {"group_key": list(group_key), "loras": [str(x) for x in loras]}
+
+        values = self._get_fields(path, ("group_key", "loras"), _compute)
+        if values is None or values.get("group_key") is None:
+            return None
+        return tuple(values["group_key"]), list(values.get("loras") or [])
 
     def merge_from(self, other_path: str) -> int:
         """Import entries from another cache file of the same version — e.g.
@@ -381,13 +528,12 @@ class DpoScanCache:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             return 0
-        if not (
-            isinstance(data, dict) and data.get("version") == self._VERSION and isinstance(data.get("entries"), dict)
-        ):
+        entries = self._entries_from(data)
+        if entries is None:
             return 0
         imported = 0
         with self._lock:
-            for key, entry in data["entries"].items():
+            for key, entry in entries.items():
                 if key not in self._entries and isinstance(entry, dict):
                     self._entries[key] = entry
                     imported += 1
@@ -798,6 +944,11 @@ def manifest_used_fingerprints(manifest: dict, output_dir: str | None = None) ->
             size = entry.get(size_key)
             if digest and isinstance(size, int):
                 fingerprints.setdefault(size, set()).add(digest)
+    for record in manifest_retired(manifest):
+        digest = record.get("sha256")
+        size = record.get("size")
+        if digest and isinstance(size, int):
+            fingerprints.setdefault(size, set()).add(digest)
     if modified and output_dir is not None:
         save_manifest(output_dir, manifest)
     return fingerprints
@@ -820,6 +971,78 @@ def is_byte_identical_used(used_fingerprints: dict[int, set[str]], path: str) ->
     return digest is not None and digest in candidates
 
 
+class Manifest(dict):
+    """A manifest as :func:`load_manifest` read it, plus a snapshot of what the
+    file held at that read (or at this copy's last save).
+
+    Several DPO tools can hold one concept's manifest in memory at once — a
+    curation session, an off-policy session, Triage & Fix and Replace Pairs.
+    The snapshot lets :func:`save_manifest` tell this holder's own edits from
+    everyone else's, so a save merges instead of overwriting pairs another
+    tool added or rewrote since this copy was read."""
+
+    baseline: "_Snapshot | None" = None
+
+
+class _Snapshot:
+    def __init__(self, manifest: dict):
+        self.pairs = {_pair_key(entry): _canonical(entry) for entry in manifest.get("pairs", [])}
+        self.extras = {k: _canonical(v) for k, v in manifest.items() if k != "pairs"}
+
+
+_MANIFEST_LOCK = threading.RLock()
+
+
+def _canonical(value) -> str:
+    return json.dumps(value, sort_keys=True)
+
+
+def _pair_key(entry: dict):
+    pair_id = entry.get("pair_id")
+    return pair_id if pair_id is not None else ("content", _canonical(entry))
+
+
+def _merge_manifest(mine: dict, base: _Snapshot, disk: dict) -> tuple[list, dict]:
+    """Three-way merge by ``pair_id``: an entry this holder changed, added or
+    deleted since ``base`` keeps this holder's version; an entry only the file
+    changed, added or deleted keeps the file's. An entry this holder edited
+    that someone else deleted is kept — the edit is newer than the delete (and
+    an orphan prune racing a file swap looks exactly like that)."""
+    disk_pairs = {_pair_key(e): e for e in disk.get("pairs", [])}
+    merged, mine_keys, tail = [], set(), 0
+    for entry in mine.get("pairs", []):
+        key = _pair_key(entry)
+        mine_keys.add(key)
+        if key not in base.pairs:
+            merged.append(entry)
+            tail += 1
+            continue
+        changed = _canonical(entry) != base.pairs[key]
+        other = disk_pairs.get(key)
+        if other is None and not changed:
+            continue
+        if other is not None and not changed and _canonical(other) != base.pairs[key]:
+            # Keep the object: callers may hold references to their entries.
+            entry.clear()
+            entry.update(other)
+        merged.append(entry)
+        tail = 0
+    # Other holders' new pairs go before this holder's trailing additions,
+    # so ``manifest["pairs"][-1]`` stays the pair this holder just appended.
+    theirs = [e for k, e in disk_pairs.items() if k not in base.pairs and k not in mine_keys]
+    merged[len(merged) - tail : len(merged) - tail] = theirs
+
+    extras = {}
+    for key in (set(mine) | set(disk)) - {"pairs"}:
+        if key in mine and _canonical(mine[key]) != base.extras.get(key):
+            extras[key] = mine[key]
+        elif key not in mine and key in base.extras:
+            continue  # this holder deleted it
+        elif key in disk:
+            extras[key] = disk[key]
+    return merged, extras
+
+
 def load_manifest(output_dir: str) -> dict:
     """The pair manifest for an output dir, or an empty one when there is none.
 
@@ -829,10 +1052,14 @@ def load_manifest(output_dir: str) -> dict:
     and the operator keeps the evidence."""
     manifest_path = os.path.join(output_dir, "manifest.json")
     if not os.path.isfile(manifest_path):
-        return {"pairs": []}
+        manifest = Manifest(pairs=[])
+        manifest.baseline = _Snapshot(manifest)
+        return manifest
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            manifest = Manifest(json.load(f))
+        manifest.baseline = _Snapshot(manifest)
+        return manifest
     except (json.JSONDecodeError, UnicodeDecodeError) as ex:
         aside = f"{manifest_path}.corrupt-{time.strftime('%Y%m%dT%H%M%S')}"
         with suppress(OSError):
@@ -850,14 +1077,37 @@ def save_manifest(output_dir: str, manifest: dict):
     A plain in-place write can leave a truncated — or, on Windows, a
     zero-filled — file if the process dies before the data reaches disk, which
     destroys the record of every pair exported so far. Writing a temp file and
-    renaming it means the manifest is either the old one or the new one."""
+    renaming it means the manifest is either the old one or the new one.
+
+    A :class:`Manifest` from :func:`load_manifest` is merged with the file as
+    it is now (see :func:`_merge_manifest`) and updated in place to the merged
+    result, so tools sharing a concept never erase each other's pairs. A plain
+    dict is written as given."""
     manifest_path = os.path.join(output_dir, "manifest.json")
     tmp_path = manifest_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, manifest_path)
+    with _MANIFEST_LOCK:
+        base = getattr(manifest, "baseline", None)
+        if base is not None and os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    disk = json.load(f)
+            except (OSError, ValueError):
+                disk = None  # unreadable: this copy is the best record left
+            if isinstance(disk, dict):
+                pairs, extras = _merge_manifest(manifest, base, disk)
+                own_pairs = manifest.get("pairs")
+                manifest.clear()
+                if isinstance(own_pairs, list):
+                    own_pairs[:] = pairs
+                    pairs = own_pairs
+                manifest.update(extras, pairs=pairs)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, manifest_path)
+        if isinstance(manifest, Manifest):
+            manifest.baseline = _Snapshot(manifest)
 
 
 def manifest_pair_counts(manifest: dict) -> dict[tuple[str, str], int]:

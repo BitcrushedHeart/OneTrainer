@@ -22,7 +22,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.TrainProgress import TrainProgress
-from modules.util.transfer_util import TransferForkState, run_prefix_and_capture
+from modules.util.transfer_util import TransferForkState, recover_base_weight, run_prefix_and_capture
 
 import torch
 from torch import nn
@@ -264,3 +264,207 @@ def test_create_parameters_selects_only_families():
     assert selected == 2 * 2 * 2  # 2 params/module x 2 family modules/layer x 2 layers
     assert selected + frozen == total
     assert groups is None or len(groups) >= 1
+
+
+def test_create_parameters_gives_the_family_dora_magnitudes_their_own_learning_rate():
+    config = _config(dora=True)
+    config.dora_oft_learning_rate = 1e-5
+    model = TinyTransferModel(config)
+    setup = TinySetup(torch.device("cpu"), torch.device("cpu"), False)
+
+    groups = setup.create_parameters(model, config).parameters_for_optimizer(config)
+
+    family = [
+        module
+        for module_name, module in model.transformer_lora.lora_modules.items()
+        if int(module_name.split(".")[1]) >= LATE_START and (".to_q" in module_name or ".w1" in module_name)
+    ]
+    assert [group["name"] for group in groups] == ["transformer", "transformer_dora"]
+    assert [group["lr"] for group in groups] == [config.learning_rate, 1e-5]
+    assert [id(p) for p in groups[0]["params"]] == [id(module.oft_R.weight) for module in family]
+    assert [id(p) for p in groups[1]["params"]] == [id(module.dora_multiplier) for module in family]
+    # the frozen partition is untouched by the split
+    total = sum(1 for m in model.transformer_lora.lora_modules.values() for _ in m.parameters())
+    assert len(setup.frozen_parameters["transformer"]) == total - 2 * len(family)
+
+
+def _perturbed_base(setup, model, config, scale: float = 0.05):
+    """Raw 'Base' late tensors that differ from the toy's own (variant) weights."""
+    generator = torch.Generator().manual_seed(7)
+    swap = setup._transfer_swap_modules(model, config)
+    return {
+        stem: module.weight.data + scale * torch.randn(module.weight.shape, generator=generator)
+        for stem, module in swap.items()
+    }
+
+
+def test_preserve_distillation_targets_teacher_plus_offset():
+    """Teacher == raw Base (no education) and an identity adapter: the student
+    IS the raw variant, so the offset target is matched exactly while the plain
+    teacher is not. Zero residual then means the distillation is intact."""
+    model, setup, config = _build(dora=False, adapter_theta=0.0)
+    base = _perturbed_base(setup, model, config)
+    model.transfer_base_late_tensors = base
+    model.transfer_teacher_late_tensors = {stem: tensor.clone() for stem, tensor in base.items()}
+    batch = {"latent_image": torch.randn(2, HIDDEN)}
+
+    config.transfer_preserve_distillation = True
+    loss = setup.calculate_transfer_loss(model, batch, config, TrainProgress())
+    assert float(loss.detach()) == pytest.approx(0.0, abs=1e-10)
+    metrics = setup.get_last_transfer_metrics()
+    assert metrics["turbo_retention"] == pytest.approx(1.0, abs=1e-4)
+    assert metrics["teacher_residual"] > 1e-6
+    assert metrics["education_gap"] == pytest.approx(0.0, abs=1e-10)  # teacher == raw Base here
+    assert metrics["education_residual"] == pytest.approx(0.0, abs=1e-8)
+    for layer in (0, 1):
+        assert model.transformer.layers[layer].calls == 1, "prefix must run exactly once"
+    for layer in (2, 3):
+        assert model.transformer.layers[layer].calls == 4, "late blocks run teacher + variant + base + student"
+
+    config.transfer_preserve_distillation = False
+    plain = setup.calculate_transfer_loss(model, batch, config, TrainProgress())
+    assert float(plain.detach()) > 1e-6
+    assert "turbo_retention" not in setup.get_last_transfer_metrics()
+
+
+def test_turbo_metrics_do_not_change_plain_loss():
+    model, setup, config = _build(dora=True, adapter_theta=0.05)
+    model.transfer_base_late_tensors = _perturbed_base(setup, model, config)
+    config.transfer_preserve_distillation = False
+    batch = {"latent_image": torch.randn(2, HIDDEN)}
+
+    plain = float(setup.calculate_transfer_loss(model, batch, config, TrainProgress()).detach())
+    with_metrics = float(
+        setup.calculate_transfer_loss(model, batch, config, TrainProgress(), turbo_metrics=True).detach()
+    )
+    assert with_metrics == pytest.approx(plain)
+    metrics = setup.get_last_transfer_metrics()
+    assert {"turbo_retention", "education_residual", "turbo_gap", "teacher_residual"} <= set(metrics)
+    assert metrics["education_gap"] > 0.0 and metrics["education_missing"] >= 0.0
+    assert f"turbo_retention_block_{LATE_START}" in metrics
+    assert metrics["teacher_residual"] == pytest.approx(metrics["residual"], rel=1e-4)
+
+
+def test_preserve_distillation_grads_and_state_restored():
+    model, setup, config = _build(dora=True, adapter_theta=0.05)
+    model.transfer_base_late_tensors = _perturbed_base(setup, model, config)
+    config.transfer_preserve_distillation = True
+    swap = setup._transfer_swap_modules(model, config)
+    weight_snapshot = {stem: module.weight.data.clone() for stem, module in swap.items()}
+
+    loss = setup.calculate_transfer_loss(model, {"latent_image": torch.randn(2, HIDDEN)}, config, TrainProgress())
+    loss.backward()
+    grads = [
+        module.oft_R.weight.grad
+        for name, module in model.transformer_lora.lora_modules.items()
+        if int(name.split(".")[1]) >= LATE_START and (".to_q" in name or ".w1" in name)
+    ]
+    assert grads and all(grad is not None and float(grad.abs().sum()) > 0.0 for grad in grads)
+    for stem, module in swap.items():
+        assert torch.equal(module.weight.data, weight_snapshot[stem]), stem
+
+
+def test_validation_reports_turbo_metrics_and_survives_probe_failure(capsys):
+    """run_transfer_validation asks for the turbo metrics; the toy model cannot
+    run the Z-Image sharpness probe, which must cost only that one scalar."""
+    model, setup, config = _build(dora=False, adapter_theta=0.05)
+    model.transfer_base_late_tensors = _perturbed_base(setup, model, config)
+    config.transfer_preserve_distillation = False
+    config.transfer_validation = True
+    config.transfer_validation_batches = 2
+    for _ in range(2):
+        setup.capture_transfer_val_batch({"latent_image": torch.randn(2, HIDDEN)}, config)
+
+    metrics = setup.run_transfer_validation(model, config, TrainProgress())
+    assert "residual" in metrics and "turbo_retention" in metrics
+    assert "turbo_sharpness" not in metrics
+    assert "sharpness probe disabled" in capsys.readouterr().out
+    again = setup.run_transfer_validation(model, config, TrainProgress())
+    assert again["residual"] == pytest.approx(metrics["residual"])
+    assert "sharpness probe disabled" not in capsys.readouterr().out
+
+
+def test_lazy_base_recovery_matches_eager_base_tensors():
+    """The real-run path: Base weights recovered from the teacher per block give
+    the same loss and metrics as an eager dict of the same Base tensors."""
+    model, setup, config = _build(dora=True, adapter_theta=0.05)
+    config.transfer_preserve_distillation = True
+    swap = setup._transfer_swap_modules(model, config)
+    generator = torch.Generator().manual_seed(11)
+    recovery = {}
+    for stem, module in swap.items():
+        blocks = module.weight.shape[1] // config.oft_block_size
+        delta = 0.05 * torch.randn(blocks, config.oft_block_size, config.oft_block_size, generator=generator)
+        multiplier = 1.0 + 0.1 * torch.randn(module.weight.shape[0], generator=generator)
+        recovery[stem] = (delta, multiplier)
+    eager = {stem: recover_base_weight(model.transfer_teacher_late_tensors[stem], *recovery[stem]) for stem in swap}
+    weight_snapshot = {stem: module.weight.data.clone() for stem, module in swap.items()}
+    batch = {"latent_image": torch.randn(2, HIDDEN)}
+
+    model.transfer_base_late_tensors = eager
+    eager_loss = float(setup.calculate_transfer_loss(model, batch, config, TrainProgress()).detach())
+    eager_metrics = setup.get_last_transfer_metrics()
+
+    model.transfer_base_late_tensors = None
+    model.transfer_base_recovery = recovery
+    for layer in model.transformer.layers:
+        layer.calls = 0
+    lazy_loss = float(setup.calculate_transfer_loss(model, batch, config, TrainProgress()).detach())
+    lazy_metrics = setup.get_last_transfer_metrics()
+
+    assert lazy_loss == pytest.approx(eager_loss, rel=1e-6)
+    assert lazy_metrics["turbo_retention"] == pytest.approx(eager_metrics["turbo_retention"], rel=1e-5)
+    for layer in (2, 3):
+        assert model.transformer.layers[layer].calls == 4
+    for stem, module in swap.items():
+        assert torch.equal(module.weight.data, weight_snapshot[stem]), stem
+
+
+def test_validation_waits_for_a_full_batch_cache():
+    """A partial cache averages a different batch set than later validations, so
+    it must not produce a residual the stop criterion would keep as its best."""
+    model, setup, config = _build(dora=False, adapter_theta=0.05)
+    config.transfer_validation = True
+    config.transfer_validation_batches = 3
+    for _ in range(2):
+        setup.capture_transfer_val_batch({"latent_image": torch.randn(2, HIDDEN)}, config)
+    assert setup.run_transfer_validation(model, config, TrainProgress()) == {}
+    setup.capture_transfer_val_batch({"latent_image": torch.randn(2, HIDDEN)}, config)
+    assert "residual" in setup.run_transfer_validation(model, config, TrainProgress())
+
+
+def test_validation_batches_survive_a_continue(tmp_path):
+    """A continued run validates on the batches the earlier segment saved, so its
+    residual stays comparable with the pre-resume best; a fresh run recaptures."""
+    model, setup, config = _build(dora=False, adapter_theta=0.05)
+    config.workspace_dir = str(tmp_path)
+    config.transfer_validation = True
+    config.transfer_validation_batches = 2
+    config.continue_last_backup = False
+    first = [{"latent_image": torch.randn(2, HIDDEN), "prompt": ["a", "b"]} for _ in range(2)]
+    for batch in first:
+        setup.capture_transfer_val_batch(batch, config)
+    before = setup.run_transfer_validation(model, config, TrainProgress())["residual"]
+
+    other = [{"latent_image": torch.randn(2, HIDDEN), "prompt": ["c", "d"]} for _ in range(2)]
+
+    config.continue_last_backup = True
+    resumed = TinySetup(torch.device("cpu"), torch.device("cpu"), False)
+    for batch in other:
+        resumed.capture_transfer_val_batch(batch, config)
+    assert [b["prompt"] for b in resumed._transfer_val_batches] == [["a", "b"], ["a", "b"]]
+    assert torch.equal(resumed._transfer_val_batches[1]["latent_image"], first[1]["latent_image"])
+    assert resumed.run_transfer_validation(model, config, TrainProgress())["residual"] == pytest.approx(before)
+
+    config.continue_last_backup = False
+    fresh = TinySetup(torch.device("cpu"), torch.device("cpu"), False)
+    for batch in other:
+        fresh.capture_transfer_val_batch(batch, config)
+    assert [b["prompt"] for b in fresh._transfer_val_batches] == [["c", "d"], ["c", "d"]]
+
+    # A saved set of the wrong size is ignored, not half-used.
+    config.continue_last_backup = True
+    config.transfer_validation_batches = 3
+    resized = TinySetup(torch.device("cpu"), torch.device("cpu"), False)
+    resized.capture_transfer_val_batch(first[0], config)
+    assert len(resized._transfer_val_batches) == 1

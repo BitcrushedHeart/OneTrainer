@@ -157,3 +157,38 @@ class TransferTab:
             "value. 0 disables.",
         )
         components.entry(self.scroll_frame, 6, 4, self.ui_state, "transfer_target_residual")
+
+        components.label(
+            self.scroll_frame,
+            7,
+            0,
+            "Preserve Distillation",
+            tooltip="Train against the teacher PLUS the variant's distillation offset (raw variant minus raw "
+            "Base late-stack activations) instead of the plain teacher. Without it the residual has no floor: "
+            "driving it to zero makes the late blocks behave like Base, which un-distills the model. Costs two "
+            "extra no-grad late-stack passes per step and a second copy of the late tensors in memory.",
+        )
+        components.switch(self.scroll_frame, 7, 1, self.ui_state, "transfer_preserve_distillation")
+
+        components.label(
+            self.scroll_frame,
+            7,
+            3,
+            "Min Turbo Retention",
+            tooltip="De-distillation guard on transfer_val/turbo_retention (1.0 = the full distillation offset "
+            "is intact, 0.0 = the late blocks have collapsed onto Base). A validation below this never becomes "
+            "the best checkpoint and counts against patience. 0 disables.",
+        )
+        components.entry(self.scroll_frame, 7, 4, self.ui_state, "transfer_min_turbo_retention")
+
+        components.label(
+            self.scroll_frame,
+            8,
+            0,
+            "Min Turbo Sharpness",
+            tooltip="De-distillation guard on transfer_val/turbo_sharpness: high-frequency energy of the "
+            "student's one-step prediction from heavy noise, relative to the raw variant's (about 1.0 while "
+            "the model is still distilled, falling as it blurs). Same effect as the retention guard. "
+            "0 disables; watch the scalar for a run before picking a value.",
+        )
+        components.entry(self.scroll_frame, 8, 1, self.ui_state, "transfer_min_turbo_sharpness")

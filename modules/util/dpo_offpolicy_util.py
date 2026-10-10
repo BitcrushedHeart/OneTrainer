@@ -163,6 +163,12 @@ class Candidate:
     #: Generations already shown for this photo (re-roll history), in order.
     shown_paths: list[str] = field(default_factory=list)
 
+    def rejected_index(self) -> int:
+        """Position of ``rejected`` in ``generated`` (-1 when nothing is picked)."""
+        if self.rejected is None:
+            return -1
+        return next((i for i, g in enumerate(self.generated) if g.path == self.rejected.path), -1)
+
     def to_dict(self) -> dict:
         data = {
             "real_path": self.real.path,
@@ -177,6 +183,10 @@ class Candidate:
             "real_score": self.real_score,
             "scored": self.scored,
             "shown_count": len(self.shown_paths),
+            # Every usable generation, so a picker can show them side by side
+            # and name the one it wants as the rejected image.
+            "generated_paths": [g.path for g in self.generated],
+            "rejected_index": self.rejected_index(),
         }
         if self.rejected is not None:
             data["aspect_mismatch"] = aspect_mismatch(
@@ -415,6 +425,31 @@ def reroll_negative(candidate: Candidate, score_of, rng: random.Random | None = 
     candidate.scored = trial.scored
     candidate.caption = trial.caption
     candidate.shown_paths.append(trial.rejected.path)
+    return True
+
+
+def _same_file(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def choose_negative(candidate: Candidate, path: str, score_of) -> bool:
+    """Make the generation at ``path`` (one of ``candidate.generated``) the
+    rejected image — the picker's explicit choice, where :func:`reroll_negative`
+    cycles. The previous pick joins the shown history the same way. Returns
+    False when ``path`` is not one of this photo's generations."""
+    chosen = next((g for g in candidate.generated if _same_file(g.path, path)), None)
+    if chosen is None:
+        return False
+    current = candidate.rejected.path if candidate.rejected else None
+    if current and current not in candidate.shown_paths:
+        candidate.shown_paths.append(current)
+    score = score_of(chosen.path)
+    candidate.rejected = chosen
+    candidate.rejected_score = score
+    candidate.scored = score is not None
+    candidate.caption = candidate.lines_by_path.get(chosen.path, candidate.caption)
+    if chosen.path not in candidate.shown_paths:
+        candidate.shown_paths.append(chosen.path)
     return True
 
 

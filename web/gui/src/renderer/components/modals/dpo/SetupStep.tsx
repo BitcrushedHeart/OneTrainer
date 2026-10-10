@@ -94,12 +94,14 @@ export function SetupStep({
   pairsPerGroup,
   groupOrder,
   captionFilter,
+  loraFilter,
   minImagesPerGroup,
   onSourceChange,
   onOutputChange,
   onPairsPerGroupChange,
   onGroupOrderChange,
   onCaptionFilterChange,
+  onLoraFilterChange,
   onMinImagesPerGroupChange,
   onStart,
   onReview,
@@ -325,6 +327,20 @@ export function SetupStep({
               above applies to the filtered list. Leave empty for all groups.
             </p>
           </div>
+          <div className="flex items-end gap-3">
+            <div className="w-56">
+              <FormEntry
+                label="LoRA filter"
+                value={loraFilter}
+                onChange={(v) => onLoraFilterChange(String(v))}
+                placeholder="e.g. mychar, detail"
+              />
+            </div>
+            <p className="text-xs text-[var(--color-on-surface-secondary)] pb-2">
+              Comma-separated; keeps groups whose images all used a matching LoRA (name substring, case-insensitive).
+              Leave empty for all groups.
+            </p>
+          </div>
         </div>
       </SectionCard>
 
@@ -346,6 +362,7 @@ export function SetupStep({
               pairsPerGroup,
               groupOrder,
               captionFilter,
+              loraFilter,
               minImagesPerGroup,
               mode: "selection",
             })
@@ -364,6 +381,7 @@ export function SetupStep({
               pairsPerGroup,
               groupOrder,
               captionFilter,
+              loraFilter,
               minImagesPerGroup,
               mode: "swiss",
             })
@@ -382,6 +400,7 @@ export function SetupStep({
               pairsPerGroup,
               groupOrder,
               captionFilter,
+              loraFilter,
               minImagesPerGroup,
               mode: "triage",
             })

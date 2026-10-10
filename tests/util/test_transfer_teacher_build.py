@@ -9,7 +9,7 @@ which is the same math OFTModule.apply_to_module bakes with.
 
 from modules.util.adapter_io import read_safetensors_buffered
 from modules.util.oft_align import AdapterOFTConfig, merged_full, reconstruct_oft_rotation
-from modules.util.transfer_util import build_teacher_late_tensors, parse_transfer_families
+from modules.util.transfer_util import build_teacher_late_tensors, parse_transfer_families, recover_base_weight
 
 import torch
 
@@ -116,3 +116,25 @@ def test_teacher_expected_shapes_guard(tmp_path, make_tiny_adapter, make_ckpt_te
     extra["layers.99.attention.to_q"] = torch.Size((16, 16))
     with pytest.raises(ValueError, match="cover"):
         build_teacher_late_tensors(base_path, adapter_path, LATE_START, fams, expected_shapes=extra)
+
+
+@pytest.mark.parametrize("dora", [False, True])
+def test_base_recovery_inverts_the_teacher_bake(tmp_path, make_tiny_adapter, make_ckpt_tensors, write_tiny_ckpt, dora):
+    """recover_base_weight turns each teacher tensor back into the raw Base one,
+    in fp32 and after a bf16 round trip of teacher and recovery data."""
+    adapter_path = make_tiny_adapter(tmp_path / "adapter.safetensors", dora=dora)
+    base = make_ckpt_tensors()
+    base_path = write_tiny_ckpt(tmp_path / "base.safetensors", base)
+
+    recovery = {}
+    teacher = build_teacher_late_tensors(base_path, adapter_path, LATE_START, None, base_recovery=recovery)
+    assert set(recovery) == set(teacher)
+    for stem, w_teacher in teacher.items():
+        delta, multiplier = recovery[stem]
+        assert (multiplier is not None) == dora
+        expected = base[stem].to(torch.float32)
+        torch.testing.assert_close(recover_base_weight(w_teacher, delta, multiplier), expected, rtol=1e-4, atol=1e-5)
+
+        low = recover_base_weight(w_teacher.to(torch.bfloat16), delta.to(torch.bfloat16), multiplier)
+        assert low.dtype == torch.bfloat16
+        torch.testing.assert_close(low.to(torch.float32), expected, rtol=0.0, atol=0.02 * float(expected.abs().max()))

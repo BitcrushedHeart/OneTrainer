@@ -6,7 +6,12 @@ One reward step, for one synthetic prompt:
    ``no_grad`` on a shifted linear sigma grid, with classifier-free guidance
    if configured. Only the prefix pays for CFG.
 2. One grad-bearing conditional forward at ``x_k`` gives ``v_k`` and the
-   one-step clean estimate ``x0 = x_k - sigma_k * v_k``.
+   one-step clean estimate ``x0 = x_k - sigma_k * v_k``. With
+   ``text_reward_grad_steps > 1`` (DRaFT-K) the chain continues: that step
+   and the next ones are Euler steps taken *with* grad (CFG as in the prefix,
+   the unconditional branch detached), and ``x0`` is the one-step estimate
+   after the last of them, so the loss sees letters as they resolve instead
+   of the blurry mid-sigma mean. One transformer graph is held per step.
 3. Decode ``x0`` once without grad, run the frozen detector, align its word
    boxes to the prompt's words.
 4. Decode only the latent window around the matched boxes *with* grad
@@ -22,6 +27,18 @@ one transformer forward (the grad one) and one grad-bearing crop decode; the
 metric readings come from a no-grad read of that crop, and the preview's full
 decode runs only on save steps, after the backward.
 
+With ``text_reward_init_sigma > 0`` the offline source becomes a *hybrid*
+rollout: the pre-generated image is re-noised to that (high) sigma, where its
+layout and surface survive but the letters have not formed, the policy rolls
+under ``no_grad`` from there to the grad step (CFG if configured), and steps
+2-4 run exactly as online: probe decode, detect, crop, CTC. The policy writes
+the letters itself, so the gradient can change letter identity instead of
+asking a one-step denoise of the source's wrong render to repaint it.
+
+The grad-bearing decode window is spent on the words whose current reading
+is furthest from the target (:func:`select_crop_region`); a word already read
+correctly contributes a near-zero loss.
+
 Conditioning is pre-encoded per epoch (:meth:`build_text_reward_bank`)
 because the text encoder is offloaded while training; embeddings are cached
 by prompt across epochs, so an offline dataset is encoded once per process.
@@ -35,15 +52,19 @@ from abc import ABCMeta
 from collections.abc import Callable
 
 from modules.model.BaseModel import BaseModel
+from modules.util.caption_text_extract import levenshtein_ratio
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.distill_dmd2_util import euler_flow_step
 from modules.util.enum.TextRewardSource import TextRewardSource
 from modules.util.text_reward_util import (
     TextRewardBank,
     TextRewardSample,
+    choose_grad_step,
     generate_text_specs,
+    grad_window,
     load_text_reward_dataset,
     load_word_list,
+    nearest_sigma_index,
     policy_read_metrics,
     text_reward_metrics,
 )
@@ -184,10 +205,12 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             )
             prompts = [s.prompt for s in specs]
 
-        # The unconditional branch only runs in the online rollout prefix; the
-        # offline step re-noises the source image and never reads it.
+        # The unconditional branch only runs in a rollout prefix (online, or
+        # the hybrid offline init); the plain offline step re-noises the
+        # source image to the grad sigma and never reads it.
+        rollout = not offline or config.text_reward_init_sigma > 0.0
         negative_prompt = None
-        if not offline and config.text_reward_cfg_scale > 1.0:
+        if rollout and config.text_reward_cfg_scale > 1.0:
             negative_prompt = config.text_reward_negative_prompt or ""
 
         cache = self._text_reward_prompt_cache(model, config)
@@ -342,6 +365,21 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
                 model.vae.tile_sample_min_size, model.vae.tile_latent_min_size = saved
         return (image.float() + 1.0) * 0.5
 
+    @staticmethod
+    def _text_reward_can_hold_probe_graph(config: TrainConfig) -> bool:
+        """Whether the probe may be the grad-bearing forward itself, its graph
+        held through the full-frame tiled decode and the detector.
+
+        Only gradient checkpointing makes that cheap: the held graph is just
+        the block inputs (~1.1 GB at 1024px, batch 1, per grad-bearing step of
+        the DRaFT-K chain), the same trade as
+        rlhf_dpo_light_reuse_rejected_graph. Without checkpointing it is every
+        activation of a forward next to the decode, which OOMs a 24 GB card.
+        Unlike the DPO case no transformer forward runs while the graph is
+        held, so offloaded checkpointing is safe here.
+        """
+        return config.text_reward_reuse_probe_graph and config.gradient_checkpointing.enabled()
+
     def calculate_text_reward_loss(
         self,
         model: BaseModel,
@@ -354,7 +392,12 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
         Returns the detached CTC value (zero when no word was found)."""
         reward = self.text_reward_model()
         offline = sample.image_path is not None
-        if not offline:
+        init_sigma = float(config.text_reward_init_sigma) if offline else 0.0
+        hybrid = offline and init_sigma > 0.0
+        # probe: the boxes come from the policy's own x0 (online rollout and
+        # hybrid offline init) instead of the clean source (plain offline).
+        probe = not offline or hybrid
+        if probe:
             self._text_reward_vae_to_train_device(model)
         if not self._text_reward_vae_ckpt_enabled and hasattr(model.vae, "enable_gradient_checkpointing"):
             model.vae.enable_gradient_checkpointing()
@@ -368,6 +411,8 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
             # image; its own size (padded to 16 px) sets the latent shape. The
             # latent and the detector's boxes/readings on the clean source are
             # cached on disk per image (see modules/util/text_reward_cache.py).
+            # The hybrid rollout only uses the latent; its boxes come from the
+            # probe below.
             source_latent, detected = self._text_reward_offline_source(model, sample, config, reward)
             source_latent = source_latent.to(device=self.train_device)
             lh, lw = int(source_latent.shape[-2]), int(source_latent.shape[-1])
@@ -378,89 +423,153 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
         cond_batch = self._text_reward_cond_batch(sample.embedding, latent_shape, model)
         uncond_batch = None
         cfg = float(config.text_reward_cfg_scale)
-        if cfg > 1.0 and sample.negative_embedding is not None:
+        if probe and cfg > 1.0 and sample.negative_embedding is not None:
             uncond_batch = self._text_reward_cond_batch(sample.negative_embedding, latent_shape, model)
 
         shift = float(model.calculate_timestep_shift(lw, lh)) if hasattr(model, "calculate_timestep_shift") else 1.0
         steps = max(1, int(config.text_reward_rollout_steps))
         sigmas = text_reward_sigmas(steps, shift, self.train_device)
+        sigma_row = sigmas[0].tolist()
 
         rng = random.Random(train_progress.global_step * 31 + 7)
-        grad_step = rng.randint(steps // 2, steps - 1) if config.text_reward_random_grad_step else steps - 1
+        init_index = nearest_sigma_index(sigma_row, steps, init_sigma) if hybrid else None
+        grad_step = choose_grad_step(
+            sigma_row,
+            steps,
+            random_grad_step=bool(config.text_reward_random_grad_step),
+            rng=rng,
+            sigma_min=float(config.text_reward_grad_sigma_min),
+            sigma_max=float(config.text_reward_grad_sigma_max),
+            after_index=init_index,
+        )
 
+        # DRaFT-K: grad_step is the first grad-bearing index, grad_last the
+        # one whose one-step estimate is scored (the same index for K = 1).
+        grad_step, grad_last = grad_window(grad_step, config.text_reward_grad_steps, steps)
         generator = torch.Generator(device=self.train_device)
         generator.manual_seed(train_progress.global_step * 3 + 1)
         sigma_k = sigmas[:, grad_step]
+        sigma_last = sigmas[:, grad_last]
+
+        def _guided_velocity(latent: Tensor, sigma: Tensor) -> Tensor:
+            """Conditional velocity, CFG-mixed with a detached unconditional
+            one when the rollout is guided. Under grad the gradient flows
+            through the conditional branch only, scaled by the CFG weight."""
+            v = self.predict_distill_velocity(model, cond_batch, config, train_progress, latent, sigma)
+            if uncond_batch is not None:
+                with torch.no_grad():
+                    v_u = self.predict_distill_velocity(model, uncond_batch, config, train_progress, latent, sigma)
+                v = v_u + cfg * (v - v_u)
+            return v
+
+        def _rollout(latent: Tensor, start: int) -> Tensor:
+            """No-grad Euler prefix from grid index ``start`` to the grad step."""
+            with torch.no_grad():
+                for i in range(start, grad_step):
+                    sigma, next_sigma = sigmas[:, i], sigmas[:, i + 1]
+                    latent = euler_flow_step(latent, _guided_velocity(latent, sigma), sigma, next_sigma)
+            return latent.detach()
 
         if source_latent is not None:
-            # Re-noise the pre-generated image to sigma_k along the flow path
-            # (x = (1 - s) x0 + s eps): the ReFL trick. No prefix to run.
+            # Re-noise the pre-generated image along the flow path
+            # (x = (1 - s) x0 + s eps): straight to sigma_k (the ReFL trick,
+            # no prefix), or for the hybrid to the init sigma and then roll
+            # the policy down to the grad step.
             eps = torch.randn(latent_shape, generator=generator, device=self.train_device, dtype=torch.float32)
-            s = sigma_k.view(1, 1, 1, 1)
-            x_k = ((1.0 - s) * source_latent.float() + s * eps).detach()
+            s = sigmas[:, init_index if hybrid else grad_step].view(1, 1, 1, 1)
+            x = ((1.0 - s) * source_latent.float() + s * eps).detach()
             del source_latent, eps
+            x_k = _rollout(x, init_index) if hybrid else x
         else:
             latent = torch.randn(latent_shape, generator=generator, device=self.train_device, dtype=torch.float32)
-            with torch.no_grad():
-                for i in range(grad_step):
-                    sigma, next_sigma = sigmas[:, i], sigmas[:, i + 1]
-                    v = self.predict_distill_velocity(model, cond_batch, config, train_progress, latent, sigma)
-                    if uncond_batch is not None:
-                        v_u = self.predict_distill_velocity(model, uncond_batch, config, train_progress, latent, sigma)
-                        v = v_u + cfg * (v - v_u)
-                    latent = euler_flow_step(latent, v, sigma, next_sigma)
-            x_k = latent.detach()
-        sigma_b = sigma_k.view(1, 1, 1, 1).to(dtype=x_k.dtype)
+            x_k = _rollout(latent, 0)
+        sigma_b = sigma_last.view(1, 1, 1, 1).to(dtype=x_k.dtype)
 
         # Where the boxes come from, and why nothing full-frame coexists with
         # the transformer's autograd graph (that pairing OOMs a 24 GB card):
-        # * OFFLINE_IMAGES: boxes and readings come from the clean source image
-        #   (the cached detection above), not from the policy's x0, so there is
-        #   no no-grad probe forward and no full-frame decode. Boxes are
-        #   relative and the latent grid is derived from the same resized
-        #   source, so they land on the grad forward's x0 unchanged. The only
-        #   full decode left is the preview, which runs after backward_fn.
-        # * ONLINE_ROLLOUT: detect BEFORE the grad-bearing forward. The grad
-        #   forward below sees the same x_k and sigma, so its x0 matches the
-        #   probe's bit-for-bit and the boxes stay valid.
+        # * plain OFFLINE_IMAGES: boxes and readings come from the clean
+        #   source image (the cached detection above), not from the policy's
+        #   x0, so there is no no-grad probe forward and no full-frame decode.
+        #   Boxes are relative and the latent grid is derived from the same
+        #   resized source, so they land on the grad forward's x0 unchanged.
+        #   The only full decode left is the preview, which runs after
+        #   backward_fn.
+        # * ONLINE_ROLLOUT and the hybrid: detect BEFORE the grad-bearing
+        #   forward. The grad forward below sees the same x_k and sigma, so
+        #   its x0 matches the probe's bit-for-bit and the boxes stay valid.
+        #   With plain gradient checkpointing the held graph is only the
+        #   block inputs, so the probe IS the grad forward
+        #   (_text_reward_can_hold_probe_graph): one transformer forward less,
+        #   and the boxes come from the very x0 that is backwarded.
+        def _grad_forward() -> tuple[Tensor, Tensor]:
+            """The grad-bearing chain: Euler steps ``grad_step .. grad_last - 1``
+            (guided like the prefix, graphs held), then the conditional forward
+            at ``grad_last`` whose one-step estimate is scored. For K = 1 this
+            is the original single forward at ``x_k``."""
+            latent = x_k
+            for i in range(grad_step, grad_last):
+                sigma, next_sigma = sigmas[:, i], sigmas[:, i + 1]
+                latent = euler_flow_step(latent, _guided_velocity(latent, sigma), sigma, next_sigma)
+            v = self.predict_distill_velocity(model, cond_batch, config, train_progress, latent, sigma_last)
+            if v.requires_grad:
+                # The gradient the CTC actually lands on the scored velocity
+                # output, as scaled by backward_fn: comparable one-to-one with
+                # the standard loss's gradient on the same tensor
+                # (text_reward/sft_grad_norm_v).
+                v.retain_grad()
+            return v, latent - sigma_b * v.to(dtype=latent.dtype)
+
         full01 = None
-        if not offline:
+        v_k = None
+        x0 = None
+        if probe:
+            if self._text_reward_can_hold_probe_graph(config):
+                v_k, x0 = _grad_forward()
+                x0_probe = x0.detach()
+            else:
+                with torch.no_grad():
+                    _, x0_probe = _grad_forward()
             with torch.no_grad():
-                v_probe = self.predict_distill_velocity(model, cond_batch, config, train_progress, x_k, sigma_k)
-                x0_probe = x_k - sigma_b * v_probe.to(dtype=x_k.dtype)
-                del v_probe
                 full01 = self._text_reward_decode(model, x0_probe, tiled=True)
                 del x0_probe
                 detected = reward.detect(full01)[0]
         alignment = reward.align(detected, sample.spec.words)
 
-        v_k = self.predict_distill_velocity(model, cond_batch, config, train_progress, x_k, sigma_k)
-        x0 = x_k - sigma_b * v_k.to(dtype=x_k.dtype)
-
-        from modules.util.text_reward_model import boxes_inside_region, latent_crop_region
+        from modules.util.text_reward_model import boxes_inside_region, select_crop_region
 
         save_due = (
             config.text_reward_save_interval > 0
             and self._text_reward_sample_count % config.text_reward_save_interval == 0
         )
-        matched = [(detected.boxes[bi], sample.spec.words[ti]) for bi, ti in alignment.pairs]
+        matched = [(detected.boxes[bi], sample.spec.words[ti], detected.readings[bi]) for bi, ti in alignment.pairs]
         loss_value = torch.zeros((), device=self.train_device)
         ctc_words = 0
-        policy_readings: dict[int, str] = {}  # offline: box index -> no-grad reading of the policy crop
+        wrong_words = 0
+        grad_norm_v = 0.0
+        policy_readings: dict[int, str] = {}  # plain offline: box index -> no-grad reading of the policy crop
         if matched:
             max_edge = max(64, int(config.text_reward_max_decode_pixels)) // 8
-            region = latent_crop_region([b for b, _ in matched], lh, lw, max_area=max_edge * max_edge)
-            keep = boxes_inside_region([b for b, _ in matched], region, lh, lw)
+            # Spend the decode window on the words read furthest from their
+            # target; a correct word contributes a near-zero loss.
+            priorities = [1.0 - levenshtein_ratio(reading.lower(), word.lower()) for _, word, reading in matched]
+            boxes = [b for b, _, _ in matched]
+            region = select_crop_region(boxes, priorities, lh, lw, max_area=max_edge * max_edge)
+            keep = boxes_inside_region(boxes, region, lh, lw)
             if keep:
+                # The boxes are known before the grad forward, so it only runs
+                # when there is a word to score: nothing scored means a zero
+                # gradient either way.
+                if x0 is None:
+                    v_k, x0 = _grad_forward()
                 y0, y1, x0_, x1 = region
-                if offline:
+                if not probe:
                     self._text_reward_vae_to_train_device(model)
                 crop01 = self._text_reward_decode(model, x0[:, :, y0:y1, x0_:x1])
                 ch, cw = (y1 - y0) * 8, (x1 - x0_) * 8
                 rel_boxes = []
                 targets = []
                 for i in keep:
-                    (bx0, by0, bx1, by1), word = matched[i]
+                    (bx0, by0, bx1, by1), word, _reading = matched[i]
                     rel_boxes.append(
                         (
                             (bx0 * lw * 8 - x0_ * 8) / cw,
@@ -470,13 +579,17 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
                         )
                     )
                     targets.append(word)
+                    if priorities[i] > 0.0:
+                        wrong_words += 1
                 with torch.autocast(device_type=self.train_device.type, enabled=False):
                     loss = reward.ctc_loss(crop01, rel_boxes, targets)
                 backward_fn(loss)
                 loss_value = loss.detach()
                 ctc_words = len(targets)
+                if v_k.grad is not None:
+                    grad_norm_v = float(v_k.grad.detach().float().norm())
                 del loss
-                if offline:
+                if not probe:
                     # Policy reading for the metrics: the recognizer on the
                     # (already decoded) crop, after the backward freed the graph.
                     with torch.no_grad(), torch.autocast(device_type=self.train_device.type, enabled=False):
@@ -484,21 +597,33 @@ class ModelSetupTextRewardMixin(metaclass=ABCMeta):
                     for i, reading in zip(keep, crop_readings, strict=True):
                         policy_readings[alignment.pairs[i][0]] = reading
                 del crop01
-        x0_preview = x0.detach() if offline and save_due else None
+        x0_preview = None
+        if not probe and save_due:
+            if x0 is None:
+                # Nothing was scored, so no grad forward ran; the preview still
+                # shows the policy's x0.
+                with torch.no_grad():
+                    _, x0 = _grad_forward()
+            x0_preview = x0.detach()
         del x0, v_k
 
-        if offline:
-            metrics = policy_read_metrics(policy_readings, list(sample.spec.words), alignment)
-            readings = [policy_readings[bi] for bi in sorted(policy_readings)]  # boxes are in reading order
-        else:
+        if probe:
             metrics = text_reward_metrics([detected.readings], [list(sample.spec.words)], [alignment])
             readings = detected.readings
+        else:
+            metrics = policy_read_metrics(policy_readings, list(sample.spec.words), alignment)
+            readings = [policy_readings[bi] for bi in sorted(policy_readings)]  # boxes are in reading order
         self._last_text_reward_metrics = {
             "ctc": float(loss_value),
             "word_ratio": metrics.word_ratio,
             "exact": metrics.exact,
             "missing": metrics.missing,
             "scored_words": float(ctc_words),
+            "scored_wrong_words": float(wrong_words),
+            "grad_sigma": float(sigma_k.reshape(-1)[0]),
+            "x0_sigma": float(sigma_last.reshape(-1)[0]),
+            "grad_steps": float(grad_last - grad_step + 1),
+            "grad_norm_v": grad_norm_v,
             f"family_ratio/{sample.spec.family}": metrics.word_ratio,
             f"family_count/{sample.spec.family}": 1.0,
         }

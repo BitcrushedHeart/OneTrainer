@@ -69,6 +69,7 @@ def _doraoft_config(block_size: int = 4) -> SimpleNamespace:
         lora_decompose_output_axis=False,
         train_device="cpu",
         dora_oft=True,
+        dora_oft_learning_rate=None,
         oft_scaled=False,
         oft_block_size=block_size,
         oft_block_share=False,

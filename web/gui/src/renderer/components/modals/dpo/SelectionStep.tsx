@@ -1,4 +1,4 @@
-import { Ban, Cpu, Loader2, SkipForward, Sparkles, Trash2, X, Zap } from "lucide-react";
+import { Ban, Cpu, Loader2, SkipForward, Sparkles, Trash2, Wand2, X, Zap } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -7,6 +7,7 @@ import { Button } from "@/components/shared";
 
 import { PreviewOverlay } from "./PreviewOverlay";
 import { PromptExpander } from "./PromptExpander";
+import { RegenFixDialog } from "./RegenFixDialog";
 import { ScoreBreakdownPanel } from "./ScoreBreakdownPanel";
 import { DEFAULT_SCORE_WEIGHTS, type ScoreAxes, sortByCombined, weightedZ } from "./scoreCombine";
 import { ScoreWeightSliders } from "./ScoreWeightSliders";
@@ -95,8 +96,15 @@ export function SelectionStep({
   onSetScoreWeights,
   scoreSortMode = "combined",
   onSetScoreSortMode,
+  regenSelection = [],
+  onToggleRegenSelect,
+  regen,
+  onStartRegen,
+  onCancelRegen,
 }: SelectionStepProps) {
   const [previewPath, setPreviewPath] = useState<string | null>(null);
+  // The images the Fix & Regenerate dialog is open for; null = closed.
+  const [regenDialogPaths, setRegenDialogPaths] = useState<string[] | null>(null);
 
   // Close preview if the step changes such that the path is no longer in the list.
   useEffect(() => {
@@ -120,24 +128,47 @@ export function SelectionStep({
     return () => window.removeEventListener("keydown", handleKey, true);
   }, [showAcceptDialog, onDismissPair]);
 
-  const handleThumbClick = (path: string) => {
+  const regenEnabled = !!onStartRegen;
+
+  // Shift+Click toggles the image into the Fix & Regenerate selection;
+  // a plain click previews it, as before.
+  const handleThumbClick = (e: React.MouseEvent, path: string) => {
+    if (e.shiftKey && regenEnabled && onToggleRegenSelect) {
+      onToggleRegenSelect(path);
+      return;
+    }
     setPreviewPath(path);
   };
 
+  // Shift+Right-click opens the fix dialog for the selection plus this image;
+  // a plain right-click picks it (best, then worst), as before.
   const handleThumbContextMenu = (e: React.MouseEvent, path: string) => {
     e.preventDefault();
+    if (e.shiftKey && regenEnabled) {
+      const paths = regenSelection.includes(path) ? regenSelection : [...regenSelection, path];
+      setRegenDialogPaths(paths);
+      return;
+    }
     void onPick(path);
   };
 
+  const regenItems = regen?.items ?? {};
+  const regenAdded = useMemo(() => new Set(regen?.added ?? []), [regen?.added]);
+  const regenSelected = useMemo(() => new Set(regenSelection), [regenSelection]);
+
+  const regenSuffix =
+    regenSelection.length > 0
+      ? ` · ${regenSelection.length} selected for Fix & Regenerate (Shift+Right-click to open)`
+      : "";
   const banner =
     phase === "best"
       ? {
-          text: `Pair ${pairsDone + 1}/${group.pairs_target}. Click an image to preview, right-click to select as BEST`,
+          text: `Pair ${pairsDone + 1}/${group.pairs_target}. Click an image to preview, right-click to select as BEST${regenSuffix}`,
           color: "#22c55e",
           bg: "rgba(34,197,94,0.1)",
         }
       : {
-          text: `Best: ${basename(bestImage)}. Click to preview, right-click to select WORST`,
+          text: `Best: ${basename(bestImage)}. Click to preview, right-click to select WORST${regenSuffix}`,
           color: "#ef4444",
           bg: "rgba(239,68,68,0.1)",
         };
@@ -321,6 +352,18 @@ export function SelectionStep({
               </Button>
             )
           ) : null}
+          {regen?.running ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onCancelRegen}
+              title={regen.warning ?? "Fix & Regenerate is running in SwarmUI. Click to stop after the current image."}
+              style={{ color: "#a855f7" }}
+            >
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Regenerating {regen.done}/{regen.planned}
+            </Button>
+          ) : null}
           <Button variant="ghost" size="sm" onClick={onSkipGroup} style={{ background: "#8B4513", color: "#fff" }}>
             <SkipForward className="w-4 h-4" />
             Skip Group
@@ -363,6 +406,13 @@ export function SelectionStep({
       >
         {banner.text}
       </div>
+      {regenEnabled ? (
+        <div className="text-[11px] text-center text-[var(--color-on-surface-secondary)] -mt-2 flex items-center justify-center gap-1">
+          <Wand2 className="w-3 h-3" />
+          Shift+Click selects images for Fix &amp; Regenerate; Shift+Right-click opens the fix dialog. New images are
+          added to the group.
+        </div>
+      ) : null}
 
       {/* Thumbnail grid */}
       {hasEnoughImages ? (
@@ -372,21 +422,26 @@ export function SelectionStep({
         >
           {displayImages.map((imgPath) => {
             const isBest = imgPath === bestImage;
+            const isRegenSelected = regenSelected.has(imgPath);
+            const regenItem = regenItems[imgPath];
+            const isRegenerating = regenItem?.status === "queued" || regenItem?.status === "running";
+            const isNew = regenAdded.has(imgPath);
+            const restingBorder = isBest ? "#22c55e" : isRegenSelected ? "#a855f7" : "var(--color-border-subtle)";
             return (
               <button
                 key={imgPath}
                 type="button"
-                onClick={() => handleThumbClick(imgPath)}
+                onClick={(e) => handleThumbClick(e, imgPath)}
                 onContextMenu={(e) => handleThumbContextMenu(e, imgPath)}
                 className={`group relative rounded border-2 overflow-hidden transition-all hover:shadow-lg hover:-translate-y-0.5 focus:outline-none focus:ring-2 focus:ring-[var(--color-cobalt-600)] bg-black/30 flex ${panelLayout === "side" ? "flex-row" : "flex-col"}`}
                 style={{
-                  borderColor: isBest ? "#22c55e" : "var(--color-border-subtle)",
+                  borderColor: restingBorder,
                 }}
                 onMouseEnter={(e) => {
-                  if (!isBest) e.currentTarget.style.borderColor = "var(--color-cobalt-600)";
+                  if (!isBest && !isRegenSelected) e.currentTarget.style.borderColor = "var(--color-cobalt-600)";
                 }}
                 onMouseLeave={(e) => {
-                  if (!isBest) e.currentTarget.style.borderColor = "var(--color-border-subtle)";
+                  if (!isBest && !isRegenSelected) e.currentTarget.style.borderColor = restingBorder;
                 }}
               >
                 <div className="relative flex-1 min-w-0" style={arStyle}>
@@ -403,6 +458,47 @@ export function SelectionStep({
                       style={{ background: "#22c55e", color: "#0b2c13" }}
                     >
                       BEST
+                    </div>
+                  )}
+                  {isNew && (
+                    <div
+                      className={`absolute ${isBest ? "top-6" : "top-1"} left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow`}
+                      style={{ background: "#a855f7", color: "#fff" }}
+                      title="Added by Fix & Regenerate"
+                    >
+                      NEW
+                    </div>
+                  )}
+                  {isRegenSelected && !isRegenerating && (
+                    <div
+                      className="absolute bottom-6 left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                      style={{ background: "#a855f7", color: "#fff" }}
+                    >
+                      FIX
+                    </div>
+                  )}
+                  {isRegenerating && (
+                    <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center gap-1 text-white text-xs">
+                      <Loader2 className="w-6 h-6 animate-spin" />
+                      regenerating…
+                    </div>
+                  )}
+                  {regenItem?.status === "failed" && (
+                    <div
+                      className="absolute bottom-6 left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                      style={{ background: "#ef4444", color: "#fff" }}
+                      title={regenItem.error ?? "Fix failed"}
+                    >
+                      fix failed
+                    </div>
+                  )}
+                  {regenItem?.status === "skipped" && (
+                    <div
+                      className="absolute bottom-6 left-1 text-[10px] font-bold px-2 py-0.5 rounded shadow"
+                      style={{ background: "#f97316", color: "#0b0b0b" }}
+                      title={regenItem.error ?? "Result already in the dataset"}
+                    >
+                      identical
                     </div>
                   )}
                   {scored[imgPath] !== undefined && (
@@ -436,6 +532,11 @@ export function SelectionStep({
         <div className="text-sm text-[var(--color-on-surface-secondary)] py-8 text-center">
           Not enough images remaining in group
         </div>
+      )}
+
+      {/* Fix & Regenerate dialog */}
+      {regenDialogPaths && onStartRegen && (
+        <RegenFixDialog paths={regenDialogPaths} onClose={() => setRegenDialogPaths(null)} onStart={onStartRegen} />
       )}
 
       {/* Preview overlay */}

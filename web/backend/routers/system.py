@@ -131,26 +131,30 @@ def cache_gc_preview():
 
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
-    cache_dir = getattr(config, "cache_dir", "") or "workspace-cache/run"
+    cache_dirs = [d for d in _gc_cache_dirs(config) if os.path.isdir(d)]
 
-    if not os.path.isdir(cache_dir):
+    if not cache_dirs:
         return GcPreviewResponse(ok=True)
 
     try:
         from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
 
-        text_stats = SmartDiskCache.gc_preview(os.path.join(cache_dir, "text"))
-        image_stats = SmartDiskCache.gc_preview(os.path.join(cache_dir, "image"))
-        total_files = text_stats["orphan_count"] + image_stats["orphan_count"]
-        total_mb = (text_stats["orphan_bytes"] + image_stats["orphan_bytes"]) / (1024 * 1024)
+        text_orphans = text_bytes = image_orphans = image_bytes = 0
+        for cache_dir in cache_dirs:
+            text_stats = SmartDiskCache.gc_preview(os.path.join(cache_dir, "text"))
+            image_stats = SmartDiskCache.gc_preview(os.path.join(cache_dir, "image"))
+            text_orphans += text_stats["orphan_count"]
+            text_bytes += text_stats["orphan_bytes"]
+            image_orphans += image_stats["orphan_count"]
+            image_bytes += image_stats["orphan_bytes"]
         return GcPreviewResponse(
             ok=True,
-            text_orphans=text_stats["orphan_count"],
-            text_bytes=text_stats["orphan_bytes"],
-            image_orphans=image_stats["orphan_count"],
-            image_bytes=image_stats["orphan_bytes"],
-            total_files=total_files,
-            total_mb=round(total_mb, 1),
+            text_orphans=text_orphans,
+            text_bytes=text_bytes,
+            image_orphans=image_orphans,
+            image_bytes=image_bytes,
+            total_files=text_orphans + image_orphans,
+            total_mb=round((text_bytes + image_bytes) / (1024 * 1024), 1),
         )
     except Exception as e:
         return GcPreviewResponse(ok=False, error=str(e))
@@ -164,16 +168,17 @@ def cache_gc_clean():
 
     config_service = ConfigService.get_instance()
     config = config_service.get_config_for_training()
-    cache_dir = getattr(config, "cache_dir", "") or "workspace-cache/run"
+    cache_dirs = [d for d in _gc_cache_dirs(config) if os.path.isdir(d)]
 
-    if not os.path.isdir(cache_dir):
+    if not cache_dirs:
         return CacheActionResponse(ok=True)
 
     try:
         from mgds.pipelineModules.SmartDiskCache import SmartDiskCache
 
-        SmartDiskCache.gc_clean(os.path.join(cache_dir, "text"))
-        SmartDiskCache.gc_clean(os.path.join(cache_dir, "image"))
+        for cache_dir in cache_dirs:
+            SmartDiskCache.gc_clean(os.path.join(cache_dir, "text"))
+            SmartDiskCache.gc_clean(os.path.join(cache_dir, "image"))
         return CacheActionResponse(ok=True)
     except Exception as e:
         return CacheActionResponse(ok=False, error=str(e))
@@ -240,6 +245,22 @@ def _load_concepts(config):
 
 def _value(obj, name: str, default=None):
     return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+
+def _gc_cache_dirs(config) -> list[str]:
+    """The run cache plus every concept's cache_dir override.
+
+    A concept cache is swept exactly like the run cache: unreferenced .pt files
+    and entries whose source file is gone. Clear Cache never touches it.
+    """
+    from mgds.pipelineModules.ConceptCacheRouter import normalize_cache_root, resolve_cache_root
+
+    default_root = getattr(config, "cache_dir", "") or "workspace-cache/run"
+    roots = {normalize_cache_root(default_root): default_root}
+    for concept in _load_concepts(config):
+        root = resolve_cache_root(_value(concept, "cache_dir", ""), default_root)
+        roots.setdefault(normalize_cache_root(root), root)
+    return list(roots.values())
 
 
 def _adaptive_policy_has_scalar_spec(config, concepts) -> bool:

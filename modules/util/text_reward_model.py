@@ -100,6 +100,36 @@ def latent_crop_region(
     return int(y0), int(y1), int(x0), int(x1)
 
 
+def select_crop_region(
+    boxes: Sequence[Sequence[float]],
+    priorities: Sequence[float],
+    latent_h: int,
+    latent_w: int,
+    *,
+    margin: float = 0.08,
+    max_area: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Latent window for the grad-bearing decode, built greedily around the
+    boxes with the highest ``priorities`` (``1 - similarity`` of the current
+    reading to its target: a word already read correctly contributes a
+    near-zero loss and must not eat the decode budget). The top box is always
+    in; every further box joins only while the window covering the selection
+    still fits ``max_area``. Ties keep reading order. With no cap, or when
+    everything fits, this is :func:`latent_crop_region` over all boxes."""
+    if not boxes:
+        return latent_crop_region([], latent_h, latent_w, margin=margin, max_area=max_area)
+    if len(priorities) != len(boxes):
+        raise ValueError("one priority per box")
+    order = sorted(range(len(boxes)), key=lambda i: (-float(priorities[i]), i))
+    chosen = [boxes[order[0]]]
+    for i in order[1:]:
+        candidate = [*chosen, boxes[i]]
+        y0, y1, x0, x1 = latent_crop_region(candidate, latent_h, latent_w, margin=margin)
+        if max_area is None or (y1 - y0) * (x1 - x0) <= max_area:
+            chosen = candidate
+    return latent_crop_region(chosen, latent_h, latent_w, margin=margin, max_area=max_area)
+
+
 def boxes_inside_region(
     boxes: Sequence[Sequence[float]],
     region: tuple[int, int, int, int],
