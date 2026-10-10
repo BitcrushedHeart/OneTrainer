@@ -185,6 +185,7 @@ function startBackend(): ChildProcess | null {
         env: {
           ...process.env,
           PYTHONUNBUFFERED: "1",
+          PYTHONIOENCODING: "utf-8",
           OT_SHUTDOWN_TOKEN: shutdownToken,
           OT_ELECTRON: "1",
         },
@@ -221,6 +222,7 @@ function startBackend(): ChildProcess | null {
         env: {
           ...process.env,
           PYTHONUNBUFFERED: "1",
+          PYTHONIOENCODING: "utf-8",
           OT_SHUTDOWN_TOKEN: shutdownToken,
           OT_ELECTRON: "1",
         },
@@ -233,21 +235,61 @@ function startBackend(): ChildProcess | null {
   }
 }
 
+// Access-log lines for successful polling requests (health, config, TensorBoard
+// charts, any .../status endpoint) and websocket upgrades. Failed polls still show.
 const NOISY_LOG_RE =
-  /GET \/api\/health|GET \/api\/presets|GET \/api\/config|GET \/api\/training\/status|WebSocket \/ws\//;
+  /"GET \/api\/(?:health|presets|config|tensorboard\/|[^\s?"]*\/status\b)[^"]*" [23]\d\d|WebSocket \/ws\//;
+const BACKEND_PREFIX = "[Backend] ";
+
+// stdout and stderr share one console, so a progress bar left mid-line on one
+// has to be ended before the other prints.
+let backendMidLine: NodeJS.WriteStream | null = null;
+
+function forwardBackendOutput(source: ChildProcess["stdout"], out: NodeJS.WriteStream): void {
+  if (!source) return;
+  // Decode as a stream so multi-byte UTF-8 characters split across chunks survive.
+  source.setEncoding("utf8");
+  let pending = "";
+
+  const write = (text: string, endsLine: boolean) => {
+    let prefix = "";
+    if (backendMidLine !== out) {
+      backendMidLine?.write("\n");
+      prefix = BACKEND_PREFIX;
+    }
+    // Progress bars redraw from column 0 with \r, so re-add the prefix after each one.
+    out.write(prefix + text.replace(/\r/g, `\r${BACKEND_PREFIX}`) + (endsLine ? "\n" : ""));
+    backendMidLine = endsLine ? null : out;
+  };
+
+  source.on("data", (chunk: string) => {
+    const lines = (pending + chunk).split("\n");
+    pending = lines.pop() ?? "";
+    for (const raw of lines) {
+      const line = raw.replace(/\r$/, "");
+      if (!devMode && backendMidLine !== out && NOISY_LOG_RE.test(line)) continue;
+      write(line, true);
+    }
+    // tqdm redraws in place with \r and only sends a newline when the bar finishes,
+    // so flush those (and anything continuing one) now. A trailing \r is held back
+    // in case it's half of a \r\n.
+    const held = pending.endsWith("\r") ? "\r" : "";
+    const partial = pending.slice(0, pending.length - held.length);
+    if (partial.includes("\r") || (partial && backendMidLine === out)) {
+      write(partial, false);
+      pending = held;
+    }
+  });
+
+  source.on("end", () => {
+    const rest = pending.replace(/\r$/, "");
+    if (rest || backendMidLine === out) write(rest, true);
+  });
+}
 
 function attachBackendHandlers(proc: ChildProcess): void {
-  proc.stdout?.on("data", (data: Buffer) => {
-    const line = data.toString();
-    if (!devMode && NOISY_LOG_RE.test(line)) return;
-    process.stdout.write(`[Backend] ${line}`);
-  });
-
-  proc.stderr?.on("data", (data: Buffer) => {
-    const line = data.toString();
-    if (!devMode && NOISY_LOG_RE.test(line)) return;
-    process.stderr.write(`[Backend] ${line}`);
-  });
+  forwardBackendOutput(proc.stdout, process.stdout);
+  forwardBackendOutput(proc.stderr, process.stderr);
 
   proc.on("close", (code) => {
     console.log(`[Backend] Process exited with code ${code}`);

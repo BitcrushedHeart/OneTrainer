@@ -7,6 +7,15 @@ from web.backend.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
+# Configure the root logger before the router imports below pull in runpod, whose
+# rp_upload module calls logging.basicConfig(level=INFO) at import time. Left to
+# that, every third-party library logs at INFO (tensorboard alone prints "No path
+# found after ..." on every chart poll). basicConfig is a no-op once root has a
+# handler, so whoever calls it first wins.
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s:     %(name)s - %(message)s")
+for _own_logger in ("web", "modules"):
+    logging.getLogger(_own_logger).setLevel(logging.INFO)
+
 sys.path.insert(0, PROJECT_ROOT)
 
 from web.backend.routers import (

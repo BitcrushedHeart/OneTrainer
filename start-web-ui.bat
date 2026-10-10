@@ -1,4 +1,6 @@
 @echo off
+REM UTF-8 console so tqdm bars and other non-ASCII backend output render correctly
+chcp 65001 >nul
 cd /d "%~dp0"
 
 set "OT_DEV="

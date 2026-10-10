@@ -13,6 +13,10 @@ from web.backend.services._singleton import SingletonMixin
 
 logger = logging.getLogger(__name__)
 
+# EventAccumulator.Reload() logs "No path found after <event file>" at INFO every
+# time it reaches the end of the file being written, i.e. on every chart poll.
+logging.getLogger("tensorboard").setLevel(logging.WARNING)
+
 try:
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
