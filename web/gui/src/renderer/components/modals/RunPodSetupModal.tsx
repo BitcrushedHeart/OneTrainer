@@ -331,7 +331,7 @@ export function RunPodSetupModal({ open, onClose }: RunPodSetupModalProps) {
         <aside className="rounded-md border border-[var(--color-border-subtle)] bg-[var(--color-surface-raised)] p-4 flex flex-col gap-4 h-fit">
           <div className="flex items-center gap-2 font-semibold">
             <Cloud className="w-4 h-4" />
-            {selectedGpu?.display_name ?? (gpuType || "RunPod")} · Europe
+            {selectedGpu?.display_name ?? (gpuType || "RunPod")} · EU (ISO 27001 / SOC 2)
           </div>
           <label className="flex flex-col gap-1 text-sm">
             <span className="text-xs uppercase font-semibold text-[var(--color-on-surface-secondary)]">API Key</span>

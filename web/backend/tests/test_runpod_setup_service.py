@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from modules.cloud.RunpodCloud import RunpodCloud
+from modules.cloud.RunpodCloud import RUNPOD_DATA_CENTERS, RunpodCloud
 from modules.trainer.CloudTrainer import CloudTrainer
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.CloudFileSync import CloudFileSync
@@ -167,11 +167,18 @@ def test_runpod_create_uses_5090_secure_europe(monkeypatch):
     assert calls[0]["cloud_type"] == "SECURE"
     assert calls[0]["support_public_ip"] is True
     assert calls[0]["start_ssh"] is True
-    assert calls[0]["data_center_id"] == "EU-RO-1"  # a real RunPod DC id, not a country code
+    assert calls[0]["data_center_id"] == "EU-NL-1"  # a real RunPod DC id, not a country code
     assert calls[0]["volume_in_gb"] == 300  # the persistent volume holds the data
     assert calls[0]["container_disk_in_gb"] == 30  # small ephemeral container disk
     assert "13.0" in calls[0]["allowed_cuda_versions"]  # cu130 torch needs a CUDA 13 host
     assert not any(v.startswith("12.") for v in calls[0]["allowed_cuda_versions"])
+
+
+def test_runpod_data_centers_are_certified_only():
+    # ISO/IEC 27001 or SOC 2 Type II European data centers only (the latent cache decodes back to the images)
+    certified = {"EU-NL-1", "EUR-IS-1", "EUR-IS-3", "EUR-IS-4", "EUR-IS-5", "EU-SE-1"}
+    assert set(RUNPOD_DATA_CENTERS) <= certified
+    assert not {"EU-RO-1", "EU-CZ-1", "EU-FR-1", "EUR-IS-2", "EUR-NO-1", "EUR-NO-2"} & set(RUNPOD_DATA_CENTERS)
 
 
 def test_runpod_create_falls_back_between_data_centers(monkeypatch):
@@ -179,7 +186,7 @@ def test_runpod_create_falls_back_between_data_centers(monkeypatch):
 
     def fake_create_pod(**kwargs):
         calls.append(kwargs)
-        if kwargs["data_center_id"] == "EU-RO-1":
+        if kwargs["data_center_id"] == RUNPOD_DATA_CENTERS[0]:
             raise RuntimeError("no capacity")
         return {"id": "pod-456"}
 
@@ -192,7 +199,7 @@ def test_runpod_create_falls_back_between_data_centers(monkeypatch):
     cloud._create()
 
     assert cfg.secrets.cloud.id == "pod-456"
-    assert [call["data_center_id"] for call in calls[:2]] == ["EU-RO-1", "EU-CZ-1"]
+    assert [call["data_center_id"] for call in calls[:2]] == RUNPOD_DATA_CENTERS[:2]
 
 
 def test_runpod_create_tries_all_data_centers_when_capacity_returns_none(monkeypatch):
@@ -201,7 +208,7 @@ def test_runpod_create_tries_all_data_centers_when_capacity_returns_none(monkeyp
     def fake_create_pod(**kwargs):
         calls.append(kwargs["data_center_id"])
         # simulate no-capacity: runpod returns None instead of raising for the first two DCs
-        if kwargs["data_center_id"] in ("EU-RO-1", "EU-CZ-1"):
+        if kwargs["data_center_id"] in RUNPOD_DATA_CENTERS[:2]:
             return None
         return {"id": "pod-789"}
 
@@ -214,7 +221,7 @@ def test_runpod_create_tries_all_data_centers_when_capacity_returns_none(monkeyp
     cloud._create()
 
     assert cfg.secrets.cloud.id == "pod-789"
-    assert calls[:3] == ["EU-RO-1", "EU-CZ-1", "EU-FR-1"]
+    assert calls[:3] == RUNPOD_DATA_CENTERS[:3]
 
 
 def test_runpod_create_raises_when_no_region_has_capacity(monkeypatch):

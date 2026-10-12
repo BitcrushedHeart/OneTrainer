@@ -17,9 +17,13 @@ RUNPOD_TEMPLATE_ID = "1a33vbssq9"
 RUNPOD_IMAGE = "dxqbyd/runpod-onetrainer-cli:1.2"
 # RunPod selects by *data center id*, not country code. The old country-code
 # list ("EU", "PL", …) never matched a real DC, so create_pod always reported
-# "no instances available" even when the GPU was in stock. These are RunPod's
-# current European data centers; extend/reorder to taste (or add non-EU ids).
-RUNPOD_DATA_CENTERS = ["EU-RO-1", "EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-SE-1", "EUR-IS-1", "EUR-IS-2", "EUR-NO-1"]
+# "no instances available" even when the GPU was in stock.
+# Restricted to European data centers certified ISO/IEC 27001 or SOC 2 Type II, since the uploaded latent cache
+# decodes back to the training images. From RunPod's data center catalog (compliance field), 2026-10-12:
+#   EU-NL-1, EUR-IS-1: GDPR, ISO 27001 | EUR-IS-3/4/5: GDPR, SOC 2 Type II | EU-SE-1: ISO 27001
+# Left out on purpose: EU-RO-1, EU-CZ-1, EUR-IS-2, EUR-NO-1 (GDPR only) and EU-FR-1, EUR-NO-2 (none listed).
+# The certification covers the data center itself, so it only means something for SECURE cloud pods.
+RUNPOD_DATA_CENTERS = ["EU-NL-1", "EUR-IS-1", "EUR-IS-3", "EUR-IS-4", "EUR-IS-5", "EU-SE-1"]
 # Ephemeral container disk (wiped on stop). All real storage — cache, outputs,
 # backups, HF cache — lives on the persistent volume mounted at /workspace, so
 # this only needs room for the OS/scratch.
