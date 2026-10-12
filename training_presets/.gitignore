@@ -5,3 +5,4 @@
 
 # #.json is an exception (from the exception). This file stores the ui state from a previous run.
 \#.json
+\#_textreward.json

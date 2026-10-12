@@ -1,3 +1,6 @@
+# lock transitive dependencies to the tested versions (regenerate with scripts/util/freeze_constraints.py)
+-c requirements-constraints.txt
+
 # base requirements
 numpy==2.2.6
 opencv-python==4.11.0.86
@@ -40,7 +43,7 @@ python-doctr==1.0.1 # frozen OCR detector + CTC recognizer for the on-image text
 
 # data loader
 -e git+https://github.com/BitcrushedHeart/mgds.git@3b1214f6b03301ef0a3d24f1c2fbfa4af320a961#egg=mgds
-xxhash
+xxhash==3.7.0
 
 # optimizers
 lion-pytorch==0.2.3 # lion optimizer
@@ -48,7 +51,7 @@ prodigyopt==1.1.2 # prodigy optimizer
 schedulefree==1.4.1 # schedule-free optimizers
 pytorch_optimizer==3.6.0 # pytorch optimizers
 prodigy-plus-schedule-free==2.0.1 # Prodigy plus optimizer
-adv_optm==2.5.2 # advanced optimizers
+adv_optm==2.5.3 # advanced optimizers
 -e git+https://github.com/KellerJordan/Muon.git@f90a42b#egg=muon-optimizer
 
 # Profiling

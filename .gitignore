@@ -32,6 +32,10 @@ secrets.json
 /dpo_dropped_resolution_mismatches.log
 /fix*.webp
 *.main.obj
+/2026-08-30/
+/tmp*.tmp
+/transfer-best.pt
+/transfer-best.pt.json
 
 # environments
 /.venv*
