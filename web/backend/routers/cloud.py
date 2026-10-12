@@ -17,11 +17,26 @@ class RunpodPrepareRequest(BaseModel):
     min_download: int = 0
     start: bool = False
     epochs: int = 3
+    # Any RunPod GPU type id (e.g. "NVIDIA A100 80GB PCIe"); empty keeps the RTX 5090 default.
+    gpu_type: str = ""
+    cloud_type: str = "SECURE"
+
+
+class RunpodGpuRequest(BaseModel):
+    # Falls back to the saved cloud secret when empty.
+    api_key: str = ""
 
 
 @router.get("/runpod/preview")
 def runpod_preview() -> dict:
     return RunpodSetupService.get_instance().preview()
+
+
+@router.post("/runpod/gpus")
+def runpod_gpus(req: RunpodGpuRequest) -> dict:
+    # POST so the API key travels in the body, not the URL. Failures come back as
+    # ok=False + error (not an HTTP error) so the modal can fall back to free text.
+    return RunpodSetupService.get_instance().list_gpu_types(req.api_key)
 
 
 @router.post("/runpod/git-preflight")

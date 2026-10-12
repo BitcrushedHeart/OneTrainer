@@ -1,3 +1,4 @@
+import re
 import secrets as pysecrets
 import shlex
 import time
@@ -23,6 +24,24 @@ RUNPOD_DATA_CENTERS = ["EU-RO-1", "EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-SE-1", "E
 # backups, HF cache — lives on the persistent volume mounted at /workspace, so
 # this only needs room for the OS/scratch.
 RUNPOD_CONTAINER_DISK_GB = 30
+# The pod installs the CUDA 13 torch build (requirements-cuda.txt, cu130). CUDA 13 dropped Maxwell, Pascal
+# and Volta (compute capability below 7.5), and CUDA wheels do not run on AMD GPUs at all. Matched against
+# the RunPod GPU id / display name; callers only warn on a match, they never refuse the GPU.
+_CU130_UNSUPPORTED_GPU = re.compile(
+    r"\b(?:V100|GV100|P100|GP100|P40|P6|P4|K80|M40|M60|TITAN V|TITAN Xp?|GTX 10\d0|Quadro P\d+)\b"
+    r"|\bAMD\b|\bInstinct\b|\bMI\d{3}",
+    re.IGNORECASE,
+)
+
+
+def runpod_gpu_compat_warning(gpu_type: str, display_name: str = "") -> str | None:
+    """A warning when the GPU likely cannot run the pod's cu130 torch build, else None."""
+    if not _CU130_UNSUPPORTED_GPU.search(f"{gpu_type} {display_name}"):
+        return None
+    return (
+        f"'{display_name or gpu_type}' is probably incompatible with the pod's CUDA 13 (cu130) torch build: "
+        "CUDA 13 dropped GPUs older than Turing (compute capability < 7.5) and does not run on AMD."
+    )
 
 
 class RunpodCloud(LinuxCloud):
@@ -108,6 +127,8 @@ class RunpodCloud(LinuxCloud):
             f"type={config.sub_type or 'SECURE'}, persistent volume={config.volume_size}GB @ /workspace",
             flush=True,
         )
+        if compat_warning := runpod_gpu_compat_warning(config.gpu_type):
+            print(f"  warning: {compat_warning}", flush=True)
         for data_center in RUNPOD_DATA_CENTERS:
             try:
                 print(f"  requesting a pod in data center {data_center}...", flush=True)

@@ -670,3 +670,166 @@ def test_wsl_rsync_run_delegates_to_wsl_with_translated_paths(monkeypatch):
     assert "/mnt/f/workspace/cache/" in args  # drive path translated for WSL
     assert "root@1.2.3.4:/workspace/remote/cache" in args  # remote spec untouched
     assert "F:" not in " ".join(args)  # no Windows drive-colon reaches rsync
+
+
+def test_mutate_config_uses_requested_gpu_and_cloud_type(monkeypatch, tmp_path):
+    _force_native_rsync(monkeypatch)
+    cfg = TrainConfig.default_values()
+    cfg.workspace_dir = str(tmp_path / "workspace")
+
+    RunpodSetupService()._mutate_config_for_runpod(
+        cfg, 100, {"gpu_type": "  NVIDIA H100 80GB HBM3 ", "cloud_type": "community"}
+    )
+
+    assert cfg.cloud.gpu_type == "NVIDIA H100 80GB HBM3"
+    assert cfg.cloud.sub_type == "COMMUNITY"
+
+
+def test_mutate_config_defaults_to_5090_secure_when_unset_or_invalid(monkeypatch, tmp_path):
+    _force_native_rsync(monkeypatch)
+    cfg = TrainConfig.default_values()
+    cfg.workspace_dir = str(tmp_path / "workspace")
+
+    RunpodSetupService()._mutate_config_for_runpod(cfg, 100, {"gpu_type": "", "cloud_type": "SPOT"})
+
+    assert cfg.cloud.gpu_type == "NVIDIA GeForce RTX 5090"
+    assert cfg.cloud.sub_type == "SECURE"
+
+
+def test_list_gpu_types_sorts_filters_and_flags(monkeypatch):
+    import web.backend.services.runpod_setup_service as svc
+
+    seen_keys = []
+
+    def fake_query(query):
+        seen_keys.append(svc.runpod.api_key)
+        return {
+            "data": {
+                "gpuTypes": [
+                    {"id": "unknown", "displayName": "unknown", "memoryInGb": 0},
+                    {"id": "NVIDIA GeForce RTX 4090", "displayName": "RTX 4090", "memoryInGb": 24},
+                    {
+                        "id": "NVIDIA GeForce RTX 5090",
+                        "displayName": "RTX 5090",
+                        "memoryInGb": 32,
+                        "secureCloud": True,
+                        "communityCloud": True,
+                        "securePrice": 0.89,
+                        "communityPrice": 0.69,
+                    },
+                    {"id": "Tesla V100-SXM2-16GB", "displayName": "V100 SXM2", "memoryInGb": 16},
+                    {"id": "AMD Instinct MI300X OAM", "displayName": "MI300X", "memoryInGb": 192},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(svc, "run_graphql_query", fake_query)
+    monkeypatch.setattr(svc.runpod, "api_key", "previous-key")
+
+    result = RunpodSetupService().list_gpu_types("typed-key")
+
+    assert result["ok"] is True
+    assert result["default"] == "NVIDIA GeForce RTX 5090"
+    assert seen_keys == ["typed-key"]
+    assert svc.runpod.api_key == "previous-key"  # the typed key does not leak into the SDK global
+    ids = [gpu["id"] for gpu in result["gpus"]]
+    assert ids == [
+        "AMD Instinct MI300X OAM",
+        "NVIDIA GeForce RTX 5090",
+        "NVIDIA GeForce RTX 4090",
+        "Tesla V100-SXM2-16GB",
+    ]
+    by_id = {gpu["id"]: gpu for gpu in result["gpus"]}
+    assert by_id["NVIDIA GeForce RTX 5090"]["secure_price"] == 0.89
+    assert by_id["NVIDIA GeForce RTX 5090"]["compat_warning"] is None
+    assert by_id["NVIDIA GeForce RTX 4090"]["compat_warning"] is None
+    assert by_id["Tesla V100-SXM2-16GB"]["compat_warning"]
+    assert by_id["AMD Instinct MI300X OAM"]["compat_warning"]
+
+
+def test_list_gpu_types_falls_back_to_get_gpus_on_query_error(monkeypatch):
+    import web.backend.services.runpod_setup_service as svc
+
+    def failing_query(query):
+        raise svc.runpod_error.QueryError("Cannot query field", query)
+
+    monkeypatch.setattr(svc, "run_graphql_query", failing_query)
+    monkeypatch.setattr(svc.runpod, "get_gpus", lambda: [{"id": "NVIDIA A40", "displayName": "A40", "memoryInGb": 48}])
+
+    result = RunpodSetupService().list_gpu_types("key")
+
+    assert result["ok"] is True
+    assert [gpu["id"] for gpu in result["gpus"]] == ["NVIDIA A40"]
+    assert result["gpus"][0]["secure_cloud"] is None
+
+
+def test_list_gpu_types_reports_errors_instead_of_raising(monkeypatch):
+    import web.backend.services.runpod_setup_service as svc
+
+    def unauthorized(query):
+        raise svc.runpod_error.AuthenticationError("Unauthorized request, please check your API key.")
+
+    monkeypatch.setattr(svc, "run_graphql_query", unauthorized)
+
+    result = RunpodSetupService().list_gpu_types("bad-key")
+
+    assert result["ok"] is False
+    assert result["gpus"] == []
+    assert "Unauthorized" in result["error"]
+    assert result["default"] == "NVIDIA GeForce RTX 5090"
+
+
+def test_list_gpu_types_without_any_key(monkeypatch):
+    import web.backend.services.runpod_setup_service as svc
+
+    class FakeConfigService:
+        @staticmethod
+        def get_config_for_training():
+            return TrainConfig.default_values()
+
+    monkeypatch.setattr(svc.ConfigService, "get_instance", staticmethod(lambda: FakeConfigService()))
+
+    result = RunpodSetupService().list_gpu_types("")
+
+    assert result["ok"] is False
+    assert "API key" in result["error"]
+
+
+def test_runpod_gpu_compat_warning_flags_pre_turing_and_amd_only():
+    from modules.cloud.RunpodCloud import runpod_gpu_compat_warning
+
+    for supported in (
+        "NVIDIA GeForce RTX 5090",
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA A100-SXM4-80GB",
+        "NVIDIA RTX A4000",
+        "NVIDIA L4",
+        "Tesla T4",
+        "NVIDIA RTX 4000 Ada Generation",
+        "NVIDIA B200",
+    ):
+        assert runpod_gpu_compat_warning(supported) is None, supported
+    for unsupported in (
+        "Tesla V100-SXM2-16GB",
+        "Tesla P100-PCIE-16GB",
+        "Tesla P4",
+        "NVIDIA GeForce GTX 1080 Ti",
+        "AMD Instinct MI300X OAM",
+    ):
+        assert runpod_gpu_compat_warning(unsupported), unsupported
+
+
+def test_runpod_create_passes_selected_gpu_and_warns_on_incompatible(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        "modules.cloud.RunpodCloud.runpod.create_pod", lambda **kwargs: calls.append(kwargs) or {"id": "p"}
+    )
+
+    cfg = TrainConfig.default_values()
+    cfg.cloud.gpu_type = "Tesla V100-SXM2-16GB"
+    cfg.cloud.sub_type = "COMMUNITY"
+    RunpodCloud(cfg)._create()
+
+    assert calls[0]["gpu_type_id"] == "Tesla V100-SXM2-16GB"
+    assert calls[0]["cloud_type"] == "COMMUNITY"
+    assert "warning:" in capsys.readouterr().out

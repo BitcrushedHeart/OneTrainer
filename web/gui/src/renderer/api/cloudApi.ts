@@ -30,8 +30,28 @@ export interface RunpodPreview {
     template_id: string;
     gpu_type: string;
     cloud_type: string;
+    cloud_types?: string[];
     install_cmd: string;
   };
+}
+
+export interface RunpodGpuType {
+  id: string;
+  display_name: string;
+  memory_gb: number | null;
+  secure_cloud: boolean | null;
+  community_cloud: boolean | null;
+  secure_price: number | null;
+  community_price: number | null;
+  /** Set when the GPU likely cannot run the pod's cu130 torch build. Informational only. */
+  compat_warning: string | null;
+}
+
+export interface RunpodGpuList {
+  ok: boolean;
+  gpus: RunpodGpuType[];
+  default: string;
+  error: string | null;
 }
 
 export interface RunpodGitPreflight {
@@ -60,12 +80,16 @@ export interface RunpodPrepareRequest {
   min_download: number;
   start: boolean;
   epochs?: number;
+  /** RunPod GPU type id; empty keeps the backend default (RTX 5090). */
+  gpu_type?: string;
+  cloud_type?: string;
 }
 
 export interface RunpodPrepareResponse {
   ok: boolean;
   config: TrainConfig;
   preview: RunpodPreview;
+  warnings?: string[];
   start?: {
     ok: boolean;
     error?: string | null;
@@ -90,6 +114,12 @@ export interface RunpodLiveTestResponse {
 
 export const cloudApi = {
   runpodPreview: () => request<RunpodPreview>("/cloud/runpod/preview"),
+
+  runpodGpus: (apiKey: string) =>
+    request<RunpodGpuList>("/cloud/runpod/gpus", {
+      method: "POST",
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
 
   runpodGitPreflight: () =>
     request<RunpodGitPreflight>("/cloud/runpod/git-preflight", {

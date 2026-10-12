@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from modules.cloud.RunpodCloud import runpod_gpu_compat_warning
 from modules.trainer.CloudTrainer import CloudTrainer
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.CloudFileSync import CloudFileSync
@@ -20,6 +21,10 @@ from web.backend.paths import PROJECT_ROOT
 from web.backend.services._singleton import SingletonMixin
 from web.backend.services.config_service import ConfigService
 
+import runpod
+from runpod import error as runpod_error
+from runpod.api.graphql import run_graphql_query
+
 # Headroom on top of the uploaded total, for things that land on the volume but
 # aren't in the upload size: the HF base-model download, the OneTrainer install,
 # and training outputs/backups/samples. Rounded up to ROUND_GB. Keep some margin
@@ -28,7 +33,26 @@ from web.backend.services.config_service import ConfigService
 BUFFER_GIB = 30
 ROUND_GB = 5
 RUNPOD_TEMPLATE_ID = "1a33vbssq9"
+# Default GPU when the request names none, so the setup flow behaves as it did before
+# the GPU became selectable.
 RUNPOD_GPU_TYPE = "NVIDIA GeForce RTX 5090"
+RUNPOD_CLOUD_TYPES = ("SECURE", "COMMUNITY")
+# runpod.get_gpus() only returns id/displayName/memoryInGb; this also asks which clouds
+# offer each GPU and its on-demand price, for the setup modal. get_gpus() is the fallback
+# if RunPod ever rejects one of the extra fields.
+RUNPOD_GPU_QUERY = """
+query GpuTypes {
+  gpuTypes {
+    id
+    displayName
+    memoryInGb
+    secureCloud
+    communityCloud
+    securePrice
+    communityPrice
+  }
+}
+"""
 RUNPOD_INSTALL_CMD = "git clone -b bitcrushed-blend https://github.com/BitcrushedHeart/OneTrainer.git"
 MGDS_REPO = "https://github.com/BitcrushedHeart/mgds.git"
 MGDS_SOURCE_DIR = Path(PROJECT_ROOT) / "venv" / "src" / "mgds"
@@ -83,8 +107,66 @@ class RunpodSetupService(SingletonMixin):
                 "template_id": RUNPOD_TEMPLATE_ID,
                 "gpu_type": RUNPOD_GPU_TYPE,
                 "cloud_type": "SECURE",
+                "cloud_types": list(RUNPOD_CLOUD_TYPES),
                 "install_cmd": RUNPOD_INSTALL_CMD,
             },
+        }
+
+    def list_gpu_types(self, api_key: str = "") -> dict[str, Any]:
+        """RunPod's GPU types for the setup modal's selector.
+
+        Never raises: on failure ``ok`` is False and ``error`` says why, and the modal
+        falls back to a free-text GPU type id.
+        """
+        result: dict[str, Any] = {"ok": False, "gpus": [], "default": RUNPOD_GPU_TYPE, "error": None}
+        key = (api_key or "").strip()
+        if not key:
+            key = str(ConfigService.get_instance().get_config_for_training().secrets.cloud.api_key or "").strip()
+        if not key:
+            result["error"] = "Enter a RunPod API key to load the GPU list."
+            return result
+        try:
+            raw = self._fetch_gpu_types(key)
+        except Exception as exc:
+            result["error"] = f"Could not load RunPod GPU types: {exc}"
+            return result
+
+        gpus = [
+            self._gpu_entry(item)
+            for item in raw or []
+            if isinstance(item, dict) and item.get("id") and str(item["id"]).lower() != "unknown"
+        ]
+        gpus.sort(key=lambda gpu: (-(gpu["memory_gb"] or 0), gpu["display_name"].lower()))
+        result.update(ok=True, gpus=gpus)
+        return result
+
+    @staticmethod
+    def _fetch_gpu_types(api_key: str) -> list[dict[str, Any]]:
+        # The runpod SDK reads its key from the module global; restore it afterwards so a
+        # key typed into the modal does not leak into anything else using the SDK.
+        previous = runpod.api_key
+        runpod.api_key = api_key
+        try:
+            try:
+                return run_graphql_query(RUNPOD_GPU_QUERY)["data"]["gpuTypes"]
+            except runpod_error.QueryError:
+                return runpod.get_gpus()
+        finally:
+            runpod.api_key = previous
+
+    @staticmethod
+    def _gpu_entry(item: dict[str, Any]) -> dict[str, Any]:
+        gpu_id = str(item["id"])
+        name = str(item.get("displayName") or gpu_id)
+        return {
+            "id": gpu_id,
+            "display_name": name,
+            "memory_gb": item.get("memoryInGb"),
+            "secure_cloud": item.get("secureCloud"),
+            "community_cloud": item.get("communityCloud"),
+            "secure_price": item.get("securePrice"),
+            "community_price": item.get("communityPrice"),
+            "compat_warning": runpod_gpu_compat_warning(gpu_id, name),
         }
 
     def run_git_preflight(self) -> dict[str, Any]:
@@ -125,7 +207,8 @@ class RunpodSetupService(SingletonMixin):
         self._mutate_config_for_runpod(config, preview["required_gb"], body)
         reconciled = service.update_config(config.to_dict())
         service.update_cloud_secrets(secrets.to_dict())
-        return {"ok": True, "config": reconciled, "preview": self.preview()}
+        warnings = [warning] if (warning := runpod_gpu_compat_warning(config.cloud.gpu_type)) else []
+        return {"ok": True, "config": reconciled, "preview": self.preview(), "warnings": warnings}
 
     def start_live_test(self, body: dict[str, Any]) -> dict[str, Any]:
         from web.backend.services.trainer_service import TrainerService
@@ -174,8 +257,8 @@ class RunpodSetupService(SingletonMixin):
         config.cloud.file_sync = self._select_file_sync()
         config.cloud.create = True
         config.cloud.name = str(body.get("pod_name") or config.cloud.name or "OneTrainer").strip() or "OneTrainer"
-        config.cloud.sub_type = "SECURE"
-        config.cloud.gpu_type = RUNPOD_GPU_TYPE
+        config.cloud.sub_type = self._requested_cloud_type(body)
+        config.cloud.gpu_type = self._requested_gpu_type(body)
         config.cloud.volume_size = int(volume_size)
         config.cloud.min_download = int(body.get("min_download") or config.cloud.min_download or 0)
         config.cloud.remote_dir = config.cloud.remote_dir or "/workspace"
@@ -196,6 +279,16 @@ class RunpodSetupService(SingletonMixin):
         # (continue_last_backup=True with no uploaded checkpoint would make the remote trainer fail).
         config.continue_last_backup = config.continue_last_backup and bool(self._latest_backup(config))
         config.clear_cache_before_training = False
+
+    @staticmethod
+    def _requested_gpu_type(body: dict[str, Any]) -> str:
+        # Any RunPod GPU type id; an empty value keeps the RTX 5090 default.
+        return str(body.get("gpu_type") or "").strip() or RUNPOD_GPU_TYPE
+
+    @staticmethod
+    def _requested_cloud_type(body: dict[str, Any]) -> str:
+        value = str(body.get("cloud_type") or "").strip().upper()
+        return value if value in RUNPOD_CLOUD_TYPES else "SECURE"
 
     def _build_live_test_cache(self, config: TrainConfig, epochs: int) -> dict[str, Any]:
         source_cache = Path(config.cache_dir)
