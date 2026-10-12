@@ -15,6 +15,8 @@ class RunpodPrepareRequest(BaseModel):
     pod_name: str = "OneTrainer"
     run_id: str = "job1"
     min_download: int = 0
+    # upload with the pod on zero GPUs (CPU-only rate), then resume it with its GPU to train
+    upload_without_gpu: bool = False
     start: bool = False
     epochs: int = 3
     # Any RunPod GPU type id (e.g. "NVIDIA A100 80GB PCIe"); empty keeps the RTX 5090 default.

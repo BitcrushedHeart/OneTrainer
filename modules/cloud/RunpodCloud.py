@@ -33,6 +33,13 @@ RUNPOD_CONTAINER_DISK_GB = 30
 # runpod.create_pod only takes an exact allow-list (no minimum), so list every 13.x RunPod hosts report;
 # a newer one missing here only narrows capacity. Last checked against RunPod's GPU catalog 2026-10-12.
 RUNPOD_ALLOWED_CUDA_VERSIONS = ["13.0", "13.1", "13.2", "13.3", "13.4"]
+# Upload-without-GPU mode (cloud.upload_without_gpu): the new pod is stopped straight away and resumed with zero
+# GPUs for the upload, then stopped and resumed with its GPU to train. A stopped pod only resumes on its own
+# machine, so if someone else took the GPU in between, keep retrying this long before giving up (the pod is then
+# left stopped with the upload intact, to start again later).
+RUNPOD_GPU_ATTACH_TIMEOUT_SECONDS = 60 * 60
+RUNPOD_GPU_ATTACH_RETRY_SECONDS = 60
+RUNPOD_STOP_TIMEOUT_SECONDS = 5 * 60
 # The pod installs the CUDA 13 torch build (requirements-cuda.txt, cu130). CUDA 13 dropped Maxwell, Pascal
 # and Volta (compute capability below 7.5), and CUDA wheels do not run on AMD GPUs at all. Matched against
 # the RunPod GPU id / display name; callers only warn on a match, they never refuse the GPU.
@@ -41,6 +48,10 @@ _CU130_UNSUPPORTED_GPU = re.compile(
     r"|\bAMD\b|\bInstinct\b|\bMI\d{3}",
     re.IGNORECASE,
 )
+
+
+class RunpodGpuUnavailableError(RuntimeError):
+    """The stopped pod could not get its GPU back on its machine; the pod and its volume are left intact."""
 
 
 def runpod_gpu_compat_warning(gpu_type: str, display_name: str = "") -> str | None:
@@ -54,10 +65,17 @@ def runpod_gpu_compat_warning(gpu_type: str, display_name: str = "") -> str | No
 
 
 class RunpodCloud(LinuxCloud):
+    # RunPod pods are always NVIDIA; don't let install.sh detect the platform, since a pod resumed with zero GPUs
+    # (upload without GPU) has no nvidia-smi and would get the CPU-only torch build.
+    platform_requirements = "requirements-cuda.txt"
+
     def __init__(self, config: TrainConfig):
         super().__init__(config)
 
         runpod.api_key = config.secrets.cloud.api_key
+        # GPUs to attach when the pod is (re)started; 0 while uploading in upload-without-GPU mode.
+        self._gpu_count = 1
+        self._wait_for_gpu = False
 
     def __get_host_port(self):
         secrets = self.config.secrets.cloud
@@ -176,6 +194,42 @@ class RunpodCloud(LinuxCloud):
             )
         secrets.id = pod["id"]
 
+        if config.upload_without_gpu:
+            # Stop the pod right away; _connect() then finds it EXITED and _start() resumes it with zero GPUs,
+            # so the upload is billed at the CPU-only rate instead of the GPU's.
+            print("upload without GPU: stopping the new pod so the upload runs with zero GPUs attached...", flush=True)
+            self._stop_and_wait()
+            self._gpu_count = 0
+
+    def attach_gpu(self):
+        """After an upload without GPU: stop the pod, resume it on the same machine with its GPU and reconnect."""
+        if self._gpu_count != 0:
+            return
+        secrets = self.config.secrets.cloud
+        print("upload finished: stopping the pod to resume it with its GPU...", flush=True)
+        self.close()
+        self._stop_and_wait()
+        self._gpu_count = 1
+        self._wait_for_gpu = True
+        secrets.host = ""
+        secrets.port = ""
+        self._connect()
+        # the container disk is wiped on a stop: anything installed outside /workspace is gone again
+        self.connection.run(f"mkfifo {shlex.quote(self.command_pipe)}", warn=True, hide=True, in_stream=False)
+        self._ensure_remote_rsync()
+        if self.config.cloud.tensorboard_tunnel:
+            self._make_tensorboard_tunnel()
+        print("GPU attached; continuing.", flush=True)
+
+    def _stop_and_wait(self):
+        pod_id = self.config.secrets.cloud.id
+        runpod.stop_pod(pod_id)
+        deadline = time.monotonic() + RUNPOD_STOP_TIMEOUT_SECONDS
+        while (pod := runpod.get_pod(pod_id)) is not None and pod.get("desiredStatus") != "EXITED":
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"RunPod pod {pod_id} did not stop within {RUNPOD_STOP_TIMEOUT_SECONDS} seconds")
+            time.sleep(5)
+
     def delete(self):
         runpod.terminate_pod(self.config.secrets.cloud.id)
 
@@ -183,7 +237,37 @@ class RunpodCloud(LinuxCloud):
         runpod.stop_pod(self.config.secrets.cloud.id)
 
     def _start(self):
-        runpod.resume_pod(self.config.secrets.cloud.id, gpu_count=1)
+        pod_id = self.config.secrets.cloud.id
+        if self._gpu_count == 0:
+            try:
+                runpod.resume_pod(pod_id, gpu_count=0)
+                print("pod resumed with zero GPUs for the upload", flush=True)
+                return
+            except Exception as exc:
+                # don't lose the pod over it: upload with the GPU attached, as without upload_without_gpu
+                print(f"could not resume the pod without a GPU ({exc}); uploading with the GPU attached", flush=True)
+                self._gpu_count = 1
+        if not self._wait_for_gpu:
+            runpod.resume_pod(pod_id, gpu_count=1)
+            return
+        deadline = time.monotonic() + RUNPOD_GPU_ATTACH_TIMEOUT_SECONDS
+        while True:
+            try:
+                runpod.resume_pod(pod_id, gpu_count=1)
+                return
+            except Exception as exc:  # noqa: PERF203 — the retry is the point
+                if time.monotonic() >= deadline:
+                    raise RunpodGpuUnavailableError(
+                        f"RunPod pod {pod_id} could not get its GPU back within "
+                        f"{RUNPOD_GPU_ATTACH_TIMEOUT_SECONDS // 60} minutes ({exc}). The pod is left stopped with the "
+                        "upload on its volume: start training again later to retry, or migrate the pod in the RunPod "
+                        "console."
+                    ) from exc
+                print(
+                    f"GPU not free on the pod's machine yet ({exc}); retrying in {RUNPOD_GPU_ATTACH_RETRY_SECONDS}s...",
+                    flush=True,
+                )
+                time.sleep(RUNPOD_GPU_ATTACH_RETRY_SECONDS)
 
     def _get_action_cmd(self, action: CloudAction):
         if action == CloudAction.STOP:

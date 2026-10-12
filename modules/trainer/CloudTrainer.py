@@ -6,7 +6,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from modules.cloud.LinuxCloud import LinuxCloud
-from modules.cloud.RunpodCloud import RunpodCloud
+from modules.cloud.RunpodCloud import RunpodCloud, RunpodGpuUnavailableError
 from modules.trainer.BaseTrainer import BaseTrainer
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
@@ -19,6 +19,9 @@ class CloudTrainer(BaseTrainer):
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands, reattach: bool = False):
         super().__init__(config, callbacks, commands)
         self.error_caught = False
+        # set when the pod is left stopped on purpose (GPU not free after an upload without GPU):
+        # on_error must not stop or delete it, or the upload is lost
+        self.keep_cloud = False
         self.callback_thread = None
         self.sync_thread = None
         self.stop_event = None
@@ -54,6 +57,13 @@ class CloudTrainer(BaseTrainer):
                     )
                 self.callbacks.on_update_status("uploading config")
                 self.cloud.upload_config(self.commands)
+                if not self.commands.get_stop_command():
+                    self.callbacks.on_update_status("attaching GPU")
+                    self.cloud.attach_gpu()
+        except RunpodGpuUnavailableError:
+            self.error_caught = True
+            self.keep_cloud = True
+            raise
         except:
             self.error_caught = True
             raise
@@ -133,7 +143,9 @@ class CloudTrainer(BaseTrainer):
             self.error_caught = True
             raise
         finally:
-            if self.error_caught:
+            if self.keep_cloud:
+                action = CloudAction.NONE
+            elif self.error_caught:
                 action = self.config.cloud.on_error
             elif self.commands.get_stop_command():
                 action = CloudAction.NONE

@@ -261,6 +261,7 @@ class RunpodSetupService(SingletonMixin):
         config.cloud.gpu_type = self._requested_gpu_type(body)
         config.cloud.volume_size = int(volume_size)
         config.cloud.min_download = int(body.get("min_download") or config.cloud.min_download or 0)
+        config.cloud.upload_without_gpu = bool(body.get("upload_without_gpu"))
         config.cloud.remote_dir = config.cloud.remote_dir or "/workspace"
         config.cloud.huggingface_cache_dir = config.cloud.huggingface_cache_dir or "/workspace/huggingface_cache"
         config.cloud.onetrainer_dir = config.cloud.onetrainer_dir or "/workspace/OneTrainer"

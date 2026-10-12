@@ -55,6 +55,7 @@ export function RunPodSetupModal({ open, onClose }: RunPodSetupModalProps) {
   const [podName, setPodName] = useState("OneTrainer");
   const [runId, setRunId] = useState("job1");
   const [minDownload, setMinDownload] = useState(0);
+  const [uploadWithoutGpu, setUploadWithoutGpu] = useState(false);
   const [liveTestEpochs, setLiveTestEpochs] = useState(3);
   const [gpuType, setGpuType] = useState("");
   const [cloudType, setCloudType] = useState("SECURE");
@@ -177,6 +178,7 @@ export function RunPodSetupModal({ open, onClose }: RunPodSetupModalProps) {
         pod_name: podName,
         run_id: runId,
         min_download: minDownload,
+        upload_without_gpu: uploadWithoutGpu,
         gpu_type: gpuType.trim(),
         cloud_type: cloudType,
         start: false,
@@ -205,6 +207,7 @@ export function RunPodSetupModal({ open, onClose }: RunPodSetupModalProps) {
         pod_name: `${podName}-live-test`,
         run_id: runId,
         min_download: minDownload,
+        upload_without_gpu: uploadWithoutGpu,
         gpu_type: gpuType.trim(),
         cloud_type: cloudType,
         start: true,
@@ -453,6 +456,21 @@ export function RunPodSetupModal({ open, onClose }: RunPodSetupModalProps) {
               value={minDownload}
               onChange={(e) => setMinDownload(Number(e.target.value) || 0)}
             />
+          </label>
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={uploadWithoutGpu}
+              onChange={(e) => setUploadWithoutGpu(e.target.checked)}
+              className="cursor-pointer mt-0.5"
+            />
+            <span>
+              Upload without GPU
+              <span className="block text-xs text-[var(--color-on-surface-secondary)]">
+                Uploads with the pod on zero GPUs (CPU rate), then restarts it with the GPU. If someone takes the GPU
+                meanwhile, it retries for up to an hour and then leaves the pod stopped with the upload intact.
+              </span>
+            </span>
           </label>
           <label className="flex flex-col gap-1 text-sm">
             <span className="text-xs uppercase font-semibold text-[var(--color-on-surface-secondary)]">

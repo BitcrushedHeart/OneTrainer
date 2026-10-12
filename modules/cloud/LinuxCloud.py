@@ -20,6 +20,9 @@ import fabric
 
 
 class LinuxCloud(BaseCloud):
+    # requirements file install.sh/update.sh install from; None lets them detect the platform
+    platform_requirements: str | None = None
+
     def __init__(self, config: TrainConfig):
         super().__init__(config)
         self.connection = None
@@ -120,6 +123,8 @@ class LinuxCloud(BaseCloud):
         cmd_env = f"export PATH=$PATH:/usr/local/cuda/bin:/venv/main/bin \
                    && export OT_LAZY_UPDATES=true \
                    && cd {shlex.quote(config.onetrainer_dir)}"
+        if self.platform_requirements:
+            cmd_env += f" && export OT_PLATFORM_REQUIREMENTS={shlex.quote(self.platform_requirements)}"
 
         if result.exited == 0:
             if update:

@@ -842,3 +842,154 @@ def test_runpod_create_passes_selected_gpu_and_warns_on_incompatible(monkeypatch
     assert calls[0]["gpu_type_id"] == "Tesla V100-SXM2-16GB"
     assert calls[0]["cloud_type"] == "COMMUNITY"
     assert "warning:" in capsys.readouterr().out
+
+
+def test_mutate_config_passes_upload_without_gpu(monkeypatch, tmp_path):
+    _force_native_rsync(monkeypatch)
+    cfg = TrainConfig.default_values()
+    cfg.workspace_dir = str(tmp_path / "workspace")
+
+    RunpodSetupService()._mutate_config_for_runpod(cfg, 100, {"upload_without_gpu": True})
+    assert cfg.cloud.upload_without_gpu is True
+
+    RunpodSetupService()._mutate_config_for_runpod(cfg, 100, {})
+    assert cfg.cloud.upload_without_gpu is False
+
+
+class _FakeRunpodLifecycle:
+    """create/stop/get/resume fakes; resume_pod fails for the gpu counts in `reject` (a list of counts, consumed)."""
+
+    def __init__(self, monkeypatch, reject=()):
+        self.calls = []
+        self.reject = list(reject)
+        self.status = "RUNNING"
+        monkeypatch.setattr("modules.cloud.RunpodCloud.runpod.create_pod", self.create_pod)
+        monkeypatch.setattr("modules.cloud.RunpodCloud.runpod.stop_pod", self.stop_pod)
+        monkeypatch.setattr("modules.cloud.RunpodCloud.runpod.get_pod", self.get_pod)
+        monkeypatch.setattr("modules.cloud.RunpodCloud.runpod.resume_pod", self.resume_pod)
+        monkeypatch.setattr("modules.cloud.RunpodCloud.time.sleep", lambda seconds: None)
+
+    def create_pod(self, **kwargs):
+        self.calls.append(("create", kwargs["gpu_type_id"]))
+        return {"id": "pod-zero"}
+
+    def stop_pod(self, pod_id):
+        self.calls.append(("stop", pod_id))
+        self.status = "EXITED"
+
+    def get_pod(self, pod_id):
+        return {"id": pod_id, "desiredStatus": self.status}
+
+    def resume_pod(self, pod_id, gpu_count):
+        self.calls.append(("resume", gpu_count))
+        if self.reject and self.reject[0] == gpu_count:
+            self.reject.pop(0)
+            raise RuntimeError("There are not enough free GPUs on the host machine to start this pod.")
+        self.status = "RUNNING"
+
+
+def _upload_without_gpu_cloud(tensorboard_tunnel=False):
+    cfg = TrainConfig.default_values()
+    cfg.cloud.gpu_type = "NVIDIA H100 80GB HBM3"
+    cfg.cloud.upload_without_gpu = True
+    cfg.cloud.tensorboard_tunnel = tensorboard_tunnel
+    return RunpodCloud(cfg)
+
+
+def test_upload_without_gpu_parks_new_pod_and_resumes_it_with_zero_gpus(monkeypatch):
+    fake = _FakeRunpodLifecycle(monkeypatch)
+    cloud = _upload_without_gpu_cloud()
+
+    cloud._create()
+    cloud._start()  # what _connect() does when it finds the parked pod EXITED
+
+    assert fake.calls == [("create", "NVIDIA H100 80GB HBM3"), ("stop", "pod-zero"), ("resume", 0)]
+
+
+def test_upload_without_gpu_falls_back_to_gpu_when_zero_gpu_resume_is_rejected(monkeypatch):
+    fake = _FakeRunpodLifecycle(monkeypatch, reject=[0])
+    cloud = _upload_without_gpu_cloud()
+
+    cloud._create()
+    cloud._start()
+    cloud.attach_gpu()  # already has its GPU: nothing more to do
+
+    assert fake.calls[-2:] == [("resume", 0), ("resume", 1)]
+    assert fake.calls[1] == ("stop", "pod-zero") and fake.calls.count(("stop", "pod-zero")) == 1
+
+
+def _stub_reconnect(monkeypatch, cloud, commands):
+    class DummyConnection:
+        def run(self, cmd, **kwargs):
+            commands.append(cmd)
+
+    def fake_connect(self):
+        if runpod_status(self) == "EXITED":
+            self._start()
+        self.connection = DummyConnection()
+
+    def runpod_status(self):
+        import modules.cloud.RunpodCloud as rc
+
+        return rc.runpod.get_pod(self.config.secrets.cloud.id)["desiredStatus"]
+
+    monkeypatch.setattr(RunpodCloud, "_connect", fake_connect)
+    monkeypatch.setattr(RunpodCloud, "close", lambda self: None)
+
+
+def test_attach_gpu_stops_and_resumes_with_gpu_retrying_until_free(monkeypatch):
+    fake = _FakeRunpodLifecycle(monkeypatch, reject=[1, 1])
+    cloud = _upload_without_gpu_cloud()
+    cloud.config.cloud.file_sync = CloudFileSync.NATIVE_RSYNC
+    commands = []
+    _stub_reconnect(monkeypatch, cloud, commands)
+
+    cloud._create()
+    cloud._start()
+    cloud.attach_gpu()
+
+    resumes = [count for kind, count in fake.calls if kind == "resume"]
+    assert resumes == [0, 1, 1, 1]  # zero-GPU upload, then two "GPU taken" retries before it attaches
+    assert fake.calls.count(("stop", "pod-zero")) == 2
+    # the container disk was wiped by the stop: rsync and the command pipe are set up again
+    assert any("command -v rsync" in cmd for cmd in commands)
+    assert any(cmd.startswith("mkfifo ") for cmd in commands)
+
+
+def test_attach_gpu_gives_up_with_pod_intact_after_timeout(monkeypatch):
+    import modules.cloud.RunpodCloud as rc
+
+    fake = _FakeRunpodLifecycle(monkeypatch, reject=[1] * 100)
+    monkeypatch.setattr(rc, "RUNPOD_GPU_ATTACH_TIMEOUT_SECONDS", 0)
+    cloud = _upload_without_gpu_cloud()
+    _stub_reconnect(monkeypatch, cloud, [])
+
+    cloud._create()
+    cloud._start()
+    try:
+        cloud.attach_gpu()
+    except rc.RunpodGpuUnavailableError as exc:
+        assert "left stopped" in str(exc)
+    else:
+        raise AssertionError("expected RunpodGpuUnavailableError")
+    assert not any(kind in ("terminate", "delete") for kind, _ in fake.calls)
+
+
+def test_runpod_install_forces_cuda_requirements():
+    cfg = TrainConfig.default_values()
+    cloud = RunpodCloud(cfg)
+    commands = []
+
+    class Result:
+        exited = 1  # no venv yet: fresh install
+
+    class DummyConnection:
+        def run(self, cmd, **kwargs):
+            commands.append(cmd)
+            return Result()
+
+    cloud.connection = DummyConnection()
+    cloud._install_onetrainer()
+
+    install = next(cmd for cmd in commands if "./install.sh" in cmd)
+    assert "OT_PLATFORM_REQUIREMENTS=requirements-cuda.txt" in install

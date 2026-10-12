@@ -26,6 +26,9 @@ class BaseCloud(metaclass=ABCMeta):
         if self.config.cloud.tensorboard_tunnel:
             self._make_tensorboard_tunnel()
 
+    def attach_gpu(self):  # noqa: B027 — optional hook, a no-op unless the cloud uploads without a GPU
+        """Called after the upload, before training starts. Clouds that upload without a GPU attach it here."""
+
     def download_output_model(self):
         local = Path(self.config.local_output_model_destination)
         remote = Path(self.config.output_model_destination)

@@ -78,6 +78,8 @@ export interface RunpodPrepareRequest {
   pod_name: string;
   run_id: string;
   min_download: number;
+  /** Upload with the pod on zero GPUs (CPU-only rate), then resume it with its GPU to train. */
+  upload_without_gpu?: boolean;
   start: boolean;
   epochs?: number;
   /** RunPod GPU type id; empty keeps the backend default (RTX 5090). */

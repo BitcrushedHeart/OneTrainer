@@ -60,6 +60,7 @@ class CloudConfig(BaseConfig):
     gpu_type: str
     volume_size: int
     min_download: int
+    upload_without_gpu: bool
     remote_dir: str
     huggingface_cache_dir: str
     onetrainer_dir: str
@@ -97,6 +98,8 @@ class CloudConfig(BaseConfig):
         data.append(("gpu_type", "", str, False))
         data.append(("volume_size", 100, int, False))
         data.append(("min_download", 0, int, False))
+        # RunPod: upload with the pod resumed on zero GPUs (CPU-only rate), then resume it with its GPU to train
+        data.append(("upload_without_gpu", False, bool, False))
         data.append(("remote_dir", "/workspace", str, False))
         data.append(("huggingface_cache_dir", "/workspace/huggingface_cache", str, False))
         data.append(("onetrainer_dir", "/workspace/OneTrainer", str, False))
