@@ -170,6 +170,8 @@ def test_runpod_create_uses_5090_secure_europe(monkeypatch):
     assert calls[0]["data_center_id"] == "EU-RO-1"  # a real RunPod DC id, not a country code
     assert calls[0]["volume_in_gb"] == 300  # the persistent volume holds the data
     assert calls[0]["container_disk_in_gb"] == 30  # small ephemeral container disk
+    assert "13.0" in calls[0]["allowed_cuda_versions"]  # cu130 torch needs a CUDA 13 host
+    assert not any(v.startswith("12.") for v in calls[0]["allowed_cuda_versions"])
 
 
 def test_runpod_create_falls_back_between_data_centers(monkeypatch):

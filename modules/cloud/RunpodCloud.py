@@ -24,6 +24,11 @@ RUNPOD_DATA_CENTERS = ["EU-RO-1", "EU-CZ-1", "EU-FR-1", "EU-NL-1", "EU-SE-1", "E
 # backups, HF cache — lives on the persistent volume mounted at /workspace, so
 # this only needs room for the OS/scratch.
 RUNPOD_CONTAINER_DISK_GB = 30
+# Host CUDA versions the pod may land on. The cu130 torch build needs a host driver that reports CUDA 13.x;
+# without this RunPod can place the pod on an older host, where torch fails at startup. The v1 API behind
+# runpod.create_pod only takes an exact allow-list (no minimum), so list every 13.x RunPod hosts report;
+# a newer one missing here only narrows capacity. Last checked against RunPod's GPU catalog 2026-10-12.
+RUNPOD_ALLOWED_CUDA_VERSIONS = ["13.0", "13.1", "13.2", "13.3", "13.4"]
 # The pod installs the CUDA 13 torch build (requirements-cuda.txt, cu130). CUDA 13 dropped Maxwell, Pascal
 # and Volta (compute capability below 7.5), and CUDA wheels do not run on AMD GPUs at all. Matched against
 # the RunPod GPU id / display name; callers only warn on a match, they never refuse the GPU.
@@ -146,6 +151,7 @@ class RunpodCloud(LinuxCloud):
                     container_disk_in_gb=RUNPOD_CONTAINER_DISK_GB,
                     volume_in_gb=config.volume_size,
                     volume_mount_path="/workspace",
+                    allowed_cuda_versions=RUNPOD_ALLOWED_CUDA_VERSIONS,
                     min_download=config.min_download or None,
                     env={"JUPYTER_PASSWORD": pysecrets.token_urlsafe(16)},
                 )
