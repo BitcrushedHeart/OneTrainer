@@ -919,9 +919,15 @@ def test_upload_without_gpu_falls_back_to_gpu_when_zero_gpu_resume_is_rejected(m
 
 
 def _stub_reconnect(monkeypatch, cloud, commands):
+    class Result:
+        exited = 0
+
     class DummyConnection:
         def run(self, cmd, **kwargs):
             commands.append(cmd)
+            return Result()
+
+    cloud.connection = DummyConnection()  # the zero-GPU connection the prefetch runs on
 
     def fake_connect(self):
         if runpod_status(self) == "EXITED":
@@ -954,6 +960,12 @@ def test_attach_gpu_stops_and_resumes_with_gpu_retrying_until_free(monkeypatch):
     # the container disk was wiped by the stop: rsync and the command pipe are set up again
     assert any("command -v rsync" in cmd for cmd in commands)
     assert any(cmd.startswith("mkfifo ") for cmd in commands)
+    # the base model was downloaded first, while the pod still had no GPU
+    prefetch = [i for i, cmd in enumerate(commands) if "run-cmd.sh prefetch_model" in cmd]
+    rsync = [i for i, cmd in enumerate(commands) if "command -v rsync" in cmd]
+    assert prefetch and prefetch[0] < rsync[0]
+    assert f"--config-path={cloud.config_file}" in commands[prefetch[0]]
+    assert "OT_PLATFORM_REQUIREMENTS=requirements-cuda.txt" in commands[prefetch[0]]
 
 
 def test_attach_gpu_gives_up_with_pod_intact_after_timeout(monkeypatch):
@@ -993,3 +1005,41 @@ def test_runpod_install_forces_cuda_requirements():
 
     install = next(cmd for cmd in commands if "./install.sh" in cmd)
     assert "OT_PLATFORM_REQUIREMENTS=requirements-cuda.txt" in install
+
+
+def test_rsync_install_reuses_debs_kept_on_the_volume():
+    cfg = TrainConfig.default_values()
+    cfg.cloud.file_sync = CloudFileSync.NATIVE_RSYNC
+    cloud = RunpodCloud(cfg)
+    commands = []
+
+    class DummyConnection:
+        def run(self, cmd, **kwargs):
+            commands.append(cmd)
+
+    cloud.connection = DummyConnection()
+    cloud._ensure_remote_rsync()
+
+    cmd = commands[0]
+    assert "dpkg -i /workspace/.ot-apt-cache/*.deb" in cmd  # fast path after a stop, no apt-get update
+    assert "Dir::Cache::archives=/workspace/.ot-apt-cache" in cmd  # first install keeps its .debs there
+    assert cmd.index("dpkg -i") < cmd.index("apt-get update")
+
+
+def test_hf_prefetch_skips_overridden_parts_and_local_models():
+    from modules.util.hf_prefetch_util import hf_prefetch_patterns, hf_prefetch_repo
+
+    cfg = TrainConfig.default_values()
+    cfg.base_model_name = "Tongyi-MAI/Z-Image"
+    cfg.transformer.model_name = "/workspace/remote/SoReal!_Base_V1.5.safetensors"
+    assert hf_prefetch_repo(cfg) == "Tongyi-MAI/Z-Image"
+    patterns = hf_prefetch_patterns(cfg)
+    assert "text_encoder*/*" in patterns and "vae/*" in patterns and "tokenizer*/*" in patterns
+    assert "transformer/*" not in patterns  # overridden by the uploaded file
+
+    cfg.transformer.model_name = ""
+    assert "transformer/*" in hf_prefetch_patterns(cfg)
+
+    for local in ("/workspace/models/base", "E:\\models\base", "models/base.safetensors", ""):
+        cfg.base_model_name = local
+        assert hf_prefetch_repo(cfg) is None, local

@@ -118,9 +118,14 @@ class RunpodCloud(LinuxCloud):
         # RunPod) before any upload, so the cache/backup sync does not fail with "command not found".
         if self.config.cloud.file_sync not in (CloudFileSync.NATIVE_RSYNC, CloudFileSync.WSL_RSYNC):
             return
+        # The .debs are kept on the persistent volume: a stop wipes the container disk, and reinstalling from
+        # them (after an upload without GPU, or any resume) skips apt-get update while the GPU is billing.
+        cache = shlex.quote(f"{self.config.cloud.remote_dir}/.ot-apt-cache")
         self.connection.run(
             "command -v rsync >/dev/null 2>&1 "
-            "|| (apt-get update && apt-get install -y --no-install-recommends rsync) "
+            f"|| (dpkg -i {cache}/*.deb >/dev/null 2>&1 && command -v rsync >/dev/null 2>&1) "
+            f"|| (mkdir -p {cache}/partial && apt-get update && apt-get install -y --no-install-recommends "
+            f"-o Dir::Cache::archives={cache} -o APT::Keep-Downloaded-Packages=true rsync) "
             "|| (echo 'failed to install rsync on the pod' >&2; exit 1)",
             in_stream=False,
         )
@@ -206,6 +211,7 @@ class RunpodCloud(LinuxCloud):
         if self._gpu_count != 0:
             return
         secrets = self.config.secrets.cloud
+        self._prefetch_base_model()
         print("upload finished: stopping the pod to resume it with its GPU...", flush=True)
         self.close()
         self._stop_and_wait()
@@ -220,6 +226,27 @@ class RunpodCloud(LinuxCloud):
         if self.config.cloud.tensorboard_tunnel:
             self._make_tensorboard_tunnel()
         print("GPU attached; continuing.", flush=True)
+
+    def _prefetch_base_model(self):
+        """Download the base model's Hugging Face parts into the volume's HF cache while still GPU-less.
+        Only an optimisation: on failure the trainer downloads them itself."""
+        config = self.config.cloud
+        cmd = (
+            f"export PATH=$PATH:/usr/local/cuda/bin:/venv/main/bin && export OT_LAZY_UPDATES=true "
+            f"&& export OT_PLATFORM_REQUIREMENTS={shlex.quote(self.platform_requirements)}"
+        )
+        if self.config.secrets.huggingface_token != "":
+            cmd += f" && export HF_TOKEN={self.config.secrets.huggingface_token}"
+        if config.huggingface_cache_dir != "":
+            cmd += f" && export HF_HOME={shlex.quote(config.huggingface_cache_dir)}"
+        cmd += (
+            f" && {shlex.quote(config.onetrainer_dir)}/run-cmd.sh prefetch_model "
+            f"--config-path={shlex.quote(self.config_file)}"
+        )
+        print("downloading the base model before attaching the GPU...", flush=True)
+        result = self.connection.run(cmd, warn=True, in_stream=False)
+        if result.exited != 0:
+            print("warning: base model prefetch failed; the trainer will download it with the GPU attached", flush=True)
 
     def _stop_and_wait(self):
         pod_id = self.config.secrets.cloud.id
