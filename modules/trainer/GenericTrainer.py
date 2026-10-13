@@ -1832,6 +1832,11 @@ class GenericTrainer(BaseTrainer):
                 self.callbacks.on_update_status("Caching")
                 for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
                     self.data_loader.get_data_set().start_next_epoch()
+                    # The secondary loaders cache into the same cache dir; without this their concepts
+                    # (DPO pairs, SFT anchors) are never cached and a sourceless run finds them empty.
+                    for source in (self.dpo_addon_source, self.sft_anchor_source):
+                        if source is not None:
+                            source.start_next_epoch()
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
