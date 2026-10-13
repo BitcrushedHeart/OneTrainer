@@ -194,6 +194,9 @@ class CloudTrainer(BaseTrainer):
 
         for concept in remote.concepts:
             adjust(concept, "path", if_exists=True)
+            # a per-concept cache_dir override lives outside the run cache dir and is uploaded separately
+            if concept.cache_dir:
+                adjust(concept, "cache_dir")
             adjust(concept.text, "prompt_path")
             # tag_dropout_special_tags may hold an inline tag list or a path to a .txt/.csv file;
             # only remap+upload it when it's actually a file, matching DropTags' own detection:

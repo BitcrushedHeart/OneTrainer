@@ -10,6 +10,10 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dataset_name_util import normalize_long_filenames
 from modules.util.time_util import get_string_timestamp
 
+# Never upload these from a cache or backup dir: index backups (cache.json.bak and the like) keep caption text
+# that the caption scrub blanks in the live index, and .tmp files are interrupted partial writes.
+UPLOAD_EXCLUDE = ("*.bak", "*.tmp")
+
 
 class BaseCloud(metaclass=ABCMeta):
     def __init__(self, config: TrainConfig):
@@ -132,6 +136,18 @@ class BaseCloud(metaclass=ABCMeta):
                 return
             self.__sync_up_dir(local=Path(self.config.local_cache_dir), remote=Path(self.config.cache_dir))
 
+        # Concepts with their own cache_dir (e.g. DPO pairs kept apart from the SFT concepts that share their
+        # chosen files) cache outside the run cache dir; upload each distinct root once.
+        uploaded = {Path(self.config.cache_dir).as_posix()}
+        for concept in self.config.concepts or []:
+            if not hasattr(concept, "local_cache_dir") or Path(concept.cache_dir).as_posix() in uploaded:
+                continue
+            uploaded.add(Path(concept.cache_dir).as_posix())
+            print(f"uploading concept cache {concept.local_cache_dir} ({concept.name})...")
+            if commands and commands.get_stop_command():
+                return
+            self.__sync_up_dir(local=Path(concept.local_cache_dir), remote=Path(concept.cache_dir))
+
         # only upload a backup when the run is actually resuming from it; a fresh sourceless run
         # (continue_last_backup disabled) trains from the base model and needs no checkpoint.
         if self.config.continue_last_backup and hasattr(self.config, "local_workspace_dir"):
@@ -145,9 +161,9 @@ class BaseCloud(metaclass=ABCMeta):
 
     def __sync_up_dir(self, local: Path, remote: Path):
         fast_sync = getattr(self.file_sync, "sync_up_dir_stream", None)
-        if callable(fast_sync) and fast_sync(local=local, remote=remote):
+        if callable(fast_sync) and fast_sync(local=local, remote=remote, exclude=UPLOAD_EXCLUDE):
             return
-        self.file_sync.sync_up_dir(local=local, remote=remote, recursive=True)
+        self.file_sync.sync_up_dir(local=local, remote=remote, recursive=True, exclude=UPLOAD_EXCLUDE)
 
     @staticmethod
     def __latest_backup(workspace_dir: Path) -> Path | None:

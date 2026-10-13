@@ -300,7 +300,9 @@ def test_sourceless_upload_skips_concepts_and_uploads_cache_backup(tmp_path):
         def sync_up(self, local, remote):
             self.files.append((Path(local), Path(remote)))
 
-        def sync_up_dir(self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None):
+        def sync_up_dir(
+            self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None, exclude=()
+        ):
             self.dirs.append((Path(local), Path(remote), recursive))
 
     class DummyCloud(BaseCloud):
@@ -356,7 +358,9 @@ def test_sourceless_upload_skips_backup_when_not_continuing(tmp_path):
         def sync_up_file(self, local, remote): ...
         def sync_up(self, local, remote): ...
 
-        def sync_up_dir(self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None):
+        def sync_up_dir(
+            self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None, exclude=()
+        ):
             self.dirs.append(Path(remote).as_posix())
 
     class DummyCloud(BaseCloud):
@@ -591,7 +595,9 @@ def test_sourceless_cache_upload_is_not_extension_filtered(tmp_path):
         def sync_up_file(self, local, remote): ...
         def sync_up(self, local, remote): ...
 
-        def sync_up_dir(self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None):
+        def sync_up_dir(
+            self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None, exclude=()
+        ):
             self.dir_calls.append((Path(remote).as_posix(), allowed_extensions))
 
     class DummyCloud(BaseCloud):
@@ -1043,3 +1049,70 @@ def test_hf_prefetch_skips_overridden_parts_and_local_models():
     for local in ("/workspace/models/base", "E:\\models\base", "models/base.safetensors", ""):
         cfg.base_model_name = local
         assert hf_prefetch_repo(cfg) is None, local
+
+
+def test_sourceless_upload_includes_per_concept_cache_dirs(tmp_path):
+    """Concepts with their own cache_dir (DPO pairs kept out of the SFT cache) are remapped and uploaded."""
+    from modules.cloud.BaseCloud import BaseCloud
+    from modules.util.config.ConceptConfig import ConceptConfig
+
+    class DummySync:
+        def __init__(self):
+            self.dirs = []
+
+        def sync_up_file(self, local, remote): ...
+
+        def sync_up(self, local, remote): ...
+
+        def sync_up_dir(
+            self, local, remote, recursive, sync_info=None, skip_hidden=False, allowed_extensions=None, exclude=()
+        ):
+            self.dirs.append((Path(local), Path(remote)))
+
+    class DummyCloud(BaseCloud):
+        def run_trainer(self): ...
+        def close(self): ...
+        def exec_callback(self, callbacks): ...
+        def send_commands(self, commands): ...
+        def sync_workspace(self): ...
+        def can_reattach(self): ...
+        def _install_onetrainer(self, update=False): ...
+        def _make_tensorboard_tunnel(self): ...
+        def _upload_config_file(self, local): ...
+        def delete_workspace(self): ...
+
+    sft_cache = tmp_path / "Sourceless"
+    dpo_cache = tmp_path / "SourcelessDPO"
+    sft_cache.mkdir()
+    dpo_cache.mkdir()
+    (tmp_path / "workspace").mkdir()
+
+    local = TrainConfig.default_values()
+    local.sourceless_training = True
+    local.latent_caching = True
+    local.continue_last_backup = False
+    local.cache_dir = str(sft_cache)
+    local.workspace_dir = str(tmp_path / "workspace")
+    sft = ConceptConfig.default_values()
+    sft.path = str(tmp_path / "sft")
+    dpo_a = ConceptConfig.default_values()
+    dpo_a.path = str(tmp_path / "dpo_a")
+    dpo_a.cache_dir = str(dpo_cache)
+    dpo_b = ConceptConfig.default_values()
+    dpo_b.path = str(tmp_path / "dpo_b")
+    dpo_b.cache_dir = str(dpo_cache)  # shared root: uploaded once
+    local.concepts = [sft, dpo_a, dpo_b]
+
+    remote = CloudTrainer._CloudTrainer__make_remote_config(local)
+    remote_dpo_cache = CloudTrainer.adjust_path_to_remote_dir(str(dpo_cache), remote.cloud.remote_dir)
+    assert remote.concepts[1].cache_dir == remote_dpo_cache
+    assert remote.concepts[1].local_cache_dir == str(dpo_cache)
+    assert remote.concepts[0].cache_dir == ""  # no override -> untouched
+
+    cloud = DummyCloud(remote)
+    cloud.file_sync = DummySync()
+    cloud.upload_config()
+
+    uploaded = [(loc.name, rem.as_posix()) for loc, rem in cloud.file_sync.dirs]
+    assert ("Sourceless", CloudTrainer.adjust_path_to_remote_dir(str(sft_cache), remote.cloud.remote_dir)) in uploaded
+    assert uploaded.count(("SourcelessDPO", remote_dpo_cache)) == 1

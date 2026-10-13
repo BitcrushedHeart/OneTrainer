@@ -31,6 +31,7 @@ class BaseFileSync(metaclass=ABCMeta):
         sync_info=None,
         skip_hidden: bool = False,
         allowed_extensions: set[str] | None = None,
+        exclude: tuple[str, ...] = (),
     ):
         pass
 

@@ -2,6 +2,7 @@ import shlex
 import shutil
 import subprocess
 from abc import abstractmethod
+from fnmatch import fnmatch
 from pathlib import Path
 
 from modules.cloud.BaseFileSync import BaseFileSync
@@ -54,6 +55,7 @@ class BaseSSHFileSync(BaseFileSync):
         sync_info=None,
         skip_hidden: bool = False,
         allowed_extensions: set[str] | None = None,
+        exclude: tuple[str, ...] = (),
     ):
         if sync_info is None:
             sync_info = self.__get_sync_info(remote)
@@ -63,6 +65,8 @@ class BaseSSHFileSync(BaseFileSync):
         for local_entry in local.iterdir():
             if local_entry.is_file():
                 if allowed_extensions is not None and local_entry.suffix.lower() not in allowed_extensions:
+                    continue
+                if any(fnmatch(local_entry.name, pattern) for pattern in exclude):
                     continue
                 remote_entry = remote / local_entry.name
                 if self.__needs_upload(local=local_entry, remote=remote_entry, sync_info=sync_info):
@@ -77,11 +81,12 @@ class BaseSSHFileSync(BaseFileSync):
                     sync_info=sync_info,
                     skip_hidden=skip_hidden,
                     allowed_extensions=allowed_extensions,
+                    exclude=exclude,
                 )
 
         self.upload_files(local_files=files, remote_dir=remote)
 
-    def sync_up_dir_stream(self, local: Path, remote: Path) -> bool:
+    def sync_up_dir_stream(self, local: Path, remote: Path, exclude: tuple[str, ...] = ()) -> bool:
         if not local.is_dir() or shutil.which("tar") is None:
             return False
 
@@ -90,7 +95,7 @@ class BaseSSHFileSync(BaseFileSync):
         if has_remote_tar.exited != 0:
             return False
 
-        local_size = self.__local_file_size_sum(local)
+        local_size = self.__local_file_size_sum(local, exclude)
         remote_posix = remote.as_posix()
         command = (
             f"rm -rf -- {shlex.quote(remote_posix)} "
@@ -105,7 +110,7 @@ class BaseSSHFileSync(BaseFileSync):
         channel.exec_command(command)
 
         proc = subprocess.Popen(
-            ["tar", "-cf", "-", "-C", str(local), "."],
+            ["tar", "-cf", "-", *(f"--exclude={pattern}" for pattern in exclude), "-C", str(local), "."],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -196,9 +201,9 @@ class BaseSSHFileSync(BaseFileSync):
         )
 
     @staticmethod
-    def __local_file_size_sum(local: Path) -> int:
+    def __local_file_size_sum(local: Path, exclude: tuple[str, ...] = ()) -> int:
         total = 0
         for path in local.rglob("*"):
-            if path.is_file():
+            if path.is_file() and not any(fnmatch(path.name, pattern) for pattern in exclude):
                 total += path.stat().st_size
         return total

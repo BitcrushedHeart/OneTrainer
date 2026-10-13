@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from fnmatch import fnmatch
 from pathlib import Path
 
 from modules.cloud.BaseSSHFileSync import BaseSSHFileSync
@@ -95,6 +96,7 @@ class NativeRsyncFileSync(BaseSSHFileSync):
         sync_info=None,
         skip_hidden: bool = False,
         allowed_extensions: set[str] | None = None,
+        exclude: tuple[str, ...] = (),
     ):
         if not recursive:
             self.sync_connection.open()
@@ -105,6 +107,7 @@ class NativeRsyncFileSync(BaseSSHFileSync):
                 if path.is_file()
                 and (allowed_extensions is None or path.suffix.lower() in allowed_extensions)
                 and (not skip_hidden or not path.name.startswith("."))
+                and not any(fnmatch(path.name, pattern) for pattern in exclude)
             ]
             if files:
                 self._run_upload_batched(files, self._remote(remote))
@@ -119,13 +122,15 @@ class NativeRsyncFileSync(BaseSSHFileSync):
         args = ["rsync", "-av", "--no-owner", "--no-group", "--delete", "-e", self.ssh_cmd]
         if skip_hidden:
             args.extend(["--exclude", ".*"])
+        for pattern in exclude:
+            args.extend(["--exclude", pattern])
         if allowed_extensions is not None:
             args.extend(self._include_extension_filter(allowed_extensions))
         args.extend([self._dir_source(local), self._remote(remote)])
         self._run(args)
 
-    def sync_up_dir_stream(self, local: Path, remote: Path) -> bool:
-        self.sync_up_dir(local=local, remote=remote, recursive=True)
+    def sync_up_dir_stream(self, local: Path, remote: Path, exclude: tuple[str, ...] = ()) -> bool:
+        self.sync_up_dir(local=local, remote=remote, recursive=True, exclude=exclude)
         return True
 
     def sync_down_file(self, local: Path, remote: Path):
