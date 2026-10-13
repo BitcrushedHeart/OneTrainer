@@ -510,6 +510,8 @@ class TrainConfig(BaseConfig):
     latent_caching: bool
     clear_cache_before_training: bool
     skip_cache_validation: bool
+    # Keep caption text out of text caches: blank stamped prompts, zero token ids.
+    cache_scrub_captions: bool
     sourceless_training: bool
 
     # training settings
@@ -808,7 +810,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=34,
+            config_version=35,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -845,6 +847,7 @@ class TrainConfig(BaseConfig):
                 32: self.__migration_32,
                 33: self.__migration_33,
                 34: self.__migration_34,
+                35: self.__migration_35,
             },
         )
 
@@ -1265,6 +1268,12 @@ class TrainConfig(BaseConfig):
         # Patience: optional second-best validation checkpoint output.
         migrated_data = data.copy()
         migrated_data.setdefault("patience_save_second_best", False)
+        return migrated_data
+
+    def __migration_35(self, data: dict) -> dict:
+        # Caption privacy: scrub caption text out of text caches by default.
+        migrated_data = data.copy()
+        migrated_data.setdefault("cache_scrub_captions", True)
         return migrated_data
 
     def from_dict(self, data: dict) -> "TrainConfig":
@@ -1779,6 +1788,7 @@ class TrainConfig(BaseConfig):
         data.append(("latent_caching", True, bool, False))
         data.append(("clear_cache_before_training", False, bool, False))
         data.append(("skip_cache_validation", False, bool, False))
+        data.append(("cache_scrub_captions", True, bool, False))
         data.append(("sourceless_training", False, bool, False))
 
         # training settings

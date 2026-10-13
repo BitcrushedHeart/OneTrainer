@@ -636,6 +636,16 @@ class TrainUI(ctk.CTk):
         )
         self.clean_button = components.button(frame, 3, 4, "Clean", self.__clean_cache)
 
+        # scrub captions from the text cache
+        components.label(
+            frame,
+            4,
+            0,
+            "Scrub Captions From Cache",
+            tooltip="Keep caption text out of the text cache: prompts are stored blank and token ids as zeros (hidden states are unchanged), so cache folders can be uploaded without the captions. Applies to newly written cache entries; use scripts/util/sanitize_text_cache.py for existing caches",
+        )
+        components.switch(frame, 4, 1, self.ui_state, "cache_scrub_captions")
+
         components.label(
             frame,
             4,

@@ -821,6 +821,11 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Speeds up startup on large datasets or slow storage,"
         " but changed source files will keep using their old cached data"
     ),
+    "cache_scrub_captions": (
+        "Keep caption text out of the text cache: prompts are stored blank and token ids as zeros"
+        " (hidden states are unchanged), so cache folders can be uploaded without the captions."
+        " Applies to newly written cache entries; use scripts/util/sanitize_text_cache.py for existing caches"
+    ),
     "sample.frames": "Number of frames to generate. Only used when generating videos.",
     "sample.length": "Length in seconds of audio output.",
     "sample.sample_inpainting": "Enables inpainting sampling. Only available when sampling from an inpainting model.",

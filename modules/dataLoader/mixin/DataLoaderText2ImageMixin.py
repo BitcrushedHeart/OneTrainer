@@ -16,6 +16,7 @@ from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.util import path_util
+from modules.util.caption_privacy_util import text_cache_scrub_kwargs
 from modules.util.concept_cache_util import concept_cache_roots, uses_concept_cache_roots
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
@@ -853,6 +854,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # appends the same line to every file encodes it once total.
             "content_key_in_name": "prompt",
             "build_max_workers": text_cache_build_workers,
+            # cache_scrub_captions: blank stamped prompts, zero token ids.
+            **(text_cache_scrub_kwargs(config, text_split_names) if text_caching else {}),
         }
 
         # Concepts with their own cache_dir are routed to a SmartDiskCache per
