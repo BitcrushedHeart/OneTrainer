@@ -500,6 +500,7 @@ class TrainConfig(BaseConfig):
     layer_offload_fraction: float
     force_circular_padding: bool
     compile: bool
+    compile_cache: bool
 
     # data settings
     concept_file_name: str
@@ -1778,6 +1779,9 @@ class TrainConfig(BaseConfig):
         data.append(("layer_offload_fraction", 0.0, float, False))
         data.append(("force_circular_padding", False, bool, False))
         data.append(("compile", False, bool, False))
+        # Dynamo precompile cache: reuse traced graphs across processes so queued
+        # runs skip the per-run torch.compile warm-up. Only meaningful with compile.
+        data.append(("compile_cache", True, bool, False))
 
         # data settings
         data.append(("concept_file_name", "training_concepts/concepts.json", str, False))

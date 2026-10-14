@@ -6,6 +6,7 @@ import math
 import os
 import random
 import shutil
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -23,7 +24,7 @@ from modules.util import create, path_util
 from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_rounding_set_seed
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
-from modules.util.compile_util import init_compile
+from modules.util.compile_util import init_compile, save_precompile_cache, set_precompile_cache
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dataset_fingerprint import compute_concept_fingerprint
@@ -150,6 +151,7 @@ class GenericTrainer(BaseTrainer):
 
         self.model = None
         self.one_step_trained = False
+        self._precompile_cache_saved = False
         self.grad_hook_handles = []
         self.dpo_validation_data_loader = None
 
@@ -202,7 +204,9 @@ class GenericTrainer(BaseTrainer):
         # trainer on the API request thread but runs start()/train() on a dedicated training
         # thread, so this must happen here (not in __init__) or the recompile limit stays at
         # the default of 8 and fullgraph=True training hard-fails on the 9th recompile.
+        set_precompile_cache(self.config.compile and self.config.compile_cache)
         init_compile()
+        phase_start = time.monotonic()
 
         if multi.is_master():
             self.__save_config_to_workspace()
@@ -259,6 +263,7 @@ class GenericTrainer(BaseTrainer):
             quantization=self.config.quantization,
         )
         self.model.train_config = self.config
+        phase_start = self.__log_startup_phase("model load", phase_start)
 
         self.callbacks.on_update_status("running model setup")
 
@@ -296,6 +301,7 @@ class GenericTrainer(BaseTrainer):
                 "patterns to drive the main loader; use RLHF mode DPO for a pairs-only run."
             )
 
+        phase_start = self.__log_startup_phase("model setup (quantize, adapters, optimizer)", phase_start)
         self.callbacks.on_update_status("creating the data loader/caching")
 
         # In SFT + DPO mode the main loader is the plain standard pipeline with
@@ -396,6 +402,8 @@ class GenericTrainer(BaseTrainer):
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
+
+        self.__log_startup_phase("data loaders", phase_start)
 
         self._patience_counter = 0
         self._patience_checks = 0
@@ -577,6 +585,13 @@ class GenericTrainer(BaseTrainer):
             with open(concept_file, "r") as f:
                 concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
         return concepts
+
+    @staticmethod
+    def __log_startup_phase(name: str, started_at: float) -> float:
+        """Print how long a startup phase took and return the next phase's start time."""
+        now = time.monotonic()
+        print(f"[startup] {name}: {now - started_at:.1f}s", flush=True)
+        return now
 
     def __count_sft_anchor_concepts(self) -> int:
         """Return the number of enabled STANDARD/PRIOR_PREDICTION concepts.
@@ -2563,6 +2578,12 @@ class GenericTrainer(BaseTrainer):
                             self.model.ema.step(self.parameters, update_step)
 
                         self.one_step_trained = True
+                        if not self._precompile_cache_saved:
+                            # Forward and checkpoint-recompute graphs all exist after
+                            # the first optimizer step: persist them now so even a run
+                            # that crashes later still warms the next one.
+                            self._precompile_cache_saved = True
+                            save_precompile_cache("after first step")
 
                 if (
                     self.config.validation
@@ -2590,6 +2611,10 @@ class GenericTrainer(BaseTrainer):
         # Thaw the heap frozen at epoch start first, so it stays collectable for
         # later runs in this process (UI, queue worker) even if the final save raises.
         gc.unfreeze()
+
+        if self.one_step_trained:
+            # Picks up graphs compiled after the first step (new buckets, sampling).
+            save_precompile_cache("end of run")
 
         if self._dpo_live_ledger is not None:
             self._dpo_live_ledger.flush(self.model.train_progress.global_step, force=True)

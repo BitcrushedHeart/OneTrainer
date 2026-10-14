@@ -375,6 +375,11 @@ FIELD_TOOLTIPS: dict[str, str] = {
         "Uses torch.compile and Triton to significantly speed up training."
         " Only applies to transformer/unet. Disable in case of compatibility issues."
     ),
+    "compile_cache": (
+        "Keeps the torch.compile result on disk so the next run (e.g. the next queue entry) skips the "
+        "compile warm-up instead of retracing every block. Only applies when compile is enabled. "
+        "Disable if a run misbehaves right after a code or torch update."
+    ),
     "unet.weight_dtype": "The unet weight data type",
     "transformer.model_name": (
         "Can be used to override the transformer in the base model."

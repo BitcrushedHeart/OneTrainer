@@ -1,5 +1,6 @@
 import threading
 import time
+import traceback
 
 import torch
 import torch.utils._sympy.functions
@@ -127,6 +128,61 @@ def _install_compile_progress_callbacks():
     _compile_progress_state["installed"] = True
 
 
+# Process-wide default for Dynamo's on-disk precompile cache. Seeded from the
+# TORCH_CACHING_PRECOMPILE env var (which torch reads at import), overridden per
+# run by set_precompile_cache() and applied to every compiling thread by
+# init_compile().
+_precompile_cache_enabled = bool(torch._dynamo.config.caching_precompile)
+
+
+def set_precompile_cache(enabled: bool) -> None:
+    """Turn Dynamo's cross-process precompile cache on or off for this run.
+
+    With it on, every compiled graph's traced bytecode and guards are written to
+    the inductor cache dir by save_precompile_cache(), and a later process that
+    compiles the same code (the next queued run, a restarted backend) loads them
+    instead of retracing: the first training step then costs seconds instead of
+    minutes. Inductor's own FX-graph / Triton caches were already shared across
+    processes; this adds the Dynamo tracing that sat in front of them.
+
+    Must run before init_compile() in the training thread: since torch 2.12 the
+    dynamo config is a ContextVar, so init_compile() applies the flag per thread.
+    """
+    global _precompile_cache_enabled
+    _precompile_cache_enabled = bool(enabled)
+
+
+def precompile_cache_enabled() -> bool:
+    return _precompile_cache_enabled
+
+
+def save_precompile_cache(label: str = "") -> None:
+    """Write the graphs compiled so far to the on-disk Dynamo cache (no-op when off).
+
+    Cheap (a few MB) and idempotent, so it runs after the first optimizer step,
+    when the forward and checkpoint-recompute graphs exist, and again at the end
+    of the run to pick up anything compiled later (new buckets, sampling).
+    """
+    if not _precompile_cache_enabled:
+        return
+    try:
+        from torch._dynamo.utils import counters
+
+        result = torch.compiler.save_cache_artifacts()
+        saved = len(result[1].artifacts.get("precompile", [])) if result is not None else 0
+        stats = dict(counters["dynamo_cache"])
+        hits = stats.get("dynamo_cache_hit", 0)
+        misses = stats.get("dynamo_cache_miss", 0)
+        suffix = f" ({label})" if label else ""
+        tqdm.write(
+            f"[torch.compile] precompile cache{suffix}: wrote {saved} package(s); "
+            f"loaded from cache this run: {hits} hit(s), {misses} miss(es)"
+        )
+    except Exception:
+        traceback.print_exc()
+        tqdm.write("[torch.compile] could not save the precompile cache; the next run will retrace.")
+
+
 def init_compile():
     # cache_size_limit and recompile_limit are aliases for the same dynamo config value.
     # since torch 2.12, dynamo config overrides are stored in ContextVars (pytorch/pytorch#173568),
@@ -134,6 +190,7 @@ def init_compile():
     # trigger a compilation - including the autograd worker threads, which recompute checkpointed
     # modules during the backward pass.
     torch._dynamo.config.cache_size_limit = 8192
+    torch._dynamo.config.caching_precompile = _precompile_cache_enabled
     _install_compile_progress_callbacks()
 
 

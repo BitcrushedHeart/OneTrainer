@@ -409,6 +409,18 @@ class ModelTab:
 
         row += 1
 
+        # compile cache
+        components.label(
+            frame,
+            row,
+            3,
+            "Cache compiled graphs",
+            tooltip="Keeps the torch.compile result on disk so the next run (e.g. the next queue entry) skips the compile warm-up instead of retracing every block. Only applies when compile is enabled. Disable if a run misbehaves right after a code or torch update.",
+        )
+        components.switch(frame, row, 4, self.ui_state, "compile_cache")
+
+        row += 1
+
         return row
 
     def __create_base_components(

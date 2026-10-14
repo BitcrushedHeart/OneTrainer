@@ -142,6 +142,7 @@ class QueueSubprocessRunner:
         return subprocess.Popen(
             [sys.executable, "-u", str(_WORKER_SCRIPT), "--config-path", config_path, "--ipc-port", str(port)],
             cwd=str(_PROJECT_ROOT),
+            env=self._child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -149,6 +150,15 @@ class QueueSubprocessRunner:
             errors="replace",
             bufsize=1,
         )
+
+    def _child_env(self) -> dict[str, str]:
+        # torch reads TORCH_CACHING_PRECOMPILE at import, before the worker has parsed
+        # its config, so the parent decides here. init_compile() re-applies the same
+        # flag per thread later; the env var only makes the process default match.
+        env = os.environ.copy()
+        use_cache = bool(self._config_dict.get("compile")) and bool(self._config_dict.get("compile_cache", True))
+        env["TORCH_CACHING_PRECOMPILE"] = "1" if use_cache else "0"
+        return env
 
     def _send_stop_locked(self) -> None:
         with contextlib.suppress(OSError):
