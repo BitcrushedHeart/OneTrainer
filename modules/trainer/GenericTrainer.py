@@ -38,6 +38,7 @@ from modules.util.dpo_addon_util import (
 from modules.util.dpo_beta_controller import DPOBetaController
 from modules.util.dpo_live_saturation import (
     LIVE_DIRNAME,
+    DPOConceptInfo,
     DPOConceptResolver,
     DPOConceptWindow,
     LiveSaturationLedger,
@@ -52,8 +53,16 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.PatienceMode import PatienceMode
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.grad_attribution_util import (
+    ConceptWindowStats,
+    GradAttribution,
+    TimestepBinNormalizer,
+    concept_groups,
+    concept_tag,
+    sample_mask,
+)
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
-from modules.util.rlhf_schedule_util import IndependentSchedule, MicroStepKind, wind_data_loader
+from modules.util.rlhf_schedule_util import KIND_ORDER, IndependentSchedule, MicroStepKind, wind_data_loader
 from modules.util.text_reward_util import TextRewardScheduler, derive_text_reward_interval
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -137,6 +146,10 @@ class GenericTrainer(BaseTrainer):
         rotation_cache_error = self.config.validate_oft_rotation_cache_startup()
         if rotation_cache_error is not None:
             raise RuntimeError(rotation_cache_error)
+
+        grad_diagnostics_error = self.config.validate_grad_diagnostics_startup()
+        if grad_diagnostics_error is not None:
+            raise RuntimeError(grad_diagnostics_error)
         if self.config.oft_rotation_cache and not self.config.oft_rotation_cache_applies():
             print(
                 "Warning: the OFT rotation cache is enabled, but this run does not train OFT v2 adapters "
@@ -183,6 +196,15 @@ class GenericTrainer(BaseTrainer):
         # (standard / DPO / KTO / text reward), rebuilt at every epoch start.
         # None under PIGGYBACK, where the main loader alone drives the epoch.
         self._independent_schedule: IndependentSchedule | None = None
+        # Gradient attribution diagnostics (config log_grad_components), set up
+        # at the start of train(); all None while the diagnostics are off.
+        self._grad_attribution: GradAttribution | None = None
+        self._concept_attribution: GradAttribution | None = None
+        self._t_normalizer: TimestepBinNormalizer | None = None
+        self._concept_stats: ConceptWindowStats | None = None
+        self._sft_concept_resolver: DPOConceptResolver | None = None
+        self._probe_dpo_resolver: DPOConceptResolver | None = None
+        self._concept_split_window = False
         self._loop_scaler = None
 
         # Defaults for state start() re-initializes; __advance_redistill_phase
@@ -838,12 +860,10 @@ class GenericTrainer(BaseTrainer):
         dpo_batch = self.dpo_addon_source.next()
         dpo_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
 
-        def _addon_backward(term, _scale=dpo_scale, _scaler=scaler):
-            term = term * _scale
-            if _scaler:
-                _scaler.scale(term).backward()
-            else:
-                term.backward()
+        def _addon_backward(term, _scale=dpo_scale, _scaler=scaler, **probe):
+            # probe: the half's prediction and per-pair values, passed by the
+            # light path only while the gradient diagnostics are on.
+            self.__backward_term(term * _scale, _scaler, kind=MicroStepKind.DPO, scale=_scale, **probe)
 
         dpo_value = self.model_setup.calculate_dpo_loss_light(
             self.model, dpo_batch, self.config, train_progress, _addon_backward
@@ -871,7 +891,7 @@ class GenericTrainer(BaseTrainer):
         scaled value and the rollout's metrics."""
         text_scale = self.config.text_reward_weight / self.config.gradient_accumulation_steps
 
-        def _text_backward(term, _scale=text_scale, _scaler=scaler):
+        def _text_backward(term, _scale=text_scale, _scaler=scaler, **_probe):
             term = term * _scale
             if _scaler:
                 _scaler.scale(term).backward()
@@ -882,6 +902,206 @@ class GenericTrainer(BaseTrainer):
             self.model, self._text_reward_bank.next(), self.config, train_progress, _text_backward
         )
         return text_value.detach() * text_scale, self.model_setup.get_last_text_reward_metrics()
+
+    # ------------------------------------------------------------------
+    # Gradient attribution diagnostics (config log_grad_components).
+    # See modules/util/grad_attribution_util.py for the method; this is the
+    # wiring: where the snapshots are taken, how a term is backwarded with
+    # its prediction probed and split by concept, and what gets logged.
+    # ------------------------------------------------------------------
+
+    def __setup_grad_diagnostics(self):
+        if not self.config.log_grad_components or self._grad_attribution is not None:
+            return
+        interval = self.config.log_grad_components_interval
+        self._grad_attribution = GradAttribution(self.parameters, order=[str(kind) for kind in KIND_ORDER])
+        self._concept_attribution = GradAttribution(self.parameters) if interval > 0 else None
+        self._t_normalizer = TimestepBinNormalizer()
+        self._concept_stats = ConceptWindowStats()
+
+        # Concept tags: the DPO scheme (folder name, TensorBoard-safe, clashes
+        # suffixed) for the DPO pattern concepts, the same for the standard
+        # concepts the main loader reads; both resolve a sample by its image
+        # path (the DPO one by the chosen folder, including the cloud remap).
+        concepts = self.__load_concepts()
+        dpo_infos = dpo_concept_infos(concepts, self.config.rlhf_supervised_mix) if self.config.rlhf_enabled else []
+        self._probe_dpo_resolver = self._dpo_concept_resolver or (DPOConceptResolver(dpo_infos) if dpo_infos else None)
+        tags_seen: dict[str, int] = {info.tag: 1 for info in dpo_infos}
+        sft_infos = []
+        for concept in concepts:
+            if not concept.enabled or concept.is_dpo() or ConceptType(concept.type) == ConceptType.VALIDATION:
+                continue
+            label = os.path.basename(os.path.normpath(concept.path)) or concept.name or "concept"
+            tag = concept_tag(label)
+            seen = tags_seen.get(tag, 0) + 1
+            tags_seen[tag] = seen
+            if seen > 1:
+                tag = f"{tag}_{seen}"
+            sft_infos.append(
+                DPOConceptInfo(
+                    label=label,
+                    tag=tag,
+                    path=os.path.normpath(concept.path),
+                    chosen_dir=concept.path,
+                    beta_override=0.0,
+                )
+            )
+        self._sft_concept_resolver = DPOConceptResolver(sft_infos) if sft_infos else None
+        self.model_setup.set_grad_probe(True)
+
+        if multi.is_master():
+            per_copy = sum(p.numel() for p in self._grad_attribution.parameters) * 4 / 2**30
+            print(
+                f"Gradient diagnostics: per-objective gradient norms and cosines every update "
+                f"(float32 snapshot-diff buffers, {per_copy:.2f} GB per copy; one snapshot plus one per objective"
+                f"{', plus one snapshot and one per concept for the conflict probe' if interval > 0 else ''}), "
+                f"per-concept timestep-normalised loss and output-gradient every update"
+                + (
+                    f", per-concept parameter-gradient conflict every {interval} updates "
+                    "(one extra backward per additional concept in each of that window's batches)."
+                    if interval > 0
+                    else "."
+                )
+                + (
+                    " OFT rotation cache: its gradients are materialised after every micro-step while this is on."
+                    if self.config.oft_rotation_cache_applies()
+                    else ""
+                )
+            )
+
+    def __attribute(self, attribution: GradAttribution | None, key: str):
+        """Close the current attribution segment under ``key``. With the OFT
+        rotation cache, land the cache's dL/dR in Q.grad first: the deltas
+        must be read in parameter space, and this is a no-op on an empty
+        accumulator, so the update step's own materialisation never double
+        counts."""
+        if attribution is None:
+            return
+        if self.config.oft_rotation_cache_applies():
+            self.model_setup.before_clip_adapters(self.model, self.config)
+        attribution.end(key)
+
+    def __concept_split_due(self, train_progress: TrainProgress) -> bool:
+        interval = self.config.log_grad_components_interval
+        if self._concept_attribution is None or interval <= 0:
+            return False
+        return (train_progress.global_step // self.config.gradient_accumulation_steps) % interval == 0
+
+    def __concept_tags(self, kind: MicroStepKind, image_paths, count: int) -> list[str | None]:
+        resolver = self._sft_concept_resolver if kind is MicroStepKind.SFT else self._probe_dpo_resolver
+        paths = list(image_paths or [])
+        tags: list[str | None] = []
+        for i in range(count):
+            info = resolver.resolve(paths[i]) if resolver is not None and i < len(paths) else None
+            tags.append(info.tag if info is not None else None)
+        return tags
+
+    def __backward_term(
+        self,
+        term: Tensor,
+        scaler,
+        *,
+        kind: MicroStepKind,
+        predicted: Tensor | None = None,
+        image_paths=None,
+        timestep=None,
+        losses: Tensor | None = None,
+        scale: float = 1.0,
+        half: str | None = None,
+    ):
+        """Backward one already-scaled term. Without the diagnostics (or without
+        a prediction to probe) this is exactly the plain backward. With them:
+        one autograd.grad from the term to the prediction gives every sample's
+        output gradient (the loss part of the graph only, no model backward),
+        which feeds the per-concept stats; on a conflict-probe window the
+        prediction is then backwarded once per concept group with the masked
+        output gradient, so the parameters receive the same total gradient in
+        per-concept pieces."""
+        scaled = scaler.scale(term) if scaler else term
+        probe = (
+            self._grad_attribution is not None
+            and kind in (MicroStepKind.SFT, MicroStepKind.DPO)
+            and isinstance(predicted, torch.Tensor)
+            and predicted.requires_grad
+        )
+        if not probe:
+            scaled.backward()
+            return
+        dpred = torch.autograd.grad(scaled, predicted, retain_graph=True)[0]
+        scaler_scale = float(scaler.get_scale()) if scaler else 1.0
+        out_norms = dpred.detach().flatten(1).float().norm(dim=1) / (scale * scaler_scale)
+        tags = self.__concept_tags(kind, image_paths, predicted.shape[0])
+        self.__record_concept_samples(kind, half, tags, out_norms, losses, timestep)
+
+        groups = concept_groups(tags) if self._concept_split_window and self._concept_attribution is not None else None
+        if not groups:
+            scaled.backward()
+            return
+        if len(groups) == 1:
+            scaled.backward()
+            self.__attribute(self._concept_attribution, next(iter(groups)))
+            return
+        items = list(groups.items())
+        for i, (tag, indices) in enumerate(items):
+            predicted.backward(gradient=dpred * sample_mask(indices, dpred), retain_graph=i < len(items) - 1)
+            self.__attribute(self._concept_attribution, tag)
+
+    def __record_concept_samples(self, kind: MicroStepKind, half, tags, out_norms: Tensor, losses, timestep):
+        """One host sync: per-sample output-gradient norms, losses and
+        timestep fractions, then the timestep-bin normalisation on the host."""
+        count = out_norms.shape[0]
+        nan = torch.full_like(out_norms, float("nan"))
+        rows = [out_norms]
+        if isinstance(losses, torch.Tensor) and losses.numel() == count:
+            rows.append(losses.detach().float().reshape(-1).to(out_norms.device))
+        else:
+            rows.append(nan)
+        if isinstance(timestep, torch.Tensor) and timestep.numel() >= count:
+            rows.append(
+                self.model_setup.timestep_fraction(self.model, timestep.detach())[:count].float().to(out_norms.device)
+            )
+        else:
+            rows.append(nan)
+        norms, loss_values, ts = torch.stack(rows).tolist()
+        ts = [None if t != t else t for t in ts]
+        out_key = f"out:{kind}:{half or ''}"
+        out_tnorm = self._t_normalizer.normalize(out_key, norms, ts)
+        loss_tnorm = self._t_normalizer.normalize(f"loss:{kind}", loss_values, ts)
+        for i, tag in enumerate(tags):
+            if tag is None:
+                continue
+            self._concept_stats.add(tag, "out_norm", norms[i])
+            self._concept_stats.add(tag, "out_norm_tnorm", out_tnorm[i])
+            if half:
+                self._concept_stats.add(tag, f"out_norm_{half}", norms[i])
+            self._concept_stats.add(tag, "loss_tnorm", loss_tnorm[i])
+
+    def __log_grad_diagnostics(self, train_progress: TrainProgress, scaler):
+        """At the update step, after gradient reduction and before clipping:
+        the per-objective norms / cosines, the per-concept window means and,
+        on a conflict-probe window, the per-concept parameter-gradient norms
+        and cosines against the rest. Resets everything for the next window."""
+        scale = float(scaler.get_scale()) if scaler else 1.0
+        if multi.is_master():
+            step = train_progress.global_step
+            for name, value in self._grad_attribution.scalars(scale).items():
+                self.tensorboard.add_scalar(f"grad/{name}", value, step)
+            for name, value in self._concept_stats.scalars().items():
+                tag, quantity = name.split("/", 1)
+                if quantity == "loss_tnorm":
+                    self.tensorboard.add_scalar(f"loss/concept/{tag}/tnorm", value, step)
+                else:
+                    self.tensorboard.add_scalar(f"grad/concept/{tag}/{quantity}", value, step)
+            if self._concept_attribution is not None and self._concept_split_window:
+                for name, value in self._concept_attribution.rest_cosines(scale).items():
+                    quantity, tag = (
+                        name.split("_", 1) if name.startswith("norm_") else ("cos_rest", name[len("cos_rest_") :])
+                    )
+                    self.tensorboard.add_scalar(f"grad/concept/{tag}/{quantity}", value, step)
+        self._grad_attribution.reset()
+        self._concept_stats.reset()
+        if self._concept_attribution is not None:
+            self._concept_attribution.reset()
 
     def __independent_micro_steps(self, schedule: IndependentSchedule, position: int):
         """The INDEPENDENT epoch driver: yields ``(kind, batch)`` from the
@@ -2106,6 +2326,7 @@ class GenericTrainer(BaseTrainer):
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
         # Mirror the scaler so the save-side staging can capture its state_dict.
         self._loop_scaler = scaler
+        self.__setup_grad_diagnostics()
 
         self.__apply_fused_back_pass(scaler)
 
@@ -2317,6 +2538,17 @@ class GenericTrainer(BaseTrainer):
 
                     self.__maybe_advance_redistill_phase(train_progress)
 
+                    # Gradient diagnostics: snapshot .grad before this
+                    # micro-step's backward(s); each term closes its segment
+                    # through __attribute. The standard path records its
+                    # prediction here so the common backward below can probe it.
+                    probe_output = None
+                    if self._grad_attribution is not None:
+                        self._grad_attribution.begin()
+                        if self._concept_attribution is not None:
+                            self._concept_attribution.begin()
+                        self._concept_split_window = self.__concept_split_due(train_progress)
+
                     # Set on SFT + DPO add-on micro-steps: the standard loss is
                     # backwarded early (see below) and its detached value is
                     # folded into accumulated_loss alongside the DPO term.
@@ -2347,6 +2579,7 @@ class GenericTrainer(BaseTrainer):
                             accumulated_text_metrics = accumulate_dpo_metrics(accumulated_text_metrics, text_metrics)
                         else:
                             raise RuntimeError(f"unknown micro-step kind {kind}")
+                        self.__attribute(self._grad_attribution, str(kind))
                     elif self.config.rlhf_dpo_primary():
                         sft_anchor_keys = ("sft_anchor_loss",) if self.sft_anchor_source is not None else ()
                         if self._kto_primary:
@@ -2491,6 +2724,7 @@ class GenericTrainer(BaseTrainer):
                         else:
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
                             loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                        probe_output = model_output_data
 
                         if schedule is not None:
                             # INDEPENDENT: the add-ons have micro-steps of their
@@ -2529,10 +2763,17 @@ class GenericTrainer(BaseTrainer):
                                 sft_predicted.retain_grad()
                             else:
                                 sft_predicted = None
-                            if scaler:
-                                scaler.scale(addon_sft_loss).backward()
-                            else:
-                                addon_sft_loss.backward()
+                            self.__backward_term(
+                                addon_sft_loss,
+                                scaler,
+                                kind=MicroStepKind.SFT,
+                                predicted=model_output_data.get("predicted"),
+                                image_paths=batch.get("image_path"),
+                                timestep=model_output_data.get("timestep"),
+                                losses=self.model_setup.get_last_per_sample_losses(),
+                                scale=1.0 / self.config.gradient_accumulation_steps,
+                            )
+                            self.__attribute(self._grad_attribution, str(MicroStepKind.SFT))
                             addon_sft_loss = addon_sft_loss.detach()
                             sft_grad_norm_v = None
                             if sft_predicted is not None and sft_predicted.grad is not None:
@@ -2544,6 +2785,7 @@ class GenericTrainer(BaseTrainer):
                             if sft_grad_norm_v is not None:
                                 text_metrics["sft_grad_norm_v"] = sft_grad_norm_v
                             accumulated_text_metrics = accumulate_dpo_metrics(accumulated_text_metrics, text_metrics)
+                            self.__attribute(self._grad_attribution, str(MicroStepKind.TEXT))
 
                         if dpo_step:
                             # The pair itself is evaluated half by half with one
@@ -2557,12 +2799,14 @@ class GenericTrainer(BaseTrainer):
                             )
                             self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
                             self.__collect_dpo_pairs(train_progress)
+                            self.__attribute(self._grad_attribution, str(MicroStepKind.DPO))
 
                         if kto_step:
                             addon_kto_loss = self.__kto_addon_term(scaler, train_progress)
                             accumulated_kto_metrics = accumulate_dpo_metrics(
                                 accumulated_kto_metrics, self.model_setup.get_last_kto_metrics()
                             )
+                            self.__attribute(self._grad_attribution, str(MicroStepKind.KTO))
 
                     if kind is not MicroStepKind.SFT:
                         # INDEPENDENT add-on micro-step: its one term was
@@ -2572,10 +2816,23 @@ class GenericTrainer(BaseTrainer):
                         )
                     elif addon_sft_loss is None:
                         loss = loss / self.config.gradient_accumulation_steps
-                        if scaler:
-                            scaler.scale(loss).backward()
-                        else:
-                            loss.backward()
+                        # A DPO-primary micro-step (pairs, with the SFT anchor
+                        # and any KTO batch folded in) is attributed to DPO as
+                        # a whole; a standard one is probed per sample.
+                        self.__backward_term(
+                            loss,
+                            scaler,
+                            kind=MicroStepKind.DPO if self.config.rlhf_dpo_primary() else MicroStepKind.SFT,
+                            predicted=probe_output.get("predicted") if probe_output is not None else None,
+                            image_paths=batch.get("image_path") if probe_output is not None else None,
+                            timestep=probe_output.get("timestep") if probe_output is not None else None,
+                            losses=self.model_setup.get_last_per_sample_losses() if probe_output is not None else None,
+                            scale=1.0 / self.config.gradient_accumulation_steps,
+                        )
+                        self.__attribute(
+                            self._grad_attribution,
+                            str(MicroStepKind.DPO if self.config.rlhf_dpo_primary() else MicroStepKind.SFT),
+                        )
                         detached_loss = loss.detach()
                         if schedule is not None:
                             accumulated_sft_loss += detached_loss
@@ -2610,6 +2867,11 @@ class GenericTrainer(BaseTrainer):
                             # The rotation cache's accumulated dL/dR becomes Q.grad here, so
                             # unscale, clipping and the step all see the full gradient.
                             self.model_setup.before_clip_adapters(self.model, self.config)
+
+                        if self._grad_attribution is not None:
+                            # After reduction and the cache materialisation, before
+                            # clipping: the window's gradient as the optimizer sees it.
+                            self.__log_grad_diagnostics(train_progress, scaler)
 
                         # Pre-clip total gradient norm, logged below with the step's loss.
                         grad_norm = None

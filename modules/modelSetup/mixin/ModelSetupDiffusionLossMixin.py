@@ -341,6 +341,9 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         f"Loss weight function {config.loss_weight_fn} not implemented for diffusion models"
                     )
 
+        # Per-sample values of the last call, for the gradient diagnostics'
+        # per-concept loss trend (read through BaseModelSetup.get_last_per_sample_losses).
+        self._last_per_sample_losses = losses.detach()
         return losses
 
     def _flow_matching_losses(
@@ -381,4 +384,5 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                         f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models"
                     )
 
+        self._last_per_sample_losses = losses.detach()
         return losses

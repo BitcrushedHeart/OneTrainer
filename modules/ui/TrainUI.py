@@ -333,6 +333,33 @@ class TrainUI(ctk.CTk):
         components.label(frame, 4, 2, "Debug Directory", tooltip="The directory where debug data is saved")
         components.path_entry(frame, 4, 3, self.ui_state, "debug_dir", mode="dir", io_type=PathIOType.OUTPUT)
 
+        # gradient attribution diagnostics
+        components.label(
+            frame,
+            5,
+            0,
+            "Gradient Diagnostics",
+            tooltip="Log where the gradient comes from. Per update: the norm of each objective's share (standard, "
+            "DPO, KTO, text reward: grad/norm_<kind>), the cosines between them (grad/cos_<a>_<b>; below -0.3 "
+            "they pull against each other) and grad/norm_total; per concept: the timestep-normalised loss trend "
+            "(loss/concept/<tag>/tnorm; falling = learning) and output-gradient pull (grad/concept/<tag>/"
+            "out_norm_tnorm). Costs a snapshot plus one float32 buffer per objective of the trainable "
+            "parameters, one host sync per micro-step, and with the OFT rotation cache a cache materialisation "
+            "per micro-step.",
+        )
+        components.switch(frame, 5, 1, self.ui_state, "log_grad_components")
+        components.label(
+            frame,
+            5,
+            2,
+            "Concept Conflict Every",
+            tooltip="Gradient Diagnostics only. Every N optimizer updates, backward each concept of the window's "
+            "batches separately (same total gradient, one extra backward per additional concept in a batch) and "
+            "log each concept's parameter-gradient norm and its cosine against the rest (grad/concept/<tag>/"
+            "cos_rest; below -0.2 the rest cancels it). 0 disables the probe.",
+        )
+        components.entry(frame, 5, 3, self.ui_state, "log_grad_components_interval")
+
         # tensorboard
         components.label(frame, 6, 0, "Tensorboard", tooltip="Starts the Tensorboard Web UI during training")
         components.switch(frame, 6, 1, self.ui_state, "tensorboard")

@@ -469,6 +469,9 @@ class TrainConfig(BaseConfig):
     tensorboard_expose: bool
     tensorboard_always_on: bool
     tensorboard_epoch_loss: bool
+    # gradient attribution diagnostics (modules.util.grad_attribution_util)
+    log_grad_components: bool
+    log_grad_components_interval: int
     tensorboard_port: str
     validation: bool
     validate_after: float
@@ -1531,6 +1534,19 @@ class TrainConfig(BaseConfig):
             return "The OFT rotation cache requires the bfloat16 train data type."
         return None
 
+    def validate_grad_diagnostics_startup(self) -> str | None:
+        if not self.log_grad_components:
+            return None
+        if self.optimizer is not None and getattr(self.optimizer, "fused_back_pass", False):
+            # The attribution diffs .grad around each backward; a fused back
+            # pass consumes the gradient inside it.
+            return "The gradient diagnostics (log_grad_components) do not support the optimizer's fused back pass."
+        if self.log_grad_components_interval < 0:
+            return (
+                "The gradient diagnostics' concept conflict interval must be 0 (off) or a positive number of updates."
+            )
+        return None
+
     def validate_transfer_startup(self) -> str | None:
         if not self.transfer_enabled:
             return None
@@ -1761,6 +1777,9 @@ class TrainConfig(BaseConfig):
         data.append(("tensorboard_expose", False, bool, False))
         data.append(("tensorboard_always_on", False, bool, False))
         data.append(("tensorboard_epoch_loss", True, bool, False))
+        # No migration: configs saved without the keys load the diagnostics off.
+        data.append(("log_grad_components", False, bool, False))
+        data.append(("log_grad_components_interval", 50, int, False))
         data.append(("tensorboard_port", 6006, int, False))
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))

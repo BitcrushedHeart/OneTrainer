@@ -73,6 +73,38 @@ def dpo_objective(
     return loss, dpo_loss, chosen_ratio, rejected_ratio, margin
 
 
+def dpo_per_sample_losses(
+    chosen_ratio: Tensor,
+    rejected_ratio: Tensor,
+    *,
+    beta: float | Tensor,
+    objective: DPOObjective,
+    ipo_tau: float,
+    label_smoothing: float,
+    kto_desirable_weight: float = 1.0,
+    kto_undesirable_weight: float = 1.0,
+) -> Tensor:
+    """Each pair's own loss, ``[B]``, such that ``dpo_objective``'s ``loss``
+    is their mean (for KTO, the mean of the pair's two half-terms). Detached;
+    for the per-concept loss trend of the gradient diagnostics."""
+    chosen_ratio = chosen_ratio.detach().float()
+    rejected_ratio = rejected_ratio.detach().float()
+    margin = chosen_ratio - rejected_ratio
+    beta_t = beta.detach().float() if isinstance(beta, Tensor) else beta
+    if objective == DPOObjective.IPO:
+        return (margin - 1.0 / (2.0 * ipo_tau)).pow(2)
+    if objective == DPOObjective.KTO:
+        desirable = kto_desirable_weight * (1.0 - torch.sigmoid(beta_t * chosen_ratio))
+        undesirable = kto_undesirable_weight * (1.0 - torch.sigmoid(-beta_t * rejected_ratio))
+        return (desirable + undesirable) / 2.0
+    logits = beta_t * margin
+    losses = -F.logsigmoid(logits)
+    if label_smoothing > 0:
+        s = label_smoothing
+        losses = (1 - s) * losses + s * (-F.logsigmoid(-logits))
+    return losses
+
+
 def kto_unpaired_objective(
     policy_logp: Tensor,
     ref_logp: Tensor,

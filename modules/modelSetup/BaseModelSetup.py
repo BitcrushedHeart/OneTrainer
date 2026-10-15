@@ -21,6 +21,7 @@ from modules.util.distill_dmd2_util import (
 from modules.util.distill_metadata_util import extract_distill_metadata
 from modules.util.dpo_light_util import (
     dpo_objective,
+    dpo_per_sample_losses,
     dpo_surrogate_weights,
     kto_unpaired_objective,
     split_dpo_pair_batch,
@@ -207,6 +208,10 @@ class BaseModelSetup(
         # Per-pair values of the last DPO micro-batch, for the per-concept and live
         # saturation logging (empty unless one of them is enabled).
         self._last_dpo_pair_records: list[dict] = []
+        # Gradient diagnostics (trainer's log_grad_components): when on, the DPO
+        # light path hands each half's prediction and per-pair values to its
+        # backward callback so the trainer can probe them.
+        self._grad_probe_active = False
         self._dpo_ref_fingerprint = None  # (reference version, fingerprint) cache
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
@@ -499,6 +504,19 @@ class BaseModelSetup(
 
     def get_last_dpo_pair_records(self) -> list[dict]:
         return self._last_dpo_pair_records
+
+    def set_grad_probe(self, active: bool) -> None:
+        self._grad_probe_active = bool(active)
+
+    def get_last_per_sample_losses(self) -> Tensor | None:
+        """Detached ``[B]`` per-sample losses of the last standard loss call
+        (before any batch mean; the diffusion / flow-matching term only)."""
+        return getattr(self, "_last_per_sample_losses", None)
+
+    def timestep_fraction(self, model: BaseModel, timestep: Tensor) -> Tensor:
+        """``timestep`` as a fraction of the schedule in [0, 1] (continuous
+        models emit it directly, discrete ones are divided by their count)."""
+        return self._dpo_timestep_fraction(model, timestep, timestep.shape[0])
 
     def get_last_distill_metrics(self) -> dict[str, float | str]:
         return self._last_distill_metrics or {}
@@ -1663,11 +1681,15 @@ class BaseModelSetup(
         chosen_mask = self._dpo_mask_weights(chosen_batch, config)
         rejected_mask = self._dpo_mask_weights(rejected_batch, config)
 
-        def half_logp(half_batch: dict, half_mask: Tensor | None) -> Tensor:
+        probe = self._grad_probe_active
+
+        def half_logp(half_batch: dict, half_mask: Tensor | None) -> tuple[Tensor, Tensor | None]:
             # The output dict dies with this call; only the per-sample log-prob
-            # (and its graph, under grad) outlives it.
+            # (and its graph, under grad) outlives it -- plus the prediction
+            # when the trainer's gradient probe wants it.
             output = self.predict(model, half_batch, config, train_progress)
-            return -mse(output["predicted"], output["target"], half_mask)
+            logp = -mse(output["predicted"], output["target"], half_mask)
+            return logp, (output["predicted"] if probe else None)
 
         # Same conditioning-dropout neutralization as the fused path: both
         # halves must see identical prompts.
@@ -1679,15 +1701,16 @@ class BaseModelSetup(
                 te.dropout_probability = 0.0
 
             with torch.no_grad(), self.reference_model(model, config):
-                ref_chosen_logp = half_logp(chosen_batch, chosen_mask)
-                ref_rejected_logp = half_logp(rejected_batch, rejected_mask)
+                ref_chosen_logp, _ = half_logp(chosen_batch, chosen_mask)
+                ref_rejected_logp, _ = half_logp(rejected_batch, rejected_mask)
 
+            rejected_predicted = None
             if hold_rejected_graph:
-                policy_rejected_live = half_logp(rejected_batch, rejected_mask)
+                policy_rejected_live, rejected_predicted = half_logp(rejected_batch, rejected_mask)
                 policy_rejected_value = policy_rejected_live.detach()
             else:
                 with torch.no_grad():
-                    policy_rejected_value = half_logp(rejected_batch, rejected_mask)
+                    policy_rejected_value, _ = half_logp(rejected_batch, rejected_mask)
 
             chosen_output = self.predict(model, chosen_batch, config, train_progress)
             policy_timestep = chosen_output.get("timestep")
@@ -1705,12 +1728,35 @@ class BaseModelSetup(
                 chosen_term = chosen_term + supervised_loss
                 loss = loss + supervised_loss.detach().float()
                 del supervised_loss
-            backward_fn(chosen_term)
+            if probe:
+                # Per-pair loss (without the supervised mix) and the chosen
+                # prediction, for the per-concept diagnostics.
+                backward_fn(
+                    chosen_term,
+                    predicted=chosen_output["predicted"],
+                    half="chosen",
+                    image_paths=chosen_batch.get("image_path"),
+                    timestep=policy_timestep,
+                    losses=dpo_per_sample_losses(chosen_ratio, rejected_ratio, **objective_kwargs),
+                )
+            else:
+                backward_fn(chosen_term)
             del chosen_output, policy_chosen_live, chosen_term
 
             if policy_rejected_live is None:
-                policy_rejected_live = half_logp(rejected_batch, rejected_mask)
-            backward_fn((g_rejected.to(policy_rejected_live.dtype) * policy_rejected_live).sum())
+                policy_rejected_live, rejected_predicted = half_logp(rejected_batch, rejected_mask)
+            rejected_term = (g_rejected.to(policy_rejected_live.dtype) * policy_rejected_live).sum()
+            if probe:
+                backward_fn(
+                    rejected_term,
+                    predicted=rejected_predicted,
+                    half="rejected",
+                    image_paths=chosen_batch.get("image_path"),
+                    timestep=policy_timestep,
+                )
+            else:
+                backward_fn(rejected_term)
+            del rejected_term, rejected_predicted
         finally:
             # Release a held rejected graph on the exception path too: a caught
             # exception's traceback keeps this frame, and its locals, alive.
