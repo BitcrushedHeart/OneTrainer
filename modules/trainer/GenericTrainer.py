@@ -2296,6 +2296,8 @@ class GenericTrainer(BaseTrainer):
                             # unscale, clipping and the step all see the full gradient.
                             self.model_setup.before_clip_adapters(self.model, self.config)
 
+                        # Pre-clip total gradient norm, logged below with the step's loss.
+                        grad_norm = None
                         if (
                             scaler
                             and self.config.optimizer.optimizer.supports_fused_back_pass()
@@ -2306,12 +2308,12 @@ class GenericTrainer(BaseTrainer):
                         elif scaler:
                             scaler.unscale_(self.model.optimizer)
                             if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                grad_norm = nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                             scaler.step(self.model.optimizer)
                             scaler.update()
                         else:
                             if self.config.clip_grad_norm is not None:
-                                nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                                grad_norm = nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                             self.model.optimizer.step()
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
@@ -2371,6 +2373,14 @@ class GenericTrainer(BaseTrainer):
                             self.tensorboard.add_scalar(
                                 "loss/train_step", accumulated_loss_cpu, train_progress.global_step
                             )
+                            if grad_norm is not None:
+                                grad_norm_cpu = float(grad_norm)
+                                self.tensorboard.add_scalar("grad/norm", grad_norm_cpu, train_progress.global_step)
+                                self.tensorboard.add_scalar(
+                                    "grad/clipped",
+                                    float(grad_norm_cpu > self.config.clip_grad_norm),
+                                    train_progress.global_step,
+                                )
                             epoch_loss_sum += accumulated_loss_cpu
                             epoch_loss_count += 1
                             if self.config.rlhf_enabled and accumulated_dpo_metrics is not None:
