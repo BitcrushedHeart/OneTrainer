@@ -148,6 +148,7 @@ class BaseDataLoader(
         is_validation: bool = False,
         is_sft_anchor: bool = False,
         dpo_validation: bool | None = None,
+        is_kto: bool = False,
     ):
         super().__init__()
 
@@ -155,6 +156,10 @@ class BaseDataLoader(
         self.temp_device = temp_device
         self.stop_check_fun = lambda: False
         self.is_sft_anchor = is_sft_anchor
+        # The KTO loader of an RLHF run: KTO concepts only (single Liked /
+        # Disliked images, no rejected half), on the standard pipeline plus the
+        # kto_label and beta-override columns.
+        self.is_kto = is_kto
         # True for a validation loader that reads chosen/rejected pairs (DPO
         # validation); False for a plain validation-loss loader.
         self.is_dpo_validation = False
@@ -169,13 +174,13 @@ class BaseDataLoader(
             # with DPO validation gets the paired pipeline, else the plain one).
             config.rlhf_enabled = dpo_validation if dpo_validation is not None else config.dpo_validation_active()
             self.is_dpo_validation = bool(config.rlhf_enabled)
-        elif is_sft_anchor:
+        elif is_sft_anchor or is_kto:
             # Standard-side loader of an RLHF run (the parallel SFT-anchor
-            # loader in DPO mode, or the main loader in SFT + DPO mode): re-use
-            # the standard (non-DPO) data pipeline so the rejected-image wiring
-            # is skipped and STANDARD samples flow as ordinary supervised
-            # batches. DPO pattern concepts are excluded in
-            # DataLoaderMgdsMixin via is_sft_anchor.
+            # loader in DPO mode, or the main loader in SFT + DPO mode), or the
+            # KTO loader: re-use the standard (non-DPO) data pipeline so the
+            # rejected-image wiring is skipped and samples flow as single
+            # images. DPO pattern concepts are excluded in DataLoaderMgdsMixin
+            # via is_sft_anchor; the KTO loader selects KTO concepts only.
             config = copy.copy(config)
             config.rlhf_enabled = False
 

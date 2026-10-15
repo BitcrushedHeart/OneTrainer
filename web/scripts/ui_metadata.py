@@ -80,14 +80,24 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "STANDARD": "Standard",
         "VALIDATION": "Validation",
         "PRIOR_PREDICTION": "Prior Prediction",
+        "KTO": "KTO (Liked / Disliked singles)",
+    },
+    "KTOLabel": {
+        "LIKED": "Liked",
+        "DISLIKED": "Disliked",
     },
     "RLHFMode": {
         "DPO": "DPO (Direct Preference Optimization)",
         "SFT_DPO": "SFT + DPO (finetune primary, DPO add-on)",
     },
+    "RLHFAddonSchedule": {
+        "PIGGYBACK": "Piggyback (add-on rides on standard steps)",
+        "INDEPENDENT": "Independent (own micro-step per batch)",
+    },
     "DPOObjective": {
         "SIGMOID": "DPO (Sigmoid)",
         "IPO": "IPO",
+        "KTO": "KTO",
     },
     "DPORefMode": {
         "NEW_ADAPTER": "New Adapter",

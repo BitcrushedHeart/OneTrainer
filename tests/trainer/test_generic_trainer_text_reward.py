@@ -94,6 +94,7 @@ def test_epoch_start_builds_bank_and_sizes_interval(capsys):
     trainer.data_loader.get_data_set.return_value.approximate_length.return_value = 96000
     trainer.sft_anchor_source = None
     trainer.dpo_addon_source = None
+    trainer.kto_source = None
     from modules.util.text_reward_util import TextRewardScheduler
 
     trainer._text_reward_scheduler = TextRewardScheduler(0)
@@ -122,6 +123,7 @@ def test_offline_interval_uses_dataset_size_times_repeats(capsys):
     trainer.data_loader.get_data_set.return_value.approximate_length.return_value = 92148
     trainer.sft_anchor_source = None
     trainer.dpo_addon_source = None
+    trainer.kto_source = None
     from modules.util.text_reward_util import TextRewardScheduler
 
     trainer._text_reward_scheduler = TextRewardScheduler(0)

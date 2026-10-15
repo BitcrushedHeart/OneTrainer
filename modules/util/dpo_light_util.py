@@ -25,6 +25,8 @@ def dpo_objective(
     objective: DPOObjective,
     ipo_tau: float,
     label_smoothing: float,
+    kto_desirable_weight: float = 1.0,
+    kto_undesirable_weight: float = 1.0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Returns (loss, dpo_loss, chosen_ratio, rejected_ratio, margin).
 
@@ -44,6 +46,22 @@ def dpo_objective(
         # do not apply.
         dpo_loss = (margin - 1.0 / (2.0 * ipo_tau)).pow(2).mean()
         loss = dpo_loss
+    elif objective == DPOObjective.KTO:
+        # KTO (Ethayarajh et al. 2024) scores the two halves as independent
+        # examples against the reference: the chosen half is desirable and
+        # wants beta*ratio > 0, the rejected half is undesirable and wants
+        # beta*ratio < 0, each through its own saturating sigmoid utility. The
+        # desirable term can only be paid by the chosen likelihood rising above
+        # the reference, so a collapsing rejected half does not satisfy it the
+        # way it does in DPO (no likelihood displacement). The KTO reference
+        # point (a KL estimate from mismatched pairs in the batch) is 0 here:
+        # at batch size 1 there is nothing to estimate it from, and it only
+        # shifts where the utility saturates. Beta per-sample works as in DPO;
+        # label smoothing does not apply.
+        desirable = kto_desirable_weight * (1.0 - torch.sigmoid(beta * chosen_ratio))
+        undesirable = kto_undesirable_weight * (1.0 - torch.sigmoid(-beta * rejected_ratio))
+        dpo_loss = torch.cat([desirable, undesirable]).mean()
+        loss = dpo_loss
     else:
         logits = beta * margin
         dpo_loss = -F.logsigmoid(logits).mean()
@@ -53,6 +71,31 @@ def dpo_objective(
             loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
 
     return loss, dpo_loss, chosen_ratio, rejected_ratio, margin
+
+
+def kto_unpaired_objective(
+    policy_logp: Tensor,
+    ref_logp: Tensor,
+    liked: Tensor,
+    *,
+    beta: float | Tensor,
+    desirable_weight: float = 1.0,
+    undesirable_weight: float = 1.0,
+) -> tuple[Tensor, Tensor]:
+    """KTO on single labelled images, no pair involved. Returns ``(loss, ratio)``.
+
+    ``ratio`` is each sample's reference-relative log-prob. A Liked image wants
+    ``beta * ratio > 0``, a Disliked one ``< 0``, each through the same
+    saturating sigmoid utility as the paired KTO objective (reference point 0;
+    see ``dpo_objective``). ``liked`` is a bool ``[B]`` tensor; ``beta`` may be a
+    scalar or a per-sample ``[B]`` tensor.
+    """
+    ratio = policy_logp - ref_logp.detach()
+    liked_f = liked.to(ratio.dtype)
+    sign = liked_f * 2.0 - 1.0
+    weight = liked_f * desirable_weight + (1.0 - liked_f) * undesirable_weight
+    loss = (weight * (1.0 - torch.sigmoid(sign * beta * ratio))).mean()
+    return loss, ratio
 
 
 def dpo_surrogate_weights(

@@ -4,6 +4,7 @@ from typing import Any
 from modules.util.config.BaseConfig import BaseConfig
 from modules.util.enum.BalancingStrategy import BalancingStrategy
 from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.KTOLabel import KTOLabel
 
 
 class ConceptImageConfig(BaseConfig):
@@ -130,6 +131,7 @@ class ConceptConfig(BaseConfig):
     seed: int
     enabled: bool
     type: ConceptType
+    kto_label: KTOLabel
     include_subdirectories: bool
     image_variations: int
     text_variations: int
@@ -224,6 +226,9 @@ class ConceptConfig(BaseConfig):
     def is_dpo(self) -> bool:
         return bool(self.dpo_chosen_pattern) and bool(self.dpo_rejected_pattern)
 
+    def is_kto(self) -> bool:
+        return ConceptType(self.type) == ConceptType.KTO
+
     @staticmethod
     def default_values():
         data = []
@@ -236,6 +241,8 @@ class ConceptConfig(BaseConfig):
         data.append(("seed", random.randint(-(1 << 30), 1 << 30), int, False))
         data.append(("enabled", True, bool, False))
         data.append(("type", ConceptType.STANDARD, ConceptType, False))
+        # Only read for KTO concepts (see ConceptType.KTO).
+        data.append(("kto_label", KTOLabel.LIKED, KTOLabel, False))
         data.append(("include_subdirectories", False, bool, False))
         data.append(("image_variations", 1, int, False))
         data.append(("text_variations", 1, int, False))

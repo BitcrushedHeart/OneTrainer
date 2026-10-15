@@ -63,6 +63,23 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
 
         return dpo_concepts
 
+    @staticmethod
+    def __select_kto_concepts(concepts: list[ConceptConfig]) -> list[ConceptConfig]:
+        """The KTO loader reads KTO concepts only: plain folders of single
+        images, each concept labelled Liked or Disliked as a whole."""
+        kto_concepts = [c for c in concepts if ConceptType(c.type) == ConceptType.KTO]
+        patterned = [
+            c.name or c.path for c in kto_concepts if c.enabled and (c.dpo_chosen_pattern or c.dpo_rejected_pattern)
+        ]
+        if patterned:
+            raise RuntimeError(
+                "KTO concepts are single Liked / Disliked images and cannot carry DPO chosen/rejected "
+                "patterns; clear the patterns or use a STANDARD concept for the pairs: " + ", ".join(patterned)
+            )
+        if not any(c.enabled for c in kto_concepts):
+            raise RuntimeError("The KTO loader needs at least one enabled KTO concept.")
+        return kto_concepts
+
     def _select_concepts(self, config: TrainConfig, is_validation: bool = False) -> list[ConceptConfig]:
         concepts = config.concepts
         if concepts is None:
@@ -78,6 +95,9 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
         # reason: a VALIDATION concept with chosen/rejected patterns belongs to
         # the DPO validation loader, and reading its whole tree as ordinary
         # validation images would score the rejected images as targets.
+        if getattr(self, "is_kto", False):
+            return self.__select_kto_concepts(concepts)
+        # KTO concepts are never in valid_types: only the KTO loader reads them.
         valid_types = (
             {ConceptType.VALIDATION} if is_validation else {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         )

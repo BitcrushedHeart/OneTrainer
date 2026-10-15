@@ -30,6 +30,7 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.PatienceMode import PatienceMode
+from modules.util.enum.RLHFAddonSchedule import RLHFAddonSchedule
 from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.enum.TextRewardSource import TextRewardSource
 from modules.util.enum.TimestepDistribution import TimestepDistribution
@@ -736,6 +737,8 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_ref_rebase_interval: int
     rlhf_dpo_objective: DPOObjective
     rlhf_dpo_ipo_tau: float
+    rlhf_kto_desirable_weight: float
+    rlhf_kto_undesirable_weight: float
     rlhf_dpo_adaptive_beta: bool
     rlhf_dpo_timestep_margin_logging: bool
     rlhf_dpo_concept_logging: bool
@@ -744,6 +747,7 @@ class TrainConfig(BaseConfig):
     rlhf_sft_anchor_weight: float
     rlhf_dpo_addon_weight: float
     rlhf_dpo_addon_interval: int
+    rlhf_addon_schedule: RLHFAddonSchedule
     rlhf_dpo_light_reuse_rejected_graph: bool
     rlhf_dpo_validation: bool
     rlhf_dpo_validation_percentage: float
@@ -1295,6 +1299,13 @@ class TrainConfig(BaseConfig):
         # Classic DPO run: pairs are the main loader; STANDARD concepts anchor it.
         return self.rlhf_enabled and not self.rlhf_sft_primary()
 
+    def rlhf_addon_independent(self) -> bool:
+        # Standard batches, DPO / KTO add-on batches and text reward rollouts
+        # each on their own micro-step (see modules.util.rlhf_schedule_util).
+        # Only meaningful where add-ons ride on a standard finetune: SFT + DPO
+        # and the plain run with a text reward; a DPO-primary run has none.
+        return self.rlhf_addon_schedule == RLHFAddonSchedule.INDEPENDENT and not self.rlhf_dpo_primary()
+
     def effective_dpo_ref_mode(self) -> DPORefMode:
         # A loaded adapter is always the reference. Without one, an explicit
         # EXISTING_ADAPTER still wins: resuming a finetune from a backup has no
@@ -1319,6 +1330,11 @@ class TrainConfig(BaseConfig):
                 "Rebasing the DPO reference needs the Existing Adapter reference mode; "
                 "New Adapter always measures against the bare base model."
             )
+        if self.rlhf_dpo_objective == DPOObjective.KTO:
+            if self.rlhf_kto_desirable_weight < 0 or self.rlhf_kto_undesirable_weight < 0:
+                return "KTO weights cannot be negative."
+            if self.rlhf_kto_desirable_weight <= 0 and self.rlhf_kto_undesirable_weight <= 0:
+                return "KTO needs a positive desirable or undesirable weight; both are zero."
         if self.rlhf_sft_primary():
             if self.rlhf_dpo_addon_weight <= 0:
                 return "SFT + DPO mode needs a positive DPO add-on weight."
@@ -2055,6 +2071,10 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_ref_rebase_interval", 0, int, False))
         data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
+        # KTO per-half weights (lambda_D / lambda_U); no migration, missing keys
+        # load as the defaults below.
+        data.append(("rlhf_kto_desirable_weight", 1.0, float, False))
+        data.append(("rlhf_kto_undesirable_weight", 1.0, float, False))
         data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
         # No migration for the two below: configs saved without the keys load
@@ -2065,6 +2085,9 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_sft_anchor_weight", 0.5, float, False))
         data.append(("rlhf_dpo_addon_weight", 1.0, float, False))
         data.append(("rlhf_dpo_addon_interval", 0, int, False))
+        # No migration: configs saved without the key load PIGGYBACK, which
+        # is exactly what those runs did (add-ons riding on standard steps).
+        data.append(("rlhf_addon_schedule", RLHFAddonSchedule.PIGGYBACK, RLHFAddonSchedule, False))
         # No migration: configs saved without the key load this default,
         # which is also the intended value for them (same gradient, one
         # forward fewer per DPO add-on step).

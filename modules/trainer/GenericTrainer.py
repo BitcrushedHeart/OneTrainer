@@ -53,6 +53,7 @@ from modules.util.enum.PatienceMode import PatienceMode
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
+from modules.util.rlhf_schedule_util import IndependentSchedule, MicroStepKind, wind_data_loader
 from modules.util.text_reward_util import TextRewardScheduler, derive_text_reward_interval
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
@@ -154,6 +155,13 @@ class GenericTrainer(BaseTrainer):
         self._precompile_cache_saved = False
         self.grad_hook_handles = []
         self.dpo_validation_data_loader = None
+        # Unpaired KTO (KTO concepts): the third loader, or the main loader
+        # when a DPO-mode run has KTO concepts and no pairs.
+        self.kto_source = None
+        self._kto_addon_interval = 1
+        self._kto_primary = False
+        self.dpo_addon_source = None
+        self._dpo_addon_interval = 1
 
         # Loop-local state mirrored on the trainer instance so the
         # save path (__backup / __save) can read it without having to
@@ -170,6 +178,11 @@ class GenericTrainer(BaseTrainer):
         # and the micro-batch scheduler that spreads its budget over the epoch.
         self._text_reward_bank = None
         self._text_reward_scheduler = TextRewardScheduler(0)
+        self._text_reward_epoch_samples = 0
+        # rlhf_addon_schedule INDEPENDENT: this epoch's micro-step sequence
+        # (standard / DPO / KTO / text reward), rebuilt at every epoch start.
+        # None under PIGGYBACK, where the main loader alone drives the epoch.
+        self._independent_schedule: IndependentSchedule | None = None
         self._loop_scaler = None
 
         # Defaults for state start() re-initializes; __advance_redistill_phase
@@ -300,6 +313,16 @@ class GenericTrainer(BaseTrainer):
                 "SFT + DPO mode needs at least one enabled STANDARD/PRIOR_PREDICTION concept without DPO "
                 "patterns to drive the main loader; use RLHF mode DPO for a pairs-only run."
             )
+        kto_concepts = self.__count_kto_concepts() if self.config.rlhf_enabled else 0
+        dpo_pair_concepts = self.__count_dpo_pair_concepts() if self.config.rlhf_enabled else 0
+        # A DPO-mode run whose only preference data are KTO concepts (Liked /
+        # Disliked singles): the KTO loader becomes the main loader.
+        self._kto_primary = self.config.rlhf_dpo_primary() and dpo_pair_concepts == 0 and kto_concepts > 0
+        if self.config.rlhf_sft_primary() and dpo_pair_concepts == 0 and kto_concepts == 0:
+            raise RuntimeError(
+                "SFT + DPO mode needs preference data: an enabled concept with DPO chosen/rejected patterns, "
+                "or a KTO concept of Liked or Disliked images."
+            )
 
         phase_start = self.__log_startup_phase("model setup (quantize, adapters, optimizer)", phase_start)
         self.callbacks.on_update_status("creating the data loader/caching")
@@ -307,11 +330,17 @@ class GenericTrainer(BaseTrainer):
         # In SFT + DPO mode the main loader is the plain standard pipeline with
         # the DPO pattern concepts excluded (the same construction as the
         # SFT-anchor loader); the pairs come from a secondary loader below.
+        if self._kto_primary:
+            print(
+                f"KTO: {kto_concepts} KTO concept(s) and no DPO pairs; the Liked / Disliked singles drive the "
+                "run (loss = kto_loss, plus the SFT anchor when standard concepts are present)."
+            )
         self.data_loader = self.create_data_loader(
             self.model,
             self.model_setup,
             self.model.train_progress,
             is_sft_anchor=self.config.rlhf_sft_primary(),
+            is_kto=self._kto_primary,
         )
         self.data_loader.stop_check_fun = self.commands.get_stop_command
         self.model_saver = self.create_model_saver()
@@ -358,11 +387,19 @@ class GenericTrainer(BaseTrainer):
         # unless rlhf_dpo_addon_interval overrides it.
         self.dpo_addon_source = None
         self._dpo_addon_interval = 1
-        if self.config.rlhf_sft_primary():
-            print(
-                f"SFT + DPO: loss = sft_loss + {self.config.rlhf_dpo_addon_weight} * dpo_loss "
-                "on interleaved DPO micro-batches."
-            )
+        independent = self.config.rlhf_addon_independent()
+        if self.config.rlhf_sft_primary() and dpo_pair_concepts > 0:
+            if independent:
+                print(
+                    f"SFT + DPO (independent schedule): every DPO pair batch gets its own micro-step, "
+                    f"loss = {self.config.rlhf_dpo_addon_weight} * dpo_loss there; standard micro-steps keep "
+                    "the plain loss."
+                )
+            else:
+                print(
+                    f"SFT + DPO: loss = sft_loss + {self.config.rlhf_dpo_addon_weight} * dpo_loss "
+                    "on interleaved DPO micro-batches."
+                )
             self.callbacks.on_update_status("creating the DPO add-on data loader/caching")
             dpo_addon_data_loader = self.create_data_loader(self.model, self.model_setup, self.model.train_progress)
             dpo_addon_data_loader.stop_check_fun = self.commands.get_stop_command
@@ -370,7 +407,38 @@ class GenericTrainer(BaseTrainer):
                 dpo_addon_data_loader, "DPO add-on", on_epoch_restart=self.__restore_train_device
             )
 
-        if self.config.text_reward_enabled:
+        # Unpaired KTO concepts next to DPO pairs: a third loader. In DPO mode a
+        # KTO batch is added to every pair micro-batch at full weight (the same
+        # footing as the pairs); in SFT + DPO mode it is interleaved like the
+        # DPO add-on, with its own interval and the add-on weight.
+        self.kto_source = None
+        self._kto_addon_interval = 1
+        if kto_concepts > 0 and not self._kto_primary:
+            if self.config.rlhf_sft_primary() and independent:
+                print(
+                    f"KTO: {kto_concepts} KTO concept(s); every KTO batch gets its own micro-step, "
+                    f"loss = {self.config.rlhf_dpo_addon_weight} * kto_loss there."
+                )
+            elif self.config.rlhf_sft_primary():
+                print(
+                    f"KTO: {kto_concepts} KTO concept(s); loss = sft_loss + {self.config.rlhf_dpo_addon_weight} "
+                    "* kto_loss on interleaved KTO micro-batches."
+                )
+            else:
+                print(f"KTO: {kto_concepts} KTO concept(s); loss = dpo_loss + kto_loss on every micro-batch.")
+            self.callbacks.on_update_status("creating the KTO data loader/caching")
+            kto_data_loader = self.create_data_loader(
+                self.model, self.model_setup, self.model.train_progress, is_kto=True
+            )
+            kto_data_loader.stop_check_fun = self.commands.get_stop_command
+            self.kto_source = CyclingBatchSource(kto_data_loader, "KTO", on_epoch_restart=self.__restore_train_device)
+
+        if self.config.text_reward_enabled and independent:
+            print(
+                f"Text reward (independent schedule): {self.config.text_reward_samples_per_epoch} OCR-rewarded "
+                f"rollouts per epoch, each on its own micro-step with loss = {self.config.text_reward_weight} * ctc."
+            )
+        elif self.config.text_reward_enabled:
             print(
                 f"Text reward: {self.config.text_reward_samples_per_epoch} OCR-rewarded rollouts per epoch, "
                 f"loss += {self.config.text_reward_weight} * ctc (never on a DPO add-on micro-batch)."
@@ -542,6 +610,11 @@ class GenericTrainer(BaseTrainer):
             if self._text_reward_bank.image_paths is not None
             else self.config.text_reward_samples_per_epoch
         )
+        self._text_reward_epoch_samples = samples
+        if self.config.rlhf_addon_independent():
+            # Every rollout is its own micro-step; the schedule below places them.
+            self._text_reward_scheduler.start_epoch(0)
+            return
         interval = derive_text_reward_interval(primary_batches, samples)
         self._text_reward_scheduler.start_epoch(interval)
         if multi.is_master():
@@ -552,11 +625,19 @@ class GenericTrainer(BaseTrainer):
 
     def __start_secondary_epochs(self):
         """Advance the SFT-anchor / DPO add-on loader epochs in lockstep with
-        the main loader and re-derive the add-on interval from the new lengths."""
+        the main loader and re-derive the add-on interval from the new lengths
+        (PIGGYBACK), or build this epoch's micro-step schedule (INDEPENDENT)."""
         if self.sft_anchor_source is not None:
             self.sft_anchor_source.start_next_epoch()
         if self.config.text_reward_enabled:
             self.__start_text_reward_epoch()
+        if self.config.rlhf_addon_independent():
+            if self.dpo_addon_source is not None:
+                self.dpo_addon_source.start_next_epoch()
+            if self.kto_source is not None:
+                self.kto_source.start_next_epoch()
+            self.__start_independent_epoch()
+            return
         if self.dpo_addon_source is not None:
             self.dpo_addon_source.start_next_epoch()
             sft_batches = self.data_loader.get_data_set().approximate_length()
@@ -569,6 +650,74 @@ class GenericTrainer(BaseTrainer):
                     f"SFT + DPO: one DPO pair every {self._dpo_addon_interval} standard micro-batch(es) "
                     f"({dpo_batches} pair batches vs {sft_batches} standard batches per epoch)."
                 )
+        if self.kto_source is not None:
+            self.kto_source.start_next_epoch()
+            if self.config.rlhf_sft_primary():
+                sft_batches = self.data_loader.get_data_set().approximate_length()
+                kto_batches = self.kto_source.approximate_length()
+                self._kto_addon_interval = derive_dpo_addon_interval(
+                    sft_batches, kto_batches, self.config.rlhf_dpo_addon_interval
+                )
+                if multi.is_master():
+                    print(
+                        f"SFT + KTO: one KTO batch every {self._kto_addon_interval} standard micro-batch(es) "
+                        f"({kto_batches} KTO batches vs {sft_batches} standard batches per epoch)."
+                    )
+
+    def __start_independent_epoch(self):
+        """Build this epoch's INDEPENDENT micro-step schedule from the loader
+        lengths (every loader has just started its epoch, so the lengths are
+        current) and, on a mid-epoch resume, wind every source forward to
+        where the schedule says it was.
+
+        Resume rule: ``epoch_step`` is the position in the schedule. The
+        schedule is a pure function of the per-kind counts, so a backup
+        written under this schedule resumes exactly where it stopped: each
+        loader skips the batches the schedule consumed before that position
+        and the text bank's cursor moves with it. A backup written under
+        PIGGYBACK (or a different dataset) carries an ``epoch_step`` that
+        counted standard batches instead; it is reinterpreted as a position
+        in this schedule -- the rest of the epoch trains under the new
+        schedule, a few batches may be seen twice or skipped once in that
+        epoch, nothing crashes and nothing is skipped wholesale. A position
+        past the end resumes at the end (the epoch is over, the next one
+        starts fresh).
+        """
+        train_progress = self.model.train_progress
+        counts = {MicroStepKind.SFT: self.data_loader.get_data_set().approximate_length()}
+        if self.dpo_addon_source is not None:
+            counts[MicroStepKind.DPO] = self.dpo_addon_source.approximate_length()
+        if self.kto_source is not None and self.config.rlhf_sft_primary():
+            counts[MicroStepKind.KTO] = self.kto_source.approximate_length()
+        if self._text_reward_bank is not None:
+            counts[MicroStepKind.TEXT] = self._text_reward_epoch_samples
+        if all(count <= 0 for kind, count in counts.items() if kind is not MicroStepKind.SFT):
+            # Nothing to interleave: the main loader drives the epoch as usual.
+            self._independent_schedule = None
+            return
+        schedule = IndependentSchedule(counts)
+        self._independent_schedule = schedule
+        if multi.is_master():
+            print(f"Independent schedule: {schedule.describe(self.config.gradient_accumulation_steps)}.")
+
+        if train_progress.epoch_step <= 0:
+            return
+        position = schedule.clamp(train_progress.epoch_step)
+        consumed = schedule.consumed_before(position)
+        batch_size = self.config.batch_size
+        wind_data_loader(self.data_loader, consumed.get(MicroStepKind.SFT, 0), batch_size)
+        if self.dpo_addon_source is not None:
+            wind_data_loader(self.dpo_addon_source.data_loader, consumed.get(MicroStepKind.DPO, 0), batch_size)
+        if MicroStepKind.KTO in counts:
+            wind_data_loader(self.kto_source.data_loader, consumed.get(MicroStepKind.KTO, 0), batch_size)
+        if self._text_reward_bank is not None:
+            self._text_reward_bank.cursor = consumed.get(MicroStepKind.TEXT, 0)
+        # epoch_sample counts standard samples (the main loader's own resume
+        # offset); keep it consistent with the position the schedule resumes at.
+        train_progress.epoch_sample = consumed.get(MicroStepKind.SFT, 0) * batch_size
+        if multi.is_master():
+            done = ", ".join(f"{count} {kind}" for kind, count in consumed.items())
+            print(f"Independent schedule: resuming at micro-step {position} of {len(schedule)} ({done} already done).")
 
     def __load_concepts(self) -> list:
         """The run's concepts, from the config or else its concept file.
@@ -604,6 +753,15 @@ class GenericTrainer(BaseTrainer):
         anchor_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         return sum(1 for c in concepts if c.enabled and ConceptType(c.type) in anchor_types and not c.is_dpo())
 
+    def __count_kto_concepts(self) -> int:
+        """Enabled KTO concepts (single Liked / Disliked images)."""
+        return sum(1 for c in self.__load_concepts() if c.enabled and ConceptType(c.type) == ConceptType.KTO)
+
+    def __count_dpo_pair_concepts(self) -> int:
+        """Enabled concepts with chosen/rejected patterns that the DPO pair loader reads."""
+        pair_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
+        return sum(1 for c in self.__load_concepts() if c.enabled and ConceptType(c.type) in pair_types and c.is_dpo())
+
     def __setup_dpo_pair_logging(self):
         """Per-concept DPO metrics (TensorBoard) and the live saturation ledger
         (<workspace>/dpo_live/), both fed from the per-pair records the model
@@ -624,7 +782,10 @@ class GenericTrainer(BaseTrainer):
             self._dpo_concept_window = DPOConceptWindow(with_weight=sigmoid)
         if self.config.rlhf_dpo_live_saturation and multi.is_master():
             if not sigmoid:
-                print("DPO live saturation needs the sigmoid objective (IPO has no beta to saturate); not tracking.")
+                print(
+                    "DPO live saturation needs the sigmoid objective (IPO has no beta to saturate, KTO saturates "
+                    "per half rather than per pair); not tracking."
+                )
                 return
             out_dir = path_util.canonical_join(self.config.workspace_dir, LIVE_DIRNAME)
             self._dpo_live_ledger = LiveSaturationLedger(
@@ -659,6 +820,94 @@ class GenericTrainer(BaseTrainer):
                 self._dpo_concept_window.add(info, record)
             if self._dpo_live_ledger is not None:
                 self._dpo_live_ledger.record(train_progress.global_step, info, record, reference)
+
+    # ------------------------------------------------------------------
+    # Add-on terms (SFT + DPO pairs / KTO batches, text reward rollouts).
+    # Each one pulls its own batch, backwards its term scaled by the add-on
+    # weight / gradient accumulation (the scaler applied when AMP is on) and
+    # returns the detached scaled value for the loss accumulator. Shared by
+    # the PIGGYBACK path (riding on a standard micro-step) and the
+    # INDEPENDENT path (a micro-step of their own); the arithmetic is the
+    # same in both, only what else sits in the micro-step differs.
+    # ------------------------------------------------------------------
+
+    def __dpo_addon_term(self, scaler, train_progress: TrainProgress) -> Tensor:
+        """One DPO pair batch, evaluated half by half with one graph alive at a
+        time (calculate_dpo_loss_light); its gradients land through the
+        backward callback, so the caller must not backward anything for it."""
+        dpo_batch = self.dpo_addon_source.next()
+        dpo_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
+
+        def _addon_backward(term, _scale=dpo_scale, _scaler=scaler):
+            term = term * _scale
+            if _scaler:
+                _scaler.scale(term).backward()
+            else:
+                term.backward()
+
+        dpo_value = self.model_setup.calculate_dpo_loss_light(
+            self.model, dpo_batch, self.config, train_progress, _addon_backward
+        )
+        return dpo_value.detach() * dpo_scale
+
+    def __kto_addon_term(self, scaler, train_progress: TrainProgress) -> Tensor:
+        """One KTO batch: a no-grad reference forward and one policy forward,
+        backwarded here with the add-on weight like the pair (one graph alive)."""
+        kto_batch = self.kto_source.next()
+        kto_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
+        kto_value = self.model_setup.calculate_kto_loss(self.model, kto_batch, self.config, train_progress)
+        kto_term = kto_value * kto_scale
+        if scaler:
+            scaler.scale(kto_term).backward()
+        else:
+            kto_term.backward()
+        detached = kto_value.detach() * kto_scale
+        del kto_value, kto_term
+        return detached
+
+    def __text_reward_term(self, scaler, train_progress: TrainProgress) -> tuple[Tensor, dict]:
+        """One text reward rollout; the CTC term is backwarded inside
+        calculate_text_reward_loss through the callback. Returns the detached
+        scaled value and the rollout's metrics."""
+        text_scale = self.config.text_reward_weight / self.config.gradient_accumulation_steps
+
+        def _text_backward(term, _scale=text_scale, _scaler=scaler):
+            term = term * _scale
+            if _scaler:
+                _scaler.scale(term).backward()
+            else:
+                term.backward()
+
+        text_value = self.model_setup.calculate_text_reward_loss(
+            self.model, self._text_reward_bank.next(), self.config, train_progress, _text_backward
+        )
+        return text_value.detach() * text_scale, self.model_setup.get_last_text_reward_metrics()
+
+    def __independent_micro_steps(self, schedule: IndependentSchedule, position: int):
+        """The INDEPENDENT epoch driver: yields ``(kind, batch)`` from the
+        schedule position on, pulling a standard batch from the main loader
+        on SFT micro-steps (``batch`` is None for the other kinds; they pull
+        their own batch when they run, so nothing is held across the
+        sample/backup block at the top of the loop). The main loader's
+        length is approximate (aspect buckets drop remainders), so it can run
+        dry a few micro-steps early; the epoch ends there, exactly as it does
+        under PIGGYBACK, and the last few scheduled add-on steps are dropped
+        rather than clumped into a tail."""
+        standard_batches = iter(self.data_loader.get_data_loader())
+        for index, kind in enumerate(schedule.kinds_from(position), start=position):
+            if kind is MicroStepKind.SFT:
+                try:
+                    batch = next(standard_batches)
+                except StopIteration:
+                    if multi.is_master():
+                        print(
+                            f"Independent schedule: the standard loader ran dry at micro-step {index} of "
+                            f"{len(schedule)}; ending the epoch here."
+                        )
+                    return
+                yield kind, batch
+            else:
+                yield kind, None
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -1849,7 +2098,7 @@ class GenericTrainer(BaseTrainer):
                     self.data_loader.get_data_set().start_next_epoch()
                     # The secondary loaders cache into the same cache dir; without this their concepts
                     # (DPO pairs, SFT anchors) are never cached and a sourceless run finds them empty.
-                    for source in (self.dpo_addon_source, self.sft_anchor_source):
+                    for source in (self.dpo_addon_source, self.sft_anchor_source, self.kto_source):
                         if source is not None:
                             source.start_next_epoch()
             return
@@ -1867,7 +2116,12 @@ class GenericTrainer(BaseTrainer):
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
         accumulated_dpo_metrics: dict[str, float] | None = None
+        accumulated_kto_metrics: dict[str, float] | None = None
         accumulated_text_metrics: dict[str, float] | None = None
+        # INDEPENDENT schedule only: the standard term on its own, so the
+        # usual SFT curve survives windows that mix kinds (loss/sft_step).
+        accumulated_sft_loss = 0.0
+        accumulated_sft_count = 0
         # Periodic reference rebase counts from the resume step, so a resumed
         # run waits for the next interval boundary rather than rebasing at once.
         if self.config.rlhf_enabled and self.config.rlhf_dpo_ref_rebase_interval > 0:
@@ -1944,6 +2198,7 @@ class GenericTrainer(BaseTrainer):
                         if (
                             self.sft_anchor_source is not None
                             or self.dpo_addon_source is not None
+                            or self.kto_source is not None
                             or self.config.text_reward_enabled
                         ):
                             self.__start_secondary_epochs()
@@ -1963,6 +2218,14 @@ class GenericTrainer(BaseTrainer):
 
             self._collect_garbage_and_freeze()
 
+            # INDEPENDENT schedule: the epoch is the whole micro-step sequence
+            # (standard + DPO + KTO + text reward), not just the main loader.
+            schedule = self._independent_schedule
+            if schedule is not None:
+                current_epoch_length = len(schedule)
+            else:
+                current_epoch_length = self.data_loader.get_data_set().approximate_length()
+
             if lr_scheduler is None:
                 lr_scheduler = create.create_lr_scheduler(
                     config=self.config,
@@ -1972,24 +2235,26 @@ class GenericTrainer(BaseTrainer):
                     num_cycles=self.config.learning_rate_cycles,
                     min_factor=self.config.learning_rate_min_factor,
                     num_epochs=self.config.epochs,
-                    approximate_epoch_length=self.data_loader.get_data_set().approximate_length(),
+                    approximate_epoch_length=current_epoch_length,
                     batch_size=self.config.batch_size,
                     gradient_accumulation_steps=self.config.gradient_accumulation_steps,
                     global_step=train_progress.global_step,
                 )
 
-            current_epoch_length = self.data_loader.get_data_set().approximate_length()
-
+            if schedule is not None:
+                micro_steps = self.__independent_micro_steps(schedule, schedule.clamp(train_progress.epoch_step))
+            else:
+                micro_steps = ((MicroStepKind.SFT, batch) for batch in self.data_loader.get_data_loader())
             if multi.is_master():
                 batches = step_tqdm = tqdm(
-                    self.data_loader.get_data_loader(),
+                    micro_steps,
                     desc="step",
                     total=current_epoch_length,
                     initial=train_progress.epoch_step,
                 )
             else:
-                batches = self.data_loader.get_data_loader()
-            for batch in batches:
+                batches = micro_steps
+            for kind, batch in batches:
                 multi.sync_commands(self.commands)
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
@@ -2057,25 +2322,74 @@ class GenericTrainer(BaseTrainer):
                     # folded into accumulated_loss alongside the DPO term.
                     addon_sft_loss = None
                     addon_dpo_loss = None
+                    addon_kto_loss = None
                     addon_text_loss = None
-                    if self.config.rlhf_dpo_primary():
-                        loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
-                        # Accumulate per-micro-batch DPO metrics across the grad-accum window.
-                        # Without this, only the final micro-batch's metric reaches TensorBoard —
-                        # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
-                        accumulated_dpo_metrics = accumulate_dpo_metrics(
-                            accumulated_dpo_metrics,
-                            self.model_setup.get_last_dpo_metrics(),
-                            extra_keys=("sft_anchor_loss",) if self.sft_anchor_source is not None else (),
-                        )
-                        self.__collect_dpo_pairs(train_progress)
+                    if kind is not MicroStepKind.SFT:
+                        # INDEPENDENT schedule: this micro-step is one add-on
+                        # term on its own, scaled exactly as when it rides on
+                        # a standard step (weight / gradient accumulation) and
+                        # backwarded inside its helper; the common backward
+                        # below is skipped. One graph alive at a time.
+                        if kind is MicroStepKind.DPO:
+                            addon_dpo_loss = self.__dpo_addon_term(scaler, train_progress)
+                            accumulated_dpo_metrics = accumulate_dpo_metrics(
+                                accumulated_dpo_metrics, self.model_setup.get_last_dpo_metrics()
+                            )
+                            self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
+                            self.__collect_dpo_pairs(train_progress)
+                        elif kind is MicroStepKind.KTO:
+                            addon_kto_loss = self.__kto_addon_term(scaler, train_progress)
+                            accumulated_kto_metrics = accumulate_dpo_metrics(
+                                accumulated_kto_metrics, self.model_setup.get_last_kto_metrics()
+                            )
+                        elif kind is MicroStepKind.TEXT:
+                            addon_text_loss, text_metrics = self.__text_reward_term(scaler, train_progress)
+                            accumulated_text_metrics = accumulate_dpo_metrics(accumulated_text_metrics, text_metrics)
+                        else:
+                            raise RuntimeError(f"unknown micro-step kind {kind}")
+                    elif self.config.rlhf_dpo_primary():
+                        sft_anchor_keys = ("sft_anchor_loss",) if self.sft_anchor_source is not None else ()
+                        if self._kto_primary:
+                            # Unpaired KTO run: the main loader yields Liked /
+                            # Disliked singles and there are no pair metrics.
+                            loss = self.model_setup.calculate_kto_loss(self.model, batch, self.config, train_progress)
+                            accumulated_kto_metrics = accumulate_dpo_metrics(
+                                accumulated_kto_metrics,
+                                self.model_setup.get_last_kto_metrics(),
+                                extra_keys=sft_anchor_keys,
+                            )
+                        else:
+                            loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
+                            # Accumulate per-micro-batch DPO metrics across the grad-accum window.
+                            # Without this, only the final micro-batch's metric reaches TensorBoard —
+                            # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
+                            accumulated_dpo_metrics = accumulate_dpo_metrics(
+                                accumulated_dpo_metrics,
+                                self.model_setup.get_last_dpo_metrics(),
+                                extra_keys=sft_anchor_keys,
+                            )
+                            self.__collect_dpo_pairs(train_progress)
+
+                            if self.kto_source is not None:
+                                # KTO singles ride on every pair micro-batch at
+                                # full weight: preference data like the pairs.
+                                kto_batch = self.kto_source.next()
+                                kto_loss = self.model_setup.calculate_kto_loss(
+                                    self.model, kto_batch, self.config, train_progress
+                                )
+                                loss = loss + kto_loss
+                                accumulated_kto_metrics = accumulate_dpo_metrics(
+                                    accumulated_kto_metrics, self.model_setup.get_last_kto_metrics()
+                                )
+                                del kto_loss
 
                         if self.sft_anchor_source is not None:
                             sft_batch = self.sft_anchor_source.next()
                             sft_output = self.model_setup.predict(self.model, sft_batch, self.config, train_progress)
                             sft_loss = self.model_setup.calculate_loss(self.model, sft_batch, sft_output, self.config)
                             loss = loss + self.config.rlhf_sft_anchor_weight * sft_loss
-                            accumulated_dpo_metrics["sft_anchor_loss"] += sft_loss.detach().item()
+                            anchor_metrics = accumulated_kto_metrics if self._kto_primary else accumulated_dpo_metrics
+                            anchor_metrics["sft_anchor_loss"] += sft_loss.detach().item()
                         # Mirror for Fix B save-side staging (after the SFT-anchor
                         # block so the mirror reflects the final dpo metrics dict).
                         self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
@@ -2178,15 +2492,24 @@ class GenericTrainer(BaseTrainer):
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
                             loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
-                        dpo_step = self.dpo_addon_source is not None and is_dpo_addon_step(
-                            train_progress.epoch_step, self._dpo_addon_interval
-                        )
-                        # The text reward never shares a micro-batch with a DPO
-                        # pair (peak memory); a blocked firing carries over.
-                        text_step = self._text_reward_bank is not None and self._text_reward_scheduler.due(
-                            train_progress.epoch_step, blocked=dpo_step
-                        )
-                        if dpo_step or text_step:
+                        if schedule is not None:
+                            # INDEPENDENT: the add-ons have micro-steps of their
+                            # own; this standard step carries nothing else.
+                            dpo_step = kto_step = text_step = False
+                        else:
+                            dpo_step = self.dpo_addon_source is not None and is_dpo_addon_step(
+                                train_progress.epoch_step, self._dpo_addon_interval
+                            )
+                            kto_step = self.kto_source is not None and is_dpo_addon_step(
+                                train_progress.epoch_step, self._kto_addon_interval
+                            )
+                            # The text reward never shares a micro-batch with a
+                            # DPO pair or a KTO batch (peak memory); a blocked
+                            # firing carries over.
+                            text_step = self._text_reward_bank is not None and self._text_reward_scheduler.due(
+                                train_progress.epoch_step, blocked=dpo_step or kto_step
+                            )
+                        if dpo_step or kto_step or text_step:
                             # Add-on micro-batch: the standard loss above stays
                             # at full weight; a DPO pair or a text-reward
                             # rollout rides along. Backward the standard loss
@@ -2217,20 +2540,7 @@ class GenericTrainer(BaseTrainer):
                             del loss, model_output_data, sft_predicted
 
                         if text_step:
-                            text_scale = self.config.text_reward_weight / self.config.gradient_accumulation_steps
-
-                            def _text_backward(term, _scale=text_scale, _scaler=scaler):
-                                term = term * _scale
-                                if _scaler:
-                                    _scaler.scale(term).backward()
-                                else:
-                                    term.backward()
-
-                            text_value = self.model_setup.calculate_text_reward_loss(
-                                self.model, self._text_reward_bank.next(), self.config, train_progress, _text_backward
-                            )
-                            addon_text_loss = text_value.detach() * text_scale
-                            text_metrics = self.model_setup.get_last_text_reward_metrics()
+                            addon_text_loss, text_metrics = self.__text_reward_term(scaler, train_progress)
                             if sft_grad_norm_v is not None:
                                 text_metrics["sft_grad_norm_v"] = sft_grad_norm_v
                             accumulated_text_metrics = accumulate_dpo_metrics(accumulated_text_metrics, text_metrics)
@@ -2238,35 +2548,38 @@ class GenericTrainer(BaseTrainer):
                         if dpo_step:
                             # The pair itself is evaluated half by half with one
                             # graph alive at a time (calculate_dpo_loss_light);
-                            # its gradients land through _addon_backward, so the
-                            # common backward below is skipped on this step.
-                            dpo_batch = self.dpo_addon_source.next()
-                            dpo_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
-
-                            def _addon_backward(term, _scale=dpo_scale, _scaler=scaler):
-                                term = term * _scale
-                                if _scaler:
-                                    _scaler.scale(term).backward()
-                                else:
-                                    term.backward()
-
-                            dpo_value = self.model_setup.calculate_dpo_loss_light(
-                                self.model, dpo_batch, self.config, train_progress, _addon_backward
-                            )
-                            addon_dpo_loss = dpo_value.detach() * dpo_scale
+                            # its gradients land through the helper's backward
+                            # callback, so the common backward below is skipped
+                            # on this step.
+                            addon_dpo_loss = self.__dpo_addon_term(scaler, train_progress)
                             accumulated_dpo_metrics = accumulate_dpo_metrics(
                                 accumulated_dpo_metrics, self.model_setup.get_last_dpo_metrics()
                             )
                             self._loop_accumulated_dpo_metrics = accumulated_dpo_metrics
                             self.__collect_dpo_pairs(train_progress)
 
-                    if addon_sft_loss is None:
+                        if kto_step:
+                            addon_kto_loss = self.__kto_addon_term(scaler, train_progress)
+                            accumulated_kto_metrics = accumulate_dpo_metrics(
+                                accumulated_kto_metrics, self.model_setup.get_last_kto_metrics()
+                            )
+
+                    if kind is not MicroStepKind.SFT:
+                        # INDEPENDENT add-on micro-step: its one term was
+                        # already backwarded above and is the whole step.
+                        detached_loss = next(
+                            term for term in (addon_dpo_loss, addon_kto_loss, addon_text_loss) if term is not None
+                        )
+                    elif addon_sft_loss is None:
                         loss = loss / self.config.gradient_accumulation_steps
                         if scaler:
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
                         detached_loss = loss.detach()
+                        if schedule is not None:
+                            accumulated_sft_loss += detached_loss
+                            accumulated_sft_count += 1
                     else:
                         # Add-on micro-step: every term was already backwarded
                         # (standard first, then the DPO pair and/or the text
@@ -2274,6 +2587,8 @@ class GenericTrainer(BaseTrainer):
                         detached_loss = addon_sft_loss
                         if addon_dpo_loss is not None:
                             detached_loss = detached_loss + addon_dpo_loss
+                        if addon_kto_loss is not None:
+                            detached_loss = detached_loss + addon_kto_loss
                         if addon_text_loss is not None:
                             detached_loss = detached_loss + addon_text_loss
 
@@ -2373,6 +2688,16 @@ class GenericTrainer(BaseTrainer):
                             self.tensorboard.add_scalar(
                                 "loss/train_step", accumulated_loss_cpu, train_progress.global_step
                             )
+                            if accumulated_sft_count > 0:
+                                # Mean standard loss over this window's standard
+                                # micro-steps (the /GA scaling undone).
+                                self.tensorboard.add_scalar(
+                                    "loss/sft_step",
+                                    float(accumulated_sft_loss)
+                                    * self.config.gradient_accumulation_steps
+                                    / accumulated_sft_count,
+                                    train_progress.global_step,
+                                )
                             if grad_norm is not None:
                                 grad_norm_cpu = float(grad_norm)
                                 self.tensorboard.add_scalar("grad/norm", grad_norm_cpu, train_progress.global_step)
@@ -2474,6 +2799,36 @@ class GenericTrainer(BaseTrainer):
                                         self.tensorboard.add_scalar(tag, value, train_progress.global_step)
                                 if self._dpo_live_ledger is not None:
                                     self._dpo_live_ledger.flush(train_progress.global_step)
+                            if accumulated_kto_metrics is not None:
+                                kto_count = accumulated_kto_metrics.pop("_count")
+                                self.tensorboard.add_scalar(
+                                    "loss/kto", accumulated_kto_metrics["loss"] / kto_count, train_progress.global_step
+                                )
+                                for label in ("liked", "disliked"):
+                                    label_count = accumulated_kto_metrics.get(f"{label}_count", 0.0)
+                                    if label_count > 0:
+                                        self.tensorboard.add_scalar(
+                                            f"kto/{label}_reward",
+                                            accumulated_kto_metrics[f"{label}_reward_sum"] / label_count,
+                                            train_progress.global_step,
+                                        )
+                                self.tensorboard.add_scalar(
+                                    "kto/accuracy",
+                                    accumulated_kto_metrics["accuracy"] / kto_count,
+                                    train_progress.global_step,
+                                )
+                                if "beta_mean" in accumulated_kto_metrics:
+                                    self.tensorboard.add_scalar(
+                                        "kto/beta_mean",
+                                        accumulated_kto_metrics["beta_mean"] / kto_count,
+                                        train_progress.global_step,
+                                    )
+                                if "sft_anchor_loss" in accumulated_kto_metrics:
+                                    self.tensorboard.add_scalar(
+                                        "kto/sft_anchor_loss",
+                                        accumulated_kto_metrics["sft_anchor_loss"] / kto_count,
+                                        train_progress.global_step,
+                                    )
                             if accumulated_text_metrics is not None:
                                 text_count = accumulated_text_metrics.pop("_count")
                                 self.tensorboard.add_scalar(
@@ -2560,7 +2915,10 @@ class GenericTrainer(BaseTrainer):
                         accumulated_dpo_metrics = None
                         if self._dpo_concept_window is not None:
                             self._dpo_concept_window.reset()
+                        accumulated_kto_metrics = None
                         accumulated_text_metrics = None
+                        accumulated_sft_loss = 0.0
+                        accumulated_sft_count = 0
                         accumulated_distill_metrics = None
                         accumulated_transfer_metrics = None
                         # Reset Fix B mirrors at the accumulator boundary so a
@@ -2603,7 +2961,10 @@ class GenericTrainer(BaseTrainer):
                 ) and multi.is_master():
                     self.__validate(train_progress)
 
-                train_progress.next_step(self.config.batch_size)
+                # epoch_sample counts standard samples: the main loader's resume
+                # offset. An INDEPENDENT add-on micro-step advances the step
+                # counters but not that.
+                train_progress.next_step(self.config.batch_size if kind is MicroStepKind.SFT else 0)
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
                 if self.commands.get_stop_command():
@@ -2748,6 +3109,7 @@ class GenericTrainer(BaseTrainer):
         self.dpo_validation_data_loader = None
         self.sft_anchor_source = None
         self.dpo_addon_source = None
+        self.kto_source = None
         self._dpo_concept_resolver = None
         self._dpo_concept_window = None
         self._dpo_live_ledger = None

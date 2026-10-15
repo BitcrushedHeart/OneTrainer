@@ -13,6 +13,7 @@ from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.BalancingStrategy import BalancingStrategy
 from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.KTOLabel import KTOLabel
 from modules.util.image_util import load_image
 from modules.util.ui import components
 from modules.util.ui.ui_utils import set_window_icon
@@ -142,10 +143,34 @@ class ConceptWindow(ctk.CTkToplevel):
             tooltip="STANDARD: Standard finetuning with the sample as the training target\n"
             "VALIDATION: Use the concept for validation instead of training\n"
             "PRIOR_PREDICTION: Use the model before training to make a target for regularization. Only implemented for LoRA.\n"
+            "KTO: Single images labelled Liked or Disliked (pick the label next to the type) for the unpaired KTO "
+            "preference loss of an RLHF run. Skipped by the standard finetune.\n"
             "For DPO preference pairs, set the chosen/rejected patterns below instead.",
             wide_tooltip=True,
         )
         components.options_kv(frame, 2, 1, self._concept_type_options(), self.ui_state, "type")
+
+        # KTO label: only meaningful for KTO concepts, so it sits next to the
+        # type and appears when KTO is selected.
+        self.__kto_label_label = components.label(
+            frame,
+            2,
+            2,
+            "KTO Label",
+            tooltip="Liked: the KTO loss pushes these images above the reference model. Disliked: below it. "
+            "The whole concept carries one label, so keep liked and disliked images in separate concepts. "
+            "Needs RLHF enabled; a KTO concept is skipped by a plain finetune.",
+        )
+        self.__kto_label_menu = components.options_kv(
+            frame,
+            2,
+            3,
+            [("Liked", KTOLabel.LIKED), ("Disliked", KTOLabel.DISLIKED)],
+            self.ui_state,
+            "kto_label",
+        )
+        self.ui_state.add_var_trace("type", self.__update_kto_label_visibility)
+        self.__update_kto_label_visibility()
 
         # path
         components.label(frame, 3, 0, "Path", tooltip="Path where the training data is located")
@@ -558,11 +583,22 @@ class ConceptWindow(ctk.CTkToplevel):
         frame.pack(fill="both", expand=1)
         return frame
 
+    def __update_kto_label_visibility(self):
+        show = self.ui_state.get_var("type").get() == ConceptType.KTO.value
+        for widget in (self.__kto_label_label, self.__kto_label_menu):
+            if not widget.winfo_exists():
+                continue
+            if show:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
     def _concept_type_options(self):
         return [
             ("Standard", ConceptType.STANDARD),
             ("Validation", ConceptType.VALIDATION),
             ("Prior Prediction", ConceptType.PRIOR_PREDICTION),
+            ("KTO", ConceptType.KTO),
         ]
 
     def __concept_stats_tab(self, master):

@@ -1,7 +1,7 @@
 import { DirPicker, FilePicker, FormEntry, Select, Toggle } from "@/components/shared";
 import type { ConceptConfig } from "@/types/generated/config";
 import { PROMPT_SOURCES } from "@/types/generated/dropdownSources";
-import { BalancingStrategyValues, ConceptTypeValues } from "@/types/generated/enums";
+import { BalancingStrategyValues, ConceptTypeValues, KTOLabelValues } from "@/types/generated/enums";
 
 export interface ConceptGeneralTabProps {
   draft: ConceptConfig;
@@ -20,6 +20,19 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
 
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Concept Type</span>
       <Select label="" options={ConceptTypeValues} value={draft.type} onChange={(v) => update("type", v)} />
+
+      {draft.type === "KTO" && (
+        <>
+          <span className="text-sm font-medium text-[var(--color-on-surface)]">KTO Label</span>
+          <Select
+            label=""
+            options={KTOLabelValues}
+            value={draft.kto_label}
+            onChange={(v) => update("kto_label", v)}
+            tooltip="Liked: the KTO loss pushes these images above the reference model. Disliked: below it. One label per concept."
+          />
+        </>
+      )}
 
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Path</span>
       <DirPicker

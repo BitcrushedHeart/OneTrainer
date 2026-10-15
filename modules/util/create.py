@@ -118,6 +118,7 @@ def create_data_loader(
     is_validation: bool = False,
     is_sft_anchor: bool = False,
     dpo_validation: bool | None = None,
+    is_kto: bool = False,
 ) -> BaseDataLoader | None:
     if config.gradient_checkpointing.offload() and config.layer_offload_fraction > 0 and config.dataloader_threads > 1:
         raise RuntimeError('layer offloading can not be activated if "dataloader_threads" > 1')
@@ -139,6 +140,7 @@ def create_data_loader(
             is_validation,
             is_sft_anchor,
             dpo_validation=dpo_validation,
+            is_kto=is_kto,
         )
         if cls is not None
         else None

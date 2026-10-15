@@ -19,10 +19,16 @@ from modules.util.distill_dmd2_util import (
     euler_flow_step,
 )
 from modules.util.distill_metadata_util import extract_distill_metadata
-from modules.util.dpo_light_util import dpo_objective, dpo_surrogate_weights, split_dpo_pair_batch
+from modules.util.dpo_light_util import (
+    dpo_objective,
+    dpo_surrogate_weights,
+    kto_unpaired_objective,
+    split_dpo_pair_batch,
+)
 from modules.util.enum.DistillCfgMode import DistillCfgMode
 from modules.util.enum.DistillVramMode import DistillVramMode
 from modules.util.enum.DPORefMode import DPORefMode
+from modules.util.enum.KTOLabel import KTOLabel
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.loss.masked_loss import clamp_mask, masked_mse_per_sample, resolve_unmasked_weight
 from modules.util.ModuleFilter import ModuleFilter
@@ -487,6 +493,9 @@ class BaseModelSetup(
 
     def get_last_dpo_metrics(self) -> dict[str, float]:
         return self._last_dpo_metrics or {}
+
+    def get_last_kto_metrics(self) -> dict[str, float]:
+        return getattr(self, "_last_kto_metrics", None) or {}
 
     def get_last_dpo_pair_records(self) -> list[dict]:
         return self._last_dpo_pair_records
@@ -1551,6 +1560,8 @@ class BaseModelSetup(
             "objective": config.rlhf_dpo_objective,
             "ipo_tau": config.rlhf_dpo_ipo_tau,
             "label_smoothing": config.rlhf_dpo_label_smoothing,
+            "kto_desirable_weight": config.rlhf_kto_desirable_weight,
+            "kto_undesirable_weight": config.rlhf_kto_undesirable_weight,
         }
 
     @staticmethod
@@ -1721,6 +1732,89 @@ class BaseModelSetup(
             image_paths=chosen_batch.get("image_path"),
         )
         return loss
+
+    def calculate_kto_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+    ) -> Tensor:
+        """Unpaired KTO on a batch of single images from KTO concepts, each
+        labelled Liked or Disliked by its concept.
+
+        One no-grad reference forward and one policy forward over the same
+        batch; they draw the same noise and timestep because predict() seeds
+        its generator from global_step. Each sample's reference-relative
+        log-prob (negative denoising error, inside the mask under masked
+        training) goes through the saturating KTO utility with the sign of its
+        label (kto_unpaired_objective). Per-concept beta overrides apply as in
+        DPO. Conditioning dropout is neutralised like in the pair path so both
+        forwards see the same prompt.
+        """
+        labels = batch.get("kto_label")
+        if labels is None:
+            raise RuntimeError(
+                "The KTO batch carries no kto_label column. Rows cached before the concept became a KTO "
+                "concept keep their stamped concept values in sourceless runs; re-cache them or run "
+                "scripts/util/sync_concept_values.py."
+            )
+        liked = torch.tensor([str(label) == KTOLabel.LIKED.value for label in labels], dtype=torch.bool)
+
+        mse_per_sample = self._dpo_mse_per_sample
+        beta = self._resolve_dpo_beta(config, batch)
+        mask = self._dpo_mask_weights(batch, config)
+
+        te_configs = (config.text_encoder, config.text_encoder_2, config.text_encoder_3, config.text_encoder_4)
+        saved_dropout = [te.dropout_probability for te in te_configs]
+        try:
+            for te in te_configs:
+                te.dropout_probability = 0.0
+            with torch.no_grad(), self.reference_model(model, config):
+                ref_output = self.predict(model, batch, config, train_progress)
+                ref_logp = -mse_per_sample(ref_output["predicted"], ref_output["target"], mask)
+                del ref_output
+            policy_output = self.predict(model, batch, config, train_progress)
+        finally:
+            for te, saved in zip(te_configs, saved_dropout, strict=True):
+                te.dropout_probability = saved
+        policy_logp = -mse_per_sample(policy_output["predicted"], policy_output["target"], mask)
+        del policy_output
+
+        liked = liked.to(policy_logp.device)
+        loss, ratio = kto_unpaired_objective(
+            policy_logp,
+            ref_logp,
+            liked,
+            beta=beta,
+            desirable_weight=config.rlhf_kto_desirable_weight,
+            undesirable_weight=config.rlhf_kto_undesirable_weight,
+        )
+        self._record_kto_metrics(loss, ratio, liked, beta)
+        return loss
+
+    def _record_kto_metrics(self, loss: Tensor, ratio: Tensor, liked: Tensor, beta: float | Tensor) -> None:
+        """Per-micro-batch KTO metrics, synced in one .tolist(). Rewards are
+        kept as sums with counts so the trainer can average each label across
+        a gradient-accumulation window whose batches may hold only one."""
+        ratio = ratio.detach().float()
+        liked_f = liked.float()
+        disliked_f = 1.0 - liked_f
+        sign = liked_f * 2.0 - 1.0
+        metric_names = ["loss", "liked_reward_sum", "liked_count", "disliked_reward_sum", "disliked_count", "accuracy"]
+        metric_tensors = [
+            loss.detach().float(),
+            (ratio * liked_f).sum(),
+            liked_f.sum(),
+            (ratio * disliked_f).sum(),
+            disliked_f.sum(),
+            ((sign * ratio) > 0).float().mean(),
+        ]
+        if isinstance(beta, Tensor):
+            metric_names.append("beta_mean")
+            metric_tensors.append(beta.detach().float().mean().to(metric_tensors[0].device))
+        metric_values = torch.stack(metric_tensors).tolist()
+        self._last_kto_metrics = dict(zip(metric_names, metric_values, strict=True))
 
     def _record_dpo_metrics(
         self,

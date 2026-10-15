@@ -628,6 +628,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # rlhf_supervised_mix), per sample for the same reason.
             output_names.append(("concept.supervised_mix_override", "supervised_mix_override"))
 
+        if getattr(self, "is_kto", False):
+            # The KTO loader runs the standard pipeline (config.rlhf_enabled is
+            # forced off, so no rejected half) but feeds a preference loss: the
+            # concept's Liked / Disliked label and its beta override travel per
+            # sample like loss_weight, because a batch mixes concepts.
+            output_names.append(("concept.kto_label", "kto_label"))
+            output_names.append(("concept.dpo_beta_override", "dpo_beta_override"))
+
         if config.masked_training:
             # Per-concept unmasked weight (negative = inherit the global value).
             # Travels per sample for the same reason as the beta override.

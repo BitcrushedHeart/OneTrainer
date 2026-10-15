@@ -14,6 +14,7 @@ from modules.util.dpo_curation_util import (
 from modules.util.dpo_pattern_util import dpo_concept_pattern_dirs
 from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
+from modules.util.enum.RLHFAddonSchedule import RLHFAddonSchedule
 from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.enum.TextRewardSource import TextRewardSource
 from modules.util.text_reward_util import load_word_list
@@ -65,7 +66,9 @@ class RLHFTab:
             tooltip="DPO: the chosen/rejected pairs drive the run; standard concepts become a weighted SFT anchor. "
             "SFT + DPO: your standard concepts drive the run at full weight exactly like a normal finetune, and "
             "a DPO pair is interleaved every N micro-batches as a weighted add-on. Set Repeats on the DPO concept "
-            "to control how much preference signal enters each epoch.",
+            "to control how much preference signal enters each epoch. KTO concepts (single images labelled Liked / "
+            "Disliked) are a third loader in both modes: added to every pair step in DPO mode, interleaved like the "
+            "pairs in SFT + DPO mode, and the main loader of a DPO-mode run that has no pairs.",
         )
         components.options_kv(self.scroll_frame, 0, 1, mode_options, self.ui_state, "rlhf_mode")
 
@@ -135,6 +138,7 @@ class RLHFTab:
         objective_options = [
             ("DPO (sigmoid)", DPOObjective.SIGMOID),
             ("IPO", DPOObjective.IPO),
+            ("KTO", DPOObjective.KTO),
         ]
         components.label(
             self.scroll_frame,
@@ -144,7 +148,11 @@ class RLHFTab:
             tooltip="DPO (sigmoid): the standard preference loss, scaled by Beta — pushes the preference margin "
             "ever higher, which can reward-hack on long runs. "
             "IPO: regresses the margin toward the fixed target 1/(2*Tau) instead — bounded by construction, "
-            "more resistant to reward hacking. Beta and Label Smoothing do not apply to IPO.",
+            "more resistant to reward hacking. Beta and Label Smoothing do not apply to IPO. "
+            "KTO: scores each half of the pair on its own against the reference (chosen = desirable, rejected = "
+            "undesirable) through a saturating sigmoid utility scaled by Beta. The chosen half must actually rise "
+            "above the reference, so it resists the chosen-likelihood drift DPO allows. Label Smoothing and "
+            "Adaptive Beta do not apply.",
         )
         components.options_kv(self.scroll_frame, 4, 1, objective_options, self.ui_state, "rlhf_dpo_objective")
 
@@ -163,24 +171,37 @@ class RLHFTab:
             self.scroll_frame,
             6,
             0,
+            "KTO Weights",
+            tooltip="KTO only. Desirable / undesirable weights (lambda_D / lambda_U): how hard the chosen half is "
+            "pulled above the reference and the rejected half pushed below it. Paired data has equal counts, so "
+            "1 / 1 is the paper's balance; raise one side to favour it. The KTO reference point is fixed at 0 "
+            "(no mismatched-pair KL estimate; there is none to take at batch size 1).",
+        )
+        components.entry(self.scroll_frame, 6, 1, self.ui_state, "rlhf_kto_desirable_weight")
+        components.entry(self.scroll_frame, 6, 2, self.ui_state, "rlhf_kto_undesirable_weight")
+
+        components.label(
+            self.scroll_frame,
+            7,
+            0,
             "Adaptive Beta",
             tooltip="Adjusts Beta per optimizer step from the smoothed reward margin (beta-DPO): informative "
             "batches with above-average margins raise Beta, uninformative ones lower it, bounded to "
             "[Beta/4, Beta*4]. Beta is the starting point. Only applies to the DPO (sigmoid) objective. "
             "Note that Beta and learning rate are coupled - if you double Beta, halve the learning rate.",
         )
-        components.switch(self.scroll_frame, 6, 1, self.ui_state, "rlhf_dpo_adaptive_beta")
+        components.switch(self.scroll_frame, 7, 1, self.ui_state, "rlhf_dpo_adaptive_beta")
 
         components.label(
             self.scroll_frame,
-            7,
+            8,
             0,
             "SFT Anchor Weight",
             tooltip="Weight on a supervised loss computed from your STANDARD concepts during a DPO run. "
             "When >0 and standard concepts are present, the loader runs them in parallel and adds "
             "weight * sft_loss to the DPO loss. Set to 0 to silently drop standard concepts (legacy behavior).",
         )
-        components.entry(self.scroll_frame, 7, 1, self.ui_state, "rlhf_sft_anchor_weight")
+        components.entry(self.scroll_frame, 8, 1, self.ui_state, "rlhf_sft_anchor_weight")
 
         components.label(
             self.scroll_frame,
@@ -211,37 +232,37 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
-            6,
+            7,
             3,
             "Save Best",
             tooltip="Saves a checkpoint when validation accuracy hits a new high. "
             "The best checkpoint is restored at the end of training.",
         )
-        components.switch(self.scroll_frame, 6, 4, self.ui_state, "rlhf_dpo_save_best")
+        components.switch(self.scroll_frame, 7, 4, self.ui_state, "rlhf_dpo_save_best")
 
         components.label(
             self.scroll_frame,
-            7,
+            8,
             3,
             "Timestep Margins",
             tooltip="Logs the reward margin bucketed by timestep quartile (dpo/margin_by_t/q1..q4) to TensorBoard. "
             "Useful to verify pairs are compared evenly across noise levels.",
         )
-        components.switch(self.scroll_frame, 7, 4, self.ui_state, "rlhf_dpo_timestep_margin_logging")
+        components.switch(self.scroll_frame, 8, 4, self.ui_state, "rlhf_dpo_timestep_margin_logging")
 
         components.label(
             self.scroll_frame,
-            8,
+            9,
             0,
             "Per-Concept Metrics",
             tooltip="Logs margin, accuracy, rewards, applied beta and gradient weight for each DPO concept "
             "separately (dpo/concept/<folder>/...) to TensorBoard, instead of only the blend of all of them.",
         )
-        components.switch(self.scroll_frame, 8, 1, self.ui_state, "rlhf_dpo_concept_logging")
+        components.switch(self.scroll_frame, 9, 1, self.ui_state, "rlhf_dpo_concept_logging")
 
         components.label(
             self.scroll_frame,
-            8,
+            9,
             3,
             "Live Saturation",
             tooltip="Tracks every DPO pair while training and writes <workspace>/dpo_live/: report.md (per concept: "
@@ -249,32 +270,54 @@ class RLHFTab:
             "(one row per pair) and ledger.json. Margins are relative to this run's DPO reference; a rebase "
             "archives the history and starts over.",
         )
-        components.switch(self.scroll_frame, 8, 4, self.ui_state, "rlhf_dpo_live_saturation")
+        components.switch(self.scroll_frame, 9, 4, self.ui_state, "rlhf_dpo_live_saturation")
 
         components.label(
             self.scroll_frame,
-            10,
+            11,
             0,
             "DPO Add-on Weight",
             tooltip="SFT + DPO mode only. Multiplier on the DPO loss when a pair is interleaved into the standard "
-            "run; the standard loss always stays at full weight. 1.0 adds the DPO term as-is.",
+            "run; the standard loss always stays at full weight. 1.0 adds the DPO term as-is. Also scales the "
+            "interleaved KTO batches of KTO concepts (Liked / Disliked singles).",
         )
-        components.entry(self.scroll_frame, 10, 1, self.ui_state, "rlhf_dpo_addon_weight")
+        components.entry(self.scroll_frame, 11, 1, self.ui_state, "rlhf_dpo_addon_weight")
+
+        components.label(
+            self.scroll_frame,
+            11,
+            3,
+            "DPO Add-on Interval",
+            tooltip="SFT + DPO mode, Piggyback schedule only. Interleave one DPO pair every N standard micro-batches. "
+            "0 = automatic: derived each epoch from the dataset sizes (including the DPO concept's Repeats) so "
+            "both finish an epoch together. Ignored by the Independent schedule.",
+        )
+        components.entry(self.scroll_frame, 11, 4, self.ui_state, "rlhf_dpo_addon_interval")
+
+        schedule_options = [
+            ("Piggyback (add-on rides on standard steps)", RLHFAddonSchedule.PIGGYBACK),
+            ("Independent (own micro-step per batch)", RLHFAddonSchedule.INDEPENDENT),
+        ]
+        components.label(
+            self.scroll_frame,
+            6,
+            3,
+            "Add-on Schedule",
+            tooltip="How DPO pairs, KTO batches and text reward rollouts are placed among the standard micro-steps "
+            "(SFT + DPO mode and the text reward). Piggyback: every micro-step is one standard batch and an add-on "
+            "term rides along every N of them (the interval on the right; lowest peak memory, but a text reward "
+            "is never allowed on a DPO step and starves when the interval reaches 1, and an interval above 1 "
+            "leaves part of the DPO data unvisited). Independent: every standard batch, DPO pair batch, KTO batch "
+            "and text rollout is its own micro-step, interleaved evenly through the epoch, so every source is "
+            "consumed at its full length and Repeats; the epoch has as many micro-steps as all sources together "
+            "and gradient accumulation counts them all. The interval is ignored. Each term keeps its weight; peak "
+            "memory is one term's graph.",
+        )
+        components.options_kv(self.scroll_frame, 6, 4, schedule_options, self.ui_state, "rlhf_addon_schedule")
 
         components.label(
             self.scroll_frame,
             10,
-            3,
-            "DPO Add-on Interval",
-            tooltip="SFT + DPO mode only. Interleave one DPO pair every N standard micro-batches. 0 = automatic: "
-            "derived each epoch from the dataset sizes (including the DPO concept's Repeats) so both finish an "
-            "epoch together.",
-        )
-        components.entry(self.scroll_frame, 10, 4, self.ui_state, "rlhf_dpo_addon_interval")
-
-        components.label(
-            self.scroll_frame,
-            9,
             3,
             "DPO Add-on Graph Reuse",
             tooltip="SFT + DPO mode only. Run the rejected image's forward with gradients first and keep its graph "
@@ -283,11 +326,11 @@ class RLHFTab:
             "are held. Ignored (the extra forward is kept) when gradient checkpointing is off or CPU offloaded with "
             "activation or layer offloading.",
         )
-        components.switch(self.scroll_frame, 9, 4, self.ui_state, "rlhf_dpo_light_reuse_rejected_graph")
+        components.switch(self.scroll_frame, 10, 4, self.ui_state, "rlhf_dpo_light_reuse_rejected_graph")
 
         components.label(
             self.scroll_frame,
-            11,
+            12,
             0,
             "Rebase Reference on Start",
             tooltip="Existing Adapter reference only. When resuming from a backup, discard the reference snapshot "
@@ -296,23 +339,23 @@ class RLHFTab:
             "the reward margins saturate and the DPO term goes flat; rebasing resets every margin to zero so the "
             "same pairs bite again. Applies on every start while enabled - turn it off after the resume.",
         )
-        components.switch(self.scroll_frame, 11, 1, self.ui_state, "rlhf_dpo_ref_rebase")
+        components.switch(self.scroll_frame, 12, 1, self.ui_state, "rlhf_dpo_ref_rebase")
 
         components.label(
             self.scroll_frame,
-            11,
+            12,
             3,
             "Rebase Reference Every",
             tooltip="Existing Adapter reference only. Re-snapshot the reference from the current adapter every N "
             "steps (global step, as shown in TensorBoard), right after an optimizer step. 0 = never. A resumed run "
             "waits for the next multiple of N rather than rebasing immediately.",
         )
-        components.entry(self.scroll_frame, 11, 4, self.ui_state, "rlhf_dpo_ref_rebase_interval")
+        components.entry(self.scroll_frame, 12, 4, self.ui_state, "rlhf_dpo_ref_rebase_interval")
 
         # --- on-image text reward (frozen OCR, CTC through the VAE) ---
         components.label(
             self.scroll_frame,
-            12,
+            13,
             0,
             "Text Reward",
             tooltip="Add a DRaFT-1 style on-image text reward to the standard finetune (plain or SFT + DPO). Each "
@@ -320,116 +363,116 @@ class RLHFTab:
             "decodes the text region, and backpropagates a frozen OCR's CTC loss into the adapter. Never runs on a "
             "micro-batch that already carries a DPO pair. Needs the python-doctr package.",
         )
-        components.switch(self.scroll_frame, 12, 1, self.ui_state, "text_reward_enabled")
+        components.switch(self.scroll_frame, 13, 1, self.ui_state, "text_reward_enabled")
         components.label(
             self.scroll_frame,
-            12,
+            13,
             3,
             "Text Reward Weight",
             tooltip="Multiplier on the CTC loss when a reward rollout is interleaved. The standard loss stays at full "
             "weight. Scalar 'loss/text_reward' in TensorBoard already includes this weight.",
         )
-        components.entry(self.scroll_frame, 12, 4, self.ui_state, "text_reward_weight")
+        components.entry(self.scroll_frame, 13, 4, self.ui_state, "text_reward_weight")
 
         components.label(
             self.scroll_frame,
-            13,
+            14,
             0,
             "Text Samples / Epoch",
             tooltip="How many reward rollouts to spread over one epoch of the standard data. The interval between "
             "them is derived each epoch from the primary loader length, like the DPO add-on interval. Prompts are "
             "redrawn and pre-encoded at every epoch start.",
         )
-        components.entry(self.scroll_frame, 13, 1, self.ui_state, "text_reward_samples_per_epoch")
+        components.entry(self.scroll_frame, 14, 1, self.ui_state, "text_reward_samples_per_epoch")
         components.label(
             self.scroll_frame,
-            13,
+            14,
             3,
             "Rollout Steps",
             tooltip="Sampling steps of the no-grad rollout prefix. Only the final grad-bearing step (or a random "
             "step in the second half, see Random Grad Step) is differentiated, so this mostly sets rollout cost.",
         )
-        components.entry(self.scroll_frame, 13, 4, self.ui_state, "text_reward_rollout_steps")
+        components.entry(self.scroll_frame, 14, 4, self.ui_state, "text_reward_rollout_steps")
 
         components.label(
             self.scroll_frame,
-            14,
+            15,
             0,
             "Random Grad Step",
             tooltip="Take the grad-bearing one-step x0 prediction at a random step in the second half of the rollout "
             "instead of always the last step. Spreads the signal across noise levels where glyph structure is decided.",
         )
-        components.switch(self.scroll_frame, 14, 1, self.ui_state, "text_reward_random_grad_step")
+        components.switch(self.scroll_frame, 15, 1, self.ui_state, "text_reward_random_grad_step")
         components.label(
             self.scroll_frame,
-            14,
+            15,
             3,
             "Rollout CFG",
             tooltip="Classifier-free guidance scale for the no-grad rollout prefix (1.0 = off, as for Turbo-like "
             "adapters). Above 1.0 the prefix costs two forwards per step and the negative prompt below is encoded.",
         )
-        components.entry(self.scroll_frame, 14, 4, self.ui_state, "text_reward_cfg_scale")
-
-        components.label(
-            self.scroll_frame,
-            15,
-            0,
-            "Rollout Negative",
-            tooltip="Negative prompt for the rollout prefix when Rollout CFG is above 1.0.",
-        )
-        components.entry(self.scroll_frame, 15, 1, self.ui_state, "text_reward_negative_prompt")
-        components.label(
-            self.scroll_frame,
-            15,
-            3,
-            "Rollout Resolution",
-            tooltip="Square edge of the reward rollout in pixels (multiple of 16).",
-        )
-        components.entry(self.scroll_frame, 15, 4, self.ui_state, "text_reward_resolution")
+        components.entry(self.scroll_frame, 15, 4, self.ui_state, "text_reward_cfg_scale")
 
         components.label(
             self.scroll_frame,
             16,
+            0,
+            "Rollout Negative",
+            tooltip="Negative prompt for the rollout prefix when Rollout CFG is above 1.0.",
+        )
+        components.entry(self.scroll_frame, 16, 1, self.ui_state, "text_reward_negative_prompt")
+        components.label(
+            self.scroll_frame,
+            16,
+            3,
+            "Rollout Resolution",
+            tooltip="Square edge of the reward rollout in pixels (multiple of 16).",
+        )
+        components.entry(self.scroll_frame, 16, 4, self.ui_state, "text_reward_resolution")
+
+        components.label(
+            self.scroll_frame,
+            17,
             0,
             "Max Decode Pixels",
             tooltip="Edge cap of the text region decoded WITH gradient through the VAE (the memory-critical part). "
             "Words outside the capped window are read but not rewarded that step. 512 keeps the decode under ~1 GB "
             "with decoder checkpointing.",
         )
-        components.entry(self.scroll_frame, 16, 1, self.ui_state, "text_reward_max_decode_pixels")
+        components.entry(self.scroll_frame, 17, 1, self.ui_state, "text_reward_max_decode_pixels")
         components.label(
             self.scroll_frame,
-            16,
+            17,
             3,
             "Word List",
             tooltip="Optional text file, one word per line, replacing the built-in dictionary for the word, price, "
             "date, time, URL, abbreviation and number prompt families. Characters outside the OCR's vocabulary are "
             "dropped from targets.",
         )
-        components.entry(self.scroll_frame, 16, 4, self.ui_state, "text_reward_word_list")
+        components.entry(self.scroll_frame, 17, 4, self.ui_state, "text_reward_word_list")
 
         components.label(
             self.scroll_frame,
-            17,
+            18,
             0,
             "Words Min / Max",
             tooltip="Number of words per prompt, drawn uniformly between these bounds.",
         )
-        components.entry(self.scroll_frame, 17, 1, self.ui_state, "text_reward_min_words")
-        components.entry(self.scroll_frame, 17, 2, self.ui_state, "text_reward_max_words")
+        components.entry(self.scroll_frame, 18, 1, self.ui_state, "text_reward_min_words")
+        components.entry(self.scroll_frame, 18, 2, self.ui_state, "text_reward_max_words")
         components.label(
             self.scroll_frame,
-            17,
+            18,
             3,
             "Save Sample Every",
             tooltip="Write every N-th reward rollout with what the OCR read to workspace/text_reward so reward "
             "hacking (text the OCR accepts but a person cannot read) is visible. 0 disables.",
         )
-        components.entry(self.scroll_frame, 17, 4, self.ui_state, "text_reward_save_interval")
+        components.entry(self.scroll_frame, 18, 4, self.ui_state, "text_reward_save_interval")
 
         components.label(
             self.scroll_frame,
-            18,
+            19,
             0,
             "Text Recognizer",
             tooltip="Recognizer behind the reward gradient. trocr-base-str (Microsoft TrOCR, scene-text fine-tune, "
@@ -438,7 +481,7 @@ class RLHFTab:
         )
         components.options(
             self.scroll_frame,
-            18,
+            19,
             1,
             ["trocr-base-str", "trocr-large-str", "trocr-base-printed", "parseq", "crnn_vgg16_bn"],
             self.ui_state,
@@ -446,7 +489,7 @@ class RLHFTab:
         )
         components.label(
             self.scroll_frame,
-            18,
+            19,
             3,
             "Text Reward Source",
             tooltip="Online Rollout: sample from noise on synthetic prompts every reward step (pays a multi-step "
@@ -456,7 +499,7 @@ class RLHFTab:
         )
         components.options_kv(
             self.scroll_frame,
-            18,
+            19,
             4,
             [("Online Rollout", TextRewardSource.ONLINE_ROLLOUT), ("Offline Images", TextRewardSource.OFFLINE_IMAGES)],
             self.ui_state,
@@ -465,26 +508,26 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
-            19,
+            20,
             0,
             "Text Dataset Folder",
             tooltip="Offline Images only. Folder written by the Text Alignment Dataset Tool: image + .txt prompt "
             "(+ .json) per sample. Samples per Epoch is ignored; every image is visited once per epoch.",
         )
-        components.path_entry(self.scroll_frame, 19, 1, self.ui_state, "text_reward_dataset_dir", mode="dir")
+        components.path_entry(self.scroll_frame, 20, 1, self.ui_state, "text_reward_dataset_dir", mode="dir")
         components.label(
             self.scroll_frame,
-            20,
+            21,
             0,
             "Text Dataset Repeats",
             tooltip="Offline Images only. Visit every dataset image this many times per epoch; the reward interval "
             "is derived from images x repeats against the primary loader length, so raise it to fire more often "
             "from a small dataset.",
         )
-        components.entry(self.scroll_frame, 20, 1, self.ui_state, "text_reward_dataset_repeats")
+        components.entry(self.scroll_frame, 21, 1, self.ui_state, "text_reward_dataset_repeats")
         components.label(
             self.scroll_frame,
-            20,
+            21,
             3,
             "Text Init Sigma",
             tooltip="Offline Images only. 0: re-noise the dataset image straight to the grad sigma and take one "
@@ -494,10 +537,10 @@ class RLHFTab:
             "(CFG applies, costs those extra no-grad forwards), re-detect on the policy's own x0 and score that. "
             "Must sit above the grad sigma window.",
         )
-        components.entry(self.scroll_frame, 20, 4, self.ui_state, "text_reward_init_sigma")
+        components.entry(self.scroll_frame, 21, 4, self.ui_state, "text_reward_init_sigma")
         components.label(
             self.scroll_frame,
-            21,
+            22,
             0,
             "Grad Sigma Min / Max",
             tooltip="Window of (shifted) sigma the grad-bearing step is drawn from; 0 / 1 keeps the original rule "
@@ -505,11 +548,11 @@ class RLHFTab:
             "model only sharpens, and the gradient into the velocity is scaled by sigma anyway. Applies to all "
             "sources.",
         )
-        components.entry(self.scroll_frame, 21, 1, self.ui_state, "text_reward_grad_sigma_min")
-        components.entry(self.scroll_frame, 21, 2, self.ui_state, "text_reward_grad_sigma_max")
+        components.entry(self.scroll_frame, 22, 1, self.ui_state, "text_reward_grad_sigma_min")
+        components.entry(self.scroll_frame, 22, 2, self.ui_state, "text_reward_grad_sigma_max")
         components.label(
             self.scroll_frame,
-            21,
+            22,
             3,
             "Reuse Probe Graph",
             tooltip="Online Rollout and the hybrid offline init: the forward that finds the text boxes is also the "
@@ -517,10 +560,10 @@ class RLHFTab:
             "through the full-frame decode and the detector, which is only cheap with gradient checkpointing on "
             "(~1.1 GB at 1024px); without checkpointing this is ignored. Turn off if reward steps OOM.",
         )
-        components.switch(self.scroll_frame, 21, 4, self.ui_state, "text_reward_reuse_probe_graph")
+        components.switch(self.scroll_frame, 22, 4, self.ui_state, "text_reward_reuse_probe_graph")
         components.label(
             self.scroll_frame,
-            22,
+            23,
             0,
             "Grad Steps (DRaFT-K)",
             tooltip="Consecutive grad-bearing Euler steps starting at the drawn grad step; the scored x0 is the "
@@ -529,10 +572,10 @@ class RLHFTab:
             "Each extra step holds one more transformer graph (~1.1 GB at 1024px with gradient checkpointing) and "
             "costs one more forward; clamped to the end of the rollout grid. Applies to all sources.",
         )
-        components.entry(self.scroll_frame, 22, 1, self.ui_state, "text_reward_grad_steps")
+        components.entry(self.scroll_frame, 23, 1, self.ui_state, "text_reward_grad_steps")
         components.button(
             self.scroll_frame,
-            19,
+            20,
             3,
             "Write Wildcard",
             command=self._write_text_wildcard,
@@ -542,7 +585,7 @@ class RLHFTab:
 
         components.button(
             self.scroll_frame,
-            8,
+            9,
             0,
             "Check Pairs",
             command=self._check_pairs,
@@ -550,7 +593,7 @@ class RLHFTab:
         )
         components.button(
             self.scroll_frame,
-            8,
+            9,
             1,
             "Review Pairs",
             command=self._review_pairs,
@@ -558,7 +601,7 @@ class RLHFTab:
         )
         components.button(
             self.scroll_frame,
-            8,
+            9,
             2,
             "Re-pair by Similarity",
             command=self._repair_rejected,
@@ -568,7 +611,7 @@ class RLHFTab:
         )
         components.button(
             self.scroll_frame,
-            8,
+            9,
             3,
             "DPO Bucket Analysis",
             command=self._bucket_analysis,
@@ -577,7 +620,7 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
-            9,
+            10,
             0,
             "Training Type:",
             tooltip="Shows whether DPO is starting from a fresh adapter or refining a loaded adapter. The output is "
@@ -585,7 +628,7 @@ class RLHFTab:
         )
         components.label(
             self.scroll_frame,
-            9,
+            10,
             1,
             training_type,
             tooltip="DPO always writes an adapter file. New Adapter means the adapter starts from scratch. Existing Adapter means DPO refines a loaded adapter.",

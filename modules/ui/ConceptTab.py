@@ -75,7 +75,7 @@ class ConceptTab(ConfigList):
         self.filter_var = StringVar(value="ALL")
         ctk.CTkOptionMenu(
             toolbar,
-            values=["ALL", "STANDARD", "VALIDATION", "PRIOR_PREDICTION"],
+            values=["ALL", "STANDARD", "VALIDATION", "PRIOR_PREDICTION", "KTO"],
             variable=self.filter_var,
             command=lambda x: self._update_filters(),
             width=150,

@@ -19,6 +19,7 @@ from PIL import Image, ImageOps
 TRAIN_CONCEPT_TYPES = {
     ConceptType.STANDARD.value,
     ConceptType.PRIOR_PREDICTION.value,
+    ConceptType.KTO.value,
 }
 VALIDATION_CONCEPT_TYPES = {
     ConceptType.VALIDATION.value,
