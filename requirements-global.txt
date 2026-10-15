@@ -42,7 +42,7 @@ lpips==0.1.4 # perceptual teacher-match metric for distillation validation
 python-doctr==1.0.1 # frozen OCR detector + CTC recognizer for the on-image text reward
 
 # data loader
--e git+https://github.com/BitcrushedHeart/mgds.git@a23c0ed7684b78c2cbf354f7cfa0a2c2775a31b0#egg=mgds
+-e git+https://github.com/BitcrushedHeart/mgds.git@0484810ed3412e2ea2d800cd11e2229c4ede8fff#egg=mgds
 xxhash==3.7.0
 
 # optimizers
