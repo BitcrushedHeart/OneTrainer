@@ -2321,6 +2321,13 @@ class GenericTrainer(BaseTrainer):
                     for source in (self.dpo_addon_source, self.sft_anchor_source, self.kto_source):
                         if source is not None:
                             source.start_next_epoch()
+                    # The validation loaders cache the same way __validate drives
+                    # them (start_next_epoch, which runs their caching pass); a
+                    # cache-only run would otherwise leave the VALIDATION concepts
+                    # uncached and a sourceless run without validation data.
+                    for loader in (self.validation_data_loader, self.dpo_validation_data_loader):
+                        if loader is not None:
+                            loader.get_data_set().start_next_epoch()
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
