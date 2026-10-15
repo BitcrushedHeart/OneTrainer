@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import os
 import warnings
@@ -509,6 +510,80 @@ class BaseModelSetup(
 
     def set_grad_probe(self, active: bool) -> None:
         self._grad_probe_active = bool(active)
+
+    # -- fixed probes (gradient diagnostics) ---------------------------------------
+    # A probe is a validation-style forward: no grad, deterministic=True (noise
+    # from a fixed seed, caption dropout off) with the timestep pinned to a
+    # fraction of the schedule. Nothing of the training step is touched: the
+    # RNG the training draws from is forked around it, the per-sample loss
+    # stash is restored, and the model stays in whatever mode training left
+    # it (as the validation pass does).
+
+    @contextlib.contextmanager
+    def _probe_context(self, config: TrainConfig, timestep_fraction: float):
+        devices = [self.train_device] if self.train_device.type == "cuda" else []
+        stash = getattr(self, "_last_per_sample_losses", None)
+        self._probe_timestep_fraction = float(timestep_fraction)
+        try:
+            with torch.random.fork_rng(devices=devices), torch.no_grad():
+                yield
+        finally:
+            self._probe_timestep_fraction = None
+            self._last_per_sample_losses = stash
+
+    def probe_loss(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        timestep_fraction: float,
+    ) -> float:
+        """The concept's own training loss (masks, loss weights) on ``batch``
+        at a fixed timestep with fixed noise."""
+        with self._probe_context(config, timestep_fraction):
+            output = self.predict(model, batch, config, train_progress, deterministic=True)
+            return float(self.calculate_loss(model, batch, output, config).detach())
+
+    def probe_dpo_margin(
+        self,
+        model: BaseModel,
+        batch: dict,
+        config: TrainConfig,
+        train_progress: TrainProgress,
+        timestep_fraction: float,
+    ) -> float:
+        """The pair batch's mean reward margin (chosen minus rejected
+        reference-relative log-prob, the quantity DPO optimises) at a fixed
+        timestep with fixed noise shared by both halves."""
+        mse = self._dpo_mse_per_sample
+        batched_input, chosen_b = self._create_dpo_batched_batch(batch)
+        mask = self._dpo_mask_weights(batched_input, config)
+        mask_c = mask[:chosen_b] if mask is not None else None
+        mask_r = mask[chosen_b:] if mask is not None else None
+
+        def half_logps(output: dict) -> tuple[Tensor, Tensor]:
+            predicted, target = output["predicted"], output["target"]
+            return (
+                -mse(predicted[:chosen_b], target[:chosen_b], mask_c),
+                -mse(predicted[chosen_b:], target[chosen_b:], mask_r),
+            )
+
+        paired_half = self._dpo_paired_half
+        self._dpo_paired_half = chosen_b
+        try:
+            with self._probe_context(config, timestep_fraction):
+                with self.reference_model(model, config):
+                    ref_c, ref_r = half_logps(
+                        self.predict(model, batched_input, config, train_progress, deterministic=True)
+                    )
+                pol_c, pol_r = half_logps(
+                    self.predict(model, batched_input, config, train_progress, deterministic=True)
+                )
+                margin = (pol_c - ref_c) - (pol_r - ref_r)
+                return float(margin.float().mean())
+        finally:
+            self._dpo_paired_half = paired_half
 
     def get_last_per_sample_losses(self) -> Tensor | None:
         """Detached ``[B]`` per-sample losses of the last standard loss call

@@ -82,7 +82,9 @@ def _pair_batch(root, stems: list[str]) -> dict:
     }
 
 
-def _trainer(tmp_path, monkeypatch, *, diagnostics: bool, interval: int, schedule, ga: int, text: bool = False):
+def _trainer(
+    tmp_path, monkeypatch, *, diagnostics: bool, interval: int, schedule, ga: int, text: bool = False, progress=None
+):
     root = str(tmp_path / "data")
     config = TrainConfig.default_values()
     config.training_method = TrainingMethod.LORA
@@ -129,12 +131,21 @@ def _trainer(tmp_path, monkeypatch, *, diagnostics: bool, interval: int, schedul
     optimizer.step.side_effect = lambda: grads.append(parameter.grad.detach().clone())
     optimizer.zero_grad.side_effect = lambda set_to_none=True: setattr(parameter, "grad", None)
     trainer.model = Mock(
-        ema=None, accumulator_state=None, parameters=None, train_progress=TrainProgress(), optimizer=optimizer
+        ema=None,
+        accumulator_state=None,
+        parameters=None,
+        train_progress=progress if progress is not None else TrainProgress(),
+        optimizer=optimizer,
     )
 
     setup = trainer.model_setup = Mock()
     setup.pop_perceptual_metrics.return_value = {}
     state = {"losses": None}
+    # fixed probes: the toy loss of the sample at the pinned timestep fraction
+    setup.probe_loss.side_effect = lambda model, batch, config, tp, t: float(
+        ((parameter.detach().unsqueeze(0) * batch["x"] - T).pow(2).sum(dim=1)).mean() * (1.0 + t)
+    )
+    setup.probe_dpo_margin.side_effect = lambda model, batch, config, tp, t: float(batch["x"].sum() * t)
 
     def predict(model, batch, config, train_progress):
         pred = parameter.unsqueeze(0) * batch["x"]
@@ -222,7 +233,7 @@ def _scalars(run) -> dict[int, dict[str, float]]:
     out: dict[int, dict[str, float]] = {}
     for call in run.trainer.tensorboard.add_scalar.call_args_list:
         tag, value, step = call.args[:3]
-        if tag.startswith(("grad/", "loss/concept/")):
+        if tag.startswith(("grad/", "loss/concept/", "dpo/concept/")):
             out.setdefault(step, {})[tag] = value
     return out
 
@@ -537,3 +548,79 @@ def test_validation_rejects_fused_back_pass_and_negative_interval():
         {k: v for k, v in config.to_dict().items() if not k.startswith("log_grad")}
     )
     assert loaded.log_grad_components is False and loaded.log_grad_components_interval == 50
+
+
+# --------------------------------------------------------------------------- #
+# per-image visit ledger and fixed probes
+# --------------------------------------------------------------------------- #
+
+
+def test_visit_ledger_logs_paired_deltas_for_revisited_images(tmp_path, monkeypatch):
+    # standard batches [A1, A2], [A1, B1], [B1, B2], [B2, A2]: A1, A2, B1 and B2 are each seen twice
+    run = _trainer(tmp_path, monkeypatch, diagnostics=True, interval=0, schedule=RLHFAddonSchedule.INDEPENDENT, ga=1)
+    run.trainer.train()
+    ledger = run.trainer._visit_ledger
+    assert ledger is not None
+    assert len(ledger.visits(os.path.join(run.root, "A", "A1.png"))) == 2
+    assert len(ledger.visits(os.path.join(run.root, "P", "chosen", "P1.png"))) == 2  # pairs keyed by chosen path
+    logged = _scalars(run)
+    last = logged[max(logged)]
+    for tag, revisited in (("A", 2.0), ("B", 2.0), ("P", 2.0)):
+        assert last[f"loss/concept/{tag}/revisited"] == revisited
+        for quantity in ("visit_delta", "since_first", "frac_improving"):
+            assert f"loss/concept/{tag}/{quantity}" in last
+    # the parameter never changes (mock optimizer) and the normaliser's bin
+    # means move, so deltas are finite numbers in a sane range
+    assert -1.0 <= last["loss/concept/A/visit_delta"] <= 1.0
+    assert 0.0 <= last["loss/concept/A/frac_improving"] <= 1.0
+
+
+def test_fixed_probes_are_captured_from_the_stream_and_run_on_the_probe_cadence(tmp_path, monkeypatch):
+    run = _trainer(tmp_path, monkeypatch, diagnostics=True, interval=2, schedule=RLHFAddonSchedule.INDEPENDENT, ga=2)
+    run.trainer.train()
+    probes = run.trainer._probe_set
+    assert probes.count("A") == 2 and probes.count("B") == 2 and probes.count("P") == 2  # every distinct image
+    assert probes.kind("P") == "dpo" and probes.kind("A") == "sft"
+    sample = dict(probes.samples("A"))[os.path.join(run.root, "A", "A1.png")]
+    assert sample["x"].shape == (1, 3) and sample["image_path"] == [os.path.join(run.root, "A", "A1.png")]
+    logged = _scalars(run)
+    probed = sorted(step for step, s in logged.items() if "loss/concept/A/probe" in s)
+    assert probed == [1, 5]  # updates 0 and 2 at GA 2 (the conflict-probe cadence)
+    first, second = logged[1], logged[5]
+    assert first["loss/concept/A/probe_n"] == 2.0 and "loss/concept/A/probe_delta" not in first
+    assert second["loss/concept/A/probe_delta"] == pytest.approx(
+        second["loss/concept/A/probe"] - first["loss/concept/A/probe"]
+    )
+    assert "dpo/concept/P/probe_margin" in first and "dpo/concept/P/probe_margin_delta" in second
+    # the probe value is the mean over the set's images and the three fixed timesteps
+    p = run.parameter.detach()
+    expected = sum(((p * X[s] - T).pow(2).sum() * (1.0 + t)).item() for s in ("A1", "A2") for t in (0.2, 0.5, 0.8)) / 6
+    assert first["loss/concept/A/probe"] == pytest.approx(expected, rel=1e-5)
+    assert os.path.isfile(os.path.join(run.trainer._diagnostics_dir, "probes.pt"))
+    assert os.path.isfile(os.path.join(run.trainer._diagnostics_dir, "visit_ledger.json"))
+
+
+def test_diagnostics_state_is_restored_on_resume_and_dropped_on_a_fresh_run(tmp_path, monkeypatch):
+    first = _trainer(tmp_path, monkeypatch, diagnostics=True, interval=1, schedule=RLHFAddonSchedule.INDEPENDENT, ga=1)
+    first.trainer.train()
+    images = len(first.trainer._visit_ledger)
+    assert images > 0 and first.trainer._probe_set.total() == 6
+    first.trainer._GenericTrainer__save_diagnostics_state()  # what a backup or end() does
+
+    resumed = _trainer(
+        tmp_path,
+        monkeypatch,
+        diagnostics=True,
+        interval=1,
+        schedule=RLHFAddonSchedule.INDEPENDENT,
+        ga=1,
+        progress=TrainProgress(epoch=0, epoch_step=0, epoch_sample=0, global_step=7),
+    )
+    resumed.trainer._GenericTrainer__setup_grad_diagnostics()
+    assert len(resumed.trainer._visit_ledger) == images
+    assert resumed.trainer._probe_set.total() == 6
+
+    fresh = _trainer(tmp_path, monkeypatch, diagnostics=True, interval=1, schedule=RLHFAddonSchedule.INDEPENDENT, ga=1)
+    fresh.trainer._GenericTrainer__setup_grad_diagnostics()
+    assert len(fresh.trainer._visit_ledger) == 0 and fresh.trainer._probe_set.total() == 0
+    assert not os.path.isfile(os.path.join(fresh.trainer._diagnostics_dir, "probes.pt"))

@@ -25,6 +25,15 @@ from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_ro
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.compile_util import init_compile, save_precompile_cache, set_precompile_cache
+from modules.util.concept_probe_util import (
+    DEFAULT_PROBE_TIMESTEPS,
+    DIAGNOSTICS_DIRNAME,
+    LEDGER_FILENAME,
+    PROBES_FILENAME,
+    ConceptVisitLedger,
+    ProbeSet,
+    move_sample,
+)
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dataset_fingerprint import compute_concept_fingerprint
@@ -116,6 +125,11 @@ class GenericTrainer(BaseTrainer):
     _dpo_concept_window: DPOConceptWindow | None = None
     _dpo_live_ledger: LiveSaturationLedger | None = None
     _dpo_unmapped_pair_warned: bool = False
+    # Per-image learning signals of the gradient diagnostics, likewise.
+    _visit_ledger: ConceptVisitLedger | None = None
+    _probe_set: ProbeSet | None = None
+    _diagnostics_dir: str | None = None
+    _diagnostics_saved_at: float = 0.0
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
@@ -206,6 +220,12 @@ class GenericTrainer(BaseTrainer):
         self._sft_concept_resolver: DPOConceptResolver | None = None
         self._probe_dpo_resolver: DPOConceptResolver | None = None
         self._concept_split_window = False
+        # Per-image visit ledger and the fixed probe set (concept_probe_util),
+        # persisted under <workspace>/diagnostics with the backups.
+        self._visit_ledger: ConceptVisitLedger | None = None
+        self._probe_set: ProbeSet | None = None
+        self._diagnostics_dir: str | None = None
+        self._diagnostics_saved_at = 0.0
         self._loop_scaler = None
 
         # Defaults for state start() re-initializes; __advance_redistill_phase
@@ -863,6 +883,7 @@ class GenericTrainer(BaseTrainer):
         time (calculate_dpo_loss_light); its gradients land through the
         backward callback, so the caller must not backward anything for it."""
         dpo_batch = self.dpo_addon_source.next()
+        self.__capture_probe_samples(MicroStepKind.DPO, dpo_batch)
         dpo_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
 
         def _addon_backward(term, _scale=dpo_scale, _scaler=scaler, **probe):
@@ -957,6 +978,37 @@ class GenericTrainer(BaseTrainer):
         self._sft_concept_resolver = DPOConceptResolver(sft_infos) if sft_infos else None
         self.model_setup.set_grad_probe(True)
 
+        # Per-image learning signals. Both are restored on a resume (a fresh
+        # run starts them empty and drops a stale file); a missing or
+        # unreadable file simply starts empty.
+        self._diagnostics_dir = os.path.join(self.config.workspace_dir, DIAGNOSTICS_DIRNAME)
+        ledger_path = os.path.join(self._diagnostics_dir, LEDGER_FILENAME)
+        probes_path = os.path.join(self._diagnostics_dir, PROBES_FILENAME)
+        resuming = self.model.train_progress.global_step > 0
+        self._visit_ledger = ConceptVisitLedger.load(ledger_path) if resuming else ConceptVisitLedger()
+        self._probe_set = ProbeSet.load(probes_path) if resuming and interval > 0 else ProbeSet()
+        if not resuming:
+            for stale in (ledger_path, probes_path):
+                if os.path.isfile(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        traceback.print_exc()
+        if multi.is_master():
+            concept_count = len(sft_infos) + len(dpo_infos)
+            per_probe = concept_count * self._probe_set.images_per_concept * len(DEFAULT_PROBE_TIMESTEPS)
+            print(
+                f"Gradient diagnostics: per-image visit ledger ({len(self._visit_ledger)} images restored)"
+                + (
+                    f"; fixed probes: up to {concept_count} concepts x {self._probe_set.images_per_concept} images x "
+                    f"{len(DEFAULT_PROBE_TIMESTEPS)} timesteps = {per_probe} no-grad forwards every {interval} updates "
+                    f"(about {per_probe / interval:.2f} forwards per update, DPO pairs cost two batched forwards each; "
+                    f"{self._probe_set.total()} probe images restored)."
+                    if interval > 0
+                    else "; fixed probes off (concept conflict interval 0)."
+                )
+            )
+
         if multi.is_master():
             per_copy = sum(p.numel() for p in self._grad_attribution.parameters) * 4 / 2**30
             print(
@@ -1039,7 +1091,7 @@ class GenericTrainer(BaseTrainer):
         scaler_scale = float(scaler.get_scale()) if scaler else 1.0
         out_norms = dpred.detach().flatten(1).float().norm(dim=1) / (scale * scaler_scale)
         tags = self.__concept_tags(kind, image_paths, predicted.shape[0])
-        self.__record_concept_samples(kind, half, tags, out_norms, losses, timestep)
+        self.__record_concept_samples(kind, half, tags, out_norms, losses, timestep, image_paths)
 
         groups = concept_groups(tags) if self._concept_split_window and self._concept_attribution is not None else None
         if not groups:
@@ -1054,9 +1106,13 @@ class GenericTrainer(BaseTrainer):
             predicted.backward(gradient=dpred * sample_mask(indices, dpred), retain_graph=i < len(items) - 1)
             self.__attribute(self._concept_attribution, tag)
 
-    def __record_concept_samples(self, kind: MicroStepKind, half, tags, out_norms: Tensor, losses, timestep):
+    def __record_concept_samples(
+        self, kind: MicroStepKind, half, tags, out_norms: Tensor, losses, timestep, image_paths=None
+    ):
         """One host sync: per-sample output-gradient norms, losses and
-        timestep fractions, then the timestep-bin normalisation on the host."""
+        timestep fractions, then the timestep-bin normalisation on the host.
+        Each sample's normalised loss also goes to the visit ledger under its
+        own source path (a pair under its chosen path, once per pair)."""
         count = out_norms.shape[0]
         nan = torch.full_like(out_norms, float("nan"))
         rows = [out_norms]
@@ -1083,6 +1139,77 @@ class GenericTrainer(BaseTrainer):
             if half:
                 self._concept_stats.add(tag, f"out_norm_{half}", norms[i])
             self._concept_stats.add(tag, "loss_tnorm", loss_tnorm[i])
+            if self._visit_ledger is not None and image_paths is not None and i < len(image_paths):
+                self._visit_ledger.record(tag, image_paths[i], loss_tnorm[i], kind=str(kind))
+
+    def __capture_probe_samples(self, kind: MicroStepKind, batch: dict):
+        """Fill the fixed probe set from the training stream: the first K
+        distinct images per concept the loader yields (seed-deterministic from
+        a fresh start; a resume restores the set from disk). Their tensors are
+        sliced out of the collated batch and kept on the CPU, so a probe reads
+        exactly what training reads from the cache."""
+        probes = self._probe_set
+        if probes is None or not isinstance(batch, dict):
+            return
+        paths = batch.get("image_path")
+        if not isinstance(paths, (list, tuple)) or not paths:
+            return
+        tags = self.__concept_tags(kind, paths, len(paths))
+        for tag in {t for t in tags if t is not None}:
+            if any(probes.wants(tag, p) for t, p in zip(tags, paths, strict=True) if t == tag):
+                mine = [p if t == tag else None for t, p in zip(tags, paths, strict=True)]
+                probes.capture(tag, str(kind), batch, mine, len(paths))
+
+    def __run_probes(self, train_progress: TrainProgress):
+        """Every concept's fixed probe set at the fixed timesteps, no grad,
+        after the optimizer step (and the rotation cache refresh) so the curve
+        shows the model as it stands. Logs the probe value, its change since
+        the first probe over the same images, and the image count."""
+        probes = self._probe_set
+        if probes is None or probes.total() == 0:
+            return
+        device = torch.device(self.config.train_device)
+        step = train_progress.global_step
+        for tag in probes.tags():
+            samples = probes.samples(tag)
+            kind = probes.kind(tag)
+            values = []
+            for _path, sample in samples:
+                batch = move_sample(sample, device)
+                for fraction in DEFAULT_PROBE_TIMESTEPS:
+                    if kind == str(MicroStepKind.DPO):
+                        values.append(
+                            self.model_setup.probe_dpo_margin(self.model, batch, self.config, train_progress, fraction)
+                        )
+                    else:
+                        values.append(
+                            self.model_setup.probe_loss(self.model, batch, self.config, train_progress, fraction)
+                        )
+            value = sum(values) / len(values)
+            delta = probes.delta_since_first(tag, value)
+            if multi.is_master():
+                prefix = (
+                    f"dpo/concept/{tag}/probe_margin" if kind == str(MicroStepKind.DPO) else f"loss/concept/{tag}/probe"
+                )
+                self.tensorboard.add_scalar(prefix, value, step)
+                if delta is not None:
+                    self.tensorboard.add_scalar(f"{prefix}_delta", delta, step)
+                self.tensorboard.add_scalar(f"{prefix}_n", float(len(samples)), step)
+        if probes.dirty:
+            # a changed set (new images or baselines) is persisted with the ledger
+            self.__save_diagnostics_state()
+
+    def __save_diagnostics_state(self, probes_only: bool = False):
+        if self._diagnostics_dir is None or not multi.is_master():
+            return
+        try:
+            if self._probe_set is not None and self._probe_set.dirty:
+                self._probe_set.save(os.path.join(self._diagnostics_dir, PROBES_FILENAME))
+            if not probes_only and self._visit_ledger is not None:
+                self._visit_ledger.save(os.path.join(self._diagnostics_dir, LEDGER_FILENAME))
+                self._diagnostics_saved_at = time.monotonic()
+        except Exception:  # noqa: BLE001 - diagnostics must never take the run down
+            traceback.print_exc()
 
     def __log_grad_diagnostics(self, train_progress: TrainProgress, scaler):
         """At the update step, after gradient reduction and before clipping:
@@ -1106,6 +1233,12 @@ class GenericTrainer(BaseTrainer):
                         name.split("_", 1) if name.startswith("norm_") else ("cos_rest", name[len("cos_rest_") :])
                     )
                     self.tensorboard.add_scalar(f"grad/concept/{tag}/{quantity}", value, step)
+            if self._visit_ledger is not None:
+                for name, value in self._visit_ledger.scalars().items():
+                    tag, quantity = name.split("/", 1)
+                    self.tensorboard.add_scalar(f"loss/concept/{tag}/{quantity}", value, step)
+                if time.monotonic() - self._diagnostics_saved_at > 600:
+                    self.__save_diagnostics_state()
         self._grad_attribution.reset()
         self._concept_stats.reset()
         if self._concept_attribution is not None:
@@ -1957,6 +2090,7 @@ class GenericTrainer(BaseTrainer):
             self.model_setup.save_dpo_reference(backup_path)
             if self._dpo_live_ledger is not None:
                 self._dpo_live_ledger.flush(train_progress.global_step, force=True)
+            self.__save_diagnostics_state()
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -2607,6 +2741,7 @@ class GenericTrainer(BaseTrainer):
                                 extra_keys=sft_anchor_keys,
                             )
                         else:
+                            self.__capture_probe_samples(MicroStepKind.DPO, batch)
                             loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
                             # Accumulate per-micro-batch DPO metrics across the grad-accum window.
                             # Without this, only the final micro-batch's metric reaches TensorBoard —
@@ -2740,6 +2875,7 @@ class GenericTrainer(BaseTrainer):
                             model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
                             loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
                         probe_output = model_output_data
+                        self.__capture_probe_samples(MicroStepKind.SFT, batch)
 
                         if schedule is not None:
                             # INDEPENDENT: the add-ons have micro-steps of their
@@ -3225,6 +3361,10 @@ class GenericTrainer(BaseTrainer):
                         # host-side; sampling/backup commands run at the next batch), and the
                         # EMA update and validation below come after.
                         self.model_setup.after_optimizer_step_adapters(self.model, self.config)
+                        if self._probe_set is not None and self._concept_split_window:
+                            # Fixed probes on the conflict-probe cadence, on the
+                            # freshly updated (and cache-refreshed) adapter.
+                            self.__run_probes(train_progress)
 
                         if self.model.ema:
                             assert multi.is_master()
@@ -3278,6 +3418,7 @@ class GenericTrainer(BaseTrainer):
 
         if self._dpo_live_ledger is not None:
             self._dpo_live_ledger.flush(self.model.train_progress.global_step, force=True)
+        self.__save_diagnostics_state()
 
         if self.one_step_trained:
             if self.config.oft_rotation_cache_applies():

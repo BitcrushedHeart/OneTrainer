@@ -185,9 +185,12 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
             shift = config.timestep_shift
 
         if deterministic:
-            # -1 is for zero-based indexing
+            # -1 is for zero-based indexing. The fraction is 0.5 (validation)
+            # unless a diagnostics probe pinned another one (_probe_timestep_fraction).
+            fraction = getattr(self, "_probe_timestep_fraction", None)
+            fraction = 0.5 if fraction is None else float(fraction)
             return torch.tensor(
-                int(num_train_timesteps * 0.5) - 1,
+                max(0, int(num_train_timesteps * fraction) - 1),
                 dtype=torch.long,
                 device=generator.device,
             ).unsqueeze(0)
@@ -313,9 +316,10 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         config: TrainConfig,
     ) -> Tensor:
         if deterministic:
+            fraction = getattr(self, "_probe_timestep_fraction", None)
             return torch.full(
                 size=(batch_size,),
-                fill_value=0.5,
+                fill_value=0.5 if fraction is None else float(fraction),
                 device=generator.device,
             )
         else:
