@@ -473,6 +473,7 @@ class TrainConfig(BaseConfig):
     # gradient attribution diagnostics (modules.util.grad_attribution_util)
     log_grad_components: bool
     log_grad_components_interval: int
+    log_vram: bool
     tensorboard_port: str
     validation: bool
     validate_after: float
@@ -1783,6 +1784,7 @@ class TrainConfig(BaseConfig):
         # No migration: configs saved without the keys load the diagnostics off.
         data.append(("log_grad_components", False, bool, False))
         data.append(("log_grad_components_interval", 50, int, False))
+        data.append(("log_vram", False, bool, False))
         data.append(("tensorboard_port", 6006, int, False))
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))

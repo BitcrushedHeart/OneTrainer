@@ -94,6 +94,12 @@ from requests.exceptions import ConnectionError
 from tqdm import tqdm
 
 
+def _latent_shape(batch) -> tuple[int, ...] | None:
+    """The ``latent_image`` shape of a batch dict, if it has one (config log_vram)."""
+    latent = batch.get("latent_image") if isinstance(batch, dict) else None
+    return tuple(latent.shape) if isinstance(latent, Tensor) and latent.ndim >= 3 else None
+
+
 class GenericTrainer(BaseTrainer):
     model_loader: BaseModelLoader
     model_setup: BaseModelSetup
@@ -227,6 +233,9 @@ class GenericTrainer(BaseTrainer):
         self._diagnostics_dir: str | None = None
         self._diagnostics_saved_at = 0.0
         self._loop_scaler = None
+        # Config log_vram: the latent shape an add-on micro-step ran at (its
+        # batch is fetched inside the helper, so the loop never sees it).
+        self._vram_addon_shape: tuple[int, ...] | None = None
 
         # Defaults for state start() re-initializes; __advance_redistill_phase
         # must be safe to reach even if start() was bypassed (tests).
@@ -883,6 +892,7 @@ class GenericTrainer(BaseTrainer):
         time (calculate_dpo_loss_light); its gradients land through the
         backward callback, so the caller must not backward anything for it."""
         dpo_batch = self.dpo_addon_source.next()
+        self._vram_addon_shape = _latent_shape(dpo_batch)
         self.__capture_probe_samples(MicroStepKind.DPO, dpo_batch)
         dpo_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
 
@@ -900,6 +910,7 @@ class GenericTrainer(BaseTrainer):
         """One KTO batch: a no-grad reference forward and one policy forward,
         backwarded here with the add-on weight like the pair (one graph alive)."""
         kto_batch = self.kto_source.next()
+        self._vram_addon_shape = _latent_shape(kto_batch)
         kto_scale = self.config.rlhf_dpo_addon_weight / self.config.gradient_accumulation_steps
         kto_value = self.model_setup.calculate_kto_loss(self.model, kto_batch, self.config, train_progress)
         kto_term = kto_value * kto_scale
@@ -2181,6 +2192,28 @@ class GenericTrainer(BaseTrainer):
             "save", self.config.save_every, self.config.save_every_unit, train_progress, start_at_zero=False
         )
 
+    def __log_vram(self, train_progress: TrainProgress, kind: MicroStepKind, batch) -> None:
+        """Config log_vram: this micro-step's CUDA peaks (allocated, and reserved
+        by the caching allocator, which is what nvidia-smi sees), what it was
+        and the latent size it ran at, then reset the peaks for the next one.
+        Host-side counters only, no sync. vram/probe marks the micro-steps that
+        ran the concept conflict probe and fixed probes on top."""
+        if not self.config.log_vram or not torch.cuda.is_available() or not multi.is_master():
+            return
+        gib = 1024**3
+        step = train_progress.global_step
+        shape = _latent_shape(batch) if batch is not None else self._vram_addon_shape
+        self._vram_addon_shape = None
+        self.tensorboard.add_scalar("vram/peak_allocated_gib", torch.cuda.max_memory_allocated() / gib, step)
+        self.tensorboard.add_scalar("vram/peak_reserved_gib", torch.cuda.max_memory_reserved() / gib, step)
+        self.tensorboard.add_scalar("vram/kind", KIND_ORDER.index(kind), step)
+        if shape is not None:
+            self.tensorboard.add_scalar("vram/latent_hw", shape[-2] * shape[-1], step)
+            self.tensorboard.add_scalar("vram/batch", shape[0], step)
+        if self._concept_split_window:
+            self.tensorboard.add_scalar("vram/probe", 1, step)
+        torch.cuda.reset_peak_memory_stats()
+
     def __needs_gc(self, train_progress: TrainProgress):
         return self.repeating_action_needed("gc", 5, TimeUnit.MINUTE, train_progress, start_at_zero=False)
 
@@ -3389,6 +3422,8 @@ class GenericTrainer(BaseTrainer):
                     or (self.config.transfer_enabled and self.config.transfer_validation)
                 ) and multi.is_master():
                     self.__validate(train_progress)
+
+                self.__log_vram(train_progress, kind, batch)
 
                 # epoch_sample counts standard samples: the main loader's resume
                 # offset. An INDEPENDENT add-on micro-step advances the step
