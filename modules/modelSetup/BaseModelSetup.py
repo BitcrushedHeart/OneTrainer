@@ -1391,6 +1391,60 @@ class BaseModelSetup(
         per_sample = torch.where(override > 0, override, torch.full_like(override, global_beta))
         return per_sample if adaptive_scale == 1.0 else per_sample * adaptive_scale
 
+    @staticmethod
+    def _resolve_supervised_mix(config: TrainConfig, batch: dict) -> float | Tensor:
+        """Supervised mix for the chosen samples of this batch: a per-sample [B]
+        tensor when concepts in the batch resolve to different mixes, otherwise
+        a scalar.
+
+        A concept's ``supervised_mix_override`` < 0 inherits the global
+        ``rlhf_supervised_mix`` (itself off when <= 0); 0 turns the term off for
+        that concept. Without the per-concept column the global value comes back
+        untouched, and a batch whose samples all resolve to one value collapses
+        to that scalar, so runs without overrides keep the original arithmetic.
+        """
+        global_mix = config.rlhf_supervised_mix
+        override = batch.get("supervised_mix_override")
+        if not isinstance(override, Tensor):
+            return global_mix
+
+        inherited = global_mix if global_mix > 0 else 0.0
+        # One host sync per DPO step: the values decide whether the supervised
+        # forward runs at all.
+        values = [value if value >= 0 else inherited for value in override.float().reshape(-1).tolist()]
+        if not values:
+            return global_mix
+        if all(value == values[0] for value in values):
+            return global_mix if values[0] == inherited else values[0]
+        return torch.tensor(values, dtype=torch.float32, device=override.device)
+
+    @staticmethod
+    def _supervised_mix_active(mix: float | Tensor) -> bool:
+        # A tensor only comes back when the samples differ, so one is > 0.
+        return isinstance(mix, Tensor) or mix > 0
+
+    def _mixed_supervised_loss(
+        self,
+        model: BaseModel,
+        chosen_batch: dict,
+        chosen_output: dict,
+        config: TrainConfig,
+        mix: float | Tensor,
+    ) -> Tensor:
+        """``mix * calculate_loss`` on the chosen half. A per-sample mix is folded
+        into the batch's per-sample ``loss_weight``, which every loss applies
+        before its batch mean, giving mean_i(mix_i * loss_i) through the same
+        (masked) loss path as the scalar form."""
+        if not isinstance(mix, Tensor):
+            return mix * self.calculate_loss(model, chosen_batch, chosen_output, config)
+        weighted = dict(chosen_batch)
+        loss_weight = chosen_batch.get("loss_weight")
+        if isinstance(loss_weight, Tensor):
+            weighted["loss_weight"] = loss_weight.float() * mix.to(loss_weight.device).reshape(loss_weight.shape)
+        else:
+            weighted["loss_weight"] = mix
+        return self.calculate_loss(model, weighted, chosen_output, config)
+
     def calculate_dpo_loss(
         self,
         model: BaseModel,
@@ -1405,6 +1459,9 @@ class BaseModelSetup(
 
         mse_per_sample = self._dpo_mse_per_sample
         beta = self._resolve_dpo_beta(config, batch)
+        # batch holds only the B chosen samples' columns (the rejected half
+        # rides in *_rejected keys), so a per-sample mix lines up with them.
+        supervised_mix = self._resolve_supervised_mix(config, batch)
         supervised_loss = None
 
         # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
@@ -1453,9 +1510,9 @@ class BaseModelSetup(
         policy_target = policy_output["target"]
         policy_chosen_logp = -mse_per_sample(policy_predicted[:chosen_b], policy_target[:chosen_b], mask_c)
         policy_rejected_logp = -mse_per_sample(policy_predicted[chosen_b:], policy_target[chosen_b:], mask_r)
-        if config.rlhf_supervised_mix > 0:
+        if self._supervised_mix_active(supervised_mix):
             chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
-            supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
+            supervised_loss = self._mixed_supervised_loss(model, batch, chosen_output, config, supervised_mix)
             del chosen_output
         del policy_output, policy_predicted, policy_target
 
@@ -1468,7 +1525,7 @@ class BaseModelSetup(
         )
 
         if supervised_loss is not None:
-            loss = loss + config.rlhf_supervised_mix * supervised_loss
+            loss = loss + supervised_loss
             del supervised_loss
 
         self._record_dpo_metrics(
@@ -1585,6 +1642,7 @@ class BaseModelSetup(
 
         beta = self._resolve_dpo_beta(config, batch)
         objective_kwargs = self._dpo_objective_kwargs(config, beta)
+        supervised_mix = self._resolve_supervised_mix(config, batch)
         chosen_batch, rejected_batch = split_dpo_pair_batch(batch)
         mse = self._dpo_mse_per_sample
         hold_rejected_graph = self._dpo_light_can_hold_rejected_graph(config)
@@ -1629,10 +1687,12 @@ class BaseModelSetup(
                 policy_chosen_live, policy_rejected_value, ref_chosen_logp, ref_rejected_logp, **objective_kwargs
             )
             chosen_term = (g_chosen.to(policy_chosen_live.dtype) * policy_chosen_live).sum()
-            if config.rlhf_supervised_mix > 0:
-                supervised_loss = self.calculate_loss(model, chosen_batch, chosen_output, config)
-                chosen_term = chosen_term + config.rlhf_supervised_mix * supervised_loss
-                loss = loss + config.rlhf_supervised_mix * supervised_loss.detach().float()
+            if self._supervised_mix_active(supervised_mix):
+                supervised_loss = self._mixed_supervised_loss(
+                    model, chosen_batch, chosen_output, config, supervised_mix
+                )
+                chosen_term = chosen_term + supervised_loss
+                loss = loss + supervised_loss.detach().float()
                 del supervised_loss
             backward_fn(chosen_term)
             del chosen_output, policy_chosen_live, chosen_term

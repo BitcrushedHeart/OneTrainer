@@ -139,6 +139,7 @@ class ConceptConfig(BaseConfig):
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
     dpo_beta_override: float
+    supervised_mix_override: float
     unmasked_weight_override: float
     unmasked_probability_override: float
     cache_dir: str
@@ -245,6 +246,9 @@ class ConceptConfig(BaseConfig):
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
         data.append(("dpo_beta_override", 0.0, float, False))
+        # DPO supervised (chosen-half) mix per concept: negative = inherit the
+        # run's rlhf_supervised_mix, 0 = no supervised term for this concept.
+        data.append(("supervised_mix_override", -1.0, float, False))
         # Masked training knobs per concept; negative = inherit the run's value.
         # Inpainting models apply only the run-wide probability (their mgds
         # module also blanks the conditioning image), so the probability

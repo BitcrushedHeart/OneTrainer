@@ -615,7 +615,7 @@ class GenericTrainer(BaseTrainer):
             self.config.rlhf_dpo_concept_logging or self.config.rlhf_dpo_live_saturation
         ):
             return
-        infos = dpo_concept_infos(self.__load_concepts())
+        infos = dpo_concept_infos(self.__load_concepts(), self.config.rlhf_supervised_mix)
         if not infos:
             return
         self._dpo_concept_resolver = DPOConceptResolver(infos)

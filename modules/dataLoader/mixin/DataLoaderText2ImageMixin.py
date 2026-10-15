@@ -624,6 +624,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # Concept fields never key the disk cache, so betas can be retuned
             # between runs without re-caching latents.
             output_names.append(("concept.dpo_beta_override", "dpo_beta_override"))
+            # Per-concept supervised mix on the chosen half (negative = inherit
+            # rlhf_supervised_mix), per sample for the same reason.
+            output_names.append(("concept.supervised_mix_override", "supervised_mix_override"))
 
         if config.masked_training:
             # Per-concept unmasked weight (negative = inherit the global value).

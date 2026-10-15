@@ -160,6 +160,7 @@ class DPOConceptInfo:
     path: str
     chosen_dir: str
     beta_override: float  # <= 0: inherits the global beta
+    supervised_mix: float = 0.0  # resolved: the concept's override, or the global mix
 
     def configured_beta(self, global_beta: float) -> float:
         return self.beta_override if self.beta_override > 0 else global_beta
@@ -169,11 +170,12 @@ def _tag(label: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", label).strip("_") or "concept"
 
 
-def dpo_concept_infos(concepts: Iterable) -> list[DPOConceptInfo]:
+def dpo_concept_infos(concepts: Iterable, global_supervised_mix: float = 0.0) -> list[DPOConceptInfo]:
     """One entry per enabled DPO pattern concept, labelled by its folder name.
 
     Concept names are not unique (two concepts can both be called "DPO
     Off-Policy"); folder names nearly always are, and a clash gets a suffix."""
+    inherited_mix = max(float(global_supervised_mix or 0.0), 0.0)
     infos = []
     tags_seen: dict[str, int] = {}
     for concept in concepts:
@@ -195,9 +197,16 @@ def dpo_concept_infos(concepts: Iterable) -> list[DPOConceptInfo]:
                 path=os.path.normpath(concept.path),
                 chosen_dir=dirs[0][0],
                 beta_override=float(concept.dpo_beta_override or 0.0),
+                supervised_mix=_resolved_mix(getattr(concept, "supervised_mix_override", -1.0), inherited_mix),
             )
         )
     return infos
+
+
+def _resolved_mix(override, inherited: float) -> float:
+    # Negative inherits the global mix; 0 is off for the concept.
+    override = -1.0 if override is None else float(override)
+    return override if override >= 0 else inherited
 
 
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
@@ -378,6 +387,7 @@ def concept_summary(
         "visits": len(visits),
         "verdicts": counts,
         "configured_beta": info.configured_beta(global_beta),
+        "supervised_mix": info.supervised_mix,
         "median_margin": None,
         "applied_beta": None,
         "median_logit": None,
@@ -745,8 +755,8 @@ def format_live_report(ledger: LiveSaturationLedger, summaries: list[dict], rows
         f"most visits. Only a pair's last {ledger.max_visits} visits count.",
         "",
         "| concept | pairs | done | learning | violating | new | median margin | beta set | beta applied "
-        "| median beta·m | typical push vs peak |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| median beta·m | typical push vs peak | sup. mix |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for s in summaries:
         v = s["verdicts"]
@@ -754,7 +764,7 @@ def format_live_report(ledger: LiveSaturationLedger, summaries: list[dict], rows
             f"| {s['label']} | {s['pairs']} | {v[VERDICT_DONE]} | {v[VERDICT_LEARNING]} | {v[VERDICT_VIOLATING]} "
             f"| {v[VERDICT_NEW]} | {_fmt(s['median_margin'], '.4f')} | {_fmt(s['configured_beta'], '.0f')} "
             f"| {_fmt(s['applied_beta'], '.0f')} | {_fmt(s['median_logit'], '.2f')} "
-            f"| {_fmt(s['advice'].get('efficiency'), '.0%')} |"
+            f"| {_fmt(s['advice'].get('efficiency'), '.0%')} | {_fmt(s['supervised_mix'], 'g')} |"
         )
     lines += ["", "## Beta", ""]
     lines += [_advice_line(s) for s in summaries]

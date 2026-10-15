@@ -276,24 +276,37 @@ class ConceptWindow(ctk.CTkToplevel):
             frame,
             13,
             0,
+            "Supervised Mix Override",
+            tooltip="Weight of the supervised (plain finetune) loss on this concept's chosen images, "
+            "overriding the global RLHF Supervised Mix. -1 (any negative value) inherits the global mix, "
+            "0 turns the supervised term off for this concept, a positive value replaces the global mix. "
+            "With masked training the term uses the same masked loss as the rest of the run, so a low "
+            "unmasked weight keeps it inside the mask.",
+        )
+        components.entry(frame, 13, 1, self.ui_state, "supervised_mix_override")
+
+        components.label(
+            frame,
+            14,
+            0,
             "Unmasked Weight Override",
             tooltip="Loss weight of the area outside the mask for this concept only, overriding the run's "
             "Unmasked Weight when masked training is enabled. 0 trains the masked region alone; a DPO "
             "concept's preference margin is then computed inside the mask only. Negative inherits the "
             "global value.",
         )
-        components.entry(frame, 13, 1, self.ui_state, "unmasked_weight_override")
+        components.entry(frame, 14, 1, self.ui_state, "unmasked_weight_override")
 
         components.label(
             frame,
-            14,
+            15,
             0,
             "Unmasked Probability Override",
             tooltip="Chance (0-1) that a sample of this concept trains on the whole image instead of its "
             "mask, drawn per sample each epoch; a DPO pair is unmasked together. Negative inherits the "
             "run's Unmasked Probability. Inpainting models apply only the run-wide value.",
         )
-        components.entry(frame, 14, 1, self.ui_state, "unmasked_probability_override")
+        components.entry(frame, 15, 1, self.ui_state, "unmasked_probability_override")
 
         frame.pack(fill="both", expand=1)
         return frame

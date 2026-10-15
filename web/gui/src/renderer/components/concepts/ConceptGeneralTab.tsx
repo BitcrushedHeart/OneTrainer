@@ -113,6 +113,15 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
         tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. 0 inherits the global beta. Adaptive beta still applies, scaling every concept by the same factor. Ignored by the IPO objective, which uses tau."
       />
 
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Supervised Mix Override</span>
+      <FormEntry
+        label=""
+        type="number"
+        value={draft.supervised_mix_override}
+        onChange={(v) => update("supervised_mix_override", v)}
+        tooltip="Weight of the supervised loss on this concept's chosen images, overriding the global RLHF Supervised Mix. -1 (any negative value) inherits the global mix, 0 turns the term off for this concept, a positive value replaces it. Uses the run's masked loss, so a low unmasked weight keeps it inside the mask."
+      />
+
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Unmasked Weight Override</span>
       <FormEntry
         label=""

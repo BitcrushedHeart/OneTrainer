@@ -59,6 +59,32 @@ def _aspect_disagrees(spatial_shape, crop_resolution) -> bool:
     return cr_landscape != t_landscape
 
 
+# Per-concept override columns and the value that means "inherit the run's
+# setting". Sourceless training reads each row's concept from the snapshot
+# stamped into cache.json when the row was cached, so rows stamped before a
+# field existed lack it (OutputPipelineModule drops the None). One batch can mix
+# such rows with newer ones; default_collate keys on the first item and would
+# raise KeyError (or silently drop the column), so missing entries take the
+# inherit value instead.
+_INHERIT_CONCEPT_COLUMNS = {
+    "dpo_beta_override": 0.0,
+    "supervised_mix_override": -1.0,
+    "unmasked_weight_override": -1.0,
+}
+
+
+def _fill_inherit_columns(batch):
+    if not batch or not all(isinstance(item, dict) for item in batch):
+        return batch
+    for key, inherit in _INHERIT_CONCEPT_COLUMNS.items():
+        present = next((item[key] for item in batch if key in item), None)
+        if present is None or all(key in item for item in batch):
+            continue
+        filler = torch.full_like(present, inherit) if isinstance(present, torch.Tensor) else inherit
+        batch = [item if key in item else {**item, key: filler} for item in batch]
+    return batch
+
+
 def _shape_safe_collate(batch):
     """Default-collate with a helpful error when tensors don't stack.
 
@@ -70,6 +96,7 @@ def _shape_safe_collate(batch):
     crop_resolution disagrees in orientation with their tensor shapes
     (the smoking gun for stale-aggregate cache corruption).
     """
+    batch = _fill_inherit_columns(batch)
     try:
         return default_collate(batch)
     except RuntimeError as e:
