@@ -352,10 +352,26 @@ class RLHFTab:
         )
         components.entry(self.scroll_frame, 12, 4, self.ui_state, "rlhf_dpo_ref_rebase_interval")
 
-        # --- on-image text reward (frozen OCR, CTC through the VAE) ---
         components.label(
             self.scroll_frame,
             13,
+            0,
+            "Chosen Anchor (DPOP)",
+            tooltip="DPO can grow the margin by making BOTH images less likely, as long as the rejected one falls "
+            "faster; the chosen reward then goes negative. This adds lambda * beta * max(0, chosen error - reference "
+            "chosen error) to the loss: a one-sided penalty that only bites when the model fits the chosen image "
+            "worse than the reference did, and never pulls it past the reference's fit. Scaled by each pair's beta "
+            "because the rejected image's push-down (about beta/2 near zero margin) is what drags the chosen one "
+            "with it; Supervised Mix is unscaled and loses to beta. 0.5 matches that push, 1.0 doubles it. "
+            "0 = off. Unscaled under IPO, not applied under KTO (its desirable term already anchors the chosen "
+            "half). Watch dpo/chosen_reward, dpo/chosen_below_ref and the SFT validation loss.",
+        )
+        components.entry(self.scroll_frame, 13, 1, self.ui_state, "rlhf_dpo_chosen_anchor")
+
+        # --- on-image text reward (frozen OCR, CTC through the VAE) ---
+        components.label(
+            self.scroll_frame,
+            14,
             0,
             "Text Reward",
             tooltip="Add a DRaFT-1 style on-image text reward to the standard finetune (plain or SFT + DPO). Each "
@@ -363,116 +379,116 @@ class RLHFTab:
             "decodes the text region, and backpropagates a frozen OCR's CTC loss into the adapter. Never runs on a "
             "micro-batch that already carries a DPO pair. Needs the python-doctr package.",
         )
-        components.switch(self.scroll_frame, 13, 1, self.ui_state, "text_reward_enabled")
+        components.switch(self.scroll_frame, 14, 1, self.ui_state, "text_reward_enabled")
         components.label(
             self.scroll_frame,
-            13,
+            14,
             3,
             "Text Reward Weight",
             tooltip="Multiplier on the CTC loss when a reward rollout is interleaved. The standard loss stays at full "
             "weight. Scalar 'loss/text_reward' in TensorBoard already includes this weight.",
         )
-        components.entry(self.scroll_frame, 13, 4, self.ui_state, "text_reward_weight")
+        components.entry(self.scroll_frame, 14, 4, self.ui_state, "text_reward_weight")
 
         components.label(
             self.scroll_frame,
-            14,
+            15,
             0,
             "Text Samples / Epoch",
             tooltip="How many reward rollouts to spread over one epoch of the standard data. The interval between "
             "them is derived each epoch from the primary loader length, like the DPO add-on interval. Prompts are "
             "redrawn and pre-encoded at every epoch start.",
         )
-        components.entry(self.scroll_frame, 14, 1, self.ui_state, "text_reward_samples_per_epoch")
+        components.entry(self.scroll_frame, 15, 1, self.ui_state, "text_reward_samples_per_epoch")
         components.label(
             self.scroll_frame,
-            14,
+            15,
             3,
             "Rollout Steps",
             tooltip="Sampling steps of the no-grad rollout prefix. Only the final grad-bearing step (or a random "
             "step in the second half, see Random Grad Step) is differentiated, so this mostly sets rollout cost.",
         )
-        components.entry(self.scroll_frame, 14, 4, self.ui_state, "text_reward_rollout_steps")
+        components.entry(self.scroll_frame, 15, 4, self.ui_state, "text_reward_rollout_steps")
 
         components.label(
             self.scroll_frame,
-            15,
+            16,
             0,
             "Random Grad Step",
             tooltip="Take the grad-bearing one-step x0 prediction at a random step in the second half of the rollout "
             "instead of always the last step. Spreads the signal across noise levels where glyph structure is decided.",
         )
-        components.switch(self.scroll_frame, 15, 1, self.ui_state, "text_reward_random_grad_step")
+        components.switch(self.scroll_frame, 16, 1, self.ui_state, "text_reward_random_grad_step")
         components.label(
             self.scroll_frame,
-            15,
+            16,
             3,
             "Rollout CFG",
             tooltip="Classifier-free guidance scale for the no-grad rollout prefix (1.0 = off, as for Turbo-like "
             "adapters). Above 1.0 the prefix costs two forwards per step and the negative prompt below is encoded.",
         )
-        components.entry(self.scroll_frame, 15, 4, self.ui_state, "text_reward_cfg_scale")
-
-        components.label(
-            self.scroll_frame,
-            16,
-            0,
-            "Rollout Negative",
-            tooltip="Negative prompt for the rollout prefix when Rollout CFG is above 1.0.",
-        )
-        components.entry(self.scroll_frame, 16, 1, self.ui_state, "text_reward_negative_prompt")
-        components.label(
-            self.scroll_frame,
-            16,
-            3,
-            "Rollout Resolution",
-            tooltip="Square edge of the reward rollout in pixels (multiple of 16).",
-        )
-        components.entry(self.scroll_frame, 16, 4, self.ui_state, "text_reward_resolution")
+        components.entry(self.scroll_frame, 16, 4, self.ui_state, "text_reward_cfg_scale")
 
         components.label(
             self.scroll_frame,
             17,
+            0,
+            "Rollout Negative",
+            tooltip="Negative prompt for the rollout prefix when Rollout CFG is above 1.0.",
+        )
+        components.entry(self.scroll_frame, 17, 1, self.ui_state, "text_reward_negative_prompt")
+        components.label(
+            self.scroll_frame,
+            17,
+            3,
+            "Rollout Resolution",
+            tooltip="Square edge of the reward rollout in pixels (multiple of 16).",
+        )
+        components.entry(self.scroll_frame, 17, 4, self.ui_state, "text_reward_resolution")
+
+        components.label(
+            self.scroll_frame,
+            18,
             0,
             "Max Decode Pixels",
             tooltip="Edge cap of the text region decoded WITH gradient through the VAE (the memory-critical part). "
             "Words outside the capped window are read but not rewarded that step. 512 keeps the decode under ~1 GB "
             "with decoder checkpointing.",
         )
-        components.entry(self.scroll_frame, 17, 1, self.ui_state, "text_reward_max_decode_pixels")
+        components.entry(self.scroll_frame, 18, 1, self.ui_state, "text_reward_max_decode_pixels")
         components.label(
             self.scroll_frame,
-            17,
+            18,
             3,
             "Word List",
             tooltip="Optional text file, one word per line, replacing the built-in dictionary for the word, price, "
             "date, time, URL, abbreviation and number prompt families. Characters outside the OCR's vocabulary are "
             "dropped from targets.",
         )
-        components.entry(self.scroll_frame, 17, 4, self.ui_state, "text_reward_word_list")
+        components.entry(self.scroll_frame, 18, 4, self.ui_state, "text_reward_word_list")
 
         components.label(
             self.scroll_frame,
-            18,
+            19,
             0,
             "Words Min / Max",
             tooltip="Number of words per prompt, drawn uniformly between these bounds.",
         )
-        components.entry(self.scroll_frame, 18, 1, self.ui_state, "text_reward_min_words")
-        components.entry(self.scroll_frame, 18, 2, self.ui_state, "text_reward_max_words")
+        components.entry(self.scroll_frame, 19, 1, self.ui_state, "text_reward_min_words")
+        components.entry(self.scroll_frame, 19, 2, self.ui_state, "text_reward_max_words")
         components.label(
             self.scroll_frame,
-            18,
+            19,
             3,
             "Save Sample Every",
             tooltip="Write every N-th reward rollout with what the OCR read to workspace/text_reward so reward "
             "hacking (text the OCR accepts but a person cannot read) is visible. 0 disables.",
         )
-        components.entry(self.scroll_frame, 18, 4, self.ui_state, "text_reward_save_interval")
+        components.entry(self.scroll_frame, 19, 4, self.ui_state, "text_reward_save_interval")
 
         components.label(
             self.scroll_frame,
-            19,
+            20,
             0,
             "Text Recognizer",
             tooltip="Recognizer behind the reward gradient. trocr-base-str (Microsoft TrOCR, scene-text fine-tune, "
@@ -481,7 +497,7 @@ class RLHFTab:
         )
         components.options(
             self.scroll_frame,
-            19,
+            20,
             1,
             ["trocr-base-str", "trocr-large-str", "trocr-base-printed", "parseq", "crnn_vgg16_bn"],
             self.ui_state,
@@ -489,7 +505,7 @@ class RLHFTab:
         )
         components.label(
             self.scroll_frame,
-            19,
+            20,
             3,
             "Text Reward Source",
             tooltip="Online Rollout: sample from noise on synthetic prompts every reward step (pays a multi-step "
@@ -499,7 +515,7 @@ class RLHFTab:
         )
         components.options_kv(
             self.scroll_frame,
-            19,
+            20,
             4,
             [("Online Rollout", TextRewardSource.ONLINE_ROLLOUT), ("Offline Images", TextRewardSource.OFFLINE_IMAGES)],
             self.ui_state,
@@ -508,26 +524,26 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
-            20,
+            21,
             0,
             "Text Dataset Folder",
             tooltip="Offline Images only. Folder written by the Text Alignment Dataset Tool: image + .txt prompt "
             "(+ .json) per sample. Samples per Epoch is ignored; every image is visited once per epoch.",
         )
-        components.path_entry(self.scroll_frame, 20, 1, self.ui_state, "text_reward_dataset_dir", mode="dir")
+        components.path_entry(self.scroll_frame, 21, 1, self.ui_state, "text_reward_dataset_dir", mode="dir")
         components.label(
             self.scroll_frame,
-            21,
+            22,
             0,
             "Text Dataset Repeats",
             tooltip="Offline Images only. Visit every dataset image this many times per epoch; the reward interval "
             "is derived from images x repeats against the primary loader length, so raise it to fire more often "
             "from a small dataset.",
         )
-        components.entry(self.scroll_frame, 21, 1, self.ui_state, "text_reward_dataset_repeats")
+        components.entry(self.scroll_frame, 22, 1, self.ui_state, "text_reward_dataset_repeats")
         components.label(
             self.scroll_frame,
-            21,
+            22,
             3,
             "Text Init Sigma",
             tooltip="Offline Images only. 0: re-noise the dataset image straight to the grad sigma and take one "
@@ -537,10 +553,10 @@ class RLHFTab:
             "(CFG applies, costs those extra no-grad forwards), re-detect on the policy's own x0 and score that. "
             "Must sit above the grad sigma window.",
         )
-        components.entry(self.scroll_frame, 21, 4, self.ui_state, "text_reward_init_sigma")
+        components.entry(self.scroll_frame, 22, 4, self.ui_state, "text_reward_init_sigma")
         components.label(
             self.scroll_frame,
-            22,
+            23,
             0,
             "Grad Sigma Min / Max",
             tooltip="Window of (shifted) sigma the grad-bearing step is drawn from; 0 / 1 keeps the original rule "
@@ -548,11 +564,11 @@ class RLHFTab:
             "model only sharpens, and the gradient into the velocity is scaled by sigma anyway. Applies to all "
             "sources.",
         )
-        components.entry(self.scroll_frame, 22, 1, self.ui_state, "text_reward_grad_sigma_min")
-        components.entry(self.scroll_frame, 22, 2, self.ui_state, "text_reward_grad_sigma_max")
+        components.entry(self.scroll_frame, 23, 1, self.ui_state, "text_reward_grad_sigma_min")
+        components.entry(self.scroll_frame, 23, 2, self.ui_state, "text_reward_grad_sigma_max")
         components.label(
             self.scroll_frame,
-            22,
+            23,
             3,
             "Reuse Probe Graph",
             tooltip="Online Rollout and the hybrid offline init: the forward that finds the text boxes is also the "
@@ -560,10 +576,10 @@ class RLHFTab:
             "through the full-frame decode and the detector, which is only cheap with gradient checkpointing on "
             "(~1.1 GB at 1024px); without checkpointing this is ignored. Turn off if reward steps OOM.",
         )
-        components.switch(self.scroll_frame, 22, 4, self.ui_state, "text_reward_reuse_probe_graph")
+        components.switch(self.scroll_frame, 23, 4, self.ui_state, "text_reward_reuse_probe_graph")
         components.label(
             self.scroll_frame,
-            23,
+            24,
             0,
             "Grad Steps (DRaFT-K)",
             tooltip="Consecutive grad-bearing Euler steps starting at the drawn grad step; the scored x0 is the "
@@ -572,10 +588,10 @@ class RLHFTab:
             "Each extra step holds one more transformer graph (~1.1 GB at 1024px with gradient checkpointing) and "
             "costs one more forward; clamped to the end of the rollout grid. Applies to all sources.",
         )
-        components.entry(self.scroll_frame, 23, 1, self.ui_state, "text_reward_grad_steps")
+        components.entry(self.scroll_frame, 24, 1, self.ui_state, "text_reward_grad_steps")
         components.button(
             self.scroll_frame,
-            20,
+            21,
             3,
             "Write Wildcard",
             command=self._write_text_wildcard,

@@ -15,6 +15,50 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+def dpo_chosen_anchor_penalties(
+    chosen_ratio: Tensor,
+    *,
+    beta: float | Tensor,
+    objective: DPOObjective,
+    chosen_anchor: float,
+) -> Tensor:
+    """Per-pair DPOP chosen-likelihood anchor, ``[B]``:
+    ``chosen_anchor * scale * relu(-chosen_ratio)`` with ``scale`` the pair's
+    beta (1 for IPO). See :func:`dpo_chosen_anchor_penalty` for the term;
+    this is its per-pair form, whose mean is that term."""
+    scale = 1.0 if objective == DPOObjective.IPO else beta
+    return chosen_anchor * (scale * F.relu(-chosen_ratio))
+
+
+def dpo_chosen_anchor_penalty(
+    chosen_ratio: Tensor,
+    *,
+    beta: float | Tensor,
+    objective: DPOObjective,
+    chosen_anchor: float,
+) -> Tensor:
+    """DPOP's chosen-likelihood anchor (Pal et al. 2024, "Smaug"), as a separate
+    additive term: ``chosen_anchor * mean(beta * relu(-chosen_ratio))``.
+
+    ``-chosen_ratio`` is ``err_policy(chosen) - err_ref(chosen)``, so the term is
+    one-sided: it is zero (and has zero gradient) while the policy fits the
+    chosen half at least as well as the reference, and only pushes back when the
+    margin is being won by making the chosen half worse too. Unlike an SFT term
+    on the chosen image it never pulls the policy toward copying it.
+
+    Scaled by the pair's beta because DPO pushes each half with weight
+    ``beta * sigmoid(-beta * margin)`` (about beta/2 near zero margin). Its direct
+    push on the chosen log-prob is always upward; the chosen half falls because
+    the rejected half's push-down spills onto it through shared features. An
+    unscaled anchor (like rlhf_supervised_mix) loses to that by a factor of beta;
+    ``chosen_anchor = 0.5`` matches the rejected push near zero margin, 1.0 doubles
+    it. IPO has no beta, so its anchor is unscaled. Not applied under KTO, whose
+    desirable term already is a chosen anchor (``1 - sigmoid(beta * chosen_ratio)``
+    rises as soon as the chosen half drops below the reference).
+    """
+    return dpo_chosen_anchor_penalties(chosen_ratio, beta=beta, objective=objective, chosen_anchor=chosen_anchor).mean()
+
+
 def dpo_objective(
     policy_chosen_logp: Tensor,
     policy_rejected_logp: Tensor,
@@ -25,6 +69,7 @@ def dpo_objective(
     objective: DPOObjective,
     ipo_tau: float,
     label_smoothing: float,
+    chosen_anchor: float = 0.0,
     kto_desirable_weight: float = 1.0,
     kto_undesirable_weight: float = 1.0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -33,7 +78,12 @@ def dpo_objective(
     ``loss`` and ``dpo_loss`` are scalars; the ratios and margin are per-sample.
     ``beta`` may be a scalar or a per-sample ``[B]`` tensor (per-concept beta
     overrides); it multiplies the per-sample margin elementwise either way, so
-    the reduction below is unchanged.
+    the reduction below is unchanged. ``loss`` includes the chosen anchor
+    (``dpo_chosen_anchor_penalty``) when ``chosen_anchor > 0`` under the sigmoid
+    and IPO objectives; ``dpo_loss`` stays the bare preference term. Because
+    the anchor sits inside ``loss``, the light path's surrogate weights
+    (``dpo_surrogate_weights`` differentiates ``loss``) carry its gradient onto
+    the chosen half automatically.
     """
     chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
     rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()
@@ -70,6 +120,11 @@ def dpo_objective(
             s = label_smoothing
             loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
 
+    if chosen_anchor > 0 and objective != DPOObjective.KTO:
+        loss = loss + dpo_chosen_anchor_penalty(
+            chosen_ratio, beta=beta, objective=objective, chosen_anchor=chosen_anchor
+        )
+
     return loss, dpo_loss, chosen_ratio, rejected_ratio, margin
 
 
@@ -81,27 +136,34 @@ def dpo_per_sample_losses(
     objective: DPOObjective,
     ipo_tau: float,
     label_smoothing: float,
+    chosen_anchor: float = 0.0,
     kto_desirable_weight: float = 1.0,
     kto_undesirable_weight: float = 1.0,
 ) -> Tensor:
     """Each pair's own loss, ``[B]``, such that ``dpo_objective``'s ``loss``
-    is their mean (for KTO, the mean of the pair's two half-terms). Detached;
-    for the per-concept loss trend of the gradient diagnostics."""
+    is their mean (for KTO, the mean of the pair's two half-terms). Includes
+    the pair's DPOP chosen anchor when ``chosen_anchor > 0``, like ``loss``.
+    Detached; for the per-concept loss trend of the gradient diagnostics."""
     chosen_ratio = chosen_ratio.detach().float()
     rejected_ratio = rejected_ratio.detach().float()
     margin = chosen_ratio - rejected_ratio
     beta_t = beta.detach().float() if isinstance(beta, Tensor) else beta
-    if objective == DPOObjective.IPO:
-        return (margin - 1.0 / (2.0 * ipo_tau)).pow(2)
     if objective == DPOObjective.KTO:
         desirable = kto_desirable_weight * (1.0 - torch.sigmoid(beta_t * chosen_ratio))
         undesirable = kto_undesirable_weight * (1.0 - torch.sigmoid(-beta_t * rejected_ratio))
         return (desirable + undesirable) / 2.0
-    logits = beta_t * margin
-    losses = -F.logsigmoid(logits)
-    if label_smoothing > 0:
-        s = label_smoothing
-        losses = (1 - s) * losses + s * (-F.logsigmoid(-logits))
+    if objective == DPOObjective.IPO:
+        losses = (margin - 1.0 / (2.0 * ipo_tau)).pow(2)
+    else:
+        logits = beta_t * margin
+        losses = -F.logsigmoid(logits)
+        if label_smoothing > 0:
+            s = label_smoothing
+            losses = (1 - s) * losses + s * (-F.logsigmoid(-logits))
+    if chosen_anchor > 0:
+        losses = losses + dpo_chosen_anchor_penalties(
+            chosen_ratio, beta=beta_t, objective=objective, chosen_anchor=chosen_anchor
+        )
     return losses
 
 

@@ -150,7 +150,9 @@ def _batch(beta_override=None) -> dict:
     return batch
 
 
-def _config(*, reuse=True, objective=DPOObjective.SIGMOID, label_smoothing=0.0, mix=0.0) -> TrainConfig:
+def _config(
+    *, reuse=True, objective=DPOObjective.SIGMOID, label_smoothing=0.0, mix=0.0, chosen_anchor=0.0
+) -> TrainConfig:
     config = TrainConfig.default_values()
     config.training_method = TrainingMethod.LORA
     config.rlhf_enabled = True
@@ -159,6 +161,7 @@ def _config(*, reuse=True, objective=DPOObjective.SIGMOID, label_smoothing=0.0, 
     config.rlhf_dpo_objective = objective
     config.rlhf_dpo_ipo_tau = 3.0
     config.rlhf_dpo_label_smoothing = label_smoothing
+    config.rlhf_dpo_chosen_anchor = chosen_anchor
     config.rlhf_supervised_mix = mix
     config.rlhf_dpo_timestep_margin_logging = True
     config.rlhf_dpo_light_reuse_rejected_graph = reuse
@@ -217,6 +220,10 @@ OBJECTIVE_CASES = {
     "sigmoid_label_smoothing": ({"label_smoothing": 0.2}, None),
     "ipo": ({"objective": DPOObjective.IPO}, None),
     "per_sample_beta": ({}, torch.tensor([0.0, 1.5, 4.0])),
+    "chosen_anchor": ({"chosen_anchor": 1.5}, None),
+    "chosen_anchor_per_sample_beta": ({"chosen_anchor": 0.7}, torch.tensor([0.0, 1.5, 4.0])),
+    "chosen_anchor_ipo": ({"objective": DPOObjective.IPO, "chosen_anchor": 2.0}, None),
+    "chosen_anchor_kto": ({"objective": DPOObjective.KTO, "chosen_anchor": 2.0}, None),
 }
 
 
@@ -242,6 +249,17 @@ def test_held_rejected_graph_matches_the_five_forward_sequence(case, mix):
         assert value == pytest.approx(base_setup.get_last_dpo_metrics()[key], abs=1e-6), key
     if beta_override is not None:
         assert "beta_mean" in held_setup.get_last_dpo_metrics()
+    anchored = config_kwargs.get("chosen_anchor", 0.0) > 0 and config_kwargs.get("objective") != DPOObjective.KTO
+    assert ("chosen_anchor_loss" in held_setup.get_last_dpo_metrics()) == anchored
+    if anchored:
+        metrics = held_setup.get_last_dpo_metrics()
+        # The fixture's policy and reference differ, so the anchor is live on
+        # some pairs; it is the gap between the total and the preference loss
+        # (no label smoothing or supervised mix in these cases when mix == 0).
+        assert 0.0 < metrics["chosen_below_ref"] <= 1.0
+        assert metrics["chosen_anchor_loss"] > 0.0
+        if mix == 0:
+            assert metrics["loss"] - metrics["dpo_loss"] == pytest.approx(metrics["chosen_anchor_loss"], abs=1e-6)
 
     # Both sequences are the exact gradient of the objective, not merely equal
     # to each other.
@@ -249,6 +267,42 @@ def test_held_rejected_graph_matches_the_five_forward_sequence(case, mix):
     assert torch.allclose(held_loss, fused_loss, rtol=0.0, atol=1e-6)
     for held_grad, fused_grad in zip(_grads(held_model), fused_grads, strict=True):
         assert torch.allclose(held_grad, fused_grad, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("case", ["chosen_anchor", "chosen_anchor_per_sample_beta", "chosen_anchor_ipo"])
+def test_batched_path_matches_the_light_path_with_the_anchor(case):
+    """calculate_dpo_loss (one [chosen; rejected] forward, one backward) and the
+    light path (surrogate weights per half) land the same gradient with the
+    DPOP anchor on: the anchor sits inside the objective's loss, so the chosen
+    half's surrogate weight carries its derivative."""
+    config_kwargs, beta_override = OBJECTIVE_CASES[case]
+    light_setup, light_model, light_loss, _ = _run(_config(**config_kwargs), _batch(beta_override))
+
+    batched_setup, batched_model = _FakeSetup(), _Model()
+    loss = batched_setup.calculate_dpo_loss(batched_model, _batch(beta_override), _config(**config_kwargs), None)
+    (loss * ADDON_SCALE).backward()
+
+    assert torch.allclose(loss.detach(), light_loss, rtol=0.0, atol=1e-6)
+    for batched_grad, light_grad in zip(_grads(batched_model), _grads(light_model), strict=True):
+        assert torch.count_nonzero(batched_grad) > 0
+        assert torch.allclose(batched_grad, light_grad, rtol=0.0, atol=1e-6)
+    batched_metrics, light_metrics = batched_setup.get_last_dpo_metrics(), light_setup.get_last_dpo_metrics()
+    assert batched_metrics.keys() == light_metrics.keys()
+    for key in ("chosen_anchor_loss", "chosen_below_ref", "loss", "dpo_loss"):
+        assert batched_metrics[key] == pytest.approx(light_metrics[key], abs=1e-6), key
+    assert batched_metrics["chosen_anchor_loss"] > 0.0
+
+
+def test_anchor_off_leaves_the_light_path_bit_for_bit_unchanged():
+    on_zero_setup, on_zero_model, on_zero_loss, _ = _run(_config(chosen_anchor=0.0), _batch())
+    plain_config = _config()
+    assert plain_config.rlhf_dpo_chosen_anchor == 0.0  # the default is off
+    plain_setup, plain_model, plain_loss, _ = _run(plain_config, _batch())
+    assert torch.equal(on_zero_loss, plain_loss)
+    for a, b in zip(_grads(on_zero_model), _grads(plain_model), strict=True):
+        assert torch.equal(a, b)
+    assert on_zero_setup.get_last_dpo_metrics() == plain_setup.get_last_dpo_metrics()
+    assert "chosen_anchor_loss" not in plain_setup.get_last_dpo_metrics()
 
 
 @pytest.mark.parametrize("reuse", [True, False])

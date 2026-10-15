@@ -735,6 +735,7 @@ class TrainConfig(BaseConfig):
     rlhf_enabled: bool
     rlhf_dpo_beta: float
     rlhf_dpo_label_smoothing: float
+    rlhf_dpo_chosen_anchor: float
     rlhf_dpo_ref_mode: DPORefMode
     rlhf_dpo_ref_rebase: bool
     rlhf_dpo_ref_rebase_interval: int
@@ -2085,6 +2086,8 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_enabled", False, bool, False))
         data.append(("rlhf_dpo_beta", 200.0, float, False))
         data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
+        # DPOP chosen anchor (Pal et al. 2024); no migration, a missing key loads 0 = off.
+        data.append(("rlhf_dpo_chosen_anchor", 0.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
         data.append(("rlhf_dpo_ref_rebase", False, bool, False))
         data.append(("rlhf_dpo_ref_rebase_interval", 0, int, False))

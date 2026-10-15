@@ -259,11 +259,14 @@ class DPOConceptResolver:
 class DPOConceptWindow:
     """Per-concept sums over one gradient-accumulation window."""
 
-    _FIELDS = ("count", "margin", "correct", "chosen", "rejected", "beta", "weight")
+    _FIELDS = ("count", "margin", "correct", "chosen", "rejected", "beta", "weight", "below_ref")
 
-    def __init__(self, *, with_weight: bool = True):
+    def __init__(self, *, with_weight: bool = True, with_anchor: bool = False):
         # The gradient factor only describes the sigmoid objective; IPO has no beta.
         self.with_weight = with_weight
+        # With the DPOP chosen anchor on: the fraction of a concept's pairs the
+        # anchor is active on (chosen half fitted worse than the reference).
+        self.with_anchor = with_anchor
         self._sums: dict[str, dict[str, float]] = {}
 
     def add(self, info: DPOConceptInfo, record: dict) -> None:
@@ -277,6 +280,8 @@ class DPOConceptWindow:
         sums["beta"] += beta
         if self.with_weight:
             sums["weight"] += gradient_weight(margin, beta)
+        if self.with_anchor:
+            sums["below_ref"] += 1.0 if record["chosen"] < 0 else 0.0
 
     def scalars(self) -> dict[str, float]:
         out = {}
@@ -293,6 +298,8 @@ class DPOConceptWindow:
             out[prefix + "beta"] = sums["beta"] / n
             if self.with_weight:
                 out[prefix + "grad_weight"] = sums["weight"] / n
+            if self.with_anchor:
+                out[prefix + "chosen_below_ref"] = sums["below_ref"] / n
         return out
 
     def reset(self) -> None:

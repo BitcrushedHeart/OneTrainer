@@ -801,7 +801,11 @@ class GenericTrainer(BaseTrainer):
         self._dpo_concept_resolver = DPOConceptResolver(infos)
         sigmoid = self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
         if self.config.rlhf_dpo_concept_logging:
-            self._dpo_concept_window = DPOConceptWindow(with_weight=sigmoid)
+            self._dpo_concept_window = DPOConceptWindow(
+                with_weight=sigmoid,
+                with_anchor=self.config.rlhf_dpo_chosen_anchor > 0
+                and self.config.rlhf_dpo_objective != DPOObjective.KTO,
+            )
         if self.config.rlhf_dpo_live_saturation and multi.is_master():
             if not sigmoid:
                 print(
@@ -3052,6 +3056,18 @@ class GenericTrainer(BaseTrainer):
                                     # the adaptive controller's ratio.
                                     self.tensorboard.add_scalar(
                                         "dpo/beta_mean", dpo_metrics["beta_mean"], train_progress.global_step
+                                    )
+                                if "chosen_anchor_loss" in dpo_metrics:
+                                    # Present only with rlhf_dpo_chosen_anchor > 0 (DPOP).
+                                    self.tensorboard.add_scalar(
+                                        "dpo/chosen_anchor_loss",
+                                        dpo_metrics["chosen_anchor_loss"],
+                                        train_progress.global_step,
+                                    )
+                                    self.tensorboard.add_scalar(
+                                        "dpo/chosen_below_ref",
+                                        dpo_metrics["chosen_below_ref"],
+                                        train_progress.global_step,
                                     )
 
                                 if self.config.rlhf_dpo_timestep_margin_logging:

@@ -20,6 +20,7 @@ from modules.util.distill_dmd2_util import (
 )
 from modules.util.distill_metadata_util import extract_distill_metadata
 from modules.util.dpo_light_util import (
+    dpo_chosen_anchor_penalty,
     dpo_objective,
     dpo_per_sample_losses,
     dpo_surrogate_weights,
@@ -28,6 +29,7 @@ from modules.util.dpo_light_util import (
 )
 from modules.util.enum.DistillCfgMode import DistillCfgMode
 from modules.util.enum.DistillVramMode import DistillVramMode
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.KTOLabel import KTOLabel
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -1578,6 +1580,7 @@ class BaseModelSetup(
             "objective": config.rlhf_dpo_objective,
             "ipo_tau": config.rlhf_dpo_ipo_tau,
             "label_smoothing": config.rlhf_dpo_label_smoothing,
+            "chosen_anchor": config.rlhf_dpo_chosen_anchor,
             "kto_desirable_weight": config.rlhf_kto_desirable_weight,
             "kto_undesirable_weight": config.rlhf_kto_undesirable_weight,
         }
@@ -1893,6 +1896,25 @@ class BaseModelSetup(
             # into the same stack, so it costs no extra GPU->CPU sync.
             metric_names.append("beta_mean")
             metric_tensors.append(beta.detach().float().mean().to(metric_tensors[0].device))
+        if config.rlhf_dpo_chosen_anchor > 0 and config.rlhf_dpo_objective != DPOObjective.KTO:
+            # The DPOP anchor's share of the loss, and how many pairs it is
+            # pushing back on (chosen half fitted worse than the reference).
+            # Recomputed from the detached ratio so both DPO paths log it alike.
+            detached_ratio = chosen_ratio.detach().float()
+            if isinstance(beta, Tensor):
+                anchor_beta = beta.detach().float().reshape(-1).to(detached_ratio.device)
+            else:
+                anchor_beta = config.rlhf_dpo_beta if beta is None else beta
+            metric_names += ["chosen_anchor_loss", "chosen_below_ref"]
+            metric_tensors += [
+                dpo_chosen_anchor_penalty(
+                    detached_ratio,
+                    beta=anchor_beta,
+                    objective=config.rlhf_dpo_objective,
+                    chosen_anchor=config.rlhf_dpo_chosen_anchor,
+                ).to(metric_tensors[0].device),
+                (detached_ratio < 0).float().mean().to(metric_tensors[0].device),
+            ]
         metric_values = torch.stack(metric_tensors).tolist()
         self._last_dpo_metrics = dict(zip(metric_names, metric_values, strict=True))
 
