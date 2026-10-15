@@ -38,6 +38,9 @@ from collections.abc import Iterable, Sequence
 import torch
 from torch import Tensor
 
+# Folder names that say nothing on their own; a concept on one is tagged with its parent too.
+GENERIC_CONCEPT_FOLDERS = frozenset({"chosen", "rejected", "train", "val", "validation", "images"})
+
 
 def concept_tag(label: str) -> str:
     """TensorBoard-safe tag for a concept folder name (the DPO scheme)."""

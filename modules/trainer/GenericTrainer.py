@@ -54,6 +54,7 @@ from modules.util.enum.PatienceMode import PatienceMode
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.grad_attribution_util import (
+    GENERIC_CONCEPT_FOLDERS,
     ConceptWindowStats,
     GradAttribution,
     TimestepBinNormalizer,
@@ -936,6 +937,9 @@ class GenericTrainer(BaseTrainer):
             if not concept.enabled or concept.is_dpo() or ConceptType(concept.type) == ConceptType.VALIDATION:
                 continue
             label = os.path.basename(os.path.normpath(concept.path)) or concept.name or "concept"
+            if label.lower() in GENERIC_CONCEPT_FOLDERS:
+                # "chosen" alone names nothing: say whose chosen folder it is
+                label = f"{os.path.basename(os.path.dirname(os.path.normpath(concept.path)))} {label}"
             tag = concept_tag(label)
             seen = tags_seen.get(tag, 0) + 1
             tags_seen[tag] = seen
