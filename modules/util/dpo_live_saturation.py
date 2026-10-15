@@ -200,12 +200,20 @@ def dpo_concept_infos(concepts: Iterable) -> list[DPOConceptInfo]:
     return infos
 
 
+_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _path_parts(path: str) -> list[str]:
+    return [part.casefold() for part in re.split(r"[\\/]+", path) if part]
+
+
 class DPOConceptResolver:
     """Maps a chosen image path to its concept (longest chosen-dir prefix)."""
 
     def __init__(self, infos: Iterable[DPOConceptInfo]):
         self.infos = list(infos)
         self._dirs = [(info.chosen_dir, "") for info in self.infos]
+        self._dir_parts = [_path_parts(info.chosen_dir) for info in self.infos]
         self._cache: dict[str, DPOConceptInfo | None] = {}
 
     def resolve(self, image_path: str | None) -> DPOConceptInfo | None:
@@ -213,8 +221,25 @@ class DPOConceptResolver:
             return None
         if image_path not in self._cache:
             index = concept_for_chosen_path(image_path, self._dirs)
+            if index is None and _DRIVE_PATH.match(image_path):
+                index = self._resolve_remapped(image_path)
             self._cache[image_path] = None if index is None else self.infos[index]
         return self._cache[image_path]
+
+    def _resolve_remapped(self, image_path: str) -> int | None:
+        """A sourceless cloud run keeps the local machine's pair paths (``F:\\...``) in
+        its cache, while CloudTrainer moved every concept to ``<remote_dir>/remote/``
+        plus the path without its drive. Match the drive-less pair path against the
+        tail of each chosen dir; the longest matching tail wins."""
+        parts = _path_parts(image_path[2:])
+        best, best_len = None, 1  # a bare "chosen" tail is too weak to count
+        for index, dir_parts in enumerate(self._dir_parts):
+            for start in range(len(dir_parts)):
+                tail = dir_parts[start:]
+                if len(tail) > best_len and len(tail) < len(parts) and parts[: len(tail)] == tail:
+                    best, best_len = index, len(tail)
+                    break
+        return best
 
 
 # --------------------------------------------------------------------------- #
