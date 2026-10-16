@@ -2500,7 +2500,11 @@ class GenericTrainer(BaseTrainer):
                     # them (start_next_epoch, which runs their caching pass); a
                     # cache-only run would otherwise leave the VALIDATION concepts
                     # uncached and a sourceless run without validation data.
-                    for loader in (self.validation_data_loader, self.dpo_validation_data_loader):
+                    # Neither exists when validation is off.
+                    for loader in (
+                        getattr(self, "validation_data_loader", None),
+                        getattr(self, "dpo_validation_data_loader", None),
+                    ):
                         if loader is not None:
                             loader.get_data_set().start_next_epoch()
             return
