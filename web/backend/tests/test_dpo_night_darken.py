@@ -18,8 +18,8 @@ import pytest
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
-NIGHT_CAPTION = "A woman standing on a pier, photo taken at night, city lights behind her."
-DARK_CAPTION = "This image is dark and dimly lit, a man in a dark room."
+NIGHT_CAPTION = "A woman standing on a dark pier, photo taken at night, city lights behind her."
+DARK_CAPTION = "This image is dark and dimly lit, a man in a dark room at night."
 DAY_CAPTION = "A woman with dark hair and dark jeans on a sunny beach."
 PLAIN_CAPTION = "A man in a red jacket on a bright street."
 
@@ -113,7 +113,7 @@ def _wait(service, timeout=20.0):
 
 
 def test_phrase_matching_is_whole_word_and_lighting_aware():
-    assert nd.match_night_phrases(NIGHT_CAPTION) == ["at night", "night"]
+    assert nd.match_night_phrases(NIGHT_CAPTION) == ["at night", "night", "dark"]
     assert "dark" in nd.match_night_phrases(DARK_CAPTION)
     assert "dimly lit" in nd.match_night_phrases(DARK_CAPTION)
     assert nd.match_night_phrases(DAY_CAPTION) == []
@@ -252,9 +252,16 @@ def test_scan_selects_night_captions_that_are_not_dark(tmp_path):
     rels = [c["rel"] for c in result["candidates"]]
     assert rels == ["chosen/train/pair_0001.png", "chosen/train/pair_0005.webp", "chosen/train/pair_0006.png"]
     assert result["already_dark"] == ["chosen/train/pair_0002.png"]
-    assert result["counts"] == {"images": 6, "caption_matches": 4, "already_dark": 1, "unreadable": 0, "candidates": 3}
+    assert result["counts"] == {
+        "images": 6,
+        "caption_matches": 4,
+        "partial_matches": 0,
+        "already_dark": 1,
+        "unreadable": 0,
+        "candidates": 3,
+    }
     first = result["candidates"][0]
-    assert first["phrases"] == ["at night", "night"]
+    assert first["phrases"] == ["at night", "night", "dark"]
     assert first["size"] == [96, 64]
     assert first["stats"]["median"] > nd.DEFAULT_DARK_MEDIAN
     # Tighter thresholds admit the dark one too.
@@ -434,3 +441,13 @@ def test_select_night_edits_takes_the_rounded_share_most_changed_first():
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_qualifies_needs_both_night_and_dark():
+    found = nd.match_night_phrases
+    assert not nd.qualifies(found("A woman with dark brown skin, smiling outdoors."))
+    assert not nd.qualifies(found("Photographed at night on a city street."))
+    assert not nd.qualifies(found("The room is dark and dimly lit."))
+    assert nd.qualifies(found("A dark alley at night, lit by one streetlamp."))
+    assert nd.qualifies(found("Dark brown skin, taken late at night in a darkened bar."))
+    assert not nd.qualifies(found("Dark brown skin and dark hair, nighttime is not mentioned... daytime."))

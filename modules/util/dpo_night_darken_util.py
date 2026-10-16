@@ -12,7 +12,9 @@ Flow
 ----
 1. **Scan** a DPO concept folder (``<concept>/chosen/**``): every chosen image
    whose caption ``.txt`` matches :data:`NIGHT_PHRASES` (whole words, case
-   insensitive) gets a luma statistic. Images that are already genuinely
+   insensitive) AND says both "night" and "dark" (:data:`REQUIRED_GROUPS`:
+   one of :data:`NIGHT_TERMS` and one of :data:`DARK_TERMS`; "dark hair",
+   "dark brown skin" don't count as dark) gets a luma statistic. Images that are already genuinely
    dark (:func:`is_already_dark`, thresholds in :class:`DarkThresholds`) are
    counted and skipped; the rest are the candidates. Minor Edits and
    Off-policy datasets are never sources — the user picks the source folder
@@ -131,6 +133,14 @@ NIGHT_PHRASES: tuple[str, ...] = (
     "nocturnal",
     "pitch black",
 )
+
+#: A caption qualifies only when it matches at least one phrase of EVERY
+#: group (the user's rule: it must say both "night" and "dark"; "dark brown
+#: skin" alone, or "at night" alone, is not enough). Phrases outside the
+#: groups are still reported but never qualify a caption on their own.
+NIGHT_TERMS: tuple[str, ...] = ("night", "nighttime", "night time", "at night", "late night", "midnight")
+DARK_TERMS: tuple[str, ...] = ("dark", "darkness", "darkened")
+REQUIRED_GROUPS: tuple[tuple[str, ...], ...] = (NIGHT_TERMS, DARK_TERMS)
 
 #: Nouns that make a bare "dark" describe an object, not the lighting
 #: ("dark hair", "dark jeans"). Such a match does not make a candidate.
@@ -340,6 +350,12 @@ def match_night_phrases(caption: str, patterns: list[tuple[str, re.Pattern]] | N
                 continue
         found.append(phrase)
     return found
+
+
+def qualifies(found: list[str], groups: tuple[tuple[str, ...], ...] = REQUIRED_GROUPS) -> bool:
+    """Whether the matched phrases cover every required group."""
+    lowered = {f.lower() for f in found}
+    return all(lowered & {g.lower() for g in group} for group in groups)
 
 
 # --------------------------------------------------------------------------- #
@@ -917,6 +933,7 @@ def scan_candidates(
     concept_dir: str,
     *,
     phrases: tuple[str, ...] | list[str] = NIGHT_PHRASES,
+    groups: tuple[tuple[str, ...], ...] = REQUIRED_GROUPS,
     thresholds: DarkThresholds | None = None,
     progress=None,
     stop=None,
@@ -927,13 +944,17 @@ def scan_candidates(
     (their paths are listed under ``already_dark``). ``progress(done, total)``
     is called per caption match; ``stop`` is a ``threading.Event``."""
     thresholds = thresholds or DarkThresholds()
-    patterns = compile_phrases(phrases)
+    # the required words always count, whatever phrase list the UI sends
+    patterns = compile_phrases(tuple(phrases) + tuple(t for g in groups for t in g))
+    partial = 0
     images = iter_chosen_images(concept_dir)
     matched = []
     for item in images:
         found = match_night_phrases(read_caption(item["caption_path"]), patterns)
-        if found:
+        if found and qualifies(found, groups):
             matched.append((item, found))
+        elif found:
+            partial += 1
     candidates: list[dict] = []
     already_dark: list[str] = []
     unreadable: list[str] = []
@@ -970,6 +991,7 @@ def scan_candidates(
         "counts": {
             "images": len(images),
             "caption_matches": len(matched),
+            "partial_matches": partial,  # matched a phrase but not both "night" and "dark"
             "already_dark": len(already_dark),
             "unreadable": len(unreadable),
             "candidates": len(candidates),
