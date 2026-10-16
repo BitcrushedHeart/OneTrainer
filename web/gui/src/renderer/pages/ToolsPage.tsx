@@ -9,6 +9,7 @@ import {
   Layers,
   ListOrdered,
   ListRestart,
+  Moon,
   RefreshCw,
   Shuffle,
   Sparkles,
@@ -29,6 +30,7 @@ import { DPOSaturationModal } from "@/components/modals/DPOSaturationModal";
 import { DPOToolModal } from "@/components/modals/DPOToolModal";
 import { MaskToolModal } from "@/components/modals/MaskToolModal";
 import { MergeOFTModal } from "@/components/modals/MergeOFTModal";
+import { NightDarkenModal } from "@/components/modals/NightDarkenModal";
 import { OffPolicyDpoModal } from "@/components/modals/OffPolicyDpoModal";
 import { ProfilingPanel } from "@/components/modals/ProfilingPanel";
 import { RepairRejectedModal } from "@/components/modals/RepairRejectedModal";
@@ -80,6 +82,7 @@ export default function ToolsPage() {
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [triageFixOpen, setTriageFixOpen] = useState(false);
   const [saturationOpen, setSaturationOpen] = useState(false);
+  const [nightDarkenOpen, setNightDarkenOpen] = useState(false);
   const [textAlignOpen, setTextAlignOpen] = useState(false);
   const [characterDpoOpen, setCharacterDpoOpen] = useState(false);
   const setActiveTab = useUiStore((s) => s.setActiveTab);
@@ -178,6 +181,12 @@ export default function ToolsPage() {
           onLaunch={() => setSaturationOpen(true)}
         />
         <ToolCard
+          icon={<Moon className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
+          title="Night Darken"
+          description="Find chosen images whose caption says night or dark but that are not, review each with a before/after wipe, darken them in place (backed up) and add the most changed as Minor Edits pairs"
+          onLaunch={() => setNightDarkenOpen(true)}
+        />
+        <ToolCard
           icon={<Sparkles className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="Distillation Dataset"
           description="Copy good images into a normalized metadata dataset for DMD2 distillation"
@@ -219,6 +228,7 @@ export default function ToolsPage() {
       <ReplacePairsModal open={replaceOpen} onClose={() => setReplaceOpen(false)} />
       <TriageFixModal open={triageFixOpen} onClose={() => setTriageFixOpen(false)} />
       <DPOSaturationModal open={saturationOpen} onClose={() => setSaturationOpen(false)} />
+      <NightDarkenModal open={nightDarkenOpen} onClose={() => setNightDarkenOpen(false)} />
       <TextAlignmentDatasetModal open={textAlignOpen} onClose={() => setTextAlignOpen(false)} />
       <CharacterDpoModal open={characterDpoOpen} onClose={() => setCharacterDpoOpen(false)} />
     </>
