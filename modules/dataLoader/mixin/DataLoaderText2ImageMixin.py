@@ -901,7 +901,17 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 modules.append(text_disk_cache)
                 sort_names = [x for x in sort_names if x not in text_split_names]
 
-        if len(sort_names) > 0:
+        if len(sort_names) > 0 and sourceless:
+            # Sourceless: "concept" (and with it concept.balancing) comes from
+            # the caches, whose rows are already grouped and balanced. Grouping
+            # and balancing them again would apply each concept's repeats twice
+            # and lay these names out on a different, longer (repeats > 1) or
+            # shorter (repeats < 1) axis than the cached tensors: the first
+            # concept's block then covers every output index, so each row's
+            # concept (beta, loss weight, mask overrides) and prompt would be
+            # another row's. Pass them through row for row instead.
+            modules.append(VariationSorting(names=sort_names))
+        elif len(sort_names) > 0:
             variation_sorting = VariationSorting(
                 names=sort_names,
                 balancing_in_name="concept.balancing",

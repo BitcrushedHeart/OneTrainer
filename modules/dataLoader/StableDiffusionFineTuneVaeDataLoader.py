@@ -319,13 +319,24 @@ class StableDiffusionFineTuneVaeDataLoader(BaseDataLoader):
                 else None
             ),
         )
-        variation_sorting = VariationSorting(
-            names=sort_names,
-            balancing_in_name="concept.balancing",
-            balancing_strategy_in_name="concept.balancing_strategy",
-            variations_group_in_name=["concept.path", "concept.seed", "concept.include_subdirectories", "concept.text"],
-            group_enabled_in_name="concept.enabled",
-        )
+        if config.sourceless_training and config.latent_caching:
+            # The sourceless cache serves "concept" already grouped and
+            # balanced; balancing again would misalign it with the latents
+            # (see DataLoaderText2ImageMixin._cache_modules_from_names).
+            variation_sorting = VariationSorting(names=sort_names)
+        else:
+            variation_sorting = VariationSorting(
+                names=sort_names,
+                balancing_in_name="concept.balancing",
+                balancing_strategy_in_name="concept.balancing_strategy",
+                variations_group_in_name=[
+                    "concept.path",
+                    "concept.seed",
+                    "concept.include_subdirectories",
+                    "concept.text",
+                ],
+                group_enabled_in_name="concept.enabled",
+            )
 
         modules = []
 
