@@ -18,10 +18,17 @@ class ScanRequest(BaseModel):
     phrases: list[str] = []
 
 
+class AdjustModel(BaseModel):
+    strength: float = 0.0
+    noise: float = 0.0
+    hue: float = 0.0
+    saturation: float = 1.0
+
+
 class DecideRequest(BaseModel):
     rel: str
     state: str
-    strength: float | None = None
+    adjust: AdjustModel | None = None
 
 
 class UndoRequest(BaseModel):
@@ -29,7 +36,8 @@ class UndoRequest(BaseModel):
 
 
 class CommitRequest(BaseModel):
-    minor_edits_dir: str = ""
+    # Empty = "<workspace>/DPO Night Edits" beside the source concept.
+    night_edits_dir: str = ""
     fraction: float = 0.33
 
 
@@ -73,8 +81,10 @@ def caption(rel: str):
 
 
 @router.get("/dpo/night-darken/preview")
-def preview(rel: str, strength: float = 0.0):
-    data = DPONightDarkenService.get_instance().preview(rel, strength)
+def preview(rel: str, strength: float = 0.0, noise: float = 0.0, hue: float = 0.0, saturation: float = 1.0):
+    data = DPONightDarkenService.get_instance().preview(
+        rel, {"strength": strength, "noise": noise, "hue": hue, "saturation": saturation}
+    )
     if data is None:
         return Response(status_code=404, content="Not a candidate")
     return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -82,7 +92,8 @@ def preview(rel: str, strength: float = 0.0):
 
 @router.post("/dpo/night-darken/decide")
 def decide(req: DecideRequest):
-    return DPONightDarkenService.get_instance().decide(req.rel, req.state, req.strength)
+    adjust = req.adjust.model_dump() if req.adjust is not None else None
+    return DPONightDarkenService.get_instance().decide(req.rel, req.state, adjust)
 
 
 @router.post("/dpo/night-darken/undo")
@@ -92,7 +103,7 @@ def undo(req: UndoRequest):
 
 @router.post("/dpo/night-darken/commit")
 def commit(req: CommitRequest):
-    return DPONightDarkenService.get_instance().commit(req.minor_edits_dir, req.fraction)
+    return DPONightDarkenService.get_instance().commit(req.night_edits_dir, req.fraction)
 
 
 @router.post("/dpo/night-darken/restore")

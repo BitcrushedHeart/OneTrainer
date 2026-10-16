@@ -1,11 +1,32 @@
 import { API_BASE, request } from "./request";
 
+/** The four review sliders; strength 0, noise 0, hue 0 and saturation 1 are the identity. */
+export interface NightDarkenAdjust {
+  strength: number;
+  noise: number;
+  hue: number;
+  saturation: number;
+}
+
+export const NEUTRAL_ADJUST: NightDarkenAdjust = { strength: 0, noise: 0, hue: 0, saturation: 1 };
+
 export interface NightDarkenDefaults {
   phrases: string[];
   thresholds: { median: number; mean: number };
   fraction: number;
-  strength: number;
-  curve: { exposure_stops: number; gamma_lift: number; highlight_knee: number; highlight_keep: number };
+  adjust: NightDarkenAdjust;
+  hue_range: number;
+  saturation_max: number;
+  night_edits_dir_name: string;
+  curve: {
+    exposure_stops: number;
+    gamma_lift: number;
+    highlight_knee: number;
+    highlight_keep: number;
+    noise_max_sigma: number;
+    noise_floor: number;
+    noise_chroma: number;
+  };
   bright_pixel_luma: number;
 }
 
@@ -20,6 +41,7 @@ export interface NightDarkenJob {
   started_at: number;
   finished_at: number | null;
   pairs_planned?: number;
+  night_edits_dir?: string | null;
   commit_id?: string | null;
 }
 
@@ -37,13 +59,13 @@ export interface NightDarkenCommit {
   at: number;
   items: number;
   pairs: number;
-  minor_edits_dir: string | null;
+  night_edits_dir: string | null;
   fraction: number;
   restored: boolean;
   restored_at: number | null;
   restore_missing: string[];
   error: string | null;
-  mean_delta_luma: number | null;
+  mean_delta_e: number | null;
 }
 
 export interface NightDarkenCounts {
@@ -62,6 +84,7 @@ export interface NightDarkenState {
   concept_dir: string | null;
   ledger_dir?: string;
   backup_dir?: string;
+  default_night_edits_dir: string | null;
   scan: NightDarkenScan | null;
   counts: NightDarkenCounts | null;
   commits: NightDarkenCommit[];
@@ -70,7 +93,9 @@ export interface NightDarkenState {
 export interface NightDarkenDecision {
   state: "accepted" | "skipped";
   at: number;
+  adjust?: NightDarkenAdjust;
   strength?: number;
+  delta_e?: number;
   delta_luma?: number;
   committed?: string;
 }
@@ -117,10 +142,10 @@ export const dpoNightDarkenApi = {
   caption: (rel: string) =>
     request<{ ok: boolean; caption?: string }>(`/dpo/night-darken/caption?rel=${encodeURIComponent(rel)}`),
 
-  decide: (rel: string, state: "accepted" | "skipped", strength: number | null) =>
+  decide: (rel: string, state: "accepted" | "skipped", adjust: NightDarkenAdjust | null) =>
     request<Ok & { decision?: NightDarkenDecision }>("/dpo/night-darken/decide", {
       method: "POST",
-      body: JSON.stringify({ rel, state, strength }),
+      body: JSON.stringify({ rel, state, adjust }),
     }),
 
   undo: (rel: string) =>
@@ -129,11 +154,14 @@ export const dpoNightDarkenApi = {
       body: JSON.stringify({ rel }),
     }),
 
-  commit: (minorEditsDir: string, fraction: number) =>
-    request<Ok & { pending?: number; pairs_planned?: number }>("/dpo/night-darken/commit", {
-      method: "POST",
-      body: JSON.stringify({ minor_edits_dir: minorEditsDir, fraction }),
-    }),
+  commit: (nightEditsDir: string, fraction: number) =>
+    request<Ok & { pending?: number; pairs_planned?: number; night_edits_dir?: string | null }>(
+      "/dpo/night-darken/commit",
+      {
+        method: "POST",
+        body: JSON.stringify({ night_edits_dir: nightEditsDir, fraction }),
+      },
+    ),
 
   restore: (commitId: string) =>
     request<Ok & { restored?: number; pairs_removed?: number; missing?: string[] }>("/dpo/night-darken/restore", {
@@ -141,6 +169,7 @@ export const dpoNightDarkenApi = {
       body: JSON.stringify({ commit_id: commitId }),
     }),
 
-  previewUrl: (rel: string, strength: number) =>
-    `${API_BASE}/dpo/night-darken/preview?rel=${encodeURIComponent(rel)}&strength=${strength.toFixed(3)}`,
+  previewUrl: (rel: string, adjust: NightDarkenAdjust) =>
+    `${API_BASE}/dpo/night-darken/preview?rel=${encodeURIComponent(rel)}&strength=${adjust.strength.toFixed(3)}` +
+    `&noise=${adjust.noise.toFixed(3)}&hue=${adjust.hue.toFixed(1)}&saturation=${adjust.saturation.toFixed(3)}`,
 };

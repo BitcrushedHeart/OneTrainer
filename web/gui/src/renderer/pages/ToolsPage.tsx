@@ -183,7 +183,7 @@ export default function ToolsPage() {
         <ToolCard
           icon={<Moon className="w-6 h-6 text-[var(--color-cobalt-600)]" />}
           title="Night Darken"
-          description="Find chosen images whose caption says night or dark but that are not, review each with a before/after wipe, darken them in place (backed up) and add the most changed as Minor Edits pairs"
+          description="Find chosen images whose caption says night or dark but that are not, review each with a before/after wipe (darken, noise, hue, saturation), replace them in place (backed up) and add the most changed as pairs in a separate Night Edits dataset"
           onLaunch={() => setNightDarkenOpen(true)}
         />
         <ToolCard

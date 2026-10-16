@@ -18,33 +18,62 @@ Flow
    Off-policy datasets are never sources — the user picks the source folder
    and the tool refuses a folder whose ``concepts.json`` / ``workspace.json``
    registration says it is one of those.
-2. **Review**, one candidate at a time: a before/after wipe over the image,
-   a strength slider that re-renders the darkened side, *Accept* (keeps the
-   current strength), *Skip*, *Back*. Decisions live in the ledger at
+2. **Review**, one candidate at a time: a before/after wipe over the image
+   and four sliders that re-render the adjusted side — darkening strength,
+   noise, hue shift and saturation — then *Accept* (keeps the current
+   settings), *Skip*, *Back*. Decisions live in the ledger at
    ``<concept>/.night_darken/ledger.json`` so a closed modal resumes.
-3. **Commit**: every accepted image is darkened at its strength and replaced
-   in place (same file name and format, PNG text chunks / EXIF / ICC kept).
-   The original goes to ``<concept>/.night_darken/backup/<split>/<name>``,
-   listed in ``<concept>/.night_darken/backup/manifest.csv`` (path, strength,
-   stats). The most changed :data:`DEFAULT_MINOR_EDITS_FRACTION` of the
-   accepted set (ranked by mean absolute luma change) is also written as new
-   pairs into the Minor Edits folder: darkened = chosen, original = rejected,
-   the same caption, and an all-white ``-masklabel.png`` beside both sides so
-   the whole image counts under masked DPO.
+3. **Commit**: every accepted image is re-rendered at full size with its
+   accepted settings and replaced in place (same file name and format, PNG
+   text chunks / EXIF / ICC kept). The original goes to
+   ``<concept>/.night_darken/backup/<split>/<name>``, listed in
+   ``<concept>/.night_darken/backup/manifest.csv`` (path, strength, noise,
+   hue, saturation, stats, change). The most changed
+   :data:`DEFAULT_MINOR_EDITS_FRACTION` of the accepted set (ranked by the
+   mean CIELAB ΔE between original and result, so every adjustment counts) is
+   also written as new pairs into the **Night Edits** dataset (default
+   ``<workspace>/DPO Night Edits`` beside the source concept, created on the
+   first commit with the Minor Edits layout: ``chosen/train`` +
+   ``rejected/train``, ``pair_NNNN`` from 0001, its own ``manifest.json`` via
+   ``load_manifest`` / ``save_manifest`` and a ``concepts.json``): adjusted =
+   chosen, original = rejected, the caption copied byte for byte, and an
+   all-white ``-masklabel.png`` beside both sides so the whole image counts
+   under masked DPO. The destination is editable but a folder the Optimise
+   workspace already registers (Minor Edits, Off-policy, RLHF_8, ...) is
+   refused, so the tool never collides with Optimise's pair numbering; the
+   new dataset can later be imported into Optimise as its own dataset.
 4. **Restore** reverses a commit: backups move back, the concept manifest
-   entries return to what they were, the Minor Edits pairs (files, masks,
+   entries return to what they were, the Night Edits pairs (files, masks,
    captions, manifest entries) are removed.
 
-Darkening
----------
-:func:`darken_rgb` works in linear light. Each pixel's linear luminance ``Y``
-is pulled down by an exposure drop of ``EXPOSURE_STOPS * strength`` stops
-and a gamma of ``1 + GAMMA_LIFT * strength`` (shadows fall faster than
-highlights, so light sources keep reading as lights), and the RGB channels
-are scaled by the resulting ``Y_out / Y`` so hue and saturation stay put.
-Clipped highlights (``Y`` above :data:`HIGHLIGHT_KNEE`) keep
-:data:`HIGHLIGHT_KEEP` of their original luminance so lamps, screens and
-specular hits survive. Strength 0 is the identity.
+Adjustments (:func:`apply_adjustments`, in this order)
+-------------------------------------------------------
+1. **Darken** (:func:`darken_rgb`), in linear light. Each pixel's linear
+   luminance ``Y`` is pulled down by an exposure drop of
+   ``EXPOSURE_STOPS * strength`` stops and a gamma of
+   ``1 + GAMMA_LIFT * strength`` (shadows fall faster than highlights, so
+   light sources keep reading as lights), and the RGB channels are scaled by
+   the resulting ``Y_out / Y`` so hue and saturation stay put. Clipped
+   highlights (``Y`` above :data:`HIGHLIGHT_KNEE`) keep :data:`HIGHLIGHT_KEEP`
+   of their original luminance so lamps, screens and specular hits survive.
+   Strength 0 is the identity.
+2. **Hue / saturation** (:func:`hue_saturation_rgb`), on gamma-encoded RGB
+   as Rec.709 Y'CbCr: the chroma vector ``(Cb, Cr)`` is rotated by the hue
+   angle and scaled by the saturation multiplier, luma is untouched, the
+   result is clipped. Hue 0 and saturation 1 are the identity.
+3. **Noise** (:func:`add_noise_rgb`), sensor-like, last. With ``a = noise *
+   NOISE_MAX_SIGMA`` and the pixel's luma ``Y'`` (0..1), the per-pixel
+   amplitude is ``a * (NOISE_FLOOR + (1 - NOISE_FLOOR) * (1 - Y'))``: full in
+   the shadows, ``NOISE_FLOOR`` of it in the highlights. A luminance draw
+   (one Gaussian shared by the three channels) plus a milder chroma draw
+   (independent Gaussians per channel, ``NOISE_CHROMA`` of the amplitude) is
+   added and clipped. The generator is seeded from the image's file stem, so
+   a given image always gets the same noise field at a given size; the
+   preview renders it at preview size, the commit at full size.
+
+Change metric: :func:`mean_delta_e`, the mean CIE76 ΔE between the original
+and the result in CIELAB (D65), computed at preview size when accepting and
+at full size on commit.
 """
 
 from __future__ import annotations
@@ -210,11 +239,21 @@ GAMMA_LIFT = 0.8
 HIGHLIGHT_KNEE = 0.8
 HIGHLIGHT_KEEP = 0.6
 
-#: Share of the accepted images (most changed first) that also become Minor
+#: Share of the accepted images (most changed first) that also become Night
 #: Edits pairs.
 DEFAULT_MINOR_EDITS_FRACTION = 0.33
 #: Default accept strength.
 DEFAULT_STRENGTH = 0.5
+#: Noise at slider 1: sigma in 0..1 units for a black pixel (about 31/255).
+NOISE_MAX_SIGMA = 0.12
+#: Share of the shadow amplitude that a white pixel still gets.
+NOISE_FLOOR = 0.25
+#: Chroma noise amplitude relative to the luminance noise.
+NOISE_CHROMA = 0.35
+#: Hue slider range in degrees.
+HUE_RANGE = 180.0
+#: Saturation slider range (multiplier).
+SATURATION_MAX = 2.0
 
 #: Long side of the image the scan statistics are computed on.
 SCAN_MAX_SIDE = 256
@@ -227,6 +266,12 @@ BACKUP_DIR = "backup"
 BACKUP_MANIFEST = "manifest.csv"
 HISTORY_ACTION = "night_darken"
 MASK_SUFFIX = "-masklabel.png"
+#: Default destination dataset for the new pairs, beside the source concept.
+NIGHT_EDITS_DIR_NAME = "DPO Night Edits"
+#: The destination's layout: ``chosen/train`` + ``rejected/train``, like Minor Edits.
+NIGHT_EDITS_SPLIT = "train"
+#: Pair numbering in a fresh destination starts here.
+NIGHT_EDITS_FIRST_PAIR_ID = 1
 #: Optimise workspace dataset types this tool never reads from.
 EXCLUDED_WORKSPACE_TYPES = ("minor_edits", "offpolicy")
 #: Folder-name words that mark an excluded source when no workspace registry says so.
@@ -238,12 +283,16 @@ BACKUP_CSV_FIELDS = (
     "chosen",
     "backup",
     "strength",
+    "noise",
+    "hue",
+    "saturation",
     "median",
     "mean",
     "bright_fraction",
+    "delta_e",
     "delta_luma",
-    "minor_edits_dir",
-    "minor_edits_pair_id",
+    "night_edits_dir",
+    "night_edits_pair_id",
 )
 
 _LEDGER_LOCK = threading.RLock()
@@ -415,6 +464,146 @@ def darken_rgb(rgb: np.ndarray, strength: float) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# Hue / saturation, noise, the combined adjustment and its change metric
+# --------------------------------------------------------------------------- #
+
+# Rec.709 Y'CbCr on gamma-encoded values.
+_CB_SCALE = 1.8556
+_CR_SCALE = 1.5748
+
+
+def hue_saturation_rgb(rgb: np.ndarray, hue_degrees: float, saturation: float) -> np.ndarray:
+    """Rotate the chroma of an ``[H, W, 3|4]`` uint8 image by ``hue_degrees``
+    and scale it by ``saturation``; luma is untouched. Neutral (0, 1) returns
+    an identical copy."""
+    rgb = np.asarray(rgb)
+    if rgb.dtype != np.uint8:
+        raise TypeError("hue_saturation_rgb expects a uint8 array")
+    hue = float(hue_degrees)
+    sat = float(max(saturation, 0.0))
+    if abs(hue) < 1e-9 and abs(sat - 1.0) < 1e-9:
+        return rgb.copy()
+    alpha = rgb[..., 3:4] if rgb.shape[-1] == 4 else None
+    x = rgb[..., :3].astype(np.float32) / 255.0
+    r, g, b = x[..., 0], x[..., 1], x[..., 2]
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    cb = (b - y) / _CB_SCALE
+    cr = (r - y) / _CR_SCALE
+    theta = np.deg2rad(hue)
+    cos_t, sin_t = float(np.cos(theta)), float(np.sin(theta))
+    cb2 = sat * (cb * cos_t - cr * sin_t)
+    cr2 = sat * (cb * sin_t + cr * cos_t)
+    r2 = y + _CR_SCALE * cr2
+    b2 = y + _CB_SCALE * cb2
+    g2 = (y - 0.2126 * r2 - 0.0722 * b2) / 0.7152
+    out = np.rint(np.clip(np.stack([r2, g2, b2], axis=-1), 0.0, 1.0) * 255.0).astype(np.uint8)
+    if alpha is not None:
+        out = np.concatenate([out, alpha], axis=-1)
+    return out
+
+
+def noise_seed(name: str) -> int:
+    """A stable 63-bit seed from an image's file stem (any path form)."""
+    import hashlib
+
+    stem = os.path.splitext(os.path.basename(str(name).replace("\\", "/")))[0]
+    return int.from_bytes(hashlib.sha256(stem.encode("utf-8")).digest()[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
+def add_noise_rgb(rgb: np.ndarray, noise: float, seed: int) -> np.ndarray:
+    """Sensor-style noise on an ``[H, W, 3|4]`` uint8 image: luminance noise
+    shared by the channels plus milder per-channel chroma noise, both scaled
+    by a shadow weight so dark pixels get the most. ``noise`` 0 returns an
+    identical copy; the same ``seed`` and shape give the same field."""
+    rgb = np.asarray(rgb)
+    if rgb.dtype != np.uint8:
+        raise TypeError("add_noise_rgb expects a uint8 array")
+    n = float(min(max(noise, 0.0), 1.0))
+    if n <= 0.0:
+        return rgb.copy()
+    alpha = rgb[..., 3:4] if rgb.shape[-1] == 4 else None
+    x = rgb[..., :3].astype(np.float32) / 255.0
+    luma = x @ _LUMA_WEIGHTS
+    amplitude = (n * NOISE_MAX_SIGMA) * (NOISE_FLOOR + (1.0 - NOISE_FLOOR) * (1.0 - luma))
+    rng = np.random.default_rng(int(seed))
+    shape = x.shape[:2]
+    luminance = rng.standard_normal(shape, dtype=np.float32)
+    chroma = rng.standard_normal((*shape, 3), dtype=np.float32)
+    delta = amplitude[..., None] * (luminance[..., None] + NOISE_CHROMA * chroma)
+    out = np.rint(np.clip(x + delta, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if alpha is not None:
+        out = np.concatenate([out, alpha], axis=-1)
+    return out
+
+
+@dataclass
+class Adjust:
+    """The four review sliders; the defaults are the identity."""
+
+    strength: float = 0.0
+    noise: float = 0.0
+    hue: float = 0.0
+    saturation: float = 1.0
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> Adjust:
+        raw = raw or {}
+        out = cls()
+        for key in ("strength", "noise", "hue", "saturation"):
+            value = raw.get(key)
+            if value is None:
+                continue
+            with suppress(TypeError, ValueError):
+                setattr(out, key, float(value))
+        out.strength = min(max(out.strength, 0.0), 1.0)
+        out.noise = min(max(out.noise, 0.0), 1.0)
+        out.hue = min(max(out.hue, -HUE_RANGE), HUE_RANGE)
+        out.saturation = min(max(out.saturation, 0.0), SATURATION_MAX)
+        return out
+
+    def to_dict(self) -> dict:
+        return {k: round(float(v), 4) for k, v in asdict(self).items()}
+
+    def is_neutral(self) -> bool:
+        return self.strength <= 0 and self.noise <= 0 and abs(self.hue) < 1e-9 and abs(self.saturation - 1.0) < 1e-9
+
+
+def apply_adjustments(rgb: np.ndarray, adjust: Adjust | dict | None, seed: int | str) -> np.ndarray:
+    """Darken, then hue/saturation, then noise (see the module docstring).
+    ``seed`` is an int or the image name :func:`noise_seed` hashes."""
+    adjust = adjust if isinstance(adjust, Adjust) else Adjust.from_dict(adjust)
+    seed_value = noise_seed(seed) if isinstance(seed, str) else int(seed)
+    out = darken_rgb(rgb, adjust.strength)
+    out = hue_saturation_rgb(out, adjust.hue, adjust.saturation)
+    return add_noise_rgb(out, adjust.noise, seed_value)
+
+
+_RGB_TO_XYZ = np.array(
+    [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]],
+    dtype=np.float32,
+)
+_D65 = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+
+
+def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """CIELAB (D65) of an ``[..., 3]`` uint8 sRGB array, float32."""
+    lin = _SRGB_TO_LINEAR_LUT[np.asarray(rgb)[..., :3]]
+    xyz = (lin @ _RGB_TO_XYZ.T) / _D65
+    delta = 6.0 / 29.0
+    f = np.where(xyz > delta**3, np.cbrt(xyz), xyz / (3.0 * delta**2) + 4.0 / 29.0)
+    lab = np.empty_like(f)
+    lab[..., 0] = 116.0 * f[..., 1] - 16.0
+    lab[..., 1] = 500.0 * (f[..., 0] - f[..., 1])
+    lab[..., 2] = 200.0 * (f[..., 1] - f[..., 2])
+    return lab
+
+
+def mean_delta_e(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean CIE76 ΔE between two uint8 images of the same size."""
+    return float(np.linalg.norm(rgb_to_lab(a) - rgb_to_lab(b), axis=-1).mean())
+
+
+# --------------------------------------------------------------------------- #
 # Image I/O
 # --------------------------------------------------------------------------- #
 
@@ -460,11 +649,14 @@ def _png_info(src) -> object:
     return info
 
 
-def save_darkened_like(original_path: str, strength: float, target_path: str) -> dict:
-    """Write the darkened original to ``target_path`` in the original's format,
+def save_adjusted_like(
+    original_path: str, adjust: Adjust | dict | None, target_path: str, seed: int | str | None = None
+) -> dict:
+    """Write the adjusted original to ``target_path`` in the original's format,
     carrying its PNG text chunks (SwarmUI parameters, Triage & Fix provenance),
-    EXIF, ICC profile and XMP across. Alpha is kept as is. Returns the luma
-    change (``delta_luma``) and the original's stats.
+    EXIF, ICC profile and XMP across. Alpha is kept as is. Returns the change
+    (``delta_e``, ``delta_luma``) and the original's stats. The noise seed
+    defaults to the original's file stem.
 
     The file is written beside the target and renamed into place, so a crash
     leaves either the old file or the new one."""
@@ -480,7 +672,8 @@ def save_darkened_like(original_path: str, strength: float, target_path: str) ->
         work = src.convert("RGBA" if has_alpha else "RGB")
         pixels = np.asarray(work)
 
-    darkened = darken_rgb(pixels, strength)
+    darkened = apply_adjustments(pixels, adjust, seed if seed is not None else original_path)
+    delta_e = mean_delta_e(pixels[..., :3], darkened[..., :3])
     delta = mean_abs_luma_delta(pixels[..., :3], darkened[..., :3])
     stats = luma_stats(pixels[..., :3])
 
@@ -512,7 +705,7 @@ def save_darkened_like(original_path: str, strength: float, target_path: str) ->
         with suppress(OSError):
             if os.path.exists(tmp):
                 os.remove(tmp)
-    return {"delta_luma": round(delta, 4), "stats": stats.to_dict(), "format": fmt}
+    return {"delta_e": round(delta_e, 4), "delta_luma": round(delta, 4), "stats": stats.to_dict(), "format": fmt}
 
 
 def write_full_mask(image_path: str, mask_path: str | None = None) -> str:
@@ -614,28 +807,62 @@ def read_caption(path: str | None) -> str:
         return ""
 
 
+def workspace_registration(folder: str) -> dict | None:
+    """The Optimise ``workspace.json`` entry registering ``folder`` as a
+    dataset (looked up in the folder's parent), or ``None``."""
+    folder = os.path.abspath(folder)
+    workspace = os.path.join(os.path.dirname(folder), "workspace.json")
+    if not os.path.isfile(workspace):
+        return None
+    try:
+        with open(workspace, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for dataset in data.get("datasets") or []:
+        if not isinstance(dataset, dict):
+            continue
+        registered = os.path.normcase(os.path.abspath(os.path.join(os.path.dirname(workspace), dataset.get("dir", ""))))
+        if registered == os.path.normcase(folder):
+            return dataset
+    return None
+
+
 def source_exclusion_reason(concept_dir: str) -> str | None:
     """Why a folder may not be a source: it is a Minor Edits or Off-policy
     dataset (by its Optimise workspace registration, else by its name)."""
     concept_dir = os.path.abspath(concept_dir)
-    workspace = os.path.join(os.path.dirname(concept_dir), "workspace.json")
-    if os.path.isfile(workspace):
-        try:
-            with open(workspace, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            data = {}
-        for dataset in data.get("datasets") or []:
-            if not isinstance(dataset, dict):
-                continue
-            folder = os.path.normcase(os.path.abspath(os.path.join(os.path.dirname(workspace), dataset.get("dir", ""))))
-            if folder == os.path.normcase(concept_dir) and dataset.get("type") in EXCLUDED_WORKSPACE_TYPES:
-                return f"{os.path.basename(concept_dir)} is registered as a {dataset.get('type')} dataset"
+    dataset = workspace_registration(concept_dir)
+    if dataset is not None and dataset.get("type") in EXCLUDED_WORKSPACE_TYPES:
+        return f"{os.path.basename(concept_dir)} is registered as a {dataset.get('type')} dataset"
     lowered = os.path.basename(concept_dir).lower()
     for word in EXCLUDED_FOLDER_WORDS:
         if word in lowered:
             return f"{os.path.basename(concept_dir)} looks like a {word} dataset"
     return None
+
+
+def destination_exclusion_reason(night_dir: str) -> str | None:
+    """Why a folder may not take the new pairs: it is a dataset Optimise
+    already owns (any ``workspace.json`` registration: Minor Edits,
+    Off-policy, RLHF_8, ...), or it is named like one. New pairs go into
+    their own dataset so they never collide with Optimise's numbering."""
+    night_dir = os.path.abspath(night_dir)
+    dataset = workspace_registration(night_dir)
+    if dataset is not None:
+        return (
+            f"{os.path.basename(night_dir)} is registered in the Optimise workspace as a {dataset.get('type')} dataset"
+        )
+    lowered = os.path.basename(night_dir).lower()
+    for word in EXCLUDED_FOLDER_WORDS:
+        if word in lowered:
+            return f"{os.path.basename(night_dir)} looks like a {word} dataset"
+    return None
+
+
+def default_night_edits_dir(concept_dir: str) -> str:
+    """``<workspace>/DPO Night Edits`` next to the source concept."""
+    return os.path.join(os.path.dirname(os.path.abspath(concept_dir)), NIGHT_EDITS_DIR_NAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -751,25 +978,18 @@ def scan_candidates(
 
 
 # --------------------------------------------------------------------------- #
-# Minor Edits pairs
+# Night Edits pairs (their own dataset, never an Optimise-owned one)
 # --------------------------------------------------------------------------- #
 
 
-def _side_dir(minor_dir: str, side: str, split: str) -> str:
-    base = os.path.join(minor_dir, side)
-    return os.path.join(base, split) if split else base
+def _side_dir(night_dir: str, side: str) -> str:
+    return os.path.join(night_dir, side, NIGHT_EDITS_SPLIT)
 
 
-def minor_edits_split(minor_dir: str) -> str:
-    """``train`` when the destination uses ``chosen/train`` (the Optimise
-    layout), else flat."""
-    return "train" if os.path.isdir(os.path.join(minor_dir, "chosen", "train")) else ""
-
-
-def _disk_pair_numbers(minor_dir: str) -> set[int]:
+def _disk_pair_numbers(night_dir: str) -> set[int]:
     numbers: set[int] = set()
     for side in ("chosen", "rejected"):
-        base = os.path.join(minor_dir, side)
+        base = os.path.join(night_dir, side)
         if not os.path.isdir(base):
             continue
         for _root, dirs, files in os.walk(base):
@@ -781,49 +1001,87 @@ def _disk_pair_numbers(minor_dir: str) -> set[int]:
     return numbers
 
 
-def minor_edits_preflight(minor_dir: str, count: int) -> str | None:
-    """Why ``count`` new pairs cannot be written: the folder is not a DPO pair
-    folder, or the next ids its manifest would hand out already exist on disk
-    (pairs the manifest does not know — Optimise's database would hand out
-    the same numbers)."""
+def next_night_pair_id(manifest: dict) -> int:
+    return max(_next_pair_id(manifest), NIGHT_EDITS_FIRST_PAIR_ID)
+
+
+def night_edits_preflight(night_dir: str, count: int) -> str | None:
+    """Why ``count`` new pairs cannot be written: no folder, an Optimise-owned
+    folder, a non-dataset folder, or the next ids the destination's manifest
+    would hand out already exist on disk (pairs its manifest does not know)."""
     if count <= 0:
         return None
-    if not minor_dir:
-        return "No Minor Edits folder set"
-    if os.path.isdir(minor_dir) and not os.path.isfile(os.path.join(minor_dir, "manifest.json")):
-        entries = [e for e in os.listdir(minor_dir) if not e.startswith(".")]
+    if not night_dir:
+        return "No Night Edits folder set"
+    reason = destination_exclusion_reason(night_dir)
+    if reason:
+        return reason
+    if os.path.isdir(night_dir) and not os.path.isfile(os.path.join(night_dir, "manifest.json")):
+        entries = [e for e in os.listdir(night_dir) if not e.startswith(".")]
         if entries and not {"chosen", "rejected"} & set(entries):
-            return "The Minor Edits folder is not empty and is not a DPO pair folder (no manifest.json)"
-    manifest = load_manifest(minor_dir) if os.path.isdir(minor_dir) else {"pairs": []}
-    first = _next_pair_id(manifest)
-    taken = _disk_pair_numbers(minor_dir) & set(range(first, first + count))
+            return "The Night Edits folder is not empty and is not a DPO pair folder (no manifest.json)"
+    manifest = load_manifest(night_dir) if os.path.isdir(night_dir) else {"pairs": []}
+    first = next_night_pair_id(manifest)
+    taken = _disk_pair_numbers(night_dir) & set(range(first, first + count))
     if taken:
         return f"pair numbers {sorted(taken)[:5]} already exist on disk but not in manifest.json"
     return None
 
 
+def ensure_night_edits_dataset(night_dir: str) -> None:
+    """Create the destination layout (``chosen/train``, ``rejected/train``) and,
+    for a brand-new folder, a ``concepts.json`` in the Minor Edits shape so
+    the dataset drops straight into a concept list."""
+    os.makedirs(_side_dir(night_dir, "chosen"), exist_ok=True)
+    os.makedirs(_side_dir(night_dir, "rejected"), exist_ok=True)
+    os.makedirs(os.path.join(night_dir, "chosen", "val"), exist_ok=True)
+    os.makedirs(os.path.join(night_dir, "rejected", "val"), exist_ok=True)
+    concepts = os.path.join(night_dir, "concepts.json")
+    if not os.path.isfile(concepts):
+        payload = [
+            {
+                "name": "DPO train",
+                "path": os.path.abspath(night_dir),
+                "type": "STANDARD",
+                "enabled": True,
+                "include_subdirectories": False,
+                "dpo_chosen_pattern": "chosen/train/{}",
+                "dpo_rejected_pattern": "rejected/train/{}",
+            },
+            {
+                "name": "DPO val",
+                "path": os.path.abspath(night_dir),
+                "type": "VALIDATION",
+                "enabled": True,
+                "include_subdirectories": False,
+                "dpo_chosen_pattern": "chosen/val/{}",
+                "dpo_rejected_pattern": "rejected/val/{}",
+            },
+        ]
+        with open(concepts, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
 def export_night_pair(
-    minor_dir: str,
+    night_dir: str,
     manifest: dict,
     *,
-    darkened_path: str,
+    adjusted_path: str,
     original_path: str,
     caption_path: str | None,
     lineage: dict,
 ) -> dict:
-    """One Minor Edits pair: the darkened image as chosen, the original as
+    """One Night Edits pair: the adjusted image as chosen, the original as
     rejected, the caption copied byte for byte, an all-white mask beside both
-    sides. Follows ``export_single_pair``'s numbering and manifest entry and
-    adds the destination's ``train`` split when it has one."""
-    split = minor_edits_split(minor_dir)
-    chosen_dir = _side_dir(minor_dir, "chosen", split)
-    rejected_dir = _side_dir(minor_dir, "rejected", split)
-    os.makedirs(chosen_dir, exist_ok=True)
-    os.makedirs(rejected_dir, exist_ok=True)
+    sides. Numbering and the manifest entry follow ``export_single_pair``,
+    starting at ``pair_0001`` in a fresh dataset; files live in ``<side>/train``."""
+    ensure_night_edits_dataset(night_dir)
+    chosen_dir = _side_dir(night_dir, "chosen")
+    rejected_dir = _side_dir(night_dir, "rejected")
 
-    pair_id = _next_pair_id(manifest)
+    pair_id = next_night_pair_id(manifest)
     stem = f"pair_{pair_id:04d}"
-    chosen_ext = os.path.splitext(darkened_path)[1].lower()
+    chosen_ext = os.path.splitext(adjusted_path)[1].lower()
     rejected_ext = os.path.splitext(original_path)[1].lower()
     chosen_target = os.path.join(chosen_dir, stem + chosen_ext)
     rejected_target = os.path.join(rejected_dir, stem + rejected_ext)
@@ -833,7 +1091,7 @@ def export_night_pair(
 
     written: list[str] = []
     try:
-        shutil.copy2(darkened_path, chosen_target)
+        shutil.copy2(adjusted_path, chosen_target)
         written.append(chosen_target)
         shutil.copy2(original_path, rejected_target)
         written.append(rejected_target)
@@ -850,16 +1108,16 @@ def export_night_pair(
                 os.remove(path)
         raise
 
-    prefix = f"{split}/" if split else ""
+    prefix = f"{NIGHT_EDITS_SPLIT}/"
     entry = {
         "pair_id": pair_id,
         "prompt": read_caption(caption_path),
         "aspectratio": resolve_aspect_ratio("", chosen_target),
-        "split": split or None,
+        "split": NIGHT_EDITS_SPLIT,
         "chosen_file": prefix + os.path.basename(chosen_target),
         "rejected_file": prefix + os.path.basename(rejected_target),
         "caption_file": (prefix + stem + ".txt") if caption_target else None,
-        "chosen_source": _normalize_source_path(darkened_path),
+        "chosen_source": _normalize_source_path(adjusted_path),
         "rejected_source": _normalize_source_path(original_path),
         "chosen_sha256": compute_file_sha256(chosen_target),
         "rejected_sha256": compute_file_sha256(rejected_target),
@@ -869,24 +1127,24 @@ def export_night_pair(
         "lineage": lineage,
     }
     manifest.setdefault("pairs", []).append(entry)
-    save_manifest(minor_dir, manifest)
+    save_manifest(night_dir, manifest)
     return {
-        "dir": os.path.abspath(minor_dir),
+        "dir": os.path.abspath(night_dir),
         "pair_id": pair_id,
-        "files": [rel(minor_dir, p) for p in written],
+        "files": [rel(night_dir, p) for p in written],
     }
 
 
-def remove_night_pair(minor_dir: str, manifest: dict, record: dict) -> None:
+def remove_night_pair(night_dir: str, manifest: dict, record: dict) -> None:
     """Reverse :func:`export_night_pair`: its files and manifest entry go."""
     for name in record.get("files") or []:
-        path = absolute(minor_dir, name)
+        path = absolute(night_dir, name)
         with suppress(OSError):
             if path:
                 os.remove(path)
     pairs = manifest.get("pairs", [])
     manifest["pairs"] = [p for p in pairs if p.get("pair_id") != record.get("pair_id")]
-    save_manifest(minor_dir, manifest)
+    save_manifest(night_dir, manifest)
 
 
 # --------------------------------------------------------------------------- #
@@ -938,7 +1196,7 @@ def append_backup_csv(concept_dir: str, rows: list[dict]) -> None:
             writer.writerow(row)
 
 
-def minor_edits_count(total: int, fraction: float) -> int:
+def night_edits_count(total: int, fraction: float) -> int:
     """How many of ``total`` accepted images become pairs: the rounded share,
     at least one when the share is positive."""
     if total <= 0 or fraction <= 0:
@@ -946,24 +1204,32 @@ def minor_edits_count(total: int, fraction: float) -> int:
     return max(1, int(round(total * min(fraction, 1.0))))
 
 
-def select_minor_edits(items: list[dict], fraction: float) -> list[dict]:
-    """The most changed share of ``items`` by ``delta_luma``."""
-    count = minor_edits_count(len(items), fraction)
-    ranked = sorted(items, key=lambda it: (-float(it.get("delta_luma") or 0.0), it["rel"]))
+def select_night_edits(items: list[dict], fraction: float) -> list[dict]:
+    """The most changed share of ``items`` by ``delta_e`` (mean CIELAB ΔE)."""
+    count = night_edits_count(len(items), fraction)
+    ranked = sorted(items, key=lambda it: (-float(it.get("delta_e") or 0.0), it["rel"]))
     return ranked[:count]
+
+
+def decision_adjust(decision: dict) -> Adjust:
+    """The accepted settings of a decision (older ledgers hold only ``strength``)."""
+    raw = dict(decision.get("adjust") or {})
+    if "strength" not in raw and decision.get("strength") is not None:
+        raw["strength"] = decision["strength"]
+    return Adjust.from_dict(raw)
 
 
 def commit_accepted(
     concept_dir: str,
     ledger: dict,
     *,
-    minor_edits_dir: str | None,
+    night_edits_dir: str | None,
     fraction: float = DEFAULT_MINOR_EDITS_FRACTION,
     progress=None,
     stop=None,
 ) -> dict:
-    """Darken every accepted, uncommitted candidate in place (backed up), then
-    add the most changed share as Minor Edits pairs. Returns the commit
+    """Adjust every accepted, uncommitted candidate in place (backed up), then
+    add the most changed share as Night Edits pairs. Returns the commit
     record, which is also appended to ``ledger["commits"]``. The ledger is
     saved after every image so a crash mid-way leaves a restorable record."""
     concept_dir = os.path.abspath(concept_dir)
@@ -974,18 +1240,18 @@ def commit_accepted(
         if d.get("state") == "accepted" and not d.get("committed") and r in by_rel
     ]
     pending.sort(key=lambda rd: rd[0])
-    minor_count = minor_edits_count(len(pending), fraction)
-    if minor_count and minor_edits_dir:
-        problem = minor_edits_preflight(minor_edits_dir, minor_count)
+    pair_count = night_edits_count(len(pending), fraction)
+    if pair_count and not night_edits_dir:
+        raise RuntimeError("Night Edits: no destination folder set (set the fraction to 0 to skip the pairs)")
+    if pair_count:
+        problem = night_edits_preflight(night_edits_dir, pair_count)
         if problem:
-            raise RuntimeError(f"Minor Edits: {problem}")
-    if minor_count and not minor_edits_dir:
-        raise RuntimeError("Minor Edits: no destination folder set (set the fraction to 0 to skip the pairs)")
+            raise RuntimeError(f"Night Edits: {problem}")
 
     commit = {
         "id": f"{_timestamp()}_{len(ledger.get('commits', [])) + 1}",
         "at": time.time(),
-        "minor_edits_dir": os.path.abspath(minor_edits_dir) if minor_edits_dir else None,
+        "night_edits_dir": os.path.abspath(night_edits_dir) if night_edits_dir else None,
         "fraction": fraction,
         "items": [],
         "restored": False,
@@ -1003,11 +1269,11 @@ def commit_accepted(
             item = by_path_rel.get(r)
             if item is None:
                 continue
-            strength = float(decision.get("strength") or 0.0)
+            adjust = decision_adjust(decision)
             chosen_path = item["path"]
             backup = backup_original(concept_dir, chosen_path)
             try:
-                result = save_darkened_like(backup, strength, chosen_path)
+                result = save_adjusted_like(backup, adjust, chosen_path, seed=item["stem"])
             except Exception:
                 with suppress(OSError):
                     shutil.copy2(backup, chosen_path)
@@ -1026,7 +1292,7 @@ def commit_accepted(
                     {
                         "at": time.time(),
                         "action": HISTORY_ACTION,
-                        "strength": strength,
+                        "adjust": adjust.to_dict(),
                         "retired": [rel(concept_dir, backup)],
                     }
                 )
@@ -1034,43 +1300,46 @@ def commit_accepted(
                 "rel": r,
                 "stem": item["stem"],
                 "split": item["split"],
-                "strength": strength,
+                "adjust": adjust.to_dict(),
+                "strength": adjust.strength,
                 "backup": rel(concept_dir, backup),
+                "delta_e": result["delta_e"],
                 "delta_luma": result["delta_luma"],
                 "stats": result["stats"],
                 "format": result["format"],
                 "caption": rel(concept_dir, item["caption_path"]) if item["caption_path"] else None,
                 "manifest_before": before,
                 "history_len": history_len,
-                "minor_pair": None,
+                "night_pair": None,
             }
             commit["items"].append(record)
             decision["committed"] = commit["id"]
             save_ledger(concept_dir, ledger)
             if progress is not None:
-                progress(done, len(pending), "darken")
+                progress(done, len(pending), "adjust")
         if any(it["manifest_before"] is not None for it in commit["items"]):
             save_manifest(concept_dir, manifest)
 
-        chosen = select_minor_edits(commit["items"], fraction) if commit["minor_edits_dir"] else []
+        chosen = select_night_edits(commit["items"], fraction) if commit["night_edits_dir"] else []
         if chosen:
-            minor_manifest = load_manifest(commit["minor_edits_dir"])
+            ensure_night_edits_dataset(commit["night_edits_dir"])
+            night_manifest = load_manifest(commit["night_edits_dir"])
             for done, record in enumerate(chosen, start=1):
                 if stop is not None and stop.is_set():
                     break
                 item = by_path_rel[record["rel"]]
-                record["minor_pair"] = export_night_pair(
-                    commit["minor_edits_dir"],
-                    minor_manifest,
-                    darkened_path=item["path"],
+                record["night_pair"] = export_night_pair(
+                    commit["night_edits_dir"],
+                    night_manifest,
+                    adjusted_path=item["path"],
                     original_path=absolute(concept_dir, record["backup"]),
                     caption_path=item["caption_path"],
                     lineage={
                         "tool": HISTORY_ACTION,
                         "source_concept": concept_dir,
                         "source_chosen": record["rel"],
-                        "strength": record["strength"],
-                        "delta_luma": record["delta_luma"],
+                        "adjust": record["adjust"],
+                        "delta_e": record["delta_e"],
                         "commit": commit["id"],
                     },
                 )
@@ -1088,13 +1357,17 @@ def commit_accepted(
                 "commit_id": commit["id"],
                 "chosen": it["rel"],
                 "backup": it["backup"],
-                "strength": it["strength"],
+                "strength": it["adjust"]["strength"],
+                "noise": it["adjust"]["noise"],
+                "hue": it["adjust"]["hue"],
+                "saturation": it["adjust"]["saturation"],
                 "median": it["stats"]["median"],
                 "mean": it["stats"]["mean"],
                 "bright_fraction": it["stats"]["bright_fraction"],
+                "delta_e": it["delta_e"],
                 "delta_luma": it["delta_luma"],
-                "minor_edits_dir": (it["minor_pair"] or {}).get("dir", ""),
-                "minor_edits_pair_id": (it["minor_pair"] or {}).get("pair_id", ""),
+                "night_edits_dir": (it["night_pair"] or {}).get("dir", ""),
+                "night_edits_pair_id": (it["night_pair"] or {}).get("pair_id", ""),
             }
             for it in commit["items"]
         ]
@@ -1105,8 +1378,8 @@ def commit_accepted(
 
 
 def restore_commit(concept_dir: str, ledger: dict, commit_id: str) -> dict:
-    """Undo one commit: backups return over the darkened files, manifest
-    entries get their old fields and history back, Minor Edits pairs go.
+    """Undo one commit: backups return over the adjusted files, manifest
+    entries get their old fields and history back, Night Edits pairs go.
     Items whose backup is missing are reported, not silently skipped."""
     concept_dir = os.path.abspath(concept_dir)
     commit = next((c for c in ledger.get("commits", []) if c.get("id") == commit_id), None)
@@ -1118,20 +1391,20 @@ def restore_commit(concept_dir: str, ledger: dict, commit_id: str) -> dict:
     restored = 0
     missing: list[str] = []
     pairs_removed = 0
-    minor_manifest = None
+    night_manifest = None
     for record in commit.get("items", []):
         backup = absolute(concept_dir, record.get("backup"))
         target = absolute(concept_dir, record.get("rel"))
         if not backup or not os.path.isfile(backup) or not target:
             missing.append(record.get("rel", "?"))
             continue
-        if record.get("minor_pair"):
-            minor_dir = record["minor_pair"]["dir"]
-            if minor_manifest is None:
-                minor_manifest = load_manifest(minor_dir)
-            remove_night_pair(minor_dir, minor_manifest, record["minor_pair"])
+        if record.get("night_pair"):
+            night_dir = record["night_pair"]["dir"]
+            if night_manifest is None:
+                night_manifest = load_manifest(night_dir)
+            remove_night_pair(night_dir, night_manifest, record["night_pair"])
             pairs_removed += 1
-            record["minor_pair_removed"] = True
+            record["night_pair_removed"] = True
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.move(backup, target)
         entry = _manifest_entry_for(manifest, record["stem"])
