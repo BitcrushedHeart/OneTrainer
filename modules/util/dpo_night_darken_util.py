@@ -76,6 +76,21 @@ Adjustments (:func:`apply_adjustments`, in this order)
 Change metric: :func:`mean_delta_e`, the mean CIE76 ΔE between the original
 and the result in CIELAB (D65), computed at preview size when accepting and
 at full size on commit.
+
+Night presets (:data:`NIGHT_PRESETS`: Dusk, Urban night, Moonlit night)
+-------------------------------------------------------------------------
+Suggested looks given as a brightness multiplier, a saturation multiplier,
+a hue and a noise sigma, mapped onto the sliders without new maths: the
+darken strength is solved by bisection so a mid-grey sRGB 118 pixel ends at
+``118 * brightness`` (:func:`solve_strength_for_brightness`), saturation and
+hue are taken as they are, and the noise sigma becomes the slider value
+whose per-channel sigma equals it at the darkened mid-grey level
+(:func:`noise_slider_for_sigma`). Applying a preset to an image jitters
+strength, saturation and noise by ±10 % with a generator seeded from the
+file stem and the preset (:func:`jittered_preset`), so no two images get
+exactly the same darkness; the preset name travels in the adjust dict, the
+ledger, the manifest history and the backup CSV. "Darken more"
+(:func:`next_preset`) steps none → Dusk → Urban → Moonlit.
 """
 
 from __future__ import annotations
@@ -303,6 +318,7 @@ BACKUP_CSV_FIELDS = (
     "delta_luma",
     "night_edits_dir",
     "night_edits_pair_id",
+    "preset",
 )
 
 _LEDGER_LOCK = threading.RLock()
@@ -554,12 +570,14 @@ def add_noise_rgb(rgb: np.ndarray, noise: float, seed: int) -> np.ndarray:
 
 @dataclass
 class Adjust:
-    """The four review sliders; the defaults are the identity."""
+    """The four review sliders; the defaults are the identity. ``preset`` is
+    the name of the night preset the values came from ("" when set by hand)."""
 
     strength: float = 0.0
     noise: float = 0.0
     hue: float = 0.0
     saturation: float = 1.0
+    preset: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict | None) -> Adjust:
@@ -575,13 +593,148 @@ class Adjust:
         out.noise = min(max(out.noise, 0.0), 1.0)
         out.hue = min(max(out.hue, -HUE_RANGE), HUE_RANGE)
         out.saturation = min(max(out.saturation, 0.0), SATURATION_MAX)
+        preset = raw.get("preset")
+        out.preset = str(preset) if isinstance(preset, str) and preset in {p["id"] for p in NIGHT_PRESETS} else ""
         return out
 
     def to_dict(self) -> dict:
-        return {k: round(float(v), 4) for k, v in asdict(self).items()}
+        out = {k: round(float(v), 4) for k, v in asdict(self).items() if k != "preset"}
+        out["preset"] = self.preset
+        return out
 
     def is_neutral(self) -> bool:
         return self.strength <= 0 and self.noise <= 0 and abs(self.hue) < 1e-9 and abs(self.saturation - 1.0) < 1e-9
+
+
+# --------------------------------------------------------------------------- #
+# Night presets: suggested night looks mapped onto the sliders
+# --------------------------------------------------------------------------- #
+
+#: The suggested settings, in their own terms: ``brightness`` a multiplier on
+#: the sRGB pixel value, ``saturation`` a multiplier, ``hue`` degrees,
+#: ``noise_sigma`` a Gaussian sigma on the 0..1 pixel scale. Weakest first;
+#: "Darken more" walks this order.
+NIGHT_PRESETS: tuple[dict, ...] = (
+    {"id": "dusk", "label": "Dusk", "brightness": 0.65, "saturation": 0.85, "hue": 0.0, "noise_sigma": 0.008},
+    {"id": "urban", "label": "Urban night", "brightness": 0.45, "saturation": 0.90, "hue": 0.0, "noise_sigma": 0.025},
+    {
+        "id": "moonlit",
+        "label": "Moonlit night",
+        "brightness": 0.30,
+        "saturation": 0.65,
+        "hue": 0.0,
+        "noise_sigma": 0.015,
+    },
+)
+#: The sRGB level the brightness multiplier is matched at (mid-grey).
+PRESET_REFERENCE_SRGB = 118
+#: Per-image jitter on strength, saturation and noise when a preset is applied.
+PRESET_JITTER = 0.10
+
+
+def _srgb_value_to_linear(value: float) -> float:
+    x = value / 255.0
+    return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+
+
+def solve_strength_for_brightness(brightness: float, reference: int = PRESET_REFERENCE_SRGB) -> float:
+    """The darken strength at which the sRGB ``reference`` grey ends at
+    ``reference * brightness``, by bisection on :func:`darken_luminance`
+    (monotone in the strength). The curve constants stay the only source of
+    truth. 0 for a brightness of 1 or more; 1 when the target is below what
+    full strength reaches."""
+    if brightness >= 1.0:
+        return 0.0
+    y0 = _srgb_value_to_linear(float(reference))
+    target = _srgb_value_to_linear(float(reference) * brightness)
+    lo, hi = 0.0, 1.0
+    if float(darken_luminance(np.array([y0], dtype=np.float64), 1.0)[0]) > target:
+        return 1.0
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        if float(darken_luminance(np.array([y0], dtype=np.float64), mid)[0]) > target:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2.0, 4)
+
+
+def noise_slider_for_sigma(sigma: float, brightness: float, reference: int = PRESET_REFERENCE_SRGB) -> float:
+    """The noise slider value whose per-channel sigma equals ``sigma`` (0..1
+    scale) at the reference grey's post-darken level. The level is
+    ``Y' = brightness * reference / 255``, where the amplitude is
+    ``slider * NOISE_MAX_SIGMA * (NOISE_FLOOR + (1 - NOISE_FLOOR) * (1 - Y'))``,
+    and a channel's sigma is that amplitude times ``sqrt(1 + NOISE_CHROMA^2)``
+    (the shared luminance draw plus its own chroma draw). Matching at the
+    darkened midtone rather than at black keeps the typical pixel at the
+    suggested sigma; black pixels get a little more, highlights less."""
+    if sigma <= 0:
+        return 0.0
+    level = min(max(brightness * reference / 255.0, 0.0), 1.0)
+    weight = NOISE_FLOOR + (1.0 - NOISE_FLOOR) * (1.0 - level)
+    amplitude = sigma / float(np.sqrt(1.0 + NOISE_CHROMA**2))
+    return round(min(max(amplitude / (NOISE_MAX_SIGMA * weight), 0.0), 1.0), 4)
+
+
+_PRESET_CACHE: dict[str, Adjust] = {}
+
+
+def preset_adjust(preset_id: str) -> Adjust:
+    """The un-jittered slider values of a preset (cached after the first solve)."""
+    cached = _PRESET_CACHE.get(preset_id)
+    if cached is not None:
+        return Adjust(**asdict(cached))
+    preset = next((p for p in NIGHT_PRESETS if p["id"] == preset_id), None)
+    if preset is None:
+        raise KeyError(preset_id)
+    out = Adjust(
+        strength=solve_strength_for_brightness(preset["brightness"]),
+        noise=noise_slider_for_sigma(preset["noise_sigma"], preset["brightness"]),
+        hue=float(preset["hue"]),
+        saturation=float(preset["saturation"]),
+        preset=preset_id,
+    )
+    _PRESET_CACHE[preset_id] = out
+    return Adjust(**asdict(out))
+
+
+def preset_table() -> list[dict]:
+    """Every preset with its suggested values and the solved slider values."""
+    return [{**p, "adjust": preset_adjust(p["id"]).to_dict()} for p in NIGHT_PRESETS]
+
+
+def jittered_preset(preset_id: str, name: str, jitter: float = PRESET_JITTER) -> Adjust:
+    """A preset for one image: strength, saturation and noise each scaled by
+    ``1 + U(-jitter, +jitter)`` drawn from a generator seeded by the image's
+    file stem and the preset id, so the same image always gets the same
+    values and a dataset never learns one exact darkness. Clamped to the
+    slider ranges; hue is left as the preset has it."""
+    base = preset_adjust(preset_id)
+    rng = np.random.default_rng((noise_seed(name) ^ noise_seed(f"preset:{preset_id}")) & 0x7FFFFFFFFFFFFFFF)
+    factors = 1.0 + rng.uniform(-jitter, jitter, size=3)
+    return Adjust.from_dict(
+        {
+            "strength": base.strength * factors[0],
+            "saturation": base.saturation * factors[1],
+            "noise": base.noise * factors[2],
+            "hue": base.hue,
+            "preset": preset_id,
+        }
+    )
+
+
+def next_preset(current: Adjust | dict | None) -> str:
+    """ "Darken more": the next stronger preset after the current settings —
+    the one after the recorded preset, else the first preset darker than the
+    current strength; the strongest stays the strongest."""
+    current = current if isinstance(current, Adjust) else Adjust.from_dict(current)
+    order = [p["id"] for p in NIGHT_PRESETS]
+    if current.preset in order:
+        return order[min(order.index(current.preset) + 1, len(order) - 1)]
+    for preset_id in order:
+        if preset_adjust(preset_id).strength > current.strength + 1e-3:
+            return preset_id
+    return order[-1]
 
 
 def apply_adjustments(rgb: np.ndarray, adjust: Adjust | dict | None, seed: int | str) -> np.ndarray:
@@ -1390,6 +1543,7 @@ def commit_accepted(
                 "delta_luma": it["delta_luma"],
                 "night_edits_dir": (it["night_pair"] or {}).get("dir", ""),
                 "night_edits_pair_id": (it["night_pair"] or {}).get("pair_id", ""),
+                "preset": it["adjust"].get("preset", ""),
             }
             for it in commit["items"]
         ]

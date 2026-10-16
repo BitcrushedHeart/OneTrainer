@@ -327,10 +327,25 @@ def test_commit_and_restore_round_trip(tmp_path):
     assert service.decide(rels[1], "skipped", None)["ok"]
     assert service.decide(rels[2], "accepted", {"strength": 0.2})["ok"]
     assert service.undo(rels[1])["removed"]
-    assert service.decide(rels[1], "accepted", {"strength": 0.5, "noise": 0.1})["ok"]
+    # rels[1] takes the "Darken more" path twice: none -> Dusk -> Urban, jittered for that image.
+    first = service.preset(rels[1], "more", None)
+    assert first["ok"] and first["preset"] == "dusk" and first["adjust"]["preset"] == "dusk"
+    urban = service.preset(rels[1], "more", first["adjust"])
+    assert urban["preset"] == "urban" and urban["adjust"] == nd.jittered_preset("urban", rels[1]).to_dict()
+    assert service.preset(rels[1], "moonlit", None)["adjust"]["preset"] == "moonlit"
+    assert service.preset(rels[1], "bogus", None)["ok"] is False
+    assert service.preset("chosen/train/pair_0003.png", "dusk", None)["ok"] is False
+    assert service.decide(rels[1], "accepted", urban["adjust"])["ok"]
     decisions = {c["rel"]: c["decision"] for c in service.candidates()["candidates"]}
-    assert decisions[rels[0]]["adjust"] == {"strength": 0.9, "noise": 0.5, "hue": -30.0, "saturation": 0.6}
-    assert decisions[rels[2]]["adjust"] == {"strength": 0.2, "noise": 0.0, "hue": 0.0, "saturation": 1.0}
+    assert decisions[rels[0]]["adjust"] == {
+        "strength": 0.9,
+        "noise": 0.5,
+        "hue": -30.0,
+        "saturation": 0.6,
+        "preset": "",
+    }
+    assert decisions[rels[1]]["adjust"] == urban["adjust"]
+    assert decisions[rels[2]]["adjust"] == {"strength": 0.2, "noise": 0.0, "hue": 0.0, "saturation": 1.0, "preset": ""}
     assert decisions[rels[0]]["delta_e"] > decisions[rels[1]]["delta_e"] > decisions[rels[2]]["delta_e"]
     assert service.state()["counts"]["accepted_uncommitted"] == 3
 
@@ -378,6 +393,7 @@ def test_commit_and_restore_round_trip(tmp_path):
         "0.6",
     )
     assert sum(1 for r in rows if r["night_edits_pair_id"]) == 1
+    assert [r["preset"] for r in rows] == ["", "urban", ""]
     assert float(rows[0]["delta_e"]) > float(rows[2]["delta_e"])
     entry = next(e for e in load_manifest(concept)["pairs"] if e["chosen_file"] == "train/pair_0001.png")
     assert entry["history"][-1]["action"] == nd.HISTORY_ACTION and entry["chosen_sha256"]
@@ -429,6 +445,56 @@ def test_commit_and_restore_round_trip(tmp_path):
     _wait(service)
     assert service.state()["commits"][1]["pairs"] == 0
     assert load_manifest(night)["pairs"] == []
+
+
+def test_presets_map_onto_the_sliders_and_jitter_deterministically():
+    grey = np.full((2, 2, 3), nd.PRESET_REFERENCE_SRGB, np.uint8)
+    for preset in nd.NIGHT_PRESETS:
+        base = nd.preset_adjust(preset["id"])
+        assert base.preset == preset["id"] and base.hue == preset["hue"] and base.saturation == preset["saturation"]
+        assert 0 < base.strength < 1 and 0 < base.noise < 1
+        # Mid-grey lands on brightness * 118 within ~2 levels, through the real darken curve.
+        landed = float(nd.darken_rgb(grey, base.strength)[0, 0, 0])
+        assert abs(landed - nd.PRESET_REFERENCE_SRGB * preset["brightness"]) <= 2.0, preset["id"]
+        # The noise slider reproduces the suggested sigma at the darkened mid-grey level
+        # (per-channel sigma of the generated field, 0..1 scale, up to sampling error).
+        level = np.full((256, 256, 3), int(round(nd.PRESET_REFERENCE_SRGB * preset["brightness"])), np.uint8)
+        noisy = nd.add_noise_rgb(level, base.noise, 1)
+        sigma = float((noisy.astype(np.float32) - level.astype(np.float32)).std() / 255.0)
+        assert abs(sigma - preset["noise_sigma"]) < 0.25 * preset["noise_sigma"] + 0.001, preset["id"]
+    strengths = [nd.preset_adjust(p["id"]).strength for p in nd.NIGHT_PRESETS]
+    assert strengths == sorted(strengths)  # Dusk < Urban < Moonlit
+    assert nd.solve_strength_for_brightness(1.0) == 0.0 and nd.solve_strength_for_brightness(0.01) == 1.0
+    assert nd.noise_slider_for_sigma(0.0, 0.5) == 0.0
+    assert nd.preset_table()[0]["adjust"]["preset"] == "dusk"
+
+    # Darken more: none -> Dusk -> Urban -> Moonlit, staying at Moonlit; by strength when no preset is tagged.
+    assert nd.next_preset(None) == "dusk"
+    assert nd.next_preset({"preset": "dusk"}) == "urban"
+    assert nd.next_preset({"preset": "urban"}) == "moonlit"
+    assert nd.next_preset({"preset": "moonlit"}) == "moonlit"
+    assert nd.next_preset({"strength": nd.preset_adjust("dusk").strength + 0.01}) == "urban"
+    assert nd.next_preset({"strength": 1.0}) == "moonlit"
+    assert nd.Adjust.from_dict({"preset": "bogus"}).preset == ""
+
+    # Jitter: deterministic per image + preset, different across images, within +-10% and clamped.
+    a = nd.jittered_preset("urban", "chosen/train/pair_0001.png")
+    b = nd.jittered_preset("urban", "pair_0001")
+    c = nd.jittered_preset("urban", "pair_0002")
+    assert a == b and a != c and a.preset == "urban" and a.hue == 0.0
+    base = nd.preset_adjust("urban")
+    jitter = nd.PRESET_JITTER + 1e-6
+    for image in ("pair_0001", "pair_0002", "pair_0077", "pair_1234"):
+        j = nd.jittered_preset("urban", image)
+        assert abs(j.strength / base.strength - 1) <= jitter
+        assert abs(j.saturation / base.saturation - 1) <= jitter
+        assert abs(j.noise / base.noise - 1) <= jitter
+        assert j != base
+    assert nd.jittered_preset("urban", "x", jitter=0.0) == base
+    assert nd.jittered_preset("moonlit", "x", jitter=5.0).strength <= 1.0  # clamped to the slider range
+    assert nd.jittered_preset("dusk", "x").to_dict()["preset"] == "dusk"
+    with pytest.raises(KeyError):
+        nd.preset_adjust("bogus")
 
 
 def test_select_night_edits_takes_the_rounded_share_most_changed_first():

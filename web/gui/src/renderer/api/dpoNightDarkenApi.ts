@@ -6,9 +6,22 @@ export interface NightDarkenAdjust {
   noise: number;
   hue: number;
   saturation: number;
+  /** Night preset id the values came from; "" or absent when set by hand. */
+  preset?: string;
 }
 
-export const NEUTRAL_ADJUST: NightDarkenAdjust = { strength: 0, noise: 0, hue: 0, saturation: 1 };
+export const NEUTRAL_ADJUST: NightDarkenAdjust = { strength: 0, noise: 0, hue: 0, saturation: 1, preset: "" };
+
+export interface NightDarkenPreset {
+  id: string;
+  label: string;
+  brightness: number;
+  saturation: number;
+  hue: number;
+  noise_sigma: number;
+  /** The solved, un-jittered slider values. */
+  adjust: NightDarkenAdjust;
+}
 
 export interface NightDarkenDefaults {
   phrases: string[];
@@ -18,6 +31,8 @@ export interface NightDarkenDefaults {
   hue_range: number;
   saturation_max: number;
   night_edits_dir_name: string;
+  presets: NightDarkenPreset[];
+  preset_jitter: number;
   curve: {
     exposure_stops: number;
     gamma_lift: number;
@@ -141,6 +156,15 @@ export const dpoNightDarkenApi = {
 
   caption: (rel: string) =>
     request<{ ok: boolean; caption?: string }>(`/dpo/night-darken/caption?rel=${encodeURIComponent(rel)}`),
+
+  preset: (rel: string, preset: string, current: NightDarkenAdjust | null) =>
+    request<Ok & { preset?: string; adjust?: NightDarkenAdjust; base?: NightDarkenAdjust }>(
+      "/dpo/night-darken/preset",
+      {
+        method: "POST",
+        body: JSON.stringify({ rel, preset, current }),
+      },
+    ),
 
   decide: (rel: string, state: "accepted" | "skipped", adjust: NightDarkenAdjust | null) =>
     request<Ok & { decision?: NightDarkenDecision }>("/dpo/night-darken/decide", {

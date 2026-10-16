@@ -71,12 +71,14 @@ function normalizeAdjust(a: NightDarkenAdjust): NightDarkenAdjust {
     noise: clamp01(a.noise),
     hue: clamp(a.hue, -HUE_RANGE, HUE_RANGE),
     saturation: clamp(a.saturation, 0, SATURATION_MAX),
+    preset: a.preset ?? "",
   };
 }
 
 function adjustLabel(a: NightDarkenAdjust | undefined, strength?: number): string {
   if (!a) return strength != null ? `strength ${fmt(strength, 2)}` : "";
   const parts = [`strength ${fmt(a.strength, 2)}`];
+  if (a.preset) parts.unshift(a.preset);
   if (a.noise > 0) parts.push(`noise ${fmt(a.noise, 2)}`);
   if (a.hue !== 0) parts.push(`hue ${a.hue > 0 ? "+" : ""}${fmt(a.hue, 0)}°`);
   if (a.saturation !== 1) parts.push(`sat ×${fmt(a.saturation, 2)}`);
@@ -218,8 +220,9 @@ export function NightDarkenModal({ open, onClose }: NightDarkenModalProps) {
     });
   }, []);
 
+  // A hand edit of any slider drops the preset tag: the values are no longer the preset's.
   const patchAdjust = useCallback((patch: Partial<NightDarkenAdjust>) => {
-    setAdjust((prev) => normalizeAdjust({ ...prev, ...patch }));
+    setAdjust((prev) => normalizeAdjust({ ...prev, ...patch, preset: "" }));
   }, []);
 
   const job: NightDarkenJob | null = state?.job ?? null;
@@ -428,6 +431,20 @@ export function NightDarkenModal({ open, onClose }: NightDarkenModalProps) {
     setIndex((i) => Math.max(0, i - 1));
   }, []);
 
+  /** Apply a night preset ("more" = the next stronger one) with the image's own jitter. */
+  const applyPreset = useCallback(
+    async (presetId: string) => {
+      if (!current || busy) return;
+      const res = await guard(() => dpoNightDarkenApi.preset(current.rel, presetId, normalizeAdjust(adjust)));
+      if (res?.ok && res.adjust) {
+        const next = normalizeAdjust(res.adjust);
+        setAdjust(next);
+        setPreviewAdjust(next);
+      }
+    },
+    [current, busy, guard, adjust],
+  );
+
   const commit = useCallback(async () => {
     setConfirmCommit(false);
     const res = await guard(() => dpoNightDarkenApi.commit(nightEditsDir, settings.fraction));
@@ -469,6 +486,7 @@ export function NightDarkenModal({ open, onClose }: NightDarkenModalProps) {
       else if (key === "[") patchAdjust({ strength: round2(adjust.strength - 0.05) });
       else if (key === "]") patchAdjust({ strength: round2(adjust.strength + 0.05) });
       else if (key === "r" || key === "R") setAdjust({ ...NEUTRAL_ADJUST, strength: adjust.strength });
+      else if (key === "d" || key === "D") void applyPreset("more");
       else if (/^[0-9]$/.test(key)) patchAdjust({ strength: key === "0" ? 1 : Number(key) / 10 });
       else return;
       e.preventDefault();
@@ -476,7 +494,7 @@ export function NightDarkenModal({ open, onClose }: NightDarkenModalProps) {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [open, decide, undo, back, step, confirmCommit, patchAdjust, adjust.strength]);
+  }, [open, decide, undo, back, step, confirmCommit, patchAdjust, applyPreset, adjust.strength]);
 
   // ---- render --------------------------------------------------------------
 
@@ -602,6 +620,35 @@ export function NightDarkenModal({ open, onClose }: NightDarkenModalProps) {
                   {caption}
                 </div>
               )}
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-[var(--color-on-surface-secondary)]">Night presets:</span>
+                {(defaults?.presets ?? []).map((p) => (
+                  <Button
+                    key={p.id}
+                    variant={adjust.preset === p.id ? "primary" : "secondary"}
+                    size="sm"
+                    onClick={() => void applyPreset(p.id)}
+                    disabled={busy || running}
+                    title={`brightness ×${p.brightness}, saturation ×${p.saturation}, hue ${p.hue}°, noise σ ${p.noise_sigma} → darken ${fmt(p.adjust.strength, 2)}, noise ${fmt(p.adjust.noise, 2)} (±${Math.round(100 * (defaults?.preset_jitter ?? 0.1))}% per image)`}
+                  >
+                    {p.label}
+                  </Button>
+                ))}
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void applyPreset("more")}
+                  disabled={busy || running}
+                  title="Next stronger preset: none → Dusk → Urban → Moonlit"
+                >
+                  Darken more (D)
+                </Button>
+                {adjust.preset && (
+                  <span className="text-[var(--color-on-surface-secondary)]">
+                    preset {adjust.preset} (jittered for this image)
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-1 gap-x-6 gap-y-1 md:grid-cols-2">
                 <SliderEntry
                   label={`Darken ${adjust.strength.toFixed(2)}`}
@@ -687,9 +734,9 @@ export function NightDarkenModal({ open, onClose }: NightDarkenModalProps) {
                 </div>
               </div>
               <div className="text-[11px] text-[var(--color-on-surface-secondary)]">
-                Keys: A/Enter accept · S/Space skip · U undo · ←/Backspace back · → next · 1-9 darken 0.1-0.9, 0 = 1.0 ·
-                [ ] ±0.05 · R reset colour/noise · drag the divider to wipe. Order: darken, then hue/saturation, then
-                noise.
+                Keys: A/Enter accept · S/Space skip · U undo · ←/Backspace back · → next · D darken more (next preset) ·
+                1-9 darken 0.1-0.9, 0 = 1.0 · [ ] ±0.05 · R reset colour/noise · drag the divider to wipe. Order:
+                darken, then hue/saturation, then noise.
               </div>
             </div>
           </SectionCard>

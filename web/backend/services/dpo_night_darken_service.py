@@ -76,6 +76,8 @@ class DPONightDarkenService(SingletonMixin):
             "hue_range": nd.HUE_RANGE,
             "saturation_max": nd.SATURATION_MAX,
             "night_edits_dir_name": nd.NIGHT_EDITS_DIR_NAME,
+            "presets": nd.preset_table(),
+            "preset_jitter": nd.PRESET_JITTER,
             "curve": {
                 "exposure_stops": nd.EXPOSURE_STOPS,
                 "gamma_lift": nd.GAMMA_LIFT,
@@ -309,6 +311,19 @@ class DPONightDarkenService(SingletonMixin):
         if source is None:
             return None
         return nd.encode_jpeg(nd.apply_adjustments(source, adjust, rel))
+
+    def preset(self, rel: str, preset_id: str, current: dict | None = None) -> dict:
+        """The jittered slider values of a preset for one candidate.
+        ``preset_id`` "more" steps to the next stronger preset from
+        ``current`` (none -> Dusk -> Urban -> Moonlit)."""
+        if self._candidate_path(rel) is None:
+            return {"ok": False, "error": "Not a candidate"}
+        chosen = nd.next_preset(current) if preset_id == "more" else preset_id
+        try:
+            adjust = nd.jittered_preset(chosen, rel)
+        except KeyError:
+            return {"ok": False, "error": f"Unknown preset {preset_id}"}
+        return {"ok": True, "preset": chosen, "adjust": adjust.to_dict(), "base": nd.preset_adjust(chosen).to_dict()}
 
     def decide(self, rel: str, state: str, adjust: dict | None = None) -> dict:
         if state not in ("accepted", "skipped"):

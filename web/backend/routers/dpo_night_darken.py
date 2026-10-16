@@ -23,6 +23,15 @@ class AdjustModel(BaseModel):
     noise: float = 0.0
     hue: float = 0.0
     saturation: float = 1.0
+    # Night preset the values came from ("" = set by hand).
+    preset: str = ""
+
+
+class PresetRequest(BaseModel):
+    rel: str
+    # A preset id, or "more" for the next stronger preset after `current`.
+    preset: str
+    current: AdjustModel | None = None
 
 
 class DecideRequest(BaseModel):
@@ -88,6 +97,12 @@ def preview(rel: str, strength: float = 0.0, noise: float = 0.0, hue: float = 0.
     if data is None:
         return Response(status_code=404, content="Not a candidate")
     return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/dpo/night-darken/preset")
+def preset(req: PresetRequest):
+    current = req.current.model_dump() if req.current is not None else None
+    return DPONightDarkenService.get_instance().preset(req.rel, req.preset, current)
 
 
 @router.post("/dpo/night-darken/decide")
