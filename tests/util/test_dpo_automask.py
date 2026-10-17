@@ -8,6 +8,7 @@ review server's refusal to serve anything but listed pairs.
 """
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -243,15 +244,38 @@ def test_review_server_serves_only_listed_pairs(tmp_path):
         assert status == 200 and ctype.startswith("text/html")
         status, ctype, body = get("/api/pairs?filter=all")
         assert status == 200 and len(json.loads(body)) == 2
-        for kind in ("chosen", "rejected", "thumb", "overlay", "heat"):
+        assert set(automask.PREVIEW_KINDS) == {
+            "chosen",
+            "rejected",
+            "thumb",
+            "overlay",
+            "heat",
+            "chosen_full",
+            "rejected_full",
+            "overlay_full",
+            "overlay_rejected_full",
+            "heat_full",
+        }
+        for kind in automask.PREVIEW_KINDS:
             status, ctype, body = get(f"/preview/0/{kind}.jpg?threshold=4&dilate=0.05")
             assert status == 200 and ctype == "image/jpeg" and body[:2] == b"\xff\xd8", kind
+        # Full kinds are native resolution; the small ones are downscaled.
+        with Image.open(io.BytesIO(get("/preview/1/overlay_rejected_full.jpg")[2])) as im:
+            assert im.size == (W, H)
+        with Image.open(io.BytesIO(get("/preview/1/heat_full.jpg")[2])) as im:
+            assert im.size == (W, H)
+        with Image.open(io.BytesIO(get("/preview/1/thumb.jpg")[2])) as im:
+            assert max(im.size) == automask.THUMB_EDGE < W
+        assert not any("full" in name for name in os.listdir(tmp_path / ".automask" / "previews"))
         status, _, body = get("/api/pair/1?threshold=3")
         assert status == 200 and json.loads(body)["live"]["flags"] == ["ok"]
 
-        # Anything that is not a listed pair index is refused.
-        assert get("/preview/2/chosen.jpg")[0] == 404
-        assert get("/preview/-1/chosen.jpg")[0] == 404
+        # Anything that is not a listed pair index or a listed kind is refused.
+        for kind in automask.PREVIEW_KINDS:
+            assert get(f"/preview/2/{kind}.jpg")[0] == 404, kind
+            assert get(f"/preview/-1/{kind}.jpg")[0] == 404, kind
+        assert get("/preview/0/full.jpg")[0] == 404
+        assert get("/preview/0/original.jpg")[0] == 404
         assert get("/preview/0/..%2F..%2Fchosen%2Ftrain%2Fa.png")[0] == 404
         assert get("/chosen/train/a.png")[0] == 404
         assert get("/.automask/proposals.json")[0] == 404

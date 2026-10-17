@@ -73,6 +73,11 @@ MASK_POSTFIX = "-masklabel"
 EXCLUDE_POSTFIX = ("-masklabel", "-condlabel")
 AUTOMASK_DIR = ".automask"
 PREVIEW_EDGE = 768
+# Preview kinds the review server serves, by pair index only. The *_full kinds
+# are native resolution for the full-screen viewer and are never cached to disk.
+FULL_KINDS = ("chosen_full", "rejected_full", "overlay_full", "overlay_rejected_full", "heat_full")
+PREVIEW_KINDS = ("chosen", "rejected", "thumb", "overlay", "heat") + FULL_KINDS
+STATIC_KINDS = ("chosen", "rejected", "thumb", "chosen_full", "rejected_full")  # browser-cacheable
 THUMB_EDGE = 256
 DEFAULT_CHOSEN_PATTERN = "chosen/{}"
 DEFAULT_REJECTED_PATTERN = "rejected/{}"
@@ -751,6 +756,18 @@ class ReviewState:
         if kind == "heat":
             difference, _ = self._score(index, params)
             return _encode_jpeg(render_heat(difference.score, params.threshold, PREVIEW_EDGE))
+        if kind in FULL_KINDS:
+            # Native resolution for the full-screen viewer: rendered per request,
+            # never written to disk (the score / mask caches above are reused).
+            if kind == "heat_full":
+                difference, _ = self._score(index, params)
+                return _encode_jpeg(render_heat(difference.score, params.threshold, max(difference.score.shape)), 92)
+            side = 1 if kind in ("rejected_full", "overlay_rejected_full") else 0
+            image = load_rgb(self._paths(index)[side])
+            if kind in ("overlay_full", "overlay_rejected_full"):
+                soft, _ = self.live(index, params)
+                image = render_overlay(image, soft)
+            return _encode_jpeg(image, 92)
         return None
 
     # -- decisions -------------------------------------------------------
@@ -942,7 +959,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 3 and parts[0] == "preview" and parts[1].isdigit():
             kind = parts[2].rsplit(".", 1)[0]
-            if kind not in ("chosen", "rejected", "thumb", "overlay", "heat"):
+            if kind not in PREVIEW_KINDS:
                 self._not_found()
                 return
             params = _params_from_query(query, state.default_params)
@@ -950,7 +967,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if body is None:
                 self._not_found()
                 return
-            self._send(200, body, "image/jpeg", cache=kind in ("chosen", "rejected", "thumb"))
+            self._send(200, body, "image/jpeg", cache=kind in STATIC_KINDS)
             return
         self._not_found()
 
@@ -1014,6 +1031,12 @@ button.on{background:#3a5a3a;border-color:#6a9a6a}
 #status{color:#9ad}
 kbd{background:#333;border-radius:3px;padding:0 4px;font-family:monospace}
 .pager{display:flex;justify-content:space-between;align-items:center;margin:6px 0}
+.grid img{cursor:zoom-in}
+#fs{display:none;position:fixed;inset:0;background:#000;z-index:10}
+#fs.on{display:block}
+#fs img{width:100vw;height:100vh;object-fit:contain;display:block;cursor:pointer}
+#fs-hud{position:absolute;left:10px;top:8px;background:#000a;color:#eee;padding:4px 8px;border-radius:4px;font-size:13px}
+#fs-help{position:absolute;right:10px;bottom:8px;background:#000a;color:#bbb;padding:4px 8px;border-radius:4px;font-size:12px}
 </style></head><body>
 <header>
  <b id="title">DPO automask</b>
@@ -1024,7 +1047,7 @@ kbd{background:#333;border-radius:3px;padding:0 4px;font-family:monospace}
   <option value="global">flag: global</option><option value="none">flag: none</option>
   <option value="size_mismatch">flag: size_mismatch</option><option value="had_mask">flag: had_mask</option>
  </select></label>
- <span><kbd>A</kbd> accept <kbd>R</kbd> reject <kbd>U</kbd> clear <kbd>&larr;</kbd><kbd>&rarr;</kbd> move <kbd>N</kbd> next undecided <kbd>O</kbd> toggle overlay</span>
+ <span><kbd>A</kbd> accept <kbd>R</kbd> reject <kbd>U</kbd> clear <kbd>&larr;</kbd><kbd>&rarr;</kbd> move <kbd>N</kbd> next undecided <kbd>O</kbd> toggle overlay <kbd>F</kbd> full screen</span>
  <span id="status"></span>
 </header>
 <main>
@@ -1047,8 +1070,12 @@ kbd{background:#333;border-radius:3px;padding:0 4px;font-family:monospace}
  <div class="pager"><button id="pg-prev">&lsaquo; page</button><span id="pg-label"></span><button id="pg-next">page &rsaquo;</button></div>
  <div class="thumbs" id="thumbs"></div>
 </aside>
+<div id="fs"><img id="fs-img"><div id="fs-hud"></div>
+ <div id="fs-help"><kbd>Space</kbd> flip chosen/rejected <kbd>O</kbd> mask <kbd>H</kbd> heatmap <kbd>A</kbd>/<kbd>R</kbd>/<kbd>U</kbd> decide <kbd>&larr;</kbd><kbd>&rarr;</kbd> pair <kbd>Esc</kbd> exit</div>
+</div>
 <script>
 const PAGE=48;let state=null,rows=[],pos=0,page=0,params={},storedParams={},overlayOn=true,liveTimer=null;
+let fsOn=false,fsSide='chosen',fsMode='plain';
 const $=id=>document.getElementById(id);
 async function getJSON(u,o){const r=await fetch(u,o);return r.json();}
 function qs(){return Object.entries(params).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');}
@@ -1081,7 +1108,33 @@ function render(){
  $('img-chosen').src='/preview/'+r.index+'/chosen.jpg';$('img-rejected').src='/preview/'+r.index+'/rejected.jpg';
  if(r.params){storedParams={...state.params,...r.params};}
  refreshLive();
+ if(fsOn)updateFs();
 }
+// ---- full-screen viewer: native resolution, same index-only preview routes ----
+function fsUrl(side,mode){
+ const r=cur();if(!r)return '';
+ if(mode==='heat')return '/preview/'+r.index+'/heat_full.jpg?'+qs();
+ if(mode==='overlay')return '/preview/'+r.index+'/'+(side==='chosen'?'overlay_full':'overlay_rejected_full')+'.jpg?'+qs();
+ return '/preview/'+r.index+'/'+side+'_full.jpg';
+}
+function updateFs(){
+ const r=cur();if(!r){closeFs();return;}
+ $('fs-img').src=fsUrl(fsSide,fsMode);
+ const other=new Image();other.src=fsUrl(fsSide==='chosen'?'rejected':'chosen',fsMode);
+ $('fs-hud').textContent=(pos+1)+'/'+rows.length+'  '+r.key+'  |  '+fsSide.toUpperCase()+(fsMode==='overlay'?' + mask':fsMode==='heat'?'  heatmap':'')+
+  '  |  '+r.flags.join(',')+'  |  decision: '+(r.decision||'-');
+}
+function openFs(){
+ fsOn=true;$('fs').classList.add('on');updateFs();
+ const el=$('fs');if(el.requestFullscreen&&!document.fullscreenElement)el.requestFullscreen().catch(()=>{});
+}
+function closeFs(){
+ fsOn=false;$('fs').classList.remove('on');
+ if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});
+}
+document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement&&fsOn)closeFs();});
+for(const id of ['img-chosen','img-rejected','img-overlay','img-heat'])$(id).onclick=openFs;
+$('fs-img').onclick=()=>{fsSide=fsSide==='chosen'?'rejected':'chosen';updateFs();};
 function scheduleLive(){clearTimeout(liveTimer);liveTimer=setTimeout(refreshLive,150);}
 async function refreshLive(){
  const r=cur();if(!r)return;
@@ -1128,6 +1181,17 @@ async function pollRerun(){
 document.addEventListener('keydown',e=>{
  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
  const k=e.key.toLowerCase();
+ if(fsOn){
+  if(e.key==='Escape')closeFs();
+  else if(e.key===' ')  {fsSide=fsSide==='chosen'?'rejected':'chosen';updateFs();}
+  else if(k==='o'){fsMode=fsMode==='overlay'?'plain':'overlay';updateFs();}
+  else if(k==='h'){fsMode=fsMode==='heat'?'plain':'heat';updateFs();}
+  else if(k==='f')closeFs();
+  else if(k==='a')decide('accept');else if(k==='r')decide('reject');else if(k==='u')decide(null);
+  else if(e.key==='ArrowLeft')move(-1);else if(e.key==='ArrowRight')move(1);else if(k==='n')nextUndecided();
+  else return;e.preventDefault();return;
+ }
+ if(k==='f'){openFs();e.preventDefault();return;}
  if(k==='a')decide('accept');else if(k==='r')decide('reject');else if(k==='u')decide(null);
  else if(e.key==='ArrowLeft')move(-1);else if(e.key==='ArrowRight')move(1);else if(k==='n')nextUndecided();
  else if(k==='o'){overlayOn=!overlayOn;$('cap-overlay').textContent=overlayOn?'chosen + proposed mask':'chosen (overlay off)';refreshLive();}
