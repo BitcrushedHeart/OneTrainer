@@ -7,7 +7,7 @@ count, the trainer pools those across micro-batches and ranks, and a step with
 no such sample leaves the controller alone.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from modules.dataLoader.BaseDataLoader import _fill_inherit_columns
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
@@ -33,7 +33,10 @@ def _config() -> TrainConfig:
 
 def _record(margin: list[float], adaptive_mask=None) -> dict:
     """The per-micro-batch DPO metrics for a batch with the given raw margins."""
-    setup = SimpleNamespace()
+    # No per-concept keys: only the pooled terms (see
+    # test_dpo_per_concept_adaptive_beta for the per-concept block).
+    setup = SimpleNamespace(_dpo_concept_keys=[], _dpo_concept_key_of_path=None, _dpo_concept_index_cache={})
+    setup._dpo_concept_indices = MethodType(BaseModelSetup._dpo_concept_indices, setup)
     margin_t = torch.tensor(margin)
     chosen = margin_t + 1.0
     rejected = torch.ones_like(margin_t)

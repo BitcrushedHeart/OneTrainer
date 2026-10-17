@@ -71,3 +71,27 @@ def controller_margin_terms(accumulated: dict) -> tuple[float, float]:
     if "adaptive_count" in accumulated:
         return float(accumulated["adaptive_margin_sum"]), float(accumulated["adaptive_count"])
     return float(accumulated["reward_margin"]) / accumulated["_count"], 1.0
+
+
+def concept_margin_key(key: str) -> str:
+    return f"adaptive_margin_sum/{key}"
+
+
+def concept_count_key(key: str) -> str:
+    return f"adaptive_count/{key}"
+
+
+def controller_concept_terms(accumulated: dict, keys: list[str]) -> list[float]:
+    """Flat ``[sum, count, sum, count, ...]`` of one optimizer step's per-concept
+    controller input, in the order of ``keys`` (one controller per adaptive DPO
+    concept, each fed only its own samples' margins).
+
+    The layout is fixed by ``keys`` rather than by what this rank saw, so every
+    rank reduces a tensor of the same length; a concept without samples on this
+    rank (or in metrics that predate the per-concept terms) contributes zeros.
+    """
+    terms = []
+    for key in keys:
+        terms.append(float(accumulated.get(concept_margin_key(key), 0.0)))
+        terms.append(float(accumulated.get(concept_count_key(key), 0.0)))
+    return terms

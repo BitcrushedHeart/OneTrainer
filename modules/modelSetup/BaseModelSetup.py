@@ -3,7 +3,7 @@ import hashlib
 import os
 import warnings
 from abc import ABCMeta, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager, nullcontext, suppress
 
 from modules.model.BaseModel import BaseModel
@@ -20,6 +20,7 @@ from modules.util.distill_dmd2_util import (
     euler_flow_step,
 )
 from modules.util.distill_metadata_util import extract_distill_metadata
+from modules.util.dpo_beta_controller import concept_count_key, concept_margin_key
 from modules.util.dpo_light_util import (
     dpo_chosen_anchor_penalty,
     dpo_objective,
@@ -218,6 +219,13 @@ class BaseModelSetup(
         self._dpo_ref_fingerprint = None  # (reference version, fingerprint) cache
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
+        # Per-concept adaptive beta: the run's adaptive DPO concepts (a fixed,
+        # sorted key list the trainer reduces per-concept margins over), how a
+        # chosen image path maps to one of them, and each one's current ratio.
+        self._dpo_concept_keys: list[str] = []
+        self._dpo_concept_key_of_path: Callable[[str | None], str | None] | None = None
+        self._dpo_concept_index_cache: dict[str, int] = {}
+        self._dpo_runtime_beta_ratios: dict[str, float] = {}
         self._last_distill_metrics = None
         self._last_grad_step_index = None  # student backprop step chosen this update (debug/tests)
         self._last_distill_x0_teacher = None  # paired teacher target from the last student update
@@ -1463,6 +1471,39 @@ class BaseModelSetup(
         # overrides instead of replacing them.
         self._dpo_runtime_beta = beta
 
+    def set_dpo_concept_keys(self, keys: Iterable[str], key_of_path: Callable[[str | None], str | None] | None) -> None:
+        """The run's adaptive DPO concepts, for per-concept adaptive beta.
+
+        ``keys`` fixes the order the per-concept margin terms are reported in
+        (every rank must reduce the same layout); ``key_of_path`` maps a chosen
+        image path to one of them, or None for a sample that belongs to no
+        adaptive concept (it then follows the pooled controller)."""
+        self._dpo_concept_keys = list(keys)
+        self._dpo_concept_key_of_path = key_of_path
+        self._dpo_concept_index_cache = {}
+
+    def set_dpo_runtime_beta_ratios(self, ratios: dict[str, float]) -> None:
+        # Each adaptive concept's own controller output, as a ratio over its
+        # configured beta (the controllers run with beta0 = 1). A concept whose
+        # controller has not updated yet is absent and keeps a ratio of 1.
+        self._dpo_runtime_beta_ratios = dict(ratios)
+
+    def _dpo_concept_indices(self, image_paths) -> Tensor | None:
+        """Per-sample [B] index into ``_dpo_concept_keys`` for the batch's chosen
+        image paths (-1: no adaptive concept), or None when per-concept adaptive
+        beta is not set up or the batch carries no paths."""
+        if not self._dpo_concept_keys or self._dpo_concept_key_of_path is None or not image_paths:
+            return None
+        indices = []
+        for path in image_paths:
+            index = self._dpo_concept_index_cache.get(path)
+            if index is None:
+                key = self._dpo_concept_key_of_path(path)
+                index = self._dpo_concept_keys.index(key) if key in self._dpo_concept_keys else -1
+                self._dpo_concept_index_cache[path] = index
+            indices.append(index)
+        return torch.tensor(indices, dtype=torch.long)
+
     def _resolve_dpo_beta(self, config: TrainConfig, batch: dict) -> float | Tensor:
         """Beta for this batch: a per-sample [B] tensor when the dataloader
         supplies per-concept overrides, otherwise the global scalar.
@@ -1478,6 +1519,10 @@ class BaseModelSetup(
         while keeping the concepts' betas in their configured proportions;
         substituting its scalar output would flatten every override onto one
         value.
+
+        With per-concept adaptive beta each sample takes the ratio of its own
+        concept's controller (1 until that controller has updated); samples
+        under no adaptive concept keep following the pooled controller.
         """
         global_beta = config.rlhf_dpo_beta
 
@@ -1493,14 +1538,23 @@ class BaseModelSetup(
 
         override = override.float()
         per_sample = torch.where(override > 0, override, torch.full_like(override, global_beta))
-        if adaptive_scale == 1.0:
-            return per_sample
+        indices = self._dpo_concept_indices(batch.get("image_path")) if self._dpo_runtime_beta_ratios else None
+        if indices is None:
+            if adaptive_scale == 1.0:
+                return per_sample
+            scale = adaptive_scale
+        else:
+            # One ratio per concept key, the pooled ratio for samples without one.
+            table = [self._dpo_runtime_beta_ratios.get(key, 1.0) for key in self._dpo_concept_keys]
+            table = torch.tensor(table + [adaptive_scale], dtype=per_sample.dtype, device=per_sample.device)
+            indices = torch.where(indices < 0, torch.full_like(indices, len(self._dpo_concept_keys)), indices)
+            scale = table[indices.to(per_sample.device)]
         adaptive = self._dpo_adaptive_mask(batch)
         if adaptive is None:
-            return per_sample * adaptive_scale
+            return per_sample * scale
         # Concepts that opted out of adaptive beta keep their configured beta;
         # the rest follow the controller.
-        return torch.where(adaptive.to(per_sample.device), per_sample * adaptive_scale, per_sample)
+        return torch.where(adaptive.to(per_sample.device), per_sample * scale, per_sample)
 
     @staticmethod
     def _dpo_adaptive_mask(batch: dict) -> Tensor | None:
@@ -2000,6 +2054,24 @@ class BaseModelSetup(
             (per_sample_margin * included).sum().to(metric_tensors[0].device),
             included.sum().to(metric_tensors[0].device),
         ]
+        # The same terms per adaptive concept (its own controller's input), as
+        # [sums..., counts...] in the fixed key order; samples under no adaptive
+        # concept only count towards the pooled terms above.
+        concept_names, concept_terms = [], None
+        indices = self._dpo_concept_indices(image_paths)
+        if indices is not None and indices.numel() == per_sample_margin.numel():
+            indices = indices.to(per_sample_margin.device)
+            keyed = included * (indices >= 0).to(included.dtype)
+            slot = indices.clamp(min=0)
+            zeros = torch.zeros(len(self._dpo_concept_keys), device=per_sample_margin.device, dtype=included.dtype)
+            concept_terms = torch.cat(
+                [
+                    zeros.scatter_add(0, slot, per_sample_margin * keyed),
+                    zeros.scatter_add(0, slot, keyed),
+                ]
+            ).to(metric_tensors[0].device)
+            concept_names += [concept_margin_key(key) for key in self._dpo_concept_keys]
+            concept_names += [concept_count_key(key) for key in self._dpo_concept_keys]
         if isinstance(beta, Tensor):
             # Per-concept betas are live: report the batch mean so the effective
             # beta stays visible (dpo/beta only tracks the global scalar). Folded
@@ -2025,7 +2097,12 @@ class BaseModelSetup(
                 ).to(metric_tensors[0].device),
                 (detached_ratio < 0).float().mean().to(metric_tensors[0].device),
             ]
-        metric_values = torch.stack(metric_tensors).tolist()
+        stacked = torch.stack(metric_tensors)
+        if concept_terms is not None:
+            # The per-concept block rides behind the scalars: still one sync.
+            stacked = torch.cat([stacked, concept_terms])
+            metric_names += concept_names
+        metric_values = stacked.tolist()
         self._last_dpo_metrics = dict(zip(metric_names, metric_values, strict=True))
 
         pair_logging = config.rlhf_dpo_concept_logging or config.rlhf_dpo_live_saturation

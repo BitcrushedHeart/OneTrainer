@@ -44,7 +44,7 @@ from modules.util.dpo_addon_util import (
     dpo_ref_rebase_due,
     is_dpo_addon_step,
 )
-from modules.util.dpo_beta_controller import DPOBetaController, controller_margin_terms
+from modules.util.dpo_beta_controller import DPOBetaController, controller_concept_terms, controller_margin_terms
 from modules.util.dpo_live_saturation import (
     LIVE_DIRNAME,
     DPOConceptInfo,
@@ -225,6 +225,13 @@ class GenericTrainer(BaseTrainer):
         self._concept_stats: ConceptWindowStats | None = None
         self._sft_concept_resolver: DPOConceptResolver | None = None
         self._probe_dpo_resolver: DPOConceptResolver | None = None
+        # Per-concept adaptive beta: one controller per adaptive DPO concept
+        # (keyed by its TensorBoard tag, created on its first update) and the
+        # ratio each one last produced. The keys are fixed at start so every
+        # rank reduces the same per-concept terms.
+        self._dpo_adaptive_keys: list[str] = []
+        self._dpo_beta_controllers: dict[str, DPOBetaController] = {}
+        self._dpo_beta_ratios: dict[str, float] = {}
         self._concept_split_window = False
         # Per-image visit ledger and the fixed probe set (concept_probe_util),
         # persisted under <workspace>/diagnostics with the backups.
@@ -497,6 +504,7 @@ class GenericTrainer(BaseTrainer):
             )
 
         self.__setup_dpo_pair_logging()
+        self.__setup_adaptive_beta_concepts()
 
         if self.config.patience and not self.config.validation:
             # Flipped before the loaders are built: config.validation also
@@ -876,6 +884,42 @@ class GenericTrainer(BaseTrainer):
                 self._dpo_concept_window.add(info, record)
             if self._dpo_live_ledger is not None:
                 self._dpo_live_ledger.record(train_progress.global_step, info, record, reference)
+
+    def __setup_adaptive_beta_concepts(self):
+        """Per-concept adaptive beta: the DPO concepts are kept apart because
+        their margins live on different scales, so one pooled controller would
+        steer every concept's beta by the dominant concept's margins. Each
+        adaptive concept gets its own controller, fed only by its own samples.
+
+        Samples are attributed to concepts the way the per-concept metrics are
+        (chosen image path under the concept's chosen folder, cloud remap
+        included), keyed by the concept's TensorBoard tag: unique per concept
+        even when names repeat. The sorted key list is fixed here so every rank
+        reduces the same per-concept terms. Opted-out concepts get no key (and
+        no controller); a sample under no adaptive concept follows the pooled
+        controller as before."""
+        self._dpo_adaptive_keys = []
+        self._dpo_beta_controllers = {}
+        self._dpo_beta_ratios = {}
+        if not (
+            self.config.rlhf_enabled
+            and self.config.rlhf_dpo_adaptive_beta
+            and self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
+        ):
+            return
+        infos = dpo_concept_infos(self.__load_concepts(), self.config.rlhf_supervised_mix)
+        adaptive = [info for info in infos if info.adaptive]
+        if not adaptive:
+            return
+        resolver = self._dpo_concept_resolver or DPOConceptResolver(infos)
+        self._dpo_adaptive_keys = sorted(info.tag for info in adaptive)
+
+        def key_of_path(path: str | None) -> str | None:
+            info = resolver.resolve(path)
+            return info.tag if info is not None and info.adaptive else None
+
+        self.model_setup.set_dpo_concept_keys(self._dpo_adaptive_keys, key_of_path)
+        print(f"DPO adaptive beta: one controller per concept for {', '.join(self._dpo_adaptive_keys)}.")
 
     # ------------------------------------------------------------------
     # Add-on terms (SFT + DPO pairs / KTO batches, text reward rollouts).
@@ -3110,8 +3154,12 @@ class GenericTrainer(BaseTrainer):
                         # The margin is the mean over the samples whose concept takes
                         # part in adaptive beta (see controller_margin_terms); a step
                         # without such samples leaves the controller and the runtime
-                        # beta where they were.
+                        # beta where they were. The per-concept controllers ride in
+                        # the same tensor (fixed key order, see
+                        # __setup_adaptive_beta_concepts) and each updates only on a
+                        # step with a sample of its own.
                         adaptive_beta = None
+                        updated_ratio_keys: list[str] = []
                         if (
                             self.config.rlhf_enabled
                             and accumulated_dpo_metrics is not None
@@ -3119,15 +3167,32 @@ class GenericTrainer(BaseTrainer):
                             and self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
                         ):
                             margin_terms = torch.tensor(
-                                controller_margin_terms(accumulated_dpo_metrics), device=train_device
+                                [
+                                    *controller_margin_terms(accumulated_dpo_metrics),
+                                    *controller_concept_terms(accumulated_dpo_metrics, self._dpo_adaptive_keys),
+                                ],
+                                device=train_device,
                             )
                             multi.reduce_tensor_sum(margin_terms)
-                            margin_sum, included = margin_terms.tolist()
+                            margin_sum, included, *concept_terms = margin_terms.tolist()
                             if self._dpo_beta_controller is None:
                                 self._dpo_beta_controller = DPOBetaController(self.config.rlhf_dpo_beta)
                             if included > 0:
                                 adaptive_beta = self._dpo_beta_controller.update(margin_sum / included)
                                 self.model_setup.set_dpo_runtime_beta(adaptive_beta)
+                            for key, concept_sum, concept_count in zip(
+                                self._dpo_adaptive_keys, concept_terms[::2], concept_terms[1::2], strict=True
+                            ):
+                                if concept_count <= 0:
+                                    continue
+                                controller = self._dpo_beta_controllers.get(key)
+                                if controller is None:
+                                    # beta0 = 1: the output is the ratio itself.
+                                    controller = self._dpo_beta_controllers[key] = DPOBetaController(1.0)
+                                self._dpo_beta_ratios[key] = controller.update(concept_sum / concept_count)
+                                updated_ratio_keys.append(key)
+                            if updated_ratio_keys:
+                                self.model_setup.set_dpo_runtime_beta_ratios(self._dpo_beta_ratios)
 
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(
@@ -3225,10 +3290,22 @@ class GenericTrainer(BaseTrainer):
                                 if adaptive_beta is not None:
                                     # Controller already ran on every rank above; here we
                                     # only log the (globally-consistent) beta it produced.
-                                    self.tensorboard.add_scalar("dpo/beta", adaptive_beta, train_progress.global_step)
+                                    # With per-concept controllers the pooled beta applies
+                                    # to no sample of a keyed concept, so dpo/beta follows
+                                    # the batch-mean beta actually applied instead.
+                                    logged_beta = adaptive_beta
+                                    if self._dpo_adaptive_keys and "beta_mean" in dpo_metrics:
+                                        logged_beta = dpo_metrics["beta_mean"]
+                                    self.tensorboard.add_scalar("dpo/beta", logged_beta, train_progress.global_step)
                                     self.tensorboard.add_scalar(
                                         "dpo/raw_margin_ema",
                                         self._dpo_beta_controller.margin_ema,
+                                        train_progress.global_step,
+                                    )
+                                for key in updated_ratio_keys:
+                                    self.tensorboard.add_scalar(
+                                        f"dpo/concept/{key}/adaptive_ratio",
+                                        self._dpo_beta_ratios[key],
                                         train_progress.global_step,
                                     )
                                 if "beta_mean" in dpo_metrics:

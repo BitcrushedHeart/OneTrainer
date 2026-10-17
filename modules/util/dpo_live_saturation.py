@@ -161,6 +161,7 @@ class DPOConceptInfo:
     chosen_dir: str
     beta_override: float  # <= 0: inherits the global beta
     supervised_mix: float = 0.0  # resolved: the concept's override, or the global mix
+    adaptive: bool = True  # takes part in adaptive beta (dpo_adaptive_beta)
 
     def configured_beta(self, global_beta: float) -> float:
         return self.beta_override if self.beta_override > 0 else global_beta
@@ -198,6 +199,7 @@ def dpo_concept_infos(concepts: Iterable, global_supervised_mix: float = 0.0) ->
                 chosen_dir=dirs[0][0],
                 beta_override=float(concept.dpo_beta_override or 0.0),
                 supervised_mix=_resolved_mix(getattr(concept, "supervised_mix_override", -1.0), inherited_mix),
+                adaptive=bool(getattr(concept, "dpo_adaptive_beta", True)),
             )
         )
     return infos

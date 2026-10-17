@@ -187,8 +187,11 @@ class RLHFTab:
             "Adaptive Beta",
             tooltip="Adjusts Beta per optimizer step from the smoothed reward margin (beta-DPO): informative "
             "batches with above-average margins raise Beta, uninformative ones lower it, bounded to "
-            "[Beta/4, Beta*4]. Beta is the starting point. Only applies to the DPO (sigmoid) objective. "
-            "Note that Beta and learning rate are coupled - if you double Beta, halve the learning rate.",
+            "[Beta/4, Beta*4]. Beta (or the concept's override) is the starting point. Each DPO concept "
+            "adapts on its own, from its own pairs' margins, so concepts whose margins live on different "
+            "scales do not steer each other; a concept can opt out in its settings. Only applies to the "
+            "DPO (sigmoid) objective. Note that Beta and learning rate are coupled - if you double Beta, "
+            "halve the learning rate.",
         )
         components.switch(self.scroll_frame, 7, 1, self.ui_state, "rlhf_dpo_adaptive_beta")
 

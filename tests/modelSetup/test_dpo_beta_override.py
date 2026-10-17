@@ -16,7 +16,14 @@ def _config(beta: float = 200.0) -> TrainConfig:
 
 
 def _resolve(runtime_beta, batch, config=None):
-    setup = SimpleNamespace(_dpo_runtime_beta=runtime_beta, _dpo_adaptive_mask=BaseModelSetup._dpo_adaptive_mask)
+    # Pooled controller only: no per-concept keys or ratios.
+    setup = SimpleNamespace(
+        _dpo_runtime_beta=runtime_beta,
+        _dpo_runtime_beta_ratios={},
+        _dpo_concept_keys=[],
+        _dpo_adaptive_mask=BaseModelSetup._dpo_adaptive_mask,
+    )
+    setup._dpo_concept_indices = lambda paths: None
     return BaseModelSetup._resolve_dpo_beta(setup, config or _config(), batch)
 
 
