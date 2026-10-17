@@ -44,7 +44,7 @@ from modules.util.dpo_addon_util import (
     dpo_ref_rebase_due,
     is_dpo_addon_step,
 )
-from modules.util.dpo_beta_controller import DPOBetaController
+from modules.util.dpo_beta_controller import DPOBetaController, controller_margin_terms
 from modules.util.dpo_live_saturation import (
     LIVE_DIRNAME,
     DPOConceptInfo,
@@ -3105,8 +3105,12 @@ class GenericTrainer(BaseTrainer):
                         # static beta and the averaged gradients mix losses at
                         # different beta scales. All ranks all-reduce the margin and
                         # run the same deterministic controller, so they stay in
-                        # lockstep without a broadcast. reduce_tensor_mean is a
+                        # lockstep without a broadcast. reduce_tensor_sum is a
                         # collective, so this must sit outside the is_master() block.
+                        # The margin is the mean over the samples whose concept takes
+                        # part in adaptive beta (see controller_margin_terms); a step
+                        # without such samples leaves the controller and the runtime
+                        # beta where they were.
                         adaptive_beta = None
                         if (
                             self.config.rlhf_enabled
@@ -3114,15 +3118,16 @@ class GenericTrainer(BaseTrainer):
                             and self.config.rlhf_dpo_adaptive_beta
                             and self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
                         ):
-                            margin_t = torch.tensor(
-                                accumulated_dpo_metrics["reward_margin"] / accumulated_dpo_metrics["_count"],
-                                device=train_device,
+                            margin_terms = torch.tensor(
+                                controller_margin_terms(accumulated_dpo_metrics), device=train_device
                             )
-                            multi.reduce_tensor_mean(margin_t)
+                            multi.reduce_tensor_sum(margin_terms)
+                            margin_sum, included = margin_terms.tolist()
                             if self._dpo_beta_controller is None:
                                 self._dpo_beta_controller = DPOBetaController(self.config.rlhf_dpo_beta)
-                            adaptive_beta = self._dpo_beta_controller.update(margin_t.item())
-                            self.model_setup.set_dpo_runtime_beta(adaptive_beta)
+                            if included > 0:
+                                adaptive_beta = self._dpo_beta_controller.update(margin_sum / included)
+                                self.model_setup.set_dpo_runtime_beta(adaptive_beta)
 
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(

@@ -177,6 +177,8 @@ def _ordering_trainer(
     )
 
     setup = trainer.model_setup = Mock()
+    # No perceptual term: the trainer skips the metric pop when the hook is None.
+    setup.pop_perceptual_metrics = None
     metrics = {
         "loss": 0.1,
         "dpo_loss": 0.1,

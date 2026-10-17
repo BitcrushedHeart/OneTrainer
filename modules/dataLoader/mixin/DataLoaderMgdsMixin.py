@@ -61,6 +61,14 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
                     f"beta override on {len(overriding)} concepts has no effect: " + ", ".join(overriding)
                 )
 
+        if config.rlhf_dpo_adaptive_beta:
+            opted_out = [c.name or c.path for c in dpo_concepts if c.enabled and not c.dpo_adaptive_beta]
+            if opted_out:
+                print(
+                    f"RLHF DPO: adaptive beta leaves {len(opted_out)} concepts alone (their configured beta is "
+                    "applied unscaled and their margins stay out of the controller): " + ", ".join(opted_out)
+                )
+
         return dpo_concepts
 
     @staticmethod

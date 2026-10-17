@@ -291,15 +291,27 @@ class ConceptWindow(ctk.CTkToplevel):
             tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. Use it when "
             "one dataset needs a looser or tighter KL leash than the rest - a lower beta allows "
             "larger moves away from the reference, a higher beta keeps the model closer to it. "
-            "0 inherits the global beta. Adaptive beta still applies: it scales every concept by "
-            "the same factor, so the overrides keep their relative proportions. Ignored by the "
-            "IPO objective, which uses tau instead of beta.",
+            "0 inherits the global beta. Adaptive beta still applies (unless DPO Adaptive Beta is off "
+            "below): it scales every concept by the same factor, so the overrides keep their relative "
+            "proportions. Ignored by the IPO objective, which uses tau instead of beta.",
         )
         components.entry(frame, 12, 1, self.ui_state, "dpo_beta_override")
 
         components.label(
             frame,
             13,
+            0,
+            "DPO Adaptive Beta",
+            tooltip="Let the run's adaptive beta controller scale this concept's beta and learn from its "
+            "margins. Off applies the configured beta unscaled and keeps this concept's margins out of "
+            "the controller; use it for a concept whose margins dwarf the others' (e.g. real-photo "
+            "chosen pairs) so it cannot swing beta for everyone.",
+        )
+        components.switch(frame, 13, 1, self.ui_state, "dpo_adaptive_beta")
+
+        components.label(
+            frame,
+            14,
             0,
             "Supervised Mix Override",
             tooltip="Weight of the supervised (plain finetune) loss on this concept's chosen images, "
@@ -308,11 +320,11 @@ class ConceptWindow(ctk.CTkToplevel):
             "With masked training the term uses the same masked loss as the rest of the run, so a low "
             "unmasked weight keeps it inside the mask.",
         )
-        components.entry(frame, 13, 1, self.ui_state, "supervised_mix_override")
+        components.entry(frame, 14, 1, self.ui_state, "supervised_mix_override")
 
         components.label(
             frame,
-            14,
+            15,
             0,
             "Unmasked Weight Override",
             tooltip="Loss weight of the area outside the mask for this concept only, overriding the run's "
@@ -320,18 +332,18 @@ class ConceptWindow(ctk.CTkToplevel):
             "concept's preference margin is then computed inside the mask only. Negative inherits the "
             "global value.",
         )
-        components.entry(frame, 14, 1, self.ui_state, "unmasked_weight_override")
+        components.entry(frame, 15, 1, self.ui_state, "unmasked_weight_override")
 
         components.label(
             frame,
-            15,
+            16,
             0,
             "Unmasked Probability Override",
             tooltip="Chance (0-1) that a sample of this concept trains on the whole image instead of its "
             "mask, drawn per sample each epoch; a DPO pair is unmasked together. Negative inherits the "
             "run's Unmasked Probability. Inpainting models apply only the run-wide value.",
         )
-        components.entry(frame, 15, 1, self.ui_state, "unmasked_probability_override")
+        components.entry(frame, 16, 1, self.ui_state, "unmasked_probability_override")
 
         frame.pack(fill="both", expand=1)
         return frame

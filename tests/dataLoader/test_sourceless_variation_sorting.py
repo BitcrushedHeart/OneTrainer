@@ -28,11 +28,24 @@ import torch
 # first one has repeats > 1 so its block is the one that used to swallow the rest.
 CONCEPTS = [
     {"name": "on-policy", "balancing": 3.0, "dpo_beta_override": 40.0, "supervised_mix_override": 1.5},
-    {"name": "off-policy", "balancing": 1.0, "dpo_beta_override": 20.0, "supervised_mix_override": 3.0},
+    # Opted out of adaptive beta: the flag must reach its rows, and only its rows.
+    {
+        "name": "off-policy",
+        "balancing": 1.0,
+        "dpo_beta_override": 20.0,
+        "supervised_mix_override": 3.0,
+        "adaptive": False,
+    },
     {"name": "minor-edits", "balancing": 1.0, "dpo_beta_override": 1.0, "supervised_mix_override": 1.0},
 ]
 ROWS_PER_CONCEPT = 3
-FIELDS = ("dpo_beta_override", "supervised_mix_override", "unmasked_weight_override", "loss_weight")
+FIELDS = (
+    "dpo_beta_override",
+    "dpo_adaptive_beta",
+    "supervised_mix_override",
+    "unmasked_weight_override",
+    "loss_weight",
+)
 
 
 class DataLoaderHarness(DataLoaderText2ImageMixin):
@@ -103,6 +116,7 @@ def _concept(index: int, cache_dir: str) -> ConceptConfig:
     concept.cache_dir = cache_dir
     concept.balancing = spec["balancing"]
     concept.dpo_beta_override = spec["dpo_beta_override"]
+    concept.dpo_adaptive_beta = spec.get("adaptive", True)
     concept.supervised_mix_override = spec["supervised_mix_override"]
     # Values exact in float32: the output module casts floats to tensors.
     concept.unmasked_weight_override = 0.25 * (index + 1)

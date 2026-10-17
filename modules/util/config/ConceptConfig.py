@@ -141,6 +141,7 @@ class ConceptConfig(BaseConfig):
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
     dpo_beta_override: float
+    dpo_adaptive_beta: bool
     supervised_mix_override: float
     unmasked_weight_override: float
     unmasked_probability_override: float
@@ -253,6 +254,10 @@ class ConceptConfig(BaseConfig):
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
         data.append(("dpo_beta_override", 0.0, float, False))
+        # Whether the run's adaptive beta controller touches this concept: off
+        # keeps its configured beta unscaled and leaves its margins out of the
+        # controller's input, for a concept whose margins dwarf the others'.
+        data.append(("dpo_adaptive_beta", True, bool, False))
         # DPO supervised (chosen-half) mix per concept: negative = inherit the
         # run's rlhf_supervised_mix, 0 = no supervised term for this concept.
         data.append(("supervised_mix_override", -1.0, float, False))

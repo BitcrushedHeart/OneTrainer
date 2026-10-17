@@ -624,6 +624,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # Concept fields never key the disk cache, so betas can be retuned
             # between runs without re-caching latents.
             output_names.append(("concept.dpo_beta_override", "dpo_beta_override"))
+            # Whether the adaptive beta controller scales this sample's beta and
+            # learns from its margin; per sample for the same reason.
+            output_names.append(("concept.dpo_adaptive_beta", "dpo_adaptive_beta"))
             # Per-concept supervised mix on the chosen half (negative = inherit
             # rlhf_supervised_mix), per sample for the same reason.
             output_names.append(("concept.supervised_mix_override", "supervised_mix_override"))
@@ -635,6 +638,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # sample like loss_weight, because a batch mixes concepts.
             output_names.append(("concept.kto_label", "kto_label"))
             output_names.append(("concept.dpo_beta_override", "dpo_beta_override"))
+            output_names.append(("concept.dpo_adaptive_beta", "dpo_adaptive_beta"))
 
         if config.masked_training:
             # Per-concept unmasked weight (negative = inherit the global value).

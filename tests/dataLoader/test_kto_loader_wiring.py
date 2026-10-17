@@ -64,11 +64,13 @@ def test_kto_loader_carries_label_and_beta_per_sample_without_a_rejected_half():
     columns = _output_columns(is_kto=True)
     assert ("concept.kto_label", "kto_label") in columns
     assert ("concept.dpo_beta_override", "dpo_beta_override") in columns
+    assert ("concept.dpo_adaptive_beta", "dpo_adaptive_beta") in columns
     assert "latent_image_rejected" not in [out for _, out in columns]
 
     plain = [out for _, out in _output_columns(is_kto=False)]
     assert "kto_label" not in plain
     assert "dpo_beta_override" not in plain
+    assert "dpo_adaptive_beta" not in plain
 
 
 def test_kto_concepts_go_to_the_kto_loader_only():

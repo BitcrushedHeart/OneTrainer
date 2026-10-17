@@ -68,6 +68,7 @@ def _aspect_disagrees(spatial_shape, crop_resolution) -> bool:
 # inherit value instead.
 _INHERIT_CONCEPT_COLUMNS = {
     "dpo_beta_override": 0.0,
+    "dpo_adaptive_beta": True,
     "supervised_mix_override": -1.0,
     "unmasked_weight_override": -1.0,
 }

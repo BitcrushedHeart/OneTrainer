@@ -123,7 +123,14 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
         type="number"
         value={draft.dpo_beta_override}
         onChange={(v) => update("dpo_beta_override", v)}
-        tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. 0 inherits the global beta. Adaptive beta still applies, scaling every concept by the same factor. Ignored by the IPO objective, which uses tau."
+        tooltip="Beta for this concept's pairs only, overriding the global RLHF beta. 0 inherits the global beta. Adaptive beta still applies (unless DPO Adaptive Beta is off below), scaling every concept by the same factor. Ignored by the IPO objective, which uses tau."
+      />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">DPO Adaptive Beta</span>
+      <Toggle
+        value={draft.dpo_adaptive_beta}
+        onChange={(v) => update("dpo_adaptive_beta", v)}
+        tooltip="Let the run's adaptive beta controller scale this concept's beta and learn from its margins. Off applies the configured beta unscaled and keeps the margins out of the controller; use it for a concept whose margins dwarf the others' (e.g. real-photo chosen pairs) so it cannot swing beta for everyone."
       />
 
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Supervised Mix Override</span>

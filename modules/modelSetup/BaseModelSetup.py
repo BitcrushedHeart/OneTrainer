@@ -1493,7 +1493,25 @@ class BaseModelSetup(
 
         override = override.float()
         per_sample = torch.where(override > 0, override, torch.full_like(override, global_beta))
-        return per_sample if adaptive_scale == 1.0 else per_sample * adaptive_scale
+        if adaptive_scale == 1.0:
+            return per_sample
+        adaptive = self._dpo_adaptive_mask(batch)
+        if adaptive is None:
+            return per_sample * adaptive_scale
+        # Concepts that opted out of adaptive beta keep their configured beta;
+        # the rest follow the controller.
+        return torch.where(adaptive.to(per_sample.device), per_sample * adaptive_scale, per_sample)
+
+    @staticmethod
+    def _dpo_adaptive_mask(batch: dict) -> Tensor | None:
+        """Per-sample [B] bool mask of the samples whose concept takes part in
+        adaptive beta (``dpo_adaptive_beta``), or None when the column is absent
+        (non-DPO loaders, rows cached before the field existed): every sample
+        takes part, as before the field."""
+        mask = batch.get("dpo_adaptive_beta")
+        if not isinstance(mask, Tensor):
+            return None
+        return mask.reshape(-1).bool()
 
     @staticmethod
     def _resolve_supervised_mix(config: TrainConfig, batch: dict) -> float | Tensor:
@@ -1644,6 +1662,7 @@ class BaseModelSetup(
             chosen_b,
             beta,
             image_paths=batch.get("image_path"),
+            adaptive_mask=self._dpo_adaptive_mask(batch),
         )
 
         return loss
@@ -1854,6 +1873,7 @@ class BaseModelSetup(
             margin.shape[0],
             beta,
             image_paths=chosen_batch.get("image_path"),
+            adaptive_mask=self._dpo_adaptive_mask(batch),
         )
         return loss
 
@@ -1953,6 +1973,7 @@ class BaseModelSetup(
         chosen_b: int,
         beta: float | Tensor | None = None,
         image_paths=None,
+        adaptive_mask: Tensor | None = None,
     ) -> None:
         # Stack the scalar metrics and sync them in a single .tolist() rather
         # than one .item() (one GPU->CPU sync) per metric.
@@ -1964,6 +1985,20 @@ class BaseModelSetup(
             rejected_ratio.detach().mean(),
             margin.detach().mean(),
             (chosen_ratio > rejected_ratio).float().mean(),
+        ]
+        # The adaptive beta controller's input: the margin summed over the
+        # samples whose concept takes part (all of them without a mask) and
+        # their count, kept apart so the trainer pools micro-batches and ranks
+        # by sample rather than averaging averages.
+        per_sample_margin = margin.detach().float().reshape(-1)
+        if adaptive_mask is None:
+            included = torch.ones_like(per_sample_margin)
+        else:
+            included = adaptive_mask.to(per_sample_margin.device, per_sample_margin.dtype).reshape(-1)
+        metric_names += ["adaptive_margin_sum", "adaptive_count"]
+        metric_tensors += [
+            (per_sample_margin * included).sum().to(metric_tensors[0].device),
+            included.sum().to(metric_tensors[0].device),
         ]
         if isinstance(beta, Tensor):
             # Per-concept betas are live: report the batch mean so the effective

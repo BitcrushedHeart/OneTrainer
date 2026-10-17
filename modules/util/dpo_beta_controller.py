@@ -55,3 +55,19 @@ class DPOBetaController:
         scale = std if std > 1e-12 else max(abs(self.margin_ema), 1e-12)
         beta = self.beta0 * (1.0 + self.alpha * math.tanh((margin - self.margin_ema) / scale))
         return min(self.max_beta, max(self.min_beta, beta))
+
+
+def controller_margin_terms(accumulated: dict) -> tuple[float, float]:
+    """(margin sum, sample count) of one optimizer step's controller input.
+
+    With the per-sample mask in the accumulated DPO metrics
+    (``adaptive_margin_sum`` / ``adaptive_count``) the terms cover only the
+    samples whose concept takes part in adaptive beta; summed across ranks they
+    give the global per-sample mean rather than a mean of per-rank means. A
+    zero count means no such sample this step and the controller is not
+    updated. Metrics without the mask (older model setups) fall back to the
+    window mean of the batch margins with a count of one.
+    """
+    if "adaptive_count" in accumulated:
+        return float(accumulated["adaptive_margin_sum"]), float(accumulated["adaptive_count"])
+    return float(accumulated["reward_margin"]) / accumulated["_count"], 1.0
