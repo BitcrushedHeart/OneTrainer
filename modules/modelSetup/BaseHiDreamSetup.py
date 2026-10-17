@@ -378,6 +378,7 @@ class BaseHiDreamSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                batch=batch,
             )
 
             scaled_noisy_latent_image, sigma = self._add_noise_discrete(

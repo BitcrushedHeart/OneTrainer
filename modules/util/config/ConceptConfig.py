@@ -5,6 +5,7 @@ from modules.util.config.BaseConfig import BaseConfig
 from modules.util.enum.BalancingStrategy import BalancingStrategy
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.KTOLabel import KTOLabel
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 
 
 class ConceptImageConfig(BaseConfig):
@@ -145,6 +146,13 @@ class ConceptConfig(BaseConfig):
     supervised_mix_override: float
     unmasked_weight_override: float
     unmasked_probability_override: float
+    min_noising_strength_override: float | None
+    max_noising_strength_override: float | None
+    timestep_distribution_override: TimestepDistribution | None
+    noising_weight_override: float | None
+    noising_bias_override: float | None
+    timestep_shift_override: float | None
+    noising_range_after_shift: bool
     cache_dir: str
 
     image: ConceptImageConfig
@@ -267,6 +275,22 @@ class ConceptConfig(BaseConfig):
         # override is ignored there.
         data.append(("unmasked_weight_override", -1.0, float, False))
         data.append(("unmasked_probability_override", -1.0, float, False))
+        # Timestep sampling per concept; None inherits the run's value (the
+        # TrainConfig field of the same name without "_override"). A batch
+        # mixes concepts, so each sample's timestep is drawn with its own
+        # concept's settings (see ModelSetupNoiseMixin). Weight and bias are
+        # legitimately negative, hence nullable rather than a sentinel.
+        data.append(("min_noising_strength_override", None, float, True))
+        data.append(("max_noising_strength_override", None, float, True))
+        data.append(("timestep_distribution_override", None, TimestepDistribution, True))
+        data.append(("noising_weight_override", None, float, True))
+        data.append(("noising_bias_override", None, float, True))
+        data.append(("timestep_shift_override", None, float, True))
+        # Off: the min/max range applies before the timestep shift, like the
+        # run's values. On: the range maps the shifted draw linearly, so the
+        # bounds mean the same noise level at every resolution under dynamic
+        # shifting.
+        data.append(("noising_range_after_shift", False, bool, False))
         # Empty = the run's cache_dir; otherwise this concept's image/text caches
         # live under <cache_dir>/image and <cache_dir>/text instead.
         data.append(("cache_dir", "", str, False))

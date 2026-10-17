@@ -55,6 +55,8 @@ export const FormEntry = forwardRef<HTMLInputElement, FormEntryProps>(
       setLocalValue(raw);
       if (raw === "" && nullable) {
         if (configPath && setConfigValue) setConfigValue(null as unknown as string | number);
+        // Controlled nullable fields (concept editor) clear to null the same way.
+        if (onChange) onChange(null as unknown as string | number);
         return;
       }
       if (type === "number") {

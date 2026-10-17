@@ -26,6 +26,13 @@ const DEFAULT_CONCEPT: ConceptConfig = {
   supervised_mix_override: -1,
   unmasked_weight_override: -1,
   unmasked_probability_override: -1,
+  min_noising_strength_override: null,
+  max_noising_strength_override: null,
+  timestep_distribution_override: null,
+  noising_weight_override: null,
+  noising_bias_override: null,
+  timestep_shift_override: null,
+  noising_range_after_shift: false,
   cache_dir: "",
   concept_stats: {},
   image: {

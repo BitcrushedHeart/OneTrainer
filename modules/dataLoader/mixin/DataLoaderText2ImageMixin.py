@@ -20,6 +20,7 @@ from modules.util.caption_privacy_util import text_cache_scrub_kwargs
 from modules.util.concept_cache_util import concept_cache_roots, uses_concept_cache_roots
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
+from modules.util.noising_override_util import NOISING_OVERRIDE_COLUMNS
 from modules.util.sourceless_cache_util import sourceless_cache_problems
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -616,6 +617,12 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             ("concept.loss_weight", "loss_weight"),
             ("concept.type", "concept_type"),
         ]
+        # Per-concept timestep sampling (None = inherit the run's value), per
+        # sample like loss_weight because a batch mixes concepts; every loader
+        # kind carries them since standard, DPO and KTO steps all draw timesteps.
+        # mgds drops a None, so a row that inherits lacks the column and
+        # BaseDataLoader fills the inherit sentinel at collate time.
+        output_names.extend((f"concept.{name}", name) for name in NOISING_OVERRIDE_COLUMNS)
 
         if config.rlhf_enabled:
             # Per-concept DPO beta (0 = inherit the global beta). A batch mixes

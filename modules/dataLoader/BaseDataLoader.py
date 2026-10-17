@@ -5,6 +5,7 @@ from modules.dataLoader.mixin.DataLoaderMgdsMixin import DataLoaderMgdsMixin
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.noising_override_util import INHERIT_COLUMN_VALUES
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.MGDS import MGDS, TrainDataLoader
@@ -65,12 +66,15 @@ def _aspect_disagrees(spatial_shape, crop_resolution) -> bool:
 # field existed lack it (OutputPipelineModule drops the None). One batch can mix
 # such rows with newer ones; default_collate keys on the first item and would
 # raise KeyError (or silently drop the column), so missing entries take the
-# inherit value instead.
+# inherit value instead. The nullable timestep sampling overrides are dropped
+# the same way when set to None, so their inherit value is a sentinel that
+# collates (NaN / "").
 _INHERIT_CONCEPT_COLUMNS = {
     "dpo_beta_override": 0.0,
     "dpo_adaptive_beta": True,
     "supervised_mix_override": -1.0,
     "unmasked_weight_override": -1.0,
+    **INHERIT_COLUMN_VALUES,
 }
 
 

@@ -202,6 +202,7 @@ class BasePixArtAlphaSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                batch=batch,
             )
 
             scaled_noisy_latent_image = self._add_noise_discrete(

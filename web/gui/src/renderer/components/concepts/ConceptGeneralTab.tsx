@@ -1,7 +1,19 @@
 import { DirPicker, FilePicker, FormEntry, Select, Toggle } from "@/components/shared";
 import type { ConceptConfig } from "@/types/generated/config";
 import { PROMPT_SOURCES } from "@/types/generated/dropdownSources";
-import { BalancingStrategyValues, ConceptTypeValues, KTOLabelValues } from "@/types/generated/enums";
+import {
+  BalancingStrategyValues,
+  ConceptTypeValues,
+  KTOLabelValues,
+  TimestepDistributionValues,
+} from "@/types/generated/enums";
+
+// Per-concept timestep sampling: an empty field / "inherit" leaves the run's value in place.
+const INHERIT = "";
+const TIMESTEP_DISTRIBUTION_OPTIONS = [
+  { label: "inherit", value: INHERIT },
+  ...TimestepDistributionValues.map((v) => ({ label: v, value: v })),
+];
 
 export interface ConceptGeneralTabProps {
   draft: ConceptConfig;
@@ -158,6 +170,84 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
         value={draft.unmasked_probability_override}
         onChange={(v) => update("unmasked_probability_override", v)}
         tooltip="Chance (0-1) that a sample of this concept trains on the whole image instead of its mask, drawn per sample each epoch; a DPO pair is unmasked together. Negative inherits the run's Unmasked Probability. Inpainting models apply only the run-wide value."
+      />
+
+      <span className="col-span-2 mt-2 text-xs font-semibold uppercase tracking-wide text-[var(--color-on-surface-variant)]">
+        Timestep sampling (empty = inherit the run's value)
+      </span>
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Noising Strength Min / Max</span>
+      <div className="flex gap-2">
+        <div className="flex-1">
+          <FormEntry
+            label=""
+            type="number"
+            nullable
+            value={draft.min_noising_strength_override}
+            onChange={(v) => update("min_noising_strength_override", v)}
+            tooltip="Minimum noising strength (0-1) for this concept's samples, overriding the run's Min Noising Strength. E.g. 0.1 skips the very lowest noise levels (JPEG artifacts, sensor grain). Empty inherits."
+          />
+        </div>
+        <div className="flex-1">
+          <FormEntry
+            label=""
+            type="number"
+            nullable
+            value={draft.max_noising_strength_override}
+            onChange={(v) => update("max_noising_strength_override", v)}
+            tooltip="Maximum noising strength (0-1) for this concept's samples, overriding the run's Max Noising Strength. E.g. 0.6 keeps a real-photo concept on fine detail. Empty inherits."
+          />
+        </div>
+      </div>
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Noising Weight / Bias</span>
+      <div className="flex gap-2">
+        <div className="flex-1">
+          <FormEntry
+            label=""
+            type="number"
+            nullable
+            value={draft.noising_weight_override}
+            onChange={(v) => update("noising_weight_override", v)}
+            tooltip="Weight parameter of the timestep distribution for this concept (same meaning as the run's Noising Weight). Empty inherits."
+          />
+        </div>
+        <div className="flex-1">
+          <FormEntry
+            label=""
+            type="number"
+            nullable
+            value={draft.noising_bias_override}
+            onChange={(v) => update("noising_bias_override", v)}
+            tooltip="Bias parameter of the timestep distribution for this concept (same meaning as the run's Noising Bias; a negative bias nudges logit-normal draws toward lower noise). Empty inherits."
+          />
+        </div>
+      </div>
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Timestep Distribution</span>
+      <Select
+        label=""
+        options={TIMESTEP_DISTRIBUTION_OPTIONS}
+        value={draft.timestep_distribution_override ?? INHERIT}
+        onChange={(v) => update("timestep_distribution_override", v === INHERIT ? null : v)}
+        tooltip="Timestep distribution for this concept's samples; inherit uses the run's. A concept on a different distribution converts the run's random draw instead of consuming extra random numbers."
+      />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Timestep Shift</span>
+      <FormEntry
+        label=""
+        type="number"
+        nullable
+        value={draft.timestep_shift_override}
+        onChange={(v) => update("timestep_shift_override", v)}
+        tooltip="Timestep shift for this concept's samples, overriding the run's Timestep Shift (and the dynamic resolution-based shift when enabled). Empty inherits."
+      />
+
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Range After Shift</span>
+      <Toggle
+        value={draft.noising_range_after_shift}
+        onChange={(v) => update("noising_range_after_shift", v)}
+        tooltip="Off: the min / max range applies before the timestep shift, like the run's values, so under dynamic shifting the same bounds land at a different noise level per resolution. On: the draw (shaped by weight / bias) covers the whole schedule, is shifted, and the shifted value is mapped linearly into [min, max], so the bounds mean the same noise level at every resolution without piling probability at the bounds."
       />
     </div>
   );

@@ -14,6 +14,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.BalancingStrategy import BalancingStrategy
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.KTOLabel import KTOLabel
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.image_util import load_image
 from modules.util.ui import components
 from modules.util.ui.ui_utils import set_window_icon
@@ -345,6 +346,84 @@ class ConceptWindow(ctk.CTkToplevel):
             "run's Unmasked Probability. Inpainting models apply only the run-wide value.",
         )
         components.entry(frame, 16, 1, self.ui_state, "unmasked_probability_override")
+
+        # timestep sampling overrides: empty = inherit the run's value
+        components.label(
+            frame,
+            17,
+            0,
+            "Timestep Sampling",
+            tooltip="Per-concept overrides of the run's noising / timestep sampling settings (training tab). "
+            "Each sample draws its timestep with its own concept's settings, so a batch mixing concepts "
+            "trains every concept at its own noise levels. Empty fields inherit the run's value.",
+            wide_tooltip=True,
+        )
+        components.label(frame, 17, 1, "min / max")
+        components.label(frame, 17, 2, "weight / bias")
+
+        components.label(
+            frame,
+            18,
+            0,
+            "Noising Strength",
+            tooltip="Min / max noising strength (0-1) for this concept's samples, overriding the run's values. "
+            "E.g. 0.1 / 0.6 trains fine detail without the very lowest noise levels. Empty inherits.",
+        )
+        components.entry(frame, 18, 1, self.ui_state, "min_noising_strength_override")
+        components.entry(frame, 18, 2, self.ui_state, "max_noising_strength_override")
+
+        components.label(
+            frame,
+            19,
+            0,
+            "Noising Weight / Bias",
+            tooltip="Weight / bias of the timestep distribution for this concept, overriding the run's values "
+            "(same meaning as on the training tab; a negative bias nudges logit-normal draws toward lower "
+            "noise). Empty inherits.",
+        )
+        components.entry(frame, 19, 1, self.ui_state, "noising_weight_override")
+        components.entry(frame, 19, 2, self.ui_state, "noising_bias_override")
+
+        components.label(
+            frame,
+            20,
+            0,
+            "Timestep Distribution",
+            tooltip="Timestep distribution for this concept's samples; 'inherit' uses the run's. A concept on a "
+            "different distribution converts the run's random draw instead of consuming extra random numbers.",
+        )
+        components.options_kv(
+            frame,
+            20,
+            1,
+            [("inherit", None)] + [(str(x), x) for x in list(TimestepDistribution)],
+            self.ui_state,
+            "timestep_distribution_override",
+        )
+
+        components.label(
+            frame,
+            21,
+            0,
+            "Timestep Shift",
+            tooltip="Timestep shift for this concept's samples, overriding the run's shift (and the dynamic, "
+            "resolution-based shift when that is enabled). Empty inherits.",
+        )
+        components.entry(frame, 21, 1, self.ui_state, "timestep_shift_override")
+
+        components.label(
+            frame,
+            22,
+            0,
+            "Range After Shift",
+            tooltip="Off: the min / max range is applied before the timestep shift, like the run's values, so "
+            "under dynamic shifting the same bounds land at a different noise level per resolution. On: the "
+            "draw (shaped by weight / bias) covers the whole schedule, is shifted, and the shifted value is "
+            "mapped linearly into [min, max], so the bounds mean the same noise level at every resolution "
+            "(no probability piles up at the bounds).",
+            wide_tooltip=True,
+        )
+        components.switch(frame, 22, 1, self.ui_state, "noising_range_after_shift")
 
         frame.pack(fill="both", expand=1)
         return frame

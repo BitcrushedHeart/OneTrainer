@@ -229,6 +229,7 @@ class BaseWuerstchenSetup(
                 generator,
                 scaled_latent_image.shape[0],
                 config,
+                batch=batch,
             )
 
             if model.model_type.is_wuerstchen_v2():

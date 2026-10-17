@@ -45,6 +45,13 @@ FIELDS = (
     "supervised_mix_override",
     "unmasked_weight_override",
     "loss_weight",
+    # Per-concept timestep sampling, served from the same snapshot.
+    "min_noising_strength_override",
+    "max_noising_strength_override",
+    "noising_weight_override",
+    "noising_bias_override",
+    "timestep_shift_override",
+    "noising_range_after_shift",
 )
 
 
@@ -121,6 +128,12 @@ def _concept(index: int, cache_dir: str) -> ConceptConfig:
     # Values exact in float32: the output module casts floats to tensors.
     concept.unmasked_weight_override = 0.25 * (index + 1)
     concept.loss_weight = 1.0 + index
+    concept.min_noising_strength_override = 0.125 * index
+    concept.max_noising_strength_override = 0.5 + 0.125 * index
+    concept.noising_weight_override = 0.5 * index
+    concept.noising_bias_override = -0.25 * index
+    concept.timestep_shift_override = 1.0 + index
+    concept.noising_range_after_shift = index == 1
     return concept
 
 

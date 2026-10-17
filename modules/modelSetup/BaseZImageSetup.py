@@ -113,10 +113,13 @@ class BaseZImageSetup(
         generator: torch.Generator,
         rand: Random,
         scaled_latent_image: Tensor,
+        batch: dict | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, list[Tensor]]:
         """The standard training branch's noise/timestep preamble, shared with
         transfer_fork_forward so transfer activations stay exactly on the
         training distribution. Behavior-preserving extraction from predict().
+
+        ``batch`` carries the per-concept timestep sampling overrides.
 
         Returns (latent_noise, timestep, sigma, scaled_noisy_latent_image,
         latent_input_list)."""
@@ -130,6 +133,7 @@ class BaseZImageSetup(
             scaled_latent_image.shape[0],
             config,
             shift=shift if config.dynamic_timestep_shifting else config.timestep_shift,
+            batch=batch,
         )
 
         scaled_noisy_latent_image, sigma = self._add_noise_discrete(
@@ -233,7 +237,7 @@ class BaseZImageSetup(
                 }
 
             latent_noise, timestep, sigma, scaled_noisy_latent_image, latent_input_list = self._prepare_flow_inputs(
-                model, config, deterministic, generator, rand, scaled_latent_image
+                model, config, deterministic, generator, rand, scaled_latent_image, batch
             )
 
             output_list = model.transformer(
@@ -334,7 +338,7 @@ class BaseZImageSetup(
             else:
                 scaled_latent_image = model.scale_latents(batch["latent_image"])
                 _, timestep, _, _, latent_input_list = self._prepare_flow_inputs(
-                    model, config, deterministic, generator, rand, scaled_latent_image
+                    model, config, deterministic, generator, rand, scaled_latent_image, batch
                 )
                 transformer_timestep = (1000 - timestep) / 1000
 

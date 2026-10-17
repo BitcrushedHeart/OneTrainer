@@ -6,6 +6,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dpo_pattern_util import validate_dpo_patterns
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.noising_override_util import describe_noising_overrides
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.MGDS import MGDS
@@ -88,7 +89,27 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
             raise RuntimeError("The KTO loader needs at least one enabled KTO concept.")
         return kto_concepts
 
+    @staticmethod
+    def _print_noising_overrides(concepts: list[ConceptConfig], config: TrainConfig) -> None:
+        # Validation draws a fixed timestep, so only training loaders report.
+        overriding = []
+        for concept in concepts:
+            description = describe_noising_overrides(concept, config) if concept.enabled else None
+            if description:
+                overriding.append(f"{concept.name or concept.path}: {description}")
+        if overriding:
+            print(
+                f"Per-concept timestep sampling: {len(overriding)} concepts override the run's noising settings "
+                "(the rest inherit): " + "; ".join(overriding)
+            )
+
     def _select_concepts(self, config: TrainConfig, is_validation: bool = False) -> list[ConceptConfig]:
+        concepts = self._filter_concepts(config, is_validation)
+        if not is_validation:
+            self._print_noising_overrides(concepts, config)
+        return concepts
+
+    def _filter_concepts(self, config: TrainConfig, is_validation: bool = False) -> list[ConceptConfig]:
         concepts = config.concepts
         if concepts is None:
             with open(config.concept_file_name, "r") as f:
