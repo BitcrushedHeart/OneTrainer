@@ -73,6 +73,7 @@ _INHERIT_CONCEPT_COLUMNS = {
     "dpo_beta_override": 0.0,
     "dpo_adaptive_beta": True,
     "supervised_mix_override": -1.0,
+    "dpo_chosen_anchor_override": -1.0,
     "unmasked_weight_override": -1.0,
     **INHERIT_COLUMN_VALUES,
 }

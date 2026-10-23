@@ -328,29 +328,44 @@ class ConceptWindow(ctk.CTkToplevel):
             frame,
             15,
             0,
+            "Chosen Anchor Override",
+            tooltip="DPOP chosen anchor coefficient for this concept's pairs, overriding the global RLHF "
+            "Chosen Anchor (DPOP). -1 (any negative value) inherits the global value, 0 turns the anchor off for "
+            "this concept, a positive value replaces it (and applies even when the global anchor is 0). "
+            "The penalty is still multiplied by the pair's beta, so a low-beta concept needs a "
+            "proportionally larger value: at beta 2, 25-50 pulls about as hard as 0.25-0.5 at beta 200. "
+            "Ignored by the KTO objective.",
+            wide_tooltip=True,
+        )
+        components.entry(frame, 15, 1, self.ui_state, "dpo_chosen_anchor_override")
+
+        components.label(
+            frame,
+            16,
+            0,
             "Unmasked Weight Override",
             tooltip="Loss weight of the area outside the mask for this concept only, overriding the run's "
             "Unmasked Weight when masked training is enabled. 0 trains the masked region alone; a DPO "
             "concept's preference margin is then computed inside the mask only. Negative inherits the "
             "global value.",
         )
-        components.entry(frame, 15, 1, self.ui_state, "unmasked_weight_override")
+        components.entry(frame, 16, 1, self.ui_state, "unmasked_weight_override")
 
         components.label(
             frame,
-            16,
+            17,
             0,
             "Unmasked Probability Override",
             tooltip="Chance (0-1) that a sample of this concept trains on the whole image instead of its "
             "mask, drawn per sample each epoch; a DPO pair is unmasked together. Negative inherits the "
             "run's Unmasked Probability. Inpainting models apply only the run-wide value.",
         )
-        components.entry(frame, 16, 1, self.ui_state, "unmasked_probability_override")
+        components.entry(frame, 17, 1, self.ui_state, "unmasked_probability_override")
 
         # timestep sampling overrides: empty = inherit the run's value
         components.label(
             frame,
-            17,
+            18,
             0,
             "Timestep Sampling",
             tooltip="Per-concept overrides of the run's noising / timestep sampling settings (training tab). "
@@ -358,35 +373,35 @@ class ConceptWindow(ctk.CTkToplevel):
             "trains every concept at its own noise levels. Empty fields inherit the run's value.",
             wide_tooltip=True,
         )
-        components.label(frame, 17, 1, "min / max")
-        components.label(frame, 17, 2, "weight / bias")
+        components.label(frame, 18, 1, "min / max")
+        components.label(frame, 18, 2, "weight / bias")
 
         components.label(
             frame,
-            18,
+            19,
             0,
             "Noising Strength",
             tooltip="Min / max noising strength (0-1) for this concept's samples, overriding the run's values. "
             "E.g. 0.1 / 0.6 trains fine detail without the very lowest noise levels. Empty inherits.",
         )
-        components.entry(frame, 18, 1, self.ui_state, "min_noising_strength_override")
-        components.entry(frame, 18, 2, self.ui_state, "max_noising_strength_override")
+        components.entry(frame, 19, 1, self.ui_state, "min_noising_strength_override")
+        components.entry(frame, 19, 2, self.ui_state, "max_noising_strength_override")
 
         components.label(
             frame,
-            19,
+            20,
             0,
             "Noising Weight / Bias",
             tooltip="Weight / bias of the timestep distribution for this concept, overriding the run's values "
             "(same meaning as on the training tab; a negative bias nudges logit-normal draws toward lower "
             "noise). Empty inherits.",
         )
-        components.entry(frame, 19, 1, self.ui_state, "noising_weight_override")
-        components.entry(frame, 19, 2, self.ui_state, "noising_bias_override")
+        components.entry(frame, 20, 1, self.ui_state, "noising_weight_override")
+        components.entry(frame, 20, 2, self.ui_state, "noising_bias_override")
 
         components.label(
             frame,
-            20,
+            21,
             0,
             "Timestep Distribution",
             tooltip="Timestep distribution for this concept's samples; 'inherit' uses the run's. A concept on a "
@@ -394,7 +409,7 @@ class ConceptWindow(ctk.CTkToplevel):
         )
         components.options_kv(
             frame,
-            20,
+            21,
             1,
             [("inherit", None)] + [(str(x), x) for x in list(TimestepDistribution)],
             self.ui_state,
@@ -403,17 +418,17 @@ class ConceptWindow(ctk.CTkToplevel):
 
         components.label(
             frame,
-            21,
+            22,
             0,
             "Timestep Shift",
             tooltip="Timestep shift for this concept's samples, overriding the run's shift (and the dynamic, "
             "resolution-based shift when that is enabled). Empty inherits.",
         )
-        components.entry(frame, 21, 1, self.ui_state, "timestep_shift_override")
+        components.entry(frame, 22, 1, self.ui_state, "timestep_shift_override")
 
         components.label(
             frame,
-            22,
+            23,
             0,
             "Range After Shift",
             tooltip="Off: the min / max range is applied before the timestep shift, like the run's values, so "
@@ -423,7 +438,7 @@ class ConceptWindow(ctk.CTkToplevel):
             "(no probability piles up at the bounds).",
             wide_tooltip=True,
         )
-        components.switch(frame, 22, 1, self.ui_state, "noising_range_after_shift")
+        components.switch(frame, 23, 1, self.ui_state, "noising_range_after_shift")
 
         frame.pack(fill="both", expand=1)
         return frame

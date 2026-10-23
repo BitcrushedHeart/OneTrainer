@@ -15,18 +15,28 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+def dpo_chosen_anchor_active(chosen_anchor: float | Tensor) -> bool:
+    """Whether a resolved chosen anchor adds a term. A per-pair ``[B]`` tensor
+    only comes back when the batch's pairs resolve to different coefficients
+    (see BaseModelSetup._resolve_chosen_anchor), so at least one of them is > 0."""
+    return isinstance(chosen_anchor, Tensor) or chosen_anchor > 0
+
+
 def dpo_chosen_anchor_penalties(
     chosen_ratio: Tensor,
     *,
     beta: float | Tensor,
     objective: DPOObjective,
-    chosen_anchor: float,
+    chosen_anchor: float | Tensor,
 ) -> Tensor:
     """Per-pair DPOP chosen-likelihood anchor, ``[B]``:
     ``chosen_anchor * scale * relu(-chosen_ratio)`` with ``scale`` the pair's
     beta (1 for IPO). See :func:`dpo_chosen_anchor_penalty` for the term;
-    this is its per-pair form, whose mean is that term."""
+    this is its per-pair form, whose mean is that term. ``chosen_anchor`` may
+    be a per-pair ``[B]`` tensor (per-concept ``dpo_chosen_anchor_override``)."""
     scale = 1.0 if objective == DPOObjective.IPO else beta
+    if isinstance(chosen_anchor, Tensor):
+        chosen_anchor = chosen_anchor.to(chosen_ratio.device, chosen_ratio.dtype).reshape(chosen_ratio.shape)
     return chosen_anchor * (scale * F.relu(-chosen_ratio))
 
 
@@ -35,7 +45,7 @@ def dpo_chosen_anchor_penalty(
     *,
     beta: float | Tensor,
     objective: DPOObjective,
-    chosen_anchor: float,
+    chosen_anchor: float | Tensor,
 ) -> Tensor:
     """DPOP's chosen-likelihood anchor (Pal et al. 2024, "Smaug"), as a separate
     additive term: ``chosen_anchor * mean(beta * relu(-chosen_ratio))``.
@@ -55,6 +65,11 @@ def dpo_chosen_anchor_penalty(
     it. IPO has no beta, so its anchor is unscaled. Not applied under KTO, whose
     desirable term already is a chosen anchor (``1 - sigmoid(beta * chosen_ratio)``
     rises as soon as the chosen half drops below the reference).
+
+    A concept's ``dpo_chosen_anchor_override`` replaces the coefficient for its
+    own pairs (``chosen_anchor`` is then a per-pair tensor). The beta scaling
+    stays, so a beta-2 concept needs ~100x the coefficient of a beta-200 one
+    for the same pull.
     """
     return dpo_chosen_anchor_penalties(chosen_ratio, beta=beta, objective=objective, chosen_anchor=chosen_anchor).mean()
 
@@ -69,7 +84,7 @@ def dpo_objective(
     objective: DPOObjective,
     ipo_tau: float,
     label_smoothing: float,
-    chosen_anchor: float = 0.0,
+    chosen_anchor: float | Tensor = 0.0,
     kto_desirable_weight: float = 1.0,
     kto_undesirable_weight: float = 1.0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -79,8 +94,9 @@ def dpo_objective(
     ``beta`` may be a scalar or a per-sample ``[B]`` tensor (per-concept beta
     overrides); it multiplies the per-sample margin elementwise either way, so
     the reduction below is unchanged. ``loss`` includes the chosen anchor
-    (``dpo_chosen_anchor_penalty``) when ``chosen_anchor > 0`` under the sigmoid
-    and IPO objectives; ``dpo_loss`` stays the bare preference term. Because
+    (``dpo_chosen_anchor_penalty``) when ``chosen_anchor > 0`` (a scalar, or a
+    per-pair ``[B]`` tensor from per-concept overrides) under the sigmoid and
+    IPO objectives; ``dpo_loss`` stays the bare preference term. Because
     the anchor sits inside ``loss``, the light path's surrogate weights
     (``dpo_surrogate_weights`` differentiates ``loss``) carry its gradient onto
     the chosen half automatically.
@@ -120,7 +136,7 @@ def dpo_objective(
             s = label_smoothing
             loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
 
-    if chosen_anchor > 0 and objective != DPOObjective.KTO:
+    if dpo_chosen_anchor_active(chosen_anchor) and objective != DPOObjective.KTO:
         loss = loss + dpo_chosen_anchor_penalty(
             chosen_ratio, beta=beta, objective=objective, chosen_anchor=chosen_anchor
         )
@@ -136,7 +152,7 @@ def dpo_per_sample_losses(
     objective: DPOObjective,
     ipo_tau: float,
     label_smoothing: float,
-    chosen_anchor: float = 0.0,
+    chosen_anchor: float | Tensor = 0.0,
     kto_desirable_weight: float = 1.0,
     kto_undesirable_weight: float = 1.0,
 ) -> Tensor:
@@ -160,7 +176,7 @@ def dpo_per_sample_losses(
         if label_smoothing > 0:
             s = label_smoothing
             losses = (1 - s) * losses + s * (-F.logsigmoid(-logits))
-    if chosen_anchor > 0:
+    if dpo_chosen_anchor_active(chosen_anchor):
         losses = losses + dpo_chosen_anchor_penalties(
             chosen_ratio, beta=beta_t, objective=objective, chosen_anchor=chosen_anchor
         )

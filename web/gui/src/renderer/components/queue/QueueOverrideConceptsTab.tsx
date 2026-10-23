@@ -27,6 +27,7 @@ const DEFAULT_CONCEPT: ConceptConfig = {
   dpo_beta_override: 0,
   dpo_adaptive_beta: true,
   supervised_mix_override: -1,
+  dpo_chosen_anchor_override: -1,
   unmasked_weight_override: -1,
   unmasked_probability_override: -1,
   min_noising_strength_override: null,

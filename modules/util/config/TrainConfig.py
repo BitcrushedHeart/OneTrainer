@@ -756,6 +756,7 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_addon_interval: int
     rlhf_addon_schedule: RLHFAddonSchedule
     rlhf_dpo_light_reuse_rejected_graph: bool
+    rlhf_dpo_light_primary: bool
     rlhf_dpo_validation: bool
     rlhf_dpo_validation_percentage: float
     rlhf_dpo_patience_enabled: bool
@@ -1352,7 +1353,21 @@ class TrainConfig(BaseConfig):
                 # to keep peak memory at one graph; a fused back pass would
                 # apply the optimizer inside the first of them.
                 return "SFT + DPO mode does not support the optimizer's fused back pass; disable it."
+        if self.rlhf_dpo_light_primary_applies():
+            if self.optimizer is not None and getattr(self.optimizer, "fused_back_pass", False):
+                # The light path backwards each half of the pair on its own (and
+                # any KTO / SFT-anchor term after them); a fused back pass would
+                # apply the optimizer inside the first of those backwards.
+                return "The DPO light path does not support the optimizer's fused back pass; disable one of them."
         return None
+
+    def rlhf_dpo_light_primary_applies(self) -> bool:
+        """DPO-primary pair micro-steps run on the light path (half-by-half
+        forwards, calculate_dpo_loss_light) instead of the fused [chosen;
+        rejected] forward. Same loss and gradient, about half the peak
+        activation memory. Only pair micro-steps are affected: KTO-primary runs
+        and SFT + DPO add-on steps (which always use the light path) ignore it."""
+        return self.rlhf_enabled and self.rlhf_dpo_light_primary and self.rlhf_dpo_primary()
 
     def validate_text_reward_startup(self) -> str | None:
         if not self.text_reward_enabled:
@@ -2119,6 +2134,9 @@ class TrainConfig(BaseConfig):
         # which is also the intended value for them (same gradient, one
         # forward fewer per DPO add-on step).
         data.append(("rlhf_dpo_light_reuse_rejected_graph", True, bool, False))
+        # No migration: configs saved without the key load False, the fused
+        # [chosen; rejected] forward those DPO-primary runs used.
+        data.append(("rlhf_dpo_light_primary", False, bool, False))
         data.append(("rlhf_dpo_validation", False, bool, False))
         data.append(("rlhf_dpo_validation_percentage", 10.0, float, False))
         data.append(("rlhf_dpo_patience_enabled", False, bool, False))

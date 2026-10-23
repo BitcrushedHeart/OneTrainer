@@ -154,6 +154,15 @@ export function ConceptGeneralTab({ draft, update, updateText }: ConceptGeneralT
         tooltip="Weight of the supervised loss on this concept's chosen images, overriding the global RLHF Supervised Mix. -1 (any negative value) inherits the global mix, 0 turns the term off for this concept, a positive value replaces it. Uses the run's masked loss, so a low unmasked weight keeps it inside the mask."
       />
 
+      <span className="text-sm font-medium text-[var(--color-on-surface)]">Chosen Anchor Override</span>
+      <FormEntry
+        label=""
+        type="number"
+        value={draft.dpo_chosen_anchor_override}
+        onChange={(v) => update("dpo_chosen_anchor_override", v)}
+        tooltip="DPOP chosen anchor coefficient for this concept's pairs, overriding the global RLHF Chosen Anchor. -1 (any negative value) inherits the global value, 0 turns the anchor off for this concept, a positive value replaces it (and applies even when the global anchor is 0). Still multiplied by the pair's beta, so a low-beta concept needs a proportionally larger value: at beta 2, 25-50 pulls about as hard as 0.25-0.5 at beta 200. Ignored by KTO."
+      />
+
       <span className="text-sm font-medium text-[var(--color-on-surface)]">Unmasked Weight Override</span>
       <FormEntry
         label=""

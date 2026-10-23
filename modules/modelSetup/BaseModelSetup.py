@@ -22,6 +22,7 @@ from modules.util.distill_dmd2_util import (
 from modules.util.distill_metadata_util import extract_distill_metadata
 from modules.util.dpo_beta_controller import concept_count_key, concept_margin_key
 from modules.util.dpo_light_util import (
+    dpo_chosen_anchor_active,
     dpo_chosen_anchor_penalty,
     dpo_objective,
     dpo_per_sample_losses,
@@ -226,6 +227,7 @@ class BaseModelSetup(
         self._dpo_concept_key_of_path: Callable[[str | None], str | None] | None = None
         self._dpo_concept_index_cache: dict[str, int] = {}
         self._dpo_runtime_beta_ratios: dict[str, float] = {}
+        self._dpo_chosen_anchor_overridden = False
         self._last_distill_metrics = None
         self._last_grad_step_index = None  # student backprop step chosen this update (debug/tests)
         self._last_distill_x0_teacher = None  # paired teacher target from the last student update
@@ -1488,6 +1490,14 @@ class BaseModelSetup(
         # controller has not updated yet is absent and keeps a ratio of 1.
         self._dpo_runtime_beta_ratios = dict(ratios)
 
+    def set_dpo_chosen_anchor_overridden(self, overridden: bool) -> None:
+        # Whether any of the run's DPO concepts sets its own chosen anchor > 0
+        # (dpo_chosen_anchor_override). With the global anchor at 0 this keeps
+        # the anchor metrics on every DPO micro-batch, including batches whose
+        # pairs all resolve to no anchor, so the trainer's window averages
+        # divide the same count as the other metrics.
+        self._dpo_chosen_anchor_overridden = overridden
+
     def _dpo_concept_indices(self, image_paths) -> Tensor | None:
         """Per-sample [B] index into ``_dpo_concept_keys`` for the batch's chosen
         image paths (-1: no adaptive concept), or None when per-concept adaptive
@@ -1595,6 +1605,32 @@ class BaseModelSetup(
         return torch.tensor(values, dtype=torch.float32, device=override.device)
 
     @staticmethod
+    def _resolve_chosen_anchor(config: TrainConfig, batch: dict) -> float | Tensor:
+        """DPOP chosen anchor coefficient for the pairs of this batch: a
+        per-pair [B] tensor when concepts in the batch resolve to different
+        coefficients, otherwise a scalar.
+
+        A concept's ``dpo_chosen_anchor_override`` < 0 inherits the global
+        ``rlhf_dpo_chosen_anchor``; 0 turns the anchor off for that concept and
+        > 0 turns it on even when the global is 0. The penalty stays scaled by
+        each pair's (adaptive) beta. Same resolution as the supervised mix:
+        without the column the global comes back untouched, and a batch whose
+        pairs all resolve to one value collapses to that scalar.
+        """
+        global_anchor = config.rlhf_dpo_chosen_anchor
+        override = batch.get("dpo_chosen_anchor_override")
+        if not isinstance(override, Tensor):
+            return global_anchor
+
+        inherited = global_anchor if global_anchor > 0 else 0.0
+        values = [value if value >= 0 else inherited for value in override.float().reshape(-1).tolist()]
+        if not values:
+            return global_anchor
+        if all(value == values[0] for value in values):
+            return global_anchor if values[0] == inherited else values[0]
+        return torch.tensor(values, dtype=torch.float32, device=override.device)
+
+    @staticmethod
     def _supervised_mix_active(mix: float | Tensor) -> bool:
         # A tensor only comes back when the samples differ, so one is > 0.
         return isinstance(mix, Tensor) or mix > 0
@@ -1638,6 +1674,7 @@ class BaseModelSetup(
         # batch holds only the B chosen samples' columns (the rejected half
         # rides in *_rejected keys), so a per-sample mix lines up with them.
         supervised_mix = self._resolve_supervised_mix(config, batch)
+        chosen_anchor = self._resolve_chosen_anchor(config, batch)
         supervised_loss = None
 
         # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
@@ -1697,7 +1734,7 @@ class BaseModelSetup(
             policy_rejected_logp,
             ref_chosen_logp,
             ref_rejected_logp,
-            **self._dpo_objective_kwargs(config, beta),
+            **self._dpo_objective_kwargs(config, beta, chosen_anchor),
         )
 
         if supervised_loss is not None:
@@ -1717,18 +1754,23 @@ class BaseModelSetup(
             beta,
             image_paths=batch.get("image_path"),
             adaptive_mask=self._dpo_adaptive_mask(batch),
+            chosen_anchor=chosen_anchor,
         )
 
         return loss
 
     @staticmethod
-    def _dpo_objective_kwargs(config: TrainConfig, beta: float | Tensor) -> dict:
+    def _dpo_objective_kwargs(
+        config: TrainConfig, beta: float | Tensor, chosen_anchor: float | Tensor | None = None
+    ) -> dict:
+        # chosen_anchor: the batch's resolved coefficient (_resolve_chosen_anchor);
+        # None takes the global rlhf_dpo_chosen_anchor.
         return {
             "beta": beta,
             "objective": config.rlhf_dpo_objective,
             "ipo_tau": config.rlhf_dpo_ipo_tau,
             "label_smoothing": config.rlhf_dpo_label_smoothing,
-            "chosen_anchor": config.rlhf_dpo_chosen_anchor,
+            "chosen_anchor": config.rlhf_dpo_chosen_anchor if chosen_anchor is None else chosen_anchor,
             "kto_desirable_weight": config.rlhf_kto_desirable_weight,
             "kto_undesirable_weight": config.rlhf_kto_undesirable_weight,
         }
@@ -1821,7 +1863,8 @@ class BaseModelSetup(
             )
 
         beta = self._resolve_dpo_beta(config, batch)
-        objective_kwargs = self._dpo_objective_kwargs(config, beta)
+        chosen_anchor = self._resolve_chosen_anchor(config, batch)
+        objective_kwargs = self._dpo_objective_kwargs(config, beta, chosen_anchor)
         supervised_mix = self._resolve_supervised_mix(config, batch)
         chosen_batch, rejected_batch = split_dpo_pair_batch(batch)
         mse = self._dpo_mse_per_sample
@@ -1928,6 +1971,7 @@ class BaseModelSetup(
             beta,
             image_paths=chosen_batch.get("image_path"),
             adaptive_mask=self._dpo_adaptive_mask(batch),
+            chosen_anchor=chosen_anchor,
         )
         return loss
 
@@ -2028,6 +2072,7 @@ class BaseModelSetup(
         beta: float | Tensor | None = None,
         image_paths=None,
         adaptive_mask: Tensor | None = None,
+        chosen_anchor: float | Tensor | None = None,
     ) -> None:
         # Stack the scalar metrics and sync them in a single .tolist() rather
         # than one .item() (one GPU->CPU sync) per metric.
@@ -2078,10 +2123,18 @@ class BaseModelSetup(
             # into the same stack, so it costs no extra GPU->CPU sync.
             metric_names.append("beta_mean")
             metric_tensors.append(beta.detach().float().mean().to(metric_tensors[0].device))
-        if config.rlhf_dpo_chosen_anchor > 0 and config.rlhf_dpo_objective != DPOObjective.KTO:
+        if chosen_anchor is None:
+            chosen_anchor = config.rlhf_dpo_chosen_anchor
+        anchor_on = (
+            config.rlhf_dpo_chosen_anchor > 0
+            or getattr(self, "_dpo_chosen_anchor_overridden", False)
+            or dpo_chosen_anchor_active(chosen_anchor)
+        )
+        if anchor_on and config.rlhf_dpo_objective != DPOObjective.KTO:
             # The DPOP anchor's share of the loss, and how many pairs it is
             # pushing back on (chosen half fitted worse than the reference).
-            # Recomputed from the detached ratio so both DPO paths log it alike.
+            # Recomputed from the detached ratio so both DPO paths log it alike,
+            # with the batch's resolved (per-concept) coefficients.
             detached_ratio = chosen_ratio.detach().float()
             if isinstance(beta, Tensor):
                 anchor_beta = beta.detach().float().reshape(-1).to(detached_ratio.device)
@@ -2093,7 +2146,7 @@ class BaseModelSetup(
                     detached_ratio,
                     beta=anchor_beta,
                     objective=config.rlhf_dpo_objective,
-                    chosen_anchor=config.rlhf_dpo_chosen_anchor,
+                    chosen_anchor=chosen_anchor,
                 ).to(metric_tensors[0].device),
                 (detached_ratio < 0).float().mean().to(metric_tensors[0].device),
             ]

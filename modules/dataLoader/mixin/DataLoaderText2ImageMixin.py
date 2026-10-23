@@ -637,6 +637,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             # Per-concept supervised mix on the chosen half (negative = inherit
             # rlhf_supervised_mix), per sample for the same reason.
             output_names.append(("concept.supervised_mix_override", "supervised_mix_override"))
+            # Per-concept DPOP chosen anchor coefficient (negative = inherit
+            # rlhf_dpo_chosen_anchor), per sample for the same reason.
+            output_names.append(("concept.dpo_chosen_anchor_override", "dpo_chosen_anchor_override"))
 
         if getattr(self, "is_kto", False):
             # The KTO loader runs the standard pipeline (config.rlhf_enabled is

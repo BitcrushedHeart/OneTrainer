@@ -439,6 +439,13 @@ class GenericTrainer(BaseTrainer):
                     sft_anchor_data_loader, "SFT-anchor", on_epoch_restart=self.__restore_train_device
                 )
 
+        if self.config.rlhf_dpo_light_primary_applies() and not self._kto_primary:
+            print(
+                "DPO light path: every pair micro-step forwards its chosen and rejected halves one at a time "
+                "(calculate_dpo_loss_light) instead of one fused [chosen; rejected] forward; same loss and "
+                "gradient, about half the peak activation memory."
+            )
+
         # SFT + DPO (RLHF mode SFT_DPO): the standard loss stays at full weight
         # and a DPO pair from this secondary loader is interleaved every
         # N standard micro-batches; loss = sft_loss + weight * dpo_loss on
@@ -503,6 +510,8 @@ class GenericTrainer(BaseTrainer):
                 f"loss += {self.config.text_reward_weight} * ctc (never on a DPO add-on micro-batch)."
             )
 
+        if self.config.rlhf_enabled:
+            self.model_setup.set_dpo_chosen_anchor_overridden(self.__dpo_chosen_anchor_overridden())
         self.__setup_dpo_pair_logging()
         self.__setup_adaptive_beta_concepts()
 
@@ -822,6 +831,16 @@ class GenericTrainer(BaseTrainer):
         pair_types = {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         return sum(1 for c in self.__load_concepts() if c.enabled and ConceptType(c.type) in pair_types and c.is_dpo())
 
+    def __dpo_chosen_anchor_overridden(self) -> bool:
+        """Whether an enabled DPO concept sets its own chosen anchor > 0
+        (dpo_chosen_anchor_override), which turns the DPOP anchor on for its
+        pairs even with rlhf_dpo_chosen_anchor at 0. Read from the concept
+        file: a sourceless run whose cache snapshot was not synced may differ."""
+        return any(
+            c.enabled and c.is_dpo() and getattr(c, "dpo_chosen_anchor_override", -1.0) > 0
+            for c in self.__load_concepts()
+        )
+
     def __setup_dpo_pair_logging(self):
         """Per-concept DPO metrics (TensorBoard) and the live saturation ledger
         (<workspace>/dpo_live/), both fed from the per-pair records the model
@@ -841,7 +860,7 @@ class GenericTrainer(BaseTrainer):
         if self.config.rlhf_dpo_concept_logging:
             self._dpo_concept_window = DPOConceptWindow(
                 with_weight=sigmoid,
-                with_anchor=self.config.rlhf_dpo_chosen_anchor > 0
+                with_anchor=(self.config.rlhf_dpo_chosen_anchor > 0 or self.__dpo_chosen_anchor_overridden())
                 and self.config.rlhf_dpo_objective != DPOObjective.KTO,
             )
         if self.config.rlhf_dpo_live_saturation and multi.is_master():
@@ -949,6 +968,34 @@ class GenericTrainer(BaseTrainer):
             self.model, dpo_batch, self.config, train_progress, _addon_backward
         )
         return dpo_value.detach() * dpo_scale
+
+    def __dpo_primary_light_term(self, batch: dict, scaler, train_progress: TrainProgress) -> Tensor:
+        """A DPO-primary pair micro-step on the light path
+        (rlhf_dpo_light_primary): the main loader's pair batch evaluated half
+        by half with one graph alive at a time (calculate_dpo_loss_light),
+        scaled by 1 / gradient accumulation exactly like the fused path's
+        ``loss / GA``. Its gradients land through the backward callback, so
+        the caller skips the common backward for this micro-step. Returns the
+        detached scaled loss (preference term, anchor and supervised mix): the
+        scalar the fused path would have logged."""
+        scale = 1.0 / self.config.gradient_accumulation_steps
+
+        def _primary_backward(term, _scale=scale, _scaler=scaler, **probe):
+            self.__backward_term(term * _scale, _scaler, kind=MicroStepKind.DPO, scale=_scale, **probe)
+
+        dpo_value = self.model_setup.calculate_dpo_loss_light(
+            self.model, batch, self.config, train_progress, _primary_backward
+        )
+        return dpo_value.detach() * scale
+
+    def __dpo_primary_extra_term(self, term: Tensor, scaler) -> Tensor:
+        """A term the fused DPO-primary path folds into its one loss (a KTO
+        batch, the weighted SFT anchor), backwarded on its own under the light
+        path with the same 1 / gradient accumulation scaling. Returns the
+        detached scaled value for the loss accumulator."""
+        scale = 1.0 / self.config.gradient_accumulation_steps
+        self.__backward_term(term * scale, scaler, kind=MicroStepKind.DPO, scale=scale)
+        return term.detach() * scale
 
     def __kto_addon_term(self, scaler, train_progress: TrainProgress) -> Tensor:
         """One KTO batch: a no-grad reference forward and one policy forward,
@@ -2786,6 +2833,10 @@ class GenericTrainer(BaseTrainer):
                     addon_dpo_loss = None
                     addon_kto_loss = None
                     addon_text_loss = None
+                    # Set on DPO-primary micro-steps under rlhf_dpo_light_primary:
+                    # every term was backwarded (scaled by 1 / GA) as it was
+                    # computed and this holds their detached sum.
+                    primary_light_loss = None
                     if kind is not MicroStepKind.SFT:
                         # INDEPENDENT schedule: this micro-step is one add-on
                         # term on its own, scaled exactly as when it rides on
@@ -2823,7 +2874,17 @@ class GenericTrainer(BaseTrainer):
                             )
                         else:
                             self.__capture_probe_samples(MicroStepKind.DPO, batch)
-                            loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
+                            if self.config.rlhf_dpo_light_primary_applies():
+                                # Light path: the pair's halves are forwarded one
+                                # at a time and backwarded inside (same loss and
+                                # gradient as the fused forward below, about half
+                                # the peak activation memory); the common
+                                # backward is skipped for this micro-step.
+                                primary_light_loss = self.__dpo_primary_light_term(batch, scaler, train_progress)
+                            else:
+                                loss = self.model_setup.calculate_dpo_loss(
+                                    self.model, batch, self.config, train_progress
+                                )
                             # Accumulate per-micro-batch DPO metrics across the grad-accum window.
                             # Without this, only the final micro-batch's metric reaches TensorBoard —
                             # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
@@ -2841,7 +2902,12 @@ class GenericTrainer(BaseTrainer):
                                 kto_loss = self.model_setup.calculate_kto_loss(
                                     self.model, kto_batch, self.config, train_progress
                                 )
-                                loss = loss + kto_loss
+                                if primary_light_loss is not None:
+                                    primary_light_loss = primary_light_loss + self.__dpo_primary_extra_term(
+                                        kto_loss, scaler
+                                    )
+                                else:
+                                    loss = loss + kto_loss
                                 accumulated_kto_metrics = accumulate_dpo_metrics(
                                     accumulated_kto_metrics, self.model_setup.get_last_kto_metrics()
                                 )
@@ -2851,7 +2917,13 @@ class GenericTrainer(BaseTrainer):
                             sft_batch = self.sft_anchor_source.next()
                             sft_output = self.model_setup.predict(self.model, sft_batch, self.config, train_progress)
                             sft_loss = self.model_setup.calculate_loss(self.model, sft_batch, sft_output, self.config)
-                            loss = loss + self.config.rlhf_sft_anchor_weight * sft_loss
+                            if primary_light_loss is not None:
+                                primary_light_loss = primary_light_loss + self.__dpo_primary_extra_term(
+                                    self.config.rlhf_sft_anchor_weight * sft_loss, scaler
+                                )
+                                del sft_output
+                            else:
+                                loss = loss + self.config.rlhf_sft_anchor_weight * sft_loss
                             anchor_metrics = accumulated_kto_metrics if self._kto_primary else accumulated_dpo_metrics
                             anchor_metrics["sft_anchor_loss"] += sft_loss.detach().item()
                         # Mirror for Fix B save-side staging (after the SFT-anchor
@@ -3046,6 +3118,14 @@ class GenericTrainer(BaseTrainer):
                         detached_loss = next(
                             term for term in (addon_dpo_loss, addon_kto_loss, addon_text_loss) if term is not None
                         )
+                    elif primary_light_loss is not None:
+                        # DPO-primary micro-step on the light path: the pair's
+                        # halves, any KTO batch and the SFT anchor were each
+                        # backwarded above with the 1 / GA scaling the fused
+                        # path applies below, so only the attribution and the
+                        # detached sum remain.
+                        self.__attribute(self._grad_attribution, str(MicroStepKind.DPO))
+                        detached_loss = primary_light_loss
                     elif addon_sft_loss is None:
                         loss = loss / self.config.gradient_accumulation_steps
                         # A DPO-primary micro-step (pairs, with the SFT anchor
@@ -3317,7 +3397,8 @@ class GenericTrainer(BaseTrainer):
                                         "dpo/beta_mean", dpo_metrics["beta_mean"], train_progress.global_step
                                     )
                                 if "chosen_anchor_loss" in dpo_metrics:
-                                    # Present only with rlhf_dpo_chosen_anchor > 0 (DPOP).
+                                    # Present only with the DPOP anchor on (rlhf_dpo_chosen_anchor
+                                    # > 0, or a concept's dpo_chosen_anchor_override > 0).
                                     self.tensorboard.add_scalar(
                                         "dpo/chosen_anchor_loss",
                                         dpo_metrics["chosen_anchor_loss"],

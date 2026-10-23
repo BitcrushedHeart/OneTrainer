@@ -320,14 +320,28 @@ class RLHFTab:
 
         components.label(
             self.scroll_frame,
+            13,
+            3,
+            "DPO Light Path",
+            tooltip="DPO mode only. Evaluate each pair batch half by half (chosen and rejected as separate "
+            "batch-sized forwards, one graph alive at a time) instead of one fused [chosen; rejected] forward of "
+            "twice the batch size. Same loss, gradient and metrics (per-concept beta, chosen anchor, supervised "
+            "mix, masks), same compute per pair, about half the peak activation memory, so the batch size can go "
+            "up. Two extra reference forwards per step instead of one. Honours DPO Add-on Graph Reuse. Not "
+            "compatible with the optimizer's fused back pass. SFT + DPO add-on steps always use this path.",
+        )
+        components.switch(self.scroll_frame, 13, 4, self.ui_state, "rlhf_dpo_light_primary")
+
+        components.label(
+            self.scroll_frame,
             10,
             3,
             "DPO Add-on Graph Reuse",
-            tooltip="SFT + DPO mode only. Run the rejected image's forward with gradients first and keep its graph "
-            "until the chosen image has been backwarded, instead of an extra no-grad forward just to read its loss. "
-            "Same gradients, one model forward fewer per DPO step, about 1 GB more VRAM at 1024px while both graphs "
-            "are held. Ignored (the extra forward is kept) when gradient checkpointing is off or CPU offloaded with "
-            "activation or layer offloading.",
+            tooltip="SFT + DPO mode, and DPO mode with the DPO Light Path. Run the rejected image's forward with "
+            "gradients first and keep its graph until the chosen image has been backwarded, instead of an extra "
+            "no-grad forward just to read its loss. Same gradients, one model forward fewer per DPO step, about 1 GB "
+            "more VRAM at 1024px while both graphs are held. Ignored (the extra forward is kept) when gradient "
+            "checkpointing is off or CPU offloaded with activation or layer offloading.",
         )
         components.switch(self.scroll_frame, 10, 4, self.ui_state, "rlhf_dpo_light_reuse_rejected_graph")
 
@@ -367,7 +381,8 @@ class RLHFTab:
             "because the rejected image's push-down (about beta/2 near zero margin) is what drags the chosen one "
             "with it; Supervised Mix is unscaled and loses to beta. 0.5 matches that push, 1.0 doubles it. "
             "0 = off. Unscaled under IPO, not applied under KTO (its desirable term already anchors the chosen "
-            "half). Watch dpo/chosen_reward, dpo/chosen_below_ref and the SFT validation loss.",
+            "half). A concept's Chosen Anchor Override replaces this value for its pairs. Watch "
+            "dpo/chosen_reward, dpo/chosen_below_ref and the SFT validation loss.",
         )
         components.entry(self.scroll_frame, 13, 1, self.ui_state, "rlhf_dpo_chosen_anchor")
 

@@ -144,6 +144,7 @@ class ConceptConfig(BaseConfig):
     dpo_beta_override: float
     dpo_adaptive_beta: bool
     supervised_mix_override: float
+    dpo_chosen_anchor_override: float
     unmasked_weight_override: float
     unmasked_probability_override: float
     min_noising_strength_override: float | None
@@ -269,6 +270,12 @@ class ConceptConfig(BaseConfig):
         # DPO supervised (chosen-half) mix per concept: negative = inherit the
         # run's rlhf_supervised_mix, 0 = no supervised term for this concept.
         data.append(("supervised_mix_override", -1.0, float, False))
+        # DPOP chosen anchor coefficient per concept: negative = inherit the
+        # run's rlhf_dpo_chosen_anchor, 0 = no anchor for this concept. Still
+        # scaled by each pair's beta, so a low-beta concept needs a
+        # proportionally larger coefficient; > 0 applies even when the run's
+        # anchor is 0.
+        data.append(("dpo_chosen_anchor_override", -1.0, float, False))
         # Masked training knobs per concept; negative = inherit the run's value.
         # Inpainting models apply only the run-wide probability (their mgds
         # module also blanks the conditioning image), so the probability

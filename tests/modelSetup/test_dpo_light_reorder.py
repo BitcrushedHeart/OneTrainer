@@ -203,10 +203,11 @@ def _fused_reference(config: TrainConfig, batch: dict):
         ref_r = logp(model.reference_net, batch["latent_image_rejected"], batch["target_rejected"])
     setup = _FakeSetup()
     beta = setup._resolve_dpo_beta(config, batch)
+    chosen_anchor = setup._resolve_chosen_anchor(config, batch)
     pred_c = model.net(batch["latent_image"])
     pol_c = -(pred_c - batch["target"]).pow(2).mean(dim=1, dtype=torch.float32)
     pol_r = logp(model.net, batch["latent_image_rejected"], batch["target_rejected"])
-    loss, *_ = dpo_objective(pol_c, pol_r, ref_c, ref_r, **setup._dpo_objective_kwargs(config, beta))
+    loss, *_ = dpo_objective(pol_c, pol_r, ref_c, ref_r, **setup._dpo_objective_kwargs(config, beta, chosen_anchor))
     if config.rlhf_supervised_mix > 0:
         loss = loss + config.rlhf_supervised_mix * setup.calculate_loss(
             model, batch, {"predicted": pred_c, "target": batch["target"]}, config
@@ -303,6 +304,61 @@ def test_anchor_off_leaves_the_light_path_bit_for_bit_unchanged():
         assert torch.equal(a, b)
     assert on_zero_setup.get_last_dpo_metrics() == plain_setup.get_last_dpo_metrics()
     assert "chosen_anchor_loss" not in plain_setup.get_last_dpo_metrics()
+
+
+# Per-concept chosen anchor (dpo_chosen_anchor_override): the run's global
+# anchor, each pair's override (negative inherits) and beta overrides. Only
+# pair 1 of the fixture fits the chosen half worse than the reference.
+ANCHOR_OVERRIDE_CASES = {
+    "override_and_inherit": (0.5, [-1.0, 3.0, 0.0], torch.tensor([0.0, 1.5, 4.0])),
+    "global_off_override_on": (0.0, [-1.0, 6.0, -1.0], None),
+    "override_switches_off": (0.5, [-1.0, 0.0, -1.0], None),
+    "uniform_override": (0.5, [2.0, 2.0, 2.0], torch.tensor([0.0, 1.5, 4.0])),
+}
+
+
+@pytest.mark.parametrize("case", list(ANCHOR_OVERRIDE_CASES))
+def test_per_concept_anchor_overrides_on_the_light_and_batched_paths(case):
+    global_anchor, override, beta_override = ANCHOR_OVERRIDE_CASES[case]
+
+    def config():
+        c = _config(chosen_anchor=global_anchor)
+        c.rlhf_dpo_concept_logging = True  # pair records: each pair's chosen ratio and beta
+        return c
+
+    def batch():
+        b = _batch(beta_override)
+        b["dpo_chosen_anchor_override"] = torch.tensor(override)
+        return b
+
+    light_setup, light_model, light_loss, _ = _run(config(), batch())
+    batched_setup, batched_model = _FakeSetup(), _Model()
+    loss = batched_setup.calculate_dpo_loss(batched_model, batch(), config(), None)
+    (loss * ADDON_SCALE).backward()
+    fused_loss, fused_grads = _fused_reference(config(), batch())
+
+    # Both paths are the exact gradient of the objective with the per-pair anchors.
+    assert torch.allclose(loss.detach(), light_loss, rtol=0.0, atol=1e-6)
+    assert torch.allclose(fused_loss, light_loss, rtol=0.0, atol=1e-6)
+    for batched_grad, light_grad, fused_grad in zip(
+        _grads(batched_model), _grads(light_model), fused_grads, strict=True
+    ):
+        assert torch.allclose(batched_grad, light_grad, rtol=0.0, atol=1e-6)
+        assert torch.allclose(fused_grad, light_grad, rtol=0.0, atol=1e-6)
+
+    # Each pair's penalty is its own coefficient (override, else the global)
+    # times its own beta times relu(-chosen_ratio).
+    records = light_setup.get_last_dpo_pair_records()
+    anchors = [value if value >= 0 else global_anchor for value in override]
+    expected = sum(a * r["beta"] * max(-r["chosen"], 0.0) for a, r in zip(anchors, records, strict=True)) / BATCH
+    for metrics in (light_setup.get_last_dpo_metrics(), batched_setup.get_last_dpo_metrics()):
+        assert metrics["chosen_anchor_loss"] == pytest.approx(expected, abs=1e-6)
+        assert metrics["loss"] - metrics["dpo_loss"] == pytest.approx(expected, abs=1e-6)
+        assert metrics["chosen_below_ref"] == pytest.approx(1 / 3)
+    if anchors[1] > 0:
+        assert expected > 0.0
+    else:
+        assert expected == 0.0
 
 
 @pytest.mark.parametrize("reuse", [True, False])
