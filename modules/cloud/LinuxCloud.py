@@ -175,9 +175,12 @@ class LinuxCloud(BaseCloud):
             self.__trail_detached_trainer()
             return
 
+        # expandable_segments: the allocator grows segments instead of caching fixed blocks, so mixed resolution
+        # buckets don't fragment VRAM into reserved-but-unusable space (V55 OOM'd with 12-31 GiB stranded).
         cmd = "export PATH=$PATH:/usr/local/cuda/bin:/venv/main/bin \
              && export PYTHONUNBUFFERED=1 \
-             && export OT_LAZY_UPDATES=true"
+             && export OT_LAZY_UPDATES=true \
+             && export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
         if self.config.secrets.huggingface_token != "":
             cmd += f" && export HF_TOKEN={self.config.secrets.huggingface_token}"
