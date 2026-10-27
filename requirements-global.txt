@@ -29,6 +29,7 @@ tensorboard==2.20.0
 gguf==0.17.1
 transformers==5.5.4 # pinned below 5.6, see https://github.com/Nerogar/OneTrainer/pull/1506
 sentencepiece==0.2.1 # transitive dependency of transformers for tokenizer loading
+fla-core==0.6.0 # Triton kernels for the Qwen3.5 (MOSS) text encoder's gated delta-net layers; not the flash-linear-attention meta package, which requires transformers>=5.6
 einops==0.8.2 # needed by PaddleOCR-VL's remote modeling code (DPO tool text adherence)
 omegaconf==2.3.0 # needed to load stable diffusion from single ckpt files
 invisible-watermark==0.2.0 # needed for the SDXL pipeline
@@ -42,7 +43,7 @@ lpips==0.1.4 # perceptual teacher-match metric for distillation validation
 python-doctr==1.0.1 # frozen OCR detector + CTC recognizer for the on-image text reward
 
 # data loader
--e git+https://github.com/BitcrushedHeart/mgds.git@0484810ed3412e2ea2d800cd11e2229c4ede8fff#egg=mgds
+-e git+https://github.com/BitcrushedHeart/mgds.git@7cd164197d9096f13c190c769919491c8fc45974#egg=mgds
 xxhash==3.7.0
 
 # optimizers

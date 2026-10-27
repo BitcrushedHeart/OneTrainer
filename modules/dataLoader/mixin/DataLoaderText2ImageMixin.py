@@ -87,6 +87,31 @@ def text_encode_batch_size() -> int:
         return 8
 
 
+def vae_encode_batch_size() -> int:
+    """Max images per VAE forward during image cache builds.
+
+    Without it every image is encoded alone. The image cache build pool runs
+    twice this many workers so one batch decodes while the previous one
+    encodes. Set OT_VAE_CACHE_BATCH=1 to restore bs=1 encoding on the shared
+    dataloader threads.
+    """
+    try:
+        return max(1, int(os.environ.get("OT_VAE_CACHE_BATCH", "8")))
+    except ValueError:
+        return 8
+
+
+def vae_encode_batch_pixels() -> int:
+    """Pixel budget per batched VAE forward (OT_VAE_CACHE_BATCH_MPIX, in
+    units of 1024x1024): bounds activation memory, so 1024px buckets batch
+    fewer images per forward than 512px ones."""
+    try:
+        megapixels = float(os.environ.get("OT_VAE_CACHE_BATCH_MPIX", "4"))
+    except ValueError:
+        megapixels = 4.0
+    return max(1, int(megapixels * 1024 * 1024))
+
+
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     @staticmethod
     def __as_output_mapping(name: str | tuple[str, str]) -> tuple[str, str]:
@@ -825,6 +850,26 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             "aspect_bucketing": aspect_bucketing,
             "extra_watched_paths_in_names": image_extra_watched or None,
             "trust_cache": config.skip_cache_validation,
+            # Enough in-flight builds to fill EncodeVAE's batch collector (see
+            # _create_dataset) while the next batch decodes.
+            "build_max_workers": 2 * vae_encode_batch_size() if vae_encode_batch_size() > 1 else None,
+            # New items get their bucket from the image headers instead of a
+            # full decode. That holds while nothing between the loads and
+            # CalcAspect resizes the image: RandomMaskRotateCrop does, so items
+            # whose concept enables it still decode.
+            "header_resolution_path_in_names": {
+                "original_resolution": "image_path",
+                **(
+                    {"original_resolution_rejected": "image_path_rejected"}
+                    if config.rlhf_enabled and config.adaptive_resolution
+                    else {}
+                ),
+            },
+            "header_resolution_blocked_in_names": (
+                ["concept.image.enable_random_mask_rotate_crop"]
+                if config.masked_training or config.model_type.has_mask_input()
+                else None
+            ),
             "adaptive_resolution": config.adaptive_resolution,
             "adaptive_resolution_ladder": config.adaptive_resolution_ladder,
             "additional_resolution_in_names": (
@@ -984,6 +1029,12 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             + self._dpo_rejected_preparation_modules(config, model)
             + self._dpo_rejected_mask_modules(config)
         )
+        if config.latent_caching and vae_encode_batch_size() > 1:
+            # With latent caching the VAE only runs during cache builds, where
+            # many workers encode concurrently: batch their forwards.
+            for module in preparation_modules:
+                if isinstance(module, EncodeVAE):
+                    module.enable_batch_collector(vae_encode_batch_size(), vae_encode_batch_pixels())
 
         debug_modules = self._debug_modules(config, model)
 
