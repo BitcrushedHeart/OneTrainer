@@ -23,8 +23,8 @@
     "output_dtype": "BFLOAT_16",
     "dataloader_threads": 1,
     "timestep_distribution": "LOGIT_NORMAL",
-    "noising_bias": 1.09,
-    "noising_weight": -0.05,
+    "noising_bias": 0.0,
+    "noising_weight": 0.0,
     "timestep_shift": 1.0,
     "dynamic_timestep_shifting": false,
     "optimizer": {
