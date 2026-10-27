@@ -456,6 +456,9 @@ _PERCEPTUAL_DEFAULTS = (
     ("perceptual_sigma_max", 0.75),
     # decode window edge in pixels (0 = whole frame); latent edge is crop // 8
     ("perceptual_crop", 512),
+    # log perceptual vs MSE gradient norms each step; re-runs the decoder
+    # backward with retain_graph, which roughly doubles the term's peak VRAM
+    ("perceptual_grad_norms", False),
 )
 
 
@@ -504,6 +507,7 @@ class TrainConfig(BaseConfig):
     enable_async_offloading: bool
     enable_activation_offloading: bool
     layer_offload_fraction: float
+    vram_limit_gib: float
     force_circular_padding: bool
     compile: bool
     compile_cache: bool
@@ -560,6 +564,7 @@ class TrainConfig(BaseConfig):
     perceptual_sigma_full: float
     perceptual_sigma_max: float
     perceptual_crop: int
+    perceptual_grad_norms: bool
     dropout_probability: float  # this is LoRA dropout!
     loss_scaler: LossScaler
     learning_rate_scaler: LearningRateScaler
@@ -1832,6 +1837,9 @@ class TrainConfig(BaseConfig):
         data.append(("enable_async_offloading", True, bool, False))
         data.append(("enable_activation_offloading", True, bool, False))
         data.append(("layer_offload_fraction", 0.0, float, False))
+        # Cap on the CUDA caching allocator's reserved memory in GiB (0 = no cap).
+        # Stops the cache spilling into shared memory under Windows WDDM.
+        data.append(("vram_limit_gib", 0.0, float, False))
         data.append(("force_circular_padding", False, bool, False))
         data.append(("compile", False, bool, False))
         # Dynamo precompile cache: reuse traced graphs across processes so queued

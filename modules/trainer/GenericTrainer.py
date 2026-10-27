@@ -75,7 +75,7 @@ from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
 from modules.util.rlhf_schedule_util import KIND_ORDER, IndependentSchedule, MicroStepKind, wind_data_loader
 from modules.util.text_reward_util import TextRewardScheduler, derive_text_reward_interval
 from modules.util.time_util import get_string_timestamp
-from modules.util.torch_util import torch_gc
+from modules.util.torch_util import set_vram_limit, torch_gc
 from modules.util.TrainProgress import TrainProgress
 from modules.util.transfer_util import TransferStopCriterion
 
@@ -289,6 +289,8 @@ class GenericTrainer(BaseTrainer):
         if self.config.train_dtype.enable_tf():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+
+        set_vram_limit(self.train_device, self.config.vram_limit_gib)
 
         self.model_loader = self.create_model_loader()
         self.model_setup = self.create_model_setup()
@@ -2282,8 +2284,9 @@ class GenericTrainer(BaseTrainer):
 
     def __log_vram(self, train_progress: TrainProgress, kind: MicroStepKind, batch) -> None:
         """Config log_vram: this micro-step's CUDA peaks (allocated, and reserved
-        by the caching allocator, which is what nvidia-smi sees), what it was
-        and the latent size it ran at, then reset the peaks for the next one.
+        by the caching allocator, which is what nvidia-smi sees), the allocator's
+        flush-and-retry count, what the micro-step was and the latent size it
+        ran at, then reset the peaks for the next one.
         Host-side counters only, no sync. vram/probe marks the micro-steps that
         ran the concept conflict probe and fixed probes on top."""
         if not self.config.log_vram or not torch.cuda.is_available() or not multi.is_master():
@@ -2294,6 +2297,9 @@ class GenericTrainer(BaseTrainer):
         self._vram_addon_shape = None
         self.tensorboard.add_scalar("vram/peak_allocated_gib", torch.cuda.max_memory_allocated() / gib, step)
         self.tensorboard.add_scalar("vram/peak_reserved_gib", torch.cuda.max_memory_reserved() / gib, step)
+        # Cumulative: allocations that had to flush the whole cache and retry,
+        # which is what hitting the vram_limit_gib cap costs.
+        self.tensorboard.add_scalar("vram/alloc_retries", torch.cuda.memory_stats().get("num_alloc_retries", 0), step)
         self.tensorboard.add_scalar("vram/kind", KIND_ORDER.index(kind), step)
         if shape is not None:
             self.tensorboard.add_scalar("vram/latent_hw", shape[-2] * shape[-1], step)

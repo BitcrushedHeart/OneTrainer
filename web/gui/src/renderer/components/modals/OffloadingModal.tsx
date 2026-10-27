@@ -24,6 +24,12 @@ export function OffloadingModal({ open, onClose }: OffloadingModalProps) {
           type="number"
           tooltip="Fraction of layers to offload to CPU (0 = none, 1 = all)"
         />
+        <FormEntry
+          label="VRAM Limit (GiB)"
+          configPath="vram_limit_gib"
+          type="number"
+          tooltip="Cap on the GPU memory PyTorch keeps reserved (0 = no cap). Stops Windows spilling into shared memory"
+        />
         <Toggle
           configPath="enable_async_offloading"
           label="Async Offloading"

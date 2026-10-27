@@ -275,7 +275,10 @@ class ModelSetupPerceptualLossMixin(metaclass=ABCMeta):
         weighted = raw * weight[idx] * scale * loss_weight
 
         self._perceptual_record(loss=weighted.sum().item(), raw=raw.mean().item())
-        if (self._perceptual_calls - 1) % max(config.gradient_accumulation_steps, 1) == 0:
+        if (
+            config.perceptual_grad_norms
+            and (self._perceptual_calls - 1) % max(config.gradient_accumulation_steps, 1) == 0
+        ):
             self._perceptual_grad_norms(batch, data, config, weighted, scale)
 
         return losses.index_add(0, idx, weighted.to(dtype=losses.dtype))

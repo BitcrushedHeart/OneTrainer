@@ -504,6 +504,12 @@ FIELD_TOOLTIPS: dict[str, str] = {
         " Only available if checkpointing is set to CPU_OFFLOADED."
         " values between 0 and 1, 0=disabled"
     ),
+    "vram_limit_gib": (
+        "Caps the GPU memory PyTorch keeps reserved, in GiB (0 = no cap). At the cap PyTorch frees its"
+        " cached blocks instead of growing further, which stops Windows spilling into slow shared memory."
+        " Set it below the card's size minus what the desktop and CUDA context use."
+        " Too low a cap raises an out-of-memory error instead."
+    ),
     "enable_async_offloading": (
         "Enable asynchronous layer offloading to overlap GPU compute with CPU-GPU transfers."
         " Can improve throughput when using layer offloading"

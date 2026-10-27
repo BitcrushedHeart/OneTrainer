@@ -238,6 +238,45 @@ def torch_gc():
         torch.mps.empty_cache()
 
 
+# Device indexes whose caching allocator set_vram_limit() capped, so a later
+# run in the same process (web backend, queue worker) can lift the cap again.
+_vram_limited_devices: set[int] = set()
+
+
+def set_vram_limit(device: torch.device, limit_gib: float):
+    """Caps the CUDA caching allocator's reserved memory on ``device`` at
+    ``limit_gib`` (0 lifts a cap set earlier in this process).
+
+    The allocator only hands cached blocks back to the driver when an allocation
+    fails. Under the Windows WDDM driver an allocation past physical VRAM does
+    not fail, it spills into shared system memory, so the cache grows into the
+    spill even when the live tensors fit. With a cap the allocator frees cached
+    blocks at the limit instead, and raises OOM only if the live tensors
+    themselves need more. expandable_segments, the other fix for this, is not
+    available on Windows."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    index = torch.cuda.current_device() if device.index is None else device.index
+
+    if limit_gib <= 0:
+        if index in _vram_limited_devices:
+            torch.cuda.set_per_process_memory_fraction(1.0, index)
+            _vram_limited_devices.discard(index)
+        return
+
+    gib = 1024**3
+    total = torch.cuda.get_device_properties(index).total_memory
+    limit = min(limit_gib * gib, total)
+    torch.cuda.set_per_process_memory_fraction(limit / total, index)
+    # Reclaim the oldest cached blocks once reserved memory is within 1 GiB of
+    # the cap, so the cap itself (a sync plus a flush of the whole cache) is
+    # rarely reached. The threshold is a fraction of the capped amount.
+    threshold = min(max((limit - gib) / limit, 0.5), 0.99)
+    torch._C._accelerator_setAllocatorSettings(f"garbage_collection_threshold:{threshold:.3f}")
+    _vram_limited_devices.add(index)
+    print(f"VRAM limit: CUDA caching allocator on cuda:{index} capped at {limit / gib:.2f} GiB")
+
+
 def torch_sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
