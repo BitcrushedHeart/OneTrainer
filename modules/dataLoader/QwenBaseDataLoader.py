@@ -14,7 +14,6 @@ from modules.modelSetup.BaseQwenSetup import BaseQwenSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
-from modules.util.thread_safety import apply_thread_safe_forward
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -70,8 +69,6 @@ class QwenBaseDataLoader(
         # head after encoding, the other skips the padded tail.
         text_caching_active = config.latent_caching and not config.train_text_encoder_or_embedding()
         text_encode_batch = text_encode_batch_size()
-        if text_caching_active and (config.dataloader_threads > 1 or text_encode_batch > 1):
-            apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
         encode_prompt = EncodeQwenText(
             tokens_name="tokens",
             tokens_attention_mask_in_name="tokens_mask",

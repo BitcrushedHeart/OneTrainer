@@ -28,6 +28,7 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLDecoderLayer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
 from transformers.models.t5.modeling_t5 import T5Block
 
 init_compile()
@@ -403,10 +404,9 @@ def enable_checkpointing_for_qwen3_encoder_layers(
         config,
         False,
         [
-            (
-                Qwen3DecoderLayer,
-                [],
-            ),  # No activation offloading, because hidden states are taken from the middle of the network by Flux2
+            # No activation offloading, because hidden states are taken from the middle of the network by Flux2
+            (Qwen3DecoderLayer, []),
+            (Qwen3_5DecoderLayer, []),
         ],
     )
 

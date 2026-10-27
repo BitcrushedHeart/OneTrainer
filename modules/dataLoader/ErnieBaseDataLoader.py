@@ -7,7 +7,6 @@ from modules.modelSetup.BaseErnieSetup import BaseErnieSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
-from modules.util.thread_safety import apply_thread_safe_forward
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -56,10 +55,6 @@ class ErnieBaseDataLoader(
         # outputs.
         text_encode_batch = text_encode_batch_size()
         use_batch_collector = config.latent_caching and text_encode_batch > 1
-        if config.dataloader_threads > 1 or use_batch_collector:
-            apply_thread_safe_forward(
-                model.text_encoder
-            )  # workaround for transformers#42673, unclear if Mistral is affected
         encode_prompt = EncodeMistralText(
             tokens_name="tokens",
             tokens_attention_mask_in_name="tokens_mask",

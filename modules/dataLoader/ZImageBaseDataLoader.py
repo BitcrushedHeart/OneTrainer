@@ -10,7 +10,6 @@ from modules.modelSetup.BaseZImageSetup import BaseZImageSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
-from modules.util.thread_safety import apply_thread_safe_forward
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -59,8 +58,6 @@ class ZImageBaseDataLoader(
             apply_chat_template_kwargs={"add_generation_prompt": True, "enable_thinking": True},
         )
         text_encode_batch = text_encode_batch_size()
-        if config.dataloader_threads > 1 or text_encode_batch > 1:
-            apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
         encode_prompt = EncodeQwenText(
             tokens_name="tokens",
             tokens_attention_mask_in_name="tokens_mask",

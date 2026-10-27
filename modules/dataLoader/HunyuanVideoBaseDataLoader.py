@@ -13,7 +13,6 @@ from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
-from modules.util.thread_safety import apply_thread_safe_forward
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -81,10 +80,6 @@ class HunyuanVideoBaseDataLoader(
         # caches full padded hidden states.
         text_encode_batch = text_encode_batch_size()
         use_batch_collector = config.latent_caching and text_encode_batch > 1
-        if config.dataloader_threads > 1 or text_encode_batch > 1:
-            for text_encoder in [model.text_encoder_1, model.text_encoder_2]:
-                if text_encoder is not None:
-                    apply_thread_safe_forward(text_encoder)
         encode_prompt_1 = EncodeLlamaText(
             tokens_name="tokens_1",
             tokens_attention_mask_in_name="tokens_mask_1",

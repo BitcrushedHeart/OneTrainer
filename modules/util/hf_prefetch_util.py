@@ -2,7 +2,7 @@
 
 Cloud runs that upload without a GPU call this while the pod is still on the CPU-only rate, so the
 model loader later finds every file cached instead of downloading the text encoder / VAE / transformer
-with the GPU attached. Mirrors what the loaders' _prepare_sub_modules fetch: the subfolders a run
+with the GPU attached. Fetches the model weight files of every part a run loads from the repo: the subfolders a run
 overrides with its own file (transformer, VAE, prior) are left out.
 """
 

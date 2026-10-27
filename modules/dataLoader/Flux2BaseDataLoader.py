@@ -14,7 +14,6 @@ from modules.modelSetup.BaseFlux2Setup import BaseFlux2Setup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
-from modules.util.thread_safety import apply_thread_safe_forward
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -69,8 +68,6 @@ class Flux2BaseDataLoader(
                 apply_chat_template=lambda caption: mistral_format_input([caption], MISTRAL_SYSTEM_MESSAGE),
                 apply_chat_template_kwargs={"add_generation_prompt": False},
             )
-            if config.dataloader_threads > 1 or use_batch_collector:
-                apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
             encode_prompt = EncodeMistralText(
                 tokens_name="tokens",
                 tokens_attention_mask_in_name="tokens_mask",
@@ -93,8 +90,6 @@ class Flux2BaseDataLoader(
                 apply_chat_template=lambda caption: qwen3_format_input(caption),
                 apply_chat_template_kwargs={"add_generation_prompt": True, "enable_thinking": False},
             )
-            if config.dataloader_threads > 1 or use_batch_collector:
-                apply_thread_safe_forward(model.text_encoder)  # workaround for transformers#42673
             encode_prompt = EncodeQwenText(
                 tokens_name="tokens",
                 tokens_attention_mask_in_name="tokens_mask",
