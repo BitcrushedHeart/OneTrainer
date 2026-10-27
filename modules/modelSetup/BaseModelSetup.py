@@ -1800,6 +1800,11 @@ class BaseModelSetup(
     @staticmethod
     def _dpo_mse_per_sample(pred: Tensor, target: Tensor, mask: Tensor | None = None) -> Tensor:
         if mask is not None:
+            # The rejected mask is sized from the rejected VAE latent, which is
+            # larger than the prediction for models that pack latent cells into
+            # tokens (MOSS: 2x2, so 1/8 vs 1/16 scale); area-average it down.
+            if mask.ndim == 4 and pred.ndim == 4 and mask.shape[-2:] != pred.shape[-2:]:
+                mask = torch.nn.functional.interpolate(mask, size=pred.shape[-2:], mode="area")
             return masked_mse_per_sample(pred, target, mask)
         # fp32 accumulation in the reduction instead of upcasting the full
         # [B,C,H,W] tensors - avoids fp32 copies per step.
