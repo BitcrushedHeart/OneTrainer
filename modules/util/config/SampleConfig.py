@@ -111,6 +111,16 @@ def _get_model_defaults(model_type) -> dict:
                 "cfg_scale": 4.0,
             }
         )
+    elif model_type.is_moss():
+        # MOSS's recommended sampling: >= 50 Euler steps at CFG 3
+        defaults.update(
+            {
+                "width": 1024,
+                "height": 1024,
+                "diffusion_steps": 50,
+                "cfg_scale": 3.0,
+            }
+        )
     elif model_type.is_hunyuan_video():
         defaults.update(
             {

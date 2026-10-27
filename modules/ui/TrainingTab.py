@@ -87,6 +87,8 @@ class TrainingTab:
             self.__setup_z_image_ui(column_0, column_1, column_2)
         elif self.train_config.model_type.is_ernie():
             self.__setup_ernie_ui(column_0, column_1, column_2)
+        elif self.train_config.model_type.is_moss():
+            self.__setup_moss_ui(column_0, column_1, column_2)
 
     def __setup_stable_diffusion_ui(self, column_0, column_1, column_2):
         self.__create_base_frame(column_0, 0)
@@ -228,6 +230,18 @@ class TrainingTab:
         self.__create_base2_frame(column_1, 0)
         self.__create_transformer_frame(column_1, 1, supports_guidance_scale=False, supports_force_attention_mask=False)
         self.__create_noise_frame(column_1, 2, supports_dynamic_timestep_shifting=True)
+
+        self.__create_masked_frame(column_2, 1)
+        self.__create_loss_frame(column_2, 2)
+        self.__create_layer_frame(column_2, 3)
+
+    def __setup_moss_ui(self, column_0, column_1, column_2):
+        self.__create_base_frame(column_0, 0)
+        self.__create_text_encoder_frame(column_0, 1, supports_clip_skip=False, supports_training=False)
+
+        self.__create_base2_frame(column_1, 0)
+        self.__create_transformer_frame(column_1, 1, supports_guidance_scale=False, supports_force_attention_mask=False)
+        self.__create_noise_frame(column_1, 2, supports_dynamic_timestep_shifting=False)
 
         self.__create_masked_frame(column_2, 1)
         self.__create_loss_frame(column_2, 2)
@@ -1224,8 +1238,8 @@ class TrainingTab:
             )
             row += 1
 
-        # Low-sigma perceptual term (Z-Image: VAE decoder features on x0_hat)
-        if self.train_config.model_type.is_z_image():
+        # Low-sigma perceptual term (Z-Image, MOSS: VAE decoder features on x0_hat)
+        if self.train_config.model_type.is_z_image() or self.train_config.model_type.is_moss():
             components.label(
                 frame,
                 row,

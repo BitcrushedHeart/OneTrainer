@@ -45,6 +45,11 @@ def calculate_n_layers(model: BaseModel) -> dict[str, int]:
                 "layers",
                 "refiner",
             ]
+        case ModelType.MOSS:
+            default_patterns = [
+                "layers",
+                "text_embedder.blocks",
+            ]
         case _:
             raise NotImplementedError(f"Scaled Optimizer is not implemented for model type: {model.model_type}")
 

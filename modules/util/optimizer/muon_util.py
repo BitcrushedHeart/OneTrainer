@@ -47,6 +47,11 @@ def calculate_muon_n_layers(model: BaseModel) -> dict[str, int]:
                 "layers",
                 "refiner",
             ]
+        case ModelType.MOSS:
+            default_patterns = [
+                "layers",
+                "text_embedder.blocks",
+            ]
         case _:
             raise NotImplementedError(
                 f"Muon optimizer spectral normalization is not implemented for model type: {model.model_type}"
@@ -161,6 +166,11 @@ def build_muon_adam_key_fn(
                 default_patterns = [
                     "layers",
                     "refiner",
+                ]
+            case ModelType.MOSS:
+                default_patterns = [
+                    "layers",
+                    "text_embedder.blocks",
                 ]
             case _:  # Unmatched cases
                 raise NotImplementedError(

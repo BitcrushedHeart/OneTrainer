@@ -41,6 +41,7 @@ const MODEL_QUANTIZATION: Record<string, number> = {
   CHROMA_1: 64,
   QWEN: 64,
   Z_IMAGE: 64,
+  MOSS: 64,
 };
 
 const QUANT_OPTIONS = ["8", "16", "32", "64", "128"];

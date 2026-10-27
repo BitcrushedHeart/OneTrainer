@@ -41,6 +41,8 @@ class ModelType(Enum):
 
     ERNIE = "ERNIE"
 
+    MOSS = "MOSS"
+
     def __str__(self):
         return self.value
 
@@ -107,6 +109,9 @@ class ModelType(Enum):
     def is_ernie(self):
         return self == ModelType.ERNIE
 
+    def is_moss(self):
+        return self == ModelType.MOSS
+
     def has_mask_input(self) -> bool:
         return (
             self == ModelType.STABLE_DIFFUSION_15_INPAINTING
@@ -165,6 +170,7 @@ class ModelType(Enum):
             or self.is_hi_dream()
             or self.is_z_image()
             or self.is_ernie()
+            or self.is_moss()
         )
 
     def is_video_model(self) -> bool:

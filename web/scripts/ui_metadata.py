@@ -25,6 +25,7 @@ ENUM_DISPLAY_LABELS: dict[str, dict[str, str]] = {
         "CHROMA_1": "Chroma1",
         "QWEN": "QwenImage",
         "Z_IMAGE": "Z-Image",
+        "MOSS": "MOSS-Image",
     },
     "TrainingMethod": {
         "FINE_TUNE": "Fine-Tune",
@@ -659,7 +660,7 @@ FIELD_TOOLTIPS: dict[str, str] = {
     "loss_weight_fn": "Choice of loss weight function. Can help the model learn details more accurately.",
     "loss_weight_strength": ("Inverse strength of loss weighting. Range: 1-20, only applies to Min SNR and P2."),
     "perceptual_strength": (
-        "Z-Image only. Adds a perceptual distance between the one-step clean estimate and the"
+        "Z-Image and MOSS only. Adds a perceptual distance between the one-step clean estimate and the"
         " dataset latent, measured in the VAE decoder's feature maps, on low/mid-noise samples."
         " Never replaces MSE. 0 disables. Tune so perceptual/grad_norm_v is ~0.1-0.2 of"
         " perceptual/mse_grad_norm_v in TensorBoard."

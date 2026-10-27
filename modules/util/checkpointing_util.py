@@ -484,6 +484,20 @@ def enable_checkpointing_for_qwen_transformer(
     )
 
 
+def enable_checkpointing_for_moss_transformer(
+    model: nn.Module,
+    config: TrainConfig,
+) -> LayerOffloadConductor:
+    return enable_checkpointing(
+        model,
+        config,
+        config.compile,
+        [
+            (model.layers, ["x"]),  # MOSS block forward: (x, rope, modulation)
+        ],
+    )
+
+
 def enable_checkpointing_for_z_image_transformer(
     model: nn.Module,
     config: TrainConfig,

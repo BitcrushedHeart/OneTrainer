@@ -589,7 +589,7 @@ def generate_model_type_info_ts(enums: list[tuple[str, type]]) -> str:
             or mt.is_chroma()
         ):
             methods = [TrainingMethod.FINE_TUNE, TrainingMethod.LORA, TrainingMethod.EMBEDDING]
-        elif mt.is_qwen() or mt.is_z_image() or mt.is_flux_2():
+        elif mt.is_qwen() or mt.is_z_image() or mt.is_flux_2() or mt.is_moss():
             methods = [TrainingMethod.FINE_TUNE, TrainingMethod.LORA]
         else:
             methods = [TrainingMethod.FINE_TUNE, TrainingMethod.LORA, TrainingMethod.EMBEDDING]

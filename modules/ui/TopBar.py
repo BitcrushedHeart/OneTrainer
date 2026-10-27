@@ -107,6 +107,7 @@ class TopBar:
                 ("QwenImage", ModelType.QWEN),
                 ("Z-Image", ModelType.Z_IMAGE),
                 ("Ernie Image", ModelType.ERNIE),
+                ("MOSS-Image", ModelType.MOSS),
             ],
             ui_state=self.ui_state,
             var_name="model_type",
@@ -147,6 +148,7 @@ class TopBar:
             or self.train_config.model_type.is_z_image()
             or self.train_config.model_type.is_flux_2()
             or self.train_config.model_type.is_ernie()
+            or self.train_config.model_type.is_moss()
         ):
             values = [
                 ("Fine Tune", TrainingMethod.FINE_TUNE),

@@ -149,6 +149,9 @@ def decoder_feature_distance(
 
 
 class ModelSetupPerceptualLossMixin(metaclass=ABCMeta):
+    # pixels per cell of the latent the window is cut from (data["predicted_latent"])
+    PERCEPTUAL_LATENT_DOWNSCALE = _LATENT_DOWNSCALE
+
     def __init__(self):
         super().__init__()
         self._perceptual_sums: dict[str, float] = {}
@@ -244,7 +247,7 @@ class ModelSetupPerceptualLossMixin(metaclass=ABCMeta):
             latent_mask = latent_mask[idx].detach()
 
         height, width = pred_latent.shape[-2:]
-        edge = config.perceptual_crop // _LATENT_DOWNSCALE if config.perceptual_crop > 0 else 0
+        edge = config.perceptual_crop // self.PERCEPTUAL_LATENT_DOWNSCALE if config.perceptual_crop > 0 else 0
         pred_crops, target_crops, mask_crops = [], [], []
         for i in range(pred_latent.shape[0]):
             y0, y1, x0, x1 = random_latent_window(height, width, edge, self._perceptual_rng)
