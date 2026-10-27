@@ -1,3 +1,4 @@
+import math
 from contextlib import nullcontext
 from random import Random
 
@@ -228,8 +229,17 @@ class MossModel(BaseModel):
         return denormed.view(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c // 4, 2 * h, 2 * w)
 
     def calculate_timestep_shift(self, latent_width: int, latent_height: int) -> float:
-        # MOSS was pretrained without a resolution-dependent shift: the final stage
-        # (technical report, Table 6) samples on the unshifted grid at every
-        # resolution, which the scheduler records as training_shift. Its shift=5.0
-        # is for inference only.
-        return float(self.noise_scheduler.config.training_shift)
+        # Flux-style exponential shift from the scheduler config, as in upstream
+        # PR #1741. Only used with dynamic_timestep_shifting; the scheduler itself
+        # ships use_dynamic_shifting=False and training_shift=1.0.
+        base_seq_len = self.noise_scheduler.config.base_image_seq_len
+        max_seq_len = self.noise_scheduler.config.max_image_seq_len
+        base_shift = self.noise_scheduler.config.base_shift
+        max_shift = self.noise_scheduler.config.max_shift
+
+        # the transformer consumes the 2x2-packed latents, one token per cell
+        image_seq_len = latent_width * latent_height
+        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        b = base_shift - m * base_seq_len
+        mu = image_seq_len * m + b
+        return math.exp(mu)
